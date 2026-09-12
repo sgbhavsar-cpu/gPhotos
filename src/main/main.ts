@@ -32,7 +32,13 @@ import {
   getServiceLogs,
 } from './services/backgroundDaemon';
 import { exportLibraryBackupZip } from './services/zipBackupService';
-import { getHeicJpegBuffer } from './services/heicService';
+import {
+  getHeicJpegBuffer,
+  getOrGenerateHeicThumbnail500,
+  getHeicHighQualityJpegBuffer,
+  prepareHeicHqTemp,
+  cleanupHeicHqTemp,
+} from './services/heicService';
 import {
   startEmbeddedWebServer,
   stopEmbeddedWebServer,
@@ -263,12 +269,16 @@ function createWindow() {
         // Direct support for Apple iPhone HEIC/HEIF files:
         // Automatically extract embedded EXIF preview or decode via libheif WASM
         if (ext === '.heic' || ext === '.heif') {
-          const heicBuf = await getHeicJpegBuffer(targetPath);
+          const isHq = preferOriginal || url.searchParams.get('quality') === 'high';
+          const heicBuf = isHq
+            ? await getHeicHighQualityJpegBuffer(targetPath)
+            : await getOrGenerateHeicThumbnail500(targetPath);
           if (heicBuf && heicBuf.length > 0) {
             return new Response(heicBuf as any, {
               headers: {
                 'Content-Type': 'image/jpeg',
                 'Access-Control-Allow-Origin': '*',
+                'Cache-Control': 'public, max-age=86400',
               },
             });
           }
@@ -896,6 +906,25 @@ ipcMain.handle('webserver:set-settings', async (_event, settings: { enabled: boo
       allUrls: [],
       error: err.message,
     };
+  }
+});
+
+ipcMain.handle('heic:prepare-hq', async (_event, filePath: string, photoId: string) => {
+  try {
+    return await prepareHeicHqTemp(filePath, photoId);
+  } catch (err) {
+    console.error('heic:prepare-hq error:', err);
+    return null;
+  }
+});
+
+ipcMain.handle('heic:cleanup-hq', async (_event, photoId: string) => {
+  try {
+    cleanupHeicHqTemp(photoId);
+    return true;
+  } catch (err) {
+    console.error('heic:cleanup-hq error:', err);
+    return false;
   }
 });
 

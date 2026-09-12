@@ -23,7 +23,9 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
         const res = await fetch('/api/library');
         if (!res.ok) return null;
         const data = await res.json();
-        return data[key] || null;
+        if (data[key]) return data[key];
+        if (key === 'gphotos_library_v1' && (data.photos || data.people)) return data;
+        return null;
       } catch {
         return null;
       }
@@ -58,7 +60,31 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
       }
     },
     selectDirectory: async () => null,
-    scanDirectory: async () => [],
+    scanDirectory: async (dirPath?: string) => {
+      try {
+        if (!dirPath) return [];
+        const res = await fetch(`/api/scan?path=${encodeURIComponent(dirPath)}`);
+        if (!res.ok) return [];
+        return await res.json();
+      } catch {
+        return [];
+      }
+    },
+    prepareHeicHq: async (filePath: string, photoId: string) => {
+      try {
+        const res = await fetch(`/api/heic/prepare-hq?path=${encodeURIComponent(filePath)}&id=${encodeURIComponent(photoId)}`);
+        if (res.ok) {
+          const data = await res.json();
+          return data.url || null;
+        }
+      } catch {}
+      return null;
+    },
+    cleanupHeicHq: async (photoId: string) => {
+      try {
+        await fetch(`/api/heic/cleanup-hq?id=${encodeURIComponent(photoId)}`);
+      } catch {}
+    },
     readExif: async () => ({}),
     analyzeDryRun: async () => ({ totalFiles: 0, byYearMonth: {}, duplicateCount: 0, previewFiles: [] }),
     executeOrganize: async () => ({ success: true, processedCount: 0, errors: [] }),

@@ -287,6 +287,8 @@ export interface IElectronAPI {
   openItemInFolder: (filePath: string) => Promise<boolean>;
   getWebServerStatus: () => Promise<WebServerStatus>;
   setWebServerSettings: (settings: { enabled: boolean; port: number }) => Promise<WebServerStatus>;
+  prepareHeicHq?: (filePath: string, photoId: string) => Promise<string | null>;
+  cleanupHeicHq?: (photoId: string) => Promise<boolean>;
 }
 
 export interface WebServerStatus {

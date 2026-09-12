@@ -12,14 +12,24 @@ function photoApiPlugin() {
         ? path.join(os.homedir(), 'Library/Application Support')
         : path.join(os.homedir(), '.config'));
     const candidates = [
-      path.join(appData, 'gPhotos', 'library.json'),
       path.join(appData, 'gphotos-desktop', 'library.json'),
+      path.join(appData, 'gPhotos', 'library.json'),
       path.join(__dirname, 'library.json'),
     ];
+    let best = candidates[0];
+    let bestSize = -1;
     for (const c of candidates) {
-      if (fs.existsSync(c)) return c;
+      if (fs.existsSync(c)) {
+        try {
+          const sz = fs.statSync(c).size;
+          if (sz > bestSize) {
+            bestSize = sz;
+            best = c;
+          }
+        } catch {}
+      }
     }
-    return candidates[0];
+    return best;
   };
 
   return {

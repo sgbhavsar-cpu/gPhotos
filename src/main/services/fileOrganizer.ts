@@ -7,7 +7,8 @@ import {
   OrganizeOptions,
   DryRunItem,
   DryRunSummary,
-  OrganizeProgress
+  OrganizeProgress,
+  Photo
 } from '../../types';
 
 const SUPPORTED_EXTENSIONS = new Set([
@@ -49,6 +50,42 @@ export function scanDirectoryRecursive(dirPath: string): string[] {
 
   scan(dirPath);
   return results;
+}
+
+export async function scanPhotoDirectory(dirPath: string): Promise<Photo[]> {
+  const filePaths = scanDirectoryRecursive(dirPath);
+  const photos: Photo[] = [];
+
+  for (const filePath of filePaths) {
+    try {
+      const stats = fs.statSync(filePath);
+      const meta = await parsePhotoMetadata(filePath);
+      const date = new Date(meta.dateTaken);
+
+      const photo: Photo = {
+        id: Buffer.from(filePath).toString('base64'),
+        filePath,
+        fileName: path.basename(filePath),
+        fileSize: stats.size,
+        fileDate: stats.mtime.toISOString(),
+        dateTaken: date.toISOString(),
+        year: date.getFullYear(),
+        month: date.getMonth() + 1,
+        day: date.getDate(),
+        width: meta.width,
+        height: meta.height,
+        exif: meta.exif,
+        location: meta.location,
+        isFavorite: false,
+      };
+
+      photos.push(photo);
+    } catch (err) {
+      console.error(`Failed to scan photo ${filePath}:`, err);
+    }
+  }
+
+  return photos;
 }
 
 export function computeFileHash(filePath: string): string {

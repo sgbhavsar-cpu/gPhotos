@@ -31,15 +31,25 @@ function getLibraryPath() {
       : path.join(os.homedir(), '.config'));
 
   const candidates = [
-    path.join(appData, 'gPhotos', 'library.json'),
     path.join(appData, 'gphotos-desktop', 'library.json'),
+    path.join(appData, 'gPhotos', 'library.json'),
     path.join(__dirname, '..', 'library.json'),
   ];
 
+  let best = candidates[0];
+  let bestSize = -1;
   for (const p of candidates) {
-    if (fs.existsSync(p)) return p;
+    if (fs.existsSync(p)) {
+      try {
+        const sz = fs.statSync(p).size;
+        if (sz > bestSize) {
+          bestSize = sz;
+          best = p;
+        }
+      } catch {}
+    }
   }
-  return candidates[0];
+  return best;
 }
 
 const MIME_TYPES = {

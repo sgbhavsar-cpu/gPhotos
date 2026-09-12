@@ -63,6 +63,8 @@ const electronAPI: IElectronAPI = {
   openItemInFolder: (filePath: string) => ipcRenderer.invoke('shell:show-item-in-folder', filePath),
   getWebServerStatus: () => ipcRenderer.invoke('webserver:get-status'),
   setWebServerSettings: (settings) => ipcRenderer.invoke('webserver:set-settings', settings),
+  prepareHeicHq: (filePath: string, photoId: string) => ipcRenderer.invoke('heic:prepare-hq', filePath, photoId),
+  cleanupHeicHq: (photoId: string) => ipcRenderer.invoke('heic:cleanup-hq', photoId),
 };
 
 contextBridge.exposeInMainWorld('electronAPI', electronAPI);

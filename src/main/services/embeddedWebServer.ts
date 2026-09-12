@@ -3,7 +3,14 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { app } from 'electron';
-import { getHeicJpegBuffer } from './heicService';
+import {
+  getHeicJpegBuffer,
+  getOrGenerateHeicThumbnail500,
+  getHeicHighQualityJpegBuffer,
+  prepareHeicHqTemp,
+  cleanupHeicHqTemp,
+} from './heicService';
+import { scanPhotoDirectory } from './fileOrganizer';
 import { WebServerStatus } from '../../types';
 
 let serverInstance: http.Server | null = null;
@@ -46,8 +53,15 @@ export function getNetworkIps(): Array<{ name: string; address: string }> {
   return ips;
 }
 
-// 2. Locate active library.json
+// 2. Locate active library.json with highest priority given to active Electron store
 function getLibraryPath(): string {
+  try {
+    if (app && typeof app.getPath === 'function') {
+      const electronPath = path.join(app.getPath('userData'), 'library.json');
+      if (fs.existsSync(electronPath)) return electronPath;
+    }
+  } catch {}
+
   const appData =
     process.env.APPDATA ||
     (process.platform === 'darwin'
@@ -55,15 +69,25 @@ function getLibraryPath(): string {
       : path.join(os.homedir(), '.config'));
 
   const candidates = [
-    path.join(appData, 'gPhotos', 'library.json'),
     path.join(appData, 'gphotos-desktop', 'library.json'),
+    path.join(appData, 'gPhotos', 'library.json'),
     path.join(__dirname, '..', '..', '..', 'library.json'),
   ];
 
+  let bestCandidate: string | null = null;
+  let bestSize = -1;
   for (const p of candidates) {
-    if (fs.existsSync(p)) return p;
+    if (fs.existsSync(p)) {
+      try {
+        const sz = fs.statSync(p).size;
+        if (sz > bestSize) {
+          bestSize = sz;
+          bestCandidate = p;
+        }
+      } catch {}
+    }
   }
-  return candidates[0];
+  return bestCandidate || candidates[0];
 }
 
 // 3. Settings path for web server config
@@ -162,6 +186,27 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     }
   }
 
+  // Endpoint: /api/scan?path=...
+  if (pathname === '/api/scan') {
+    const targetDir = parsedUrl.searchParams.get('path');
+    if (targetDir && fs.existsSync(targetDir)) {
+      try {
+        const photos = await scanPhotoDirectory(targetDir);
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify(photos));
+        return;
+      } catch (err: any) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: err.message }));
+        return;
+      }
+    } else {
+      res.statusCode = 400;
+      res.end(JSON.stringify({ error: 'Invalid or missing directory path' }));
+      return;
+    }
+  }
+
   // Endpoint: /api/photo?path=...
   if (pathname === '/api/photo') {
     const filePath = parsedUrl.searchParams.get('path');
@@ -169,6 +214,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     const preferOriginal =
       parsedUrl.searchParams.get('preferOriginal') === '1' ||
       parsedUrl.searchParams.get('preferOriginal') === 'true';
+    const quality = parsedUrl.searchParams.get('quality');
 
     let targetPath: string | null = null;
     if (preferOriginal && originalPath && fs.existsSync(originalPath)) {
@@ -182,17 +228,25 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     if (targetPath && fs.existsSync(targetPath)) {
       const ext = path.extname(targetPath).toLowerCase();
 
-      // Robust Apple iPhone HEIC/HEIF Handling (embedded EXIF JPEG preview + fallback decode)
+      // Robust Apple iPhone HEIC/HEIF Handling:
+      // When quality is high or preferOriginal is requested (e.g. fullscreen lightbox), serve HQ JPEG.
+      // Otherwise, serve fast, disk-cached 500px auto-oriented thumbnail.
       if (ext === '.heic' || ext === '.heif') {
-        const jpegBuf = await getHeicJpegBuffer(targetPath);
+        const isHq = preferOriginal || quality === 'high';
+        const jpegBuf = isHq
+          ? await getHeicHighQualityJpegBuffer(targetPath)
+          : await getOrGenerateHeicThumbnail500(targetPath);
+
         if (jpegBuf && jpegBuf.length > 0) {
           res.setHeader('Content-Type', 'image/jpeg');
+          res.setHeader('Cache-Control', 'public, max-age=86400');
           res.end(jpegBuf);
           return;
         }
       }
 
       res.setHeader('Content-Type', MIME_TYPES[ext] || 'image/jpeg');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
       fs.createReadStream(targetPath).pipe(res);
       return;
     } else {
@@ -200,6 +254,36 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
       res.end('Photo not found');
       return;
     }
+  }
+
+  // Endpoint: /api/heic/prepare-hq?path=...&id=...
+  if (pathname === '/api/heic/prepare-hq') {
+    const targetPath = parsedUrl.searchParams.get('path');
+    const photoId = parsedUrl.searchParams.get('id') || 'temp';
+    if (targetPath && fs.existsSync(targetPath)) {
+      const tempPath = await prepareHeicHqTemp(targetPath, photoId);
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({
+        tempPath,
+        url: `/api/photo?path=${encodeURIComponent(tempPath || targetPath)}&quality=high`,
+      }));
+      return;
+    } else {
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: 'File not found' }));
+      return;
+    }
+  }
+
+  // Endpoint: /api/heic/cleanup-hq?id=...
+  if (pathname === '/api/heic/cleanup-hq') {
+    const photoId = parsedUrl.searchParams.get('id');
+    if (photoId) {
+      cleanupHeicHqTemp(photoId);
+    }
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ success: true }));
+    return;
   }
 
   // Endpoint: /api/file-exists?path=...
@@ -261,40 +345,46 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     }
   }
 
-  // SPA fallback to index.html
-  if (!fs.existsSync(fullPath) || (fs.existsSync(fullPath) && fs.statSync(fullPath).isDirectory())) {
-    fullPath = path.join(distDir, 'index.html');
-  }
-
-  if (fs.existsSync(fullPath) && !fs.statSync(fullPath).isDirectory()) {
+  if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) {
     const ext = path.extname(fullPath).toLowerCase();
     res.setHeader('Content-Type', MIME_TYPES[ext] || 'application/octet-stream');
     fs.createReadStream(fullPath).pipe(res);
-  } else {
-    res.statusCode = 404;
-    res.end('Not Found');
+    return;
   }
+
+  // SPA Fallback: index.html
+  const indexPath = path.join(distDir, 'index.html');
+  if (fs.existsSync(indexPath)) {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    fs.createReadStream(indexPath).pipe(res);
+    return;
+  }
+
+  res.statusCode = 404;
+  res.end('Not Found');
 }
 
 export function startEmbeddedWebServer(port: number = 5173): Promise<WebServerStatus> {
   return new Promise((resolve) => {
-    stopEmbeddedWebServer();
+    if (isServerRunning && serverInstance && activePort === port) {
+      resolve(getEmbeddedWebServerStatus());
+      return;
+    }
+
+    if (serverInstance) {
+      try {
+        serverInstance.close();
+      } catch {}
+      serverInstance = null;
+      isServerRunning = false;
+    }
 
     serverEnabled = true;
-    serverError = undefined;
 
     function tryPort(targetPort: number) {
-      const srv = http.createServer((req, res) => {
-        handleHttpRequest(req, res).catch((err) => {
-          console.error('Unhandled error in embedded web server:', err);
-          if (!res.headersSent) {
-            res.statusCode = 500;
-            res.end('Internal Server Error');
-          }
-        });
-      });
+      const srv = http.createServer(handleHttpRequest);
 
-      srv.once('error', (err: any) => {
+      srv.on('error', (err: any) => {
         if (err.code === 'EADDRINUSE') {
           console.warn(`[EmbeddedWebServer] Port ${targetPort} in use, trying ${targetPort + 1}...`);
           tryPort(targetPort + 1);
@@ -309,6 +399,7 @@ export function startEmbeddedWebServer(port: number = 5173): Promise<WebServerSt
         serverInstance = srv;
         activePort = targetPort;
         isServerRunning = true;
+        serverError = undefined;
         console.log(`[EmbeddedWebServer] 🚀 Running at http://0.0.0.0:${activePort}`);
         resolve(getEmbeddedWebServerStatus());
       });

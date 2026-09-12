@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   Image as ImageIcon,
   Users,
@@ -14,12 +14,23 @@ import {
   HelpCircle,
   Settings,
   BookImage,
-  ArrowRightLeft
+  ArrowRightLeft,
+  ChevronDown,
+  ChevronRight,
 } from 'lucide-react';
 import { LibraryState } from '../services/libraryStore';
 import { VirtualStorageConfig } from '../../types';
 
-export type ActiveTab = 'photos' | 'albums' | 'people' | 'places' | 'organize' | 'virtual_storage' | 'favorites' | 'folders' | 'settings';
+export type ActiveTab =
+  | 'photos'
+  | 'albums'
+  | 'people'
+  | 'places'
+  | 'organize'
+  | 'virtual_storage'
+  | 'favorites'
+  | 'folders'
+  | 'settings';
 
 interface SidebarProps {
   activeTab: ActiveTab;
@@ -50,6 +61,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onOpenAiAssistant,
   onOpenLibrarySwitcher,
 }) => {
+  const [isLibraryCollapsed, setIsLibraryCollapsed] = useState(false);
+  const [isNetworkStorageCollapsed, setIsNetworkStorageCollapsed] = useState(false);
+
   const navItems = [
     { id: 'photos' as ActiveTab, label: 'Photos', icon: ImageIcon, count: state.photos.length },
     { id: 'albums' as ActiveTab, label: 'Albums', icon: BookImage, count: (state.albums || []).length },
@@ -59,41 +73,46 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: 'virtual_storage' as ActiveTab, label: 'Network Mirrors', icon: HardDrive },
     { id: 'folders' as ActiveTab, label: 'Folder Tree', icon: FolderTree },
     { id: 'organize' as ActiveTab, label: 'Organize by Date', icon: FolderSync },
-    { id: 'settings' as ActiveTab, label: 'Settings & Service', icon: Settings },
+    { id: 'settings' as ActiveTab, label: 'Settings & Mobile', icon: Settings },
   ];
 
   return (
-    <aside style={{
-      width: '260px',
-      minWidth: '260px',
-      height: '100%',
-      backgroundColor: 'var(--bg-surface)',
-      borderRight: '1px solid var(--border-subtle)',
-      display: 'flex',
-      flexDirection: 'column',
-      padding: '20px 16px',
-      gap: '24px',
-    }}>
+    <aside
+      className="sidebar-scrollable"
+      style={{
+        width: '260px',
+        minWidth: '260px',
+        height: '100%',
+        backgroundColor: 'var(--bg-surface)',
+        borderRight: '1px solid var(--border-subtle)',
+        display: 'flex',
+        flexDirection: 'column',
+        padding: '20px 14px',
+        gap: '20px',
+      }}
+    >
       {/* Brand Header */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 8px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 6px', flexShrink: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <div style={{
-            width: '42px',
-            height: '42px',
-            borderRadius: 'var(--radius-md)',
-            background: 'var(--accent-gradient)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            boxShadow: 'var(--shadow-glow)',
-          }}>
-            <Sparkles size={22} color="white" />
+          <div
+            style={{
+              width: '40px',
+              height: '40px',
+              borderRadius: 'var(--radius-md)',
+              background: 'var(--accent-gradient)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              boxShadow: 'var(--shadow-glow)',
+            }}
+          >
+            <Sparkles size={20} color="white" />
           </div>
           <div>
-            <h1 style={{ fontSize: '1.18rem', fontWeight: 700, letterSpacing: '-0.02em', color: 'var(--text-primary)', margin: 0 }}>
+            <h1 style={{ fontSize: '1.15rem', fontWeight: 700, letterSpacing: '-0.02em', color: 'var(--text-primary)', margin: 0 }}>
               gPhotos
             </h1>
-            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontWeight: 500 }}>
+            <span style={{ fontSize: '0.73rem', color: 'var(--text-muted)', fontWeight: 500 }}>
               Desktop Edition
             </span>
           </div>
@@ -104,28 +123,28 @@ export const Sidebar: React.FC<SidebarProps> = ({
             className="btn btn-ghost btn-icon"
             onClick={onOpenHelp}
             style={{
-              width: '36px',
-              height: '36px',
+              width: '34px',
+              height: '34px',
               borderRadius: 'var(--radius-full)',
               color: 'var(--accent-primary)',
               backgroundColor: 'rgba(59, 130, 246, 0.1)',
             }}
             title="User Guide & Feature Help"
           >
-            <HelpCircle size={20} />
+            <HelpCircle size={18} />
           </button>
         )}
       </div>
 
       {/* Action Buttons */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', flexShrink: 0 }}>
         <button
           className="btn btn-primary"
           onClick={onOpenFolder}
           disabled={state.isScanning}
           style={{ width: '100%', justifyContent: 'flex-start', height: '40px', gap: '10px' }}
         >
-          <FolderOpen size={20} />
+          <FolderOpen size={18} />
           <span>{state.isScanning ? 'Scanning...' : 'Scan Photo Folder'}</span>
         </button>
 
@@ -136,7 +155,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             disabled={state.isDetectingFaces}
             style={{ width: '100%', justifyContent: 'flex-start', fontSize: '0.82rem', height: '38px', gap: '10px' }}
           >
-            <Sparkles size={18} color="#ec4899" />
+            <Sparkles size={17} color="#ec4899" />
             <span>
               {state.isDetectingFaces
                 ? `Scanning Faces (${state.faceDetectionProgress?.current || 0}/${state.faceDetectionProgress?.total || 0})`
@@ -152,7 +171,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             style={{ width: '100%', justifyContent: 'flex-start', fontSize: '0.82rem', height: '38px', gap: '10px' }}
             title="Cluster similar photos and suggest best shots to keep"
           >
-            <Layers size={18} color="#818cf8" />
+            <Layers size={17} color="#818cf8" />
             <span>Clean Duplicates</span>
           </button>
         )}
@@ -172,149 +191,227 @@ export const Sidebar: React.FC<SidebarProps> = ({
             }}
             title="Chat with AI assistant to search photos, people combinations, places and memories"
           >
-            <Sparkles size={18} color="#c084fc" />
+            <Sparkles size={17} color="#c084fc" />
             <span>Search with AI</span>
           </button>
         )}
       </div>
 
-      {/* Navigation List */}
-      <nav style={{ display: 'flex', flexDirection: 'column', gap: '4px', flex: 1 }}>
-        <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', color: 'var(--text-muted)', fontWeight: 700, padding: '8px 12px 4px', letterSpacing: '0.05em' }}>
-          Library
+      {/* Navigation Sections */}
+      <nav style={{ display: 'flex', flexDirection: 'column', gap: '12px', flex: 1, minHeight: 0 }}>
+        {/* Section 1: Collapsible Library */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+          <button
+            type="button"
+            onClick={() => setIsLibraryCollapsed(!isLibraryCollapsed)}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '6px 10px',
+              background: 'none',
+              border: 'none',
+              cursor: 'pointer',
+              color: 'var(--text-muted)',
+              fontSize: '0.72rem',
+              fontWeight: 700,
+              textTransform: 'uppercase',
+              letterSpacing: '0.05em',
+              borderRadius: 'var(--radius-sm)',
+              transition: 'background 0.15s ease',
+            }}
+            title={isLibraryCollapsed ? 'Expand Library items' : 'Collapse Library items'}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              {isLibraryCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+              <span>Library</span>
+            </div>
+            <span
+              style={{
+                fontSize: '0.68rem',
+                padding: '1px 6px',
+                borderRadius: '9999px',
+                backgroundColor: 'rgba(255, 255, 255, 0.07)',
+                color: 'var(--text-muted)',
+                fontWeight: 600,
+              }}
+            >
+              {state.photos.length}
+            </span>
+          </button>
+
+          {!isLibraryCollapsed && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', marginTop: '2px' }}>
+              {navItems.map((item) => {
+                const Icon = item.icon;
+                const isActive = activeTab === item.id;
+                return (
+                  <button
+                    key={item.id}
+                    onClick={() => onSelectTab(item.id)}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      padding: '9px 12px',
+                      borderRadius: 'var(--radius-md)',
+                      backgroundColor: isActive ? 'var(--bg-surface-elevated)' : 'transparent',
+                      color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)',
+                      border: 'none',
+                      cursor: 'pointer',
+                      fontFamily: 'var(--font-sans)',
+                      fontSize: '0.88rem',
+                      fontWeight: isActive ? 600 : 500,
+                      transition: 'all var(--transition-fast)',
+                      borderLeft: isActive ? '3px solid var(--accent-primary)' : '3px solid transparent',
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                      <Icon size={18} color={isActive ? '#60a5fa' : 'currentColor'} />
+                      <span>{item.label}</span>
+                    </div>
+                    {item.count !== undefined && (
+                      <span
+                        style={{
+                          fontSize: '0.72rem',
+                          padding: '2px 7px',
+                          borderRadius: 'var(--radius-full)',
+                          backgroundColor: isActive ? 'rgba(59, 130, 246, 0.2)' : 'rgba(255, 255, 255, 0.05)',
+                          color: isActive ? '#93c5fd' : 'var(--text-muted)',
+                          fontWeight: 600,
+                        }}
+                      >
+                        {item.count}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
-        {navItems.map((item) => {
-          const Icon = item.icon;
-          const isActive = activeTab === item.id;
-          return (
+
+        {/* Section 2: Collapsible Network Storage / Mirrors */}
+        {virtualStorages && virtualStorages.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', marginTop: '6px' }}>
             <button
-              key={item.id}
-              onClick={() => onSelectTab(item.id)}
+              type="button"
+              onClick={() => setIsNetworkStorageCollapsed(!isNetworkStorageCollapsed)}
               style={{
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'space-between',
-                padding: '11px 14px',
-                borderRadius: 'var(--radius-md)',
-                backgroundColor: isActive ? 'var(--bg-surface-elevated)' : 'transparent',
-                color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)',
+                padding: '6px 10px',
+                background: 'none',
                 border: 'none',
                 cursor: 'pointer',
-                fontFamily: 'var(--font-sans)',
-                fontSize: '0.9rem',
-                fontWeight: isActive ? 600 : 500,
-                transition: 'all var(--transition-fast)',
-                borderLeft: isActive ? '3px solid var(--accent-primary)' : '3px solid transparent',
+                color: 'var(--text-muted)',
+                fontSize: '0.72rem',
+                fontWeight: 700,
+                textTransform: 'uppercase',
+                letterSpacing: '0.05em',
+                borderRadius: 'var(--radius-sm)',
+                transition: 'background 0.15s ease',
               }}
+              title={isNetworkStorageCollapsed ? 'Expand Network Storages' : 'Collapse Network Storages'}
             >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                <Icon size={20} color={isActive ? '#60a5fa' : 'currentColor'} />
-                <span>{item.label}</span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                {isNetworkStorageCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                <span>Network Storage</span>
               </div>
-              {item.count !== undefined && (
-                <span style={{
-                  fontSize: '0.75rem',
-                  padding: '2px 8px',
-                  borderRadius: 'var(--radius-full)',
-                  backgroundColor: isActive ? 'rgba(59, 130, 246, 0.2)' : 'rgba(255, 255, 255, 0.05)',
-                  color: isActive ? '#93c5fd' : 'var(--text-muted)',
+              <span
+                style={{
+                  fontSize: '0.68rem',
+                  padding: '1px 6px',
+                  borderRadius: '9999px',
+                  backgroundColor: 'rgba(6, 182, 212, 0.15)',
+                  color: 'var(--accent-cyan)',
                   fontWeight: 600,
-                }}>
-                  {item.count}
-                </span>
-              )}
+                }}
+              >
+                {virtualStorages.length}
+              </span>
             </button>
-          );
-        })}
 
-        {/* Network Storages Quick List */}
-        {virtualStorages && virtualStorages.length > 0 && (
-          <div style={{ marginTop: '16px', display: 'flex', flexDirection: 'column', gap: '3px' }}>
-            <div style={{
-              fontSize: '0.7rem',
-              textTransform: 'uppercase',
-              color: 'var(--text-muted)',
-              fontWeight: 700,
-              padding: '6px 12px 2px',
-              letterSpacing: '0.05em',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-            }}>
-              <span>Network Mirrors</span>
-              <span style={{ fontSize: '0.68rem', color: 'var(--accent-cyan)' }}>{virtualStorages.length}</span>
-            </div>
+            {!isNetworkStorageCollapsed && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', marginTop: '2px' }}>
+                {virtualStorages.map((storage) => {
+                  const isStorageActive =
+                    state.selectedFolder &&
+                    (state.selectedFolder.toLowerCase().includes(storage.name.toLowerCase()) ||
+                      state.photos.some((p) => p.isVirtual && p.storageName === storage.name));
 
-            {virtualStorages.map((storage) => {
-              const isStorageActive =
-                state.selectedFolder &&
-                (state.selectedFolder.toLowerCase().includes(storage.name.toLowerCase()) ||
-                  state.photos.some((p) => p.isVirtual && p.storageName === storage.name));
-
-              return (
-                <div
-                  key={storage.id}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    padding: '7px 12px',
-                    borderRadius: 'var(--radius-md)',
-                    backgroundColor: isStorageActive ? 'rgba(6, 182, 212, 0.12)' : 'transparent',
-                    border: isStorageActive ? '1px solid rgba(6, 182, 212, 0.3)' : '1px solid transparent',
-                    cursor: 'pointer',
-                    transition: 'all var(--transition-fast)',
-                  }}
-                  onClick={() => onSelectStorage && onSelectStorage(storage)}
-                  title={`Source: ${storage.networkSourcePath}\nClick to browse photos`}
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
-                    <HardDrive size={15} color={isStorageActive ? 'var(--accent-cyan)' : 'var(--text-muted)'} />
-                    <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      <div style={{
-                        fontSize: '0.8rem',
-                        fontWeight: isStorageActive ? 600 : 500,
-                        color: isStorageActive ? 'var(--text-primary)' : 'var(--text-secondary)',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                      }}>
-                        {storage.name}
+                  return (
+                    <div
+                      key={storage.id}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        padding: '7px 10px',
+                        borderRadius: 'var(--radius-md)',
+                        backgroundColor: isStorageActive ? 'rgba(6, 182, 212, 0.12)' : 'transparent',
+                        border: isStorageActive ? '1px solid rgba(6, 182, 212, 0.3)' : '1px solid transparent',
+                        cursor: 'pointer',
+                        transition: 'all var(--transition-fast)',
+                      }}
+                      onClick={() => onSelectStorage && onSelectStorage(storage)}
+                      title={`Source: ${storage.networkSourcePath}\nClick to browse photos`}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+                        <HardDrive size={15} color={isStorageActive ? 'var(--accent-cyan)' : 'var(--text-muted)'} />
+                        <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          <div
+                            style={{
+                              fontSize: '0.8rem',
+                              fontWeight: isStorageActive ? 600 : 500,
+                              color: isStorageActive ? 'var(--text-primary)' : 'var(--text-secondary)',
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                            }}
+                          >
+                            {storage.name}
+                          </div>
+                          <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>
+                            {storage.totalItems || 0} photos
+                          </div>
+                        </div>
                       </div>
-                      <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>
-                        {storage.totalItems || 0} photos
-                      </div>
+
+                      <button
+                        className="btn btn-ghost btn-icon"
+                        style={{ width: '24px', height: '24px', padding: 0, color: 'var(--accent-cyan)', flexShrink: 0 }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (onRefreshStorage) onRefreshStorage(storage);
+                        }}
+                        title="Rescan remote folder for new photos & detect faces"
+                      >
+                        <RefreshCw size={12} />
+                      </button>
                     </div>
-                  </div>
-
-                  <button
-                    className="btn btn-ghost btn-icon"
-                    style={{ width: '24px', height: '24px', padding: 0, color: 'var(--accent-cyan)', flexShrink: 0 }}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (onRefreshStorage) onRefreshStorage(storage);
-                    }}
-                    title="Rescan remote folder for new photos & detect faces"
-                  >
-                    <RefreshCw size={12} />
-                  </button>
-                </div>
-              );
-            })}
+                  );
+                })}
+              </div>
+            )}
           </div>
         )}
       </nav>
 
       {/* Current Folder / Library Switcher Widget */}
-      <div style={{
-        padding: '12px',
-        borderRadius: 'var(--radius-md)',
-        backgroundColor: 'rgba(255, 255, 255, 0.04)',
-        border: '1px solid var(--border-subtle)',
-        fontSize: '0.75rem',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: '6px',
-      }}>
+      <div
+        style={{
+          padding: '12px',
+          borderRadius: 'var(--radius-md)',
+          backgroundColor: 'rgba(255, 255, 255, 0.04)',
+          border: '1px solid var(--border-subtle)',
+          fontSize: '0.75rem',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '6px',
+          flexShrink: 0,
+        }}
+      >
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <span style={{ color: 'var(--text-muted)', fontWeight: 600 }}>Active Library:</span>
           {onOpenLibrarySwitcher && (
@@ -366,7 +463,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             fontSize: '0.82rem',
             color: 'var(--text-secondary)',
             padding: '8px 12px',
-            marginTop: 'auto',
+            flexShrink: 0,
           }}
           title="Open User Guide & Feature Manual"
         >
