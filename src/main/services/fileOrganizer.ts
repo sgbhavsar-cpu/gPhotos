@@ -11,7 +11,7 @@ import {
 } from '../../types';
 
 const SUPPORTED_EXTENSIONS = new Set([
-  '.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.tiff', '.tif', '.dng', '.raw', '.cr2', '.nef'
+  '.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif', '.tiff', '.tif', '.dng', '.raw', '.cr2', '.nef'
 ]);
 
 const MONTH_NAMES = [

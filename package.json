@@ -9,6 +9,7 @@
     "build:ui": "vite build",
     "build:electron": "tsc -p tsconfig.electron.json",
     "build": "vite build && tsc -p tsconfig.electron.json",
+    "dist:win": "npm run build && electron-builder --win",
     "start": "electron ."
   },
   "keywords": [
@@ -38,6 +39,7 @@
     "@vitejs/plugin-react": "^6.1.1",
     "cross-env": "^10.1.0",
     "electron": "^41.7.1",
+    "electron-builder": "^25.1.8",
     "jsdom": "^29.1.1",
     "typescript": "^7.0.2",
     "vite": "^8.3.0"
