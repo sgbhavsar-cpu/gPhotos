@@ -11,7 +11,15 @@ function photoApiPlugin() {
       (process.platform === 'darwin'
         ? path.join(os.homedir(), 'Library/Application Support')
         : path.join(os.homedir(), '.config'));
-    return path.join(appData, 'gphotos-desktop', 'library.json');
+    const candidates = [
+      path.join(appData, 'gPhotos', 'library.json'),
+      path.join(appData, 'gphotos-desktop', 'library.json'),
+      path.join(__dirname, 'library.json'),
+    ];
+    for (const c of candidates) {
+      if (fs.existsSync(c)) return c;
+    }
+    return candidates[0];
   };
 
   return {
@@ -152,6 +160,7 @@ export default defineConfig({
     },
   },
   server: {
+    host: '0.0.0.0',
     port: 5173,
     strictPort: true,
   },

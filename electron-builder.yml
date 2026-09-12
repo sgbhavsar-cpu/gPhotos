@@ -9,6 +9,7 @@ files:
   - public/**/*
   - package.json
 win:
+  icon: public/icon.png
   target:
     - target: nsis
       arch:
@@ -16,9 +17,11 @@ win:
     - target: portable
       arch:
         - x64
-  artifactName: ${productName}-Setup-${version}.${ext}
 nsis:
+  artifactName: ${productName}-Setup-${version}.${ext}
   oneClick: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: always
   createStartMenuShortcut: true
+portable:
+  artifactName: ${productName}-Portable-${version}.${ext}

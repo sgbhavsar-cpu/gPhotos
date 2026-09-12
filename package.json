@@ -10,6 +10,7 @@
     "build:electron": "tsc -p tsconfig.electron.json",
     "build": "vite build && tsc -p tsconfig.electron.json",
     "dist:win": "npm run build && electron-builder --win",
+    "serve:mobile": "node scripts/serve_mobile.js",
     "start": "electron ."
   },
   "keywords": [
