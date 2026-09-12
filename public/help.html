@@ -1,0 +1,834 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Google Photos Desktop — User Guide & Architecture Manual</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-base: #090d16;
+      --bg-surface: #0f172a;
+      --bg-card: rgba(30, 41, 59, 0.7);
+      --bg-elevated: #1e293b;
+      --border: rgba(255, 255, 255, 0.08);
+      --border-accent: rgba(59, 130, 246, 0.3);
+      --text-main: #f8fafc;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --blue: #3b82f6;
+      --indigo: #6366f1;
+      --emerald: #10b981;
+      --amber: #f59e0b;
+      --rose: #f43f5e;
+      --purple: #a855f7;
+      --gradient-brand: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 50%, #ec4899 100%);
+      --gradient-card: linear-gradient(180deg, rgba(30, 41, 59, 0.7) 0%, rgba(15, 23, 42, 0.8) 100%);
+      --radius-sm: 8px;
+      --radius-md: 12px;
+      --radius-lg: 18px;
+      --radius-xl: 24px;
+      --shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+      --shadow-glow: 0 0 25px rgba(59, 130, 246, 0.2);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      background-color: var(--bg-base);
+      color: var(--text-main);
+      line-height: 1.6;
+      display: flex;
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* Sidebar Navigation */
+    .sidebar {
+      width: 290px;
+      background: var(--bg-surface);
+      border-right: 1px solid var(--border);
+      padding: 32px 20px;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow-y: auto;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .brand-icon {
+      width: 40px;
+      height: 40px;
+      border-radius: var(--radius-md);
+      background: var(--gradient-brand);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      box-shadow: var(--shadow-glow);
+    }
+
+    .brand-text h1 {
+      font-size: 1.05rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-text span {
+      font-size: 0.72rem;
+      color: var(--blue);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .nav-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .nav-group-title {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+      padding-left: 8px;
+    }
+
+    .nav-link {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: var(--radius-sm);
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 0.88rem;
+      font-weight: 600;
+      transition: all 0.2s ease;
+    }
+
+    .nav-link:hover {
+      color: var(--text-main);
+      background: rgba(255, 255, 255, 0.05);
+      transform: translateX(4px);
+    }
+
+    .nav-link.active {
+      background: rgba(59, 130, 246, 0.15);
+      color: var(--blue);
+      border-left: 3px solid var(--blue);
+    }
+
+    /* Main Content Area */
+    .content {
+      flex: 1;
+      padding: 48px 64px;
+      max-width: 1080px;
+      margin: 0 auto;
+    }
+
+    .hero-banner {
+      background: var(--gradient-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-xl);
+      padding: 40px;
+      margin-bottom: 48px;
+      position: relative;
+      overflow: hidden;
+      box-shadow: var(--shadow);
+    }
+
+    .hero-banner::before {
+      content: '';
+      position: absolute;
+      top: -50%;
+      right: -20%;
+      width: 380px;
+      height: 380px;
+      background: radial-gradient(circle, rgba(59, 130, 246, 0.25) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 12px;
+      background: rgba(59, 130, 246, 0.15);
+      border: 1px solid var(--border-accent);
+      border-radius: 9999px;
+      color: var(--blue);
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 16px;
+    }
+
+    .hero-title {
+      font-size: 2.2rem;
+      font-weight: 800;
+      line-height: 1.2;
+      margin-bottom: 14px;
+      letter-spacing: -0.03em;
+    }
+
+    .hero-subtitle {
+      font-size: 1.05rem;
+      color: var(--text-secondary);
+      max-width: 720px;
+      line-height: 1.6;
+    }
+
+    /* Section Styles */
+    section {
+      margin-bottom: 64px;
+      scroll-margin-top: 40px;
+    }
+
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 24px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .section-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: var(--radius-md);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+    }
+
+    .section-title {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 20px;
+      margin: 20px 0;
+    }
+
+    .grid-3 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+      margin: 20px 0;
+    }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 24px;
+      backdrop-filter: blur(12px);
+      box-shadow: var(--shadow);
+      transition: all 0.2s ease;
+    }
+
+    .card:hover {
+      border-color: var(--border-accent);
+      transform: translateY(-2px);
+    }
+
+    .card-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .card-desc {
+      font-size: 0.88rem;
+      color: var(--text-secondary);
+      line-height: 1.6;
+    }
+
+    /* Formula & Code blocks */
+    .formula-box {
+      background: #0b1120;
+      border: 1px solid rgba(59, 130, 246, 0.2);
+      border-left: 4px solid var(--blue);
+      border-radius: var(--radius-sm);
+      padding: 16px 20px;
+      margin: 16px 0;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+      color: #93c5fd;
+      overflow-x: auto;
+    }
+
+    .callout {
+      padding: 16px 20px;
+      border-radius: var(--radius-md);
+      margin: 20px 0;
+      display: flex;
+      gap: 14px;
+      align-items: flex-start;
+      font-size: 0.9rem;
+    }
+
+    .callout-info {
+      background: rgba(59, 130, 246, 0.1);
+      border: 1px solid rgba(59, 130, 246, 0.25);
+      color: #93c5fd;
+    }
+
+    .callout-tip {
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.25);
+      color: #6ee7b7;
+    }
+
+    .callout-warning {
+      background: rgba(245, 158, 11, 0.1);
+      border: 1px solid rgba(245, 158, 11, 0.25);
+      color: #fcd34d;
+    }
+
+    .callout-icon {
+      font-size: 20px;
+      line-height: 1;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      margin-right: 6px;
+    }
+
+    .pill-green { background: rgba(16, 185, 129, 0.2); color: #34d399; }
+    .pill-blue { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
+    .pill-amber { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
+    .pill-rose { background: rgba(244, 63, 94, 0.2); color: #fb7185; }
+
+    ol, ul {
+      padding-left: 20px;
+      margin: 12px 0;
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+    }
+
+    li {
+      margin-bottom: 8px;
+    }
+
+    li strong {
+      color: var(--text-main);
+    }
+
+    /* Comparison Table */
+    .table-container {
+      overflow-x: auto;
+      margin: 20px 0;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 0.88rem;
+    }
+
+    th {
+      background: var(--bg-surface);
+      color: var(--text-main);
+      padding: 14px 18px;
+      font-weight: 700;
+      border-bottom: 1px solid var(--border);
+    }
+
+    td {
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text-secondary);
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    tr:hover td {
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    /* Footer */
+    footer {
+      border-top: 1px solid var(--border);
+      padding-top: 32px;
+      margin-top: 64px;
+      font-size: 0.82rem;
+      color: var(--text-muted);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Navigation Sidebar -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-icon">✨</div>
+      <div class="brand-text">
+        <h1>Google Photos</h1>
+        <span>User Guide & Manual</span>
+      </div>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-group-title">Core AI Features</div>
+      <a href="#deduplication" class="nav-link">🔍 Deduplication & Bursts</a>
+      <a href="#face-recognition" class="nav-link">👤 Face Recognition & Rescan</a>
+      <a href="#cover-picker" class="nav-link">⭐ Best Face & Renaming</a>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-group-title">System & Storage</div>
+      <a href="#library-switcher" class="nav-link">📁 Library Switcher</a>
+      <a href="#zip-backup" class="nav-link">📦 .ZIP Library Backup</a>
+      <a href="#background-service" class="nav-link">⚙️ Background Service Engine</a>
+      <a href="#virtual-storage" class="nav-link">🌐 Virtual Network Mirrors</a>
+      <a href="#storage-deletion" class="nav-link">🗑️ Storage Deletion & Unlinking</a>
+    </div>
+
+    <div class="nav-group">
+      <div class="nav-group-title">Productivity Tools</div>
+      <a href="#split-organizer" class="nav-link">🗂️ Split-Pane Date Organizer</a>
+      <a href="#places-map" class="nav-link">🗺️ Free OpenStreetMap & Places</a>
+      <a href="#photo-editing" class="nav-link">✏️ In-App Photo Editing</a>
+      <a href="#filtering" class="nav-link">🏷️ Multi-Select & Zoom Wheel</a>
+      <a href="#error-handling" class="nav-link">🛡️ Error Handling & Safety</a>
+    </div>
+  </aside>
+
+  <!-- Main Documentation Content -->
+  <main class="content">
+
+    <!-- Hero Header -->
+    <div class="hero-banner">
+      <div class="badge">Comprehensive Reference v1.2</div>
+      <h1 class="hero-title">How Google Photos Desktop Works</h1>
+      <p class="hero-subtitle">
+        A private, high-performance, on-device photo manager with zero cloud lock-in. Powered by local AI face recognition, intelligent duplicate clustering, and non-blocking background synchronization.
+      </p>
+    </div>
+
+    <!-- 1. Deduplication Section -->
+    <section id="deduplication">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(245, 158, 11, 0.15); color: var(--amber);">🔍</div>
+        <h2 class="section-title">De-duplication & AI Burst Shot Selection</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        When taking photos with smartphones or cameras, people frequently capture identical duplicate shots or high-speed bursts to ensure everyone looks great. Our multi-stage AI deduplication engine detects, groups, scores, and cleans duplicate photos automatically.
+      </p>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">
+            <span class="pill pill-green">Step 1</span>
+            Temporal & Biometric Clustering
+          </div>
+          <p class="card-desc">
+            The engine scans your photos chronologically. It groups photos together into a single cluster if they satisfy any of the following:
+          </p>
+          <ul>
+            <li><strong>Time Proximity</strong>: Photos taken within 20–60 seconds of each other.</li>
+            <li><strong>Biometric Intersection</strong>: Exactly the same people detected across the candidate frames.</li>
+            <li><strong>Identical Face Count</strong>: Equal number of subjects captured within 10 seconds.</li>
+            <li><strong>Sequential Burst Filenames</strong>: Numbered sequence (e.g. <code>IMG_0214.jpg</code>, <code>IMG_0215.jpg</code>).</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            <span class="pill pill-blue">Step 2</span>
+            Multi-Criteria AI Quality Scoring
+          </div>
+          <p class="card-desc">
+            Every photo in the cluster is evaluated across four objective quality dimensions (0 to 100 points total) to determine the <strong>AI Best Shot</strong>:
+          </p>
+          <ul>
+            <li><strong>Sharpness & Focus (0–40 pts)</strong>: High-frequency JPEG byte density and face detector focus confidence. Blurry shots receive heavy penalties.</li>
+            <li><strong>Facial Expressions (0–25 pts)</strong>: Micro-expression analysis awards bonuses for smiling (<code>happy</code> +10 pts) and alert expressions.</li>
+            <li><strong>Eye Openness & Gaze (0–10 pts)</strong>: Frontal face orientation ensuring subjects look toward camera.</li>
+            <li><strong>Resolution (0–25 pts)</strong>: Sensor megapixel utilization.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="formula-box">
+        Quality Score = Sharpness (0-40) + Expression Bonus (0-25) + Eye Gaze (0-10) + Resolution (0-25)
+      </div>
+
+      <div class="card" style="margin-top: 20px;">
+        <div class="card-title">
+          <span class="pill pill-rose">Step 3</span>
+          User Verification & Safe OS Trashing
+        </div>
+        <p class="card-desc">
+          The Duplicate & Burst Cleaner displays each cluster side-by-side:
+        </p>
+        <ul>
+          <li>The <strong>AI Best Shot</strong> is highlighted with a gold border and labeled with specific reasons (e.g., <em>"Crisp face focus • Smiling expression • Looking at camera"</em>).</li>
+          <li>Inferior or blurry duplicates are automatically pre-selected as trash candidates.</li>
+          <li><strong>You Retain Full Control</strong>: Click <em>"Keep This Instead"</em> on any frame to change the preferred shot.</li>
+          <li><strong>Zero Permanent Deletion Risk</strong>: When you click <em>"Trash Selected Duplicates"</em>, files are moved to your <strong>Windows Recycle Bin</strong> via <code>shell.trashItem</code> so you can restore them anytime if needed.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- 2. Background Service Section -->
+    <section id="background-service">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(59, 130, 246, 0.15); color: var(--blue);">⚙️</div>
+        <h2 class="section-title">Background Service & Sync Engine</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Google Photos Desktop gives you two flexible execution models for continuously discovering new photos and generating 500px virtual mirror thumbnails:
+      </p>
+
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Feature</th>
+              <th>Mode A: Windows System Background Service</th>
+              <th>Mode B: Application Background Thread</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Installation</strong></td>
+              <td>1-Click Install in <strong>Settings</strong> page</td>
+              <td>Default (Always Active when not installed)</td>
+            </tr>
+            <tr>
+              <td><strong>Runs When App Window Closed</strong></td>
+              <td><span class="pill pill-green">Yes (24/7 Independent Daemon)</span></td>
+              <td><span class="pill pill-blue">Yes (via Windows System Tray)</span></td>
+            </tr>
+            <tr>
+              <td><strong>Runs Across System Restarts</strong></td>
+              <td><span class="pill pill-green">Yes (Automatic at Logon)</span></td>
+              <td>Only if "Run at Startup" tray option is checked</td>
+            </tr>
+            <tr>
+              <td><strong>Administrator Elevation Needed</strong></td>
+              <td><span class="pill pill-green">No (User-Level Windows Service)</span></td>
+              <td><span class="pill pill-green">No</span></td>
+            </tr>
+            <tr>
+              <td><strong>System Resource Usage</strong></td>
+              <td>Ultralight (Sleeps until sync interval timer)</td>
+              <td>Shared with running application</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout callout-tip">
+        <div class="callout-icon">💡</div>
+        <div>
+          <strong>Automatic Fallback Guarantee</strong>: If you do not install the system service, or if you click <em>"Uninstall Service"</em> in Settings, the application automatically runs its built-in background thread while the app or tray is open. You never miss a sync cycle.
+        </div>
+      </div>
+    </section>
+
+    <!-- 3. Face Recognition & Active Learning Section -->
+    <section id="face-recognition">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(168, 85, 247, 0.15); color: var(--purple);">👤</div>
+        <h2 class="section-title">Biometric Face Recognition & Active Learning</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Our face recognition engine operates 100% locally on your computer using neural network models with WebGPU acceleration:
+      </p>
+
+      <div class="grid-3">
+        <div class="card">
+          <div class="card-title">CosFace 128-D Hypersphere</div>
+          <p class="card-desc">
+            Each detected face is normalized onto a unit hypersphere ($L_2$ norm). Matches are calculated using cosine distance ($1 - \mathbf{a} \cdot \mathbf{b}$), delivering superior discrimination over Euclidean metrics.
+          </p>
+        </div>
+
+        <div class="card">
+          <div class="card-title">2.5× Active Learning Bonus</div>
+          <p class="card-desc">
+            When you confirm a face tag or assign a person name, that face receives a <strong>2.5× ground-truth weight multiplier</strong> in the person's biometric centroid, immediately finding more photos of them.
+          </p>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Single-Photo Uniqueness</div>
+          <p class="card-desc">
+            The clustering engine enforces the invariant that one photo cannot contain two identical people. If a merge conflict arises, the app shows the conflict photo for instant 1-click Lightbox resolution.
+          </p>
+        </div>
+      </div>
+
+      <div class="callout callout-info" style="margin-top: 16px;">
+        <div class="callout-icon">🔄</div>
+        <div>
+          <strong>Reset & Rescan (Clean Start)</strong>: Want to start fresh? Click <em>"Reset & Rescan"</em> in the People tab. The app safely deletes all background face records, resets all photo scan flags, and automatically rescans every photo from 1 to Total with a live progress counter.
+        </div>
+      </div>
+    </section>
+
+    <!-- 4. Cover Face, Best Face & Renaming -->
+    <section id="cover-picker">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(245, 158, 11, 0.15); color: var(--amber);">⭐</div>
+        <h2 class="section-title">Best Face, Renaming & Cover Photo Customization</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Personalize who represents each album and organize identities effortlessly:
+      </p>
+      <ul>
+        <li><strong>Instant Person Renaming</strong>: Click directly on any person's name or the pencil icon and type immediately. Save with <kbd>Enter</kbd> or cancel with <kbd>Esc</kbd>. Native keyboard focus is active out of the box without opening DevTools.</li>
+        <li><strong>Main People Grid</strong>: Click the camera icon directly on any person's circular avatar to choose a cover face.</li>
+        <li><strong>Person Virtual Album</strong>: Click the header avatar or the <em>"Change Cover Face"</em> button.</li>
+        <li><strong>1-Click AI Best Face</strong>: Click <em>"AI Best Face"</em> to automatically analyze all frames of that person and choose the highest-resolution, clearest smiling face.</li>
+        <li><strong>On Any Photo Card</strong>: Click the ⭐ star icon in the card footer to set that specific photo and face as the person's primary cover.</li>
+      </ul>
+    </section>
+
+    <!-- Library Switcher Section -->
+    <section id="library-switcher">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(59, 130, 246, 0.15); color: var(--blue);">📁</div>
+        <h2 class="section-title">Library Switcher & Multi-Folder Management</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Work seamlessly across multiple physical photo folders and hard drives:
+      </p>
+      <ul>
+        <li><strong>Active Library Card</strong>: Located at the bottom of the sidebar. Click the library name or the <em>"Switch"</em> button.</li>
+        <li><strong>Browse Folder Picker</strong>: Open any folder on your computer to instantly index photos, read EXIF dates, and load faces.</li>
+        <li><strong>Recent Libraries</strong>: One-click switching between frequently used photo folders.</li>
+        <li><strong>Cross-Session Persistence</strong>: Your active library and recent history are saved and remembered automatically across restarts.</li>
+      </ul>
+    </section>
+
+    <!-- ZIP Backup Section -->
+    <section id="zip-backup">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(168, 85, 247, 0.15); color: var(--purple);">📦</div>
+        <h2 class="section-title">Zero-Dependency .ZIP Library Backup & Recovery</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Export full backups of your photo database, face recognitions, and settings in standard PKZIP format:
+      </p>
+      <ul>
+        <li><strong>Native Zip Engine</strong>: Uses built-in Node.js compression without external command-line utilities. 100% compatible with Windows Explorer, WinRAR, and 7-Zip.</li>
+        <li><strong>1-Click Export in Settings</strong>: Navigate to <strong>Settings</strong> &rarr; click <em>"Create Backup (.zip)"</em> to export a timestamped archive.</li>
+        <li><strong>Complete State Included</strong>: Backs up <code>library.json</code>, <code>settings.json</code>, manifest statistics, and restoration instructions.</li>
+        <li><strong>Locate on Disk</strong>: Click <em>"Show in Explorer"</em> to instantly highlight the generated backup file.</li>
+      </ul>
+    </section>
+
+    <!-- 5. Virtual Storage Section -->
+    <section id="virtual-storage">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(16, 185, 129, 0.15); color: var(--emerald);">🌐</div>
+        <h2 class="section-title">Virtual Network Storage & 500px Mirrors</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Browse massive network drives (NAS, SMB, external USB) instantly without lag or filling up your local SSD:
+      </p>
+      <ul>
+        <li><strong>Lightweight 500px Cache</strong>: The app creates lightweight, compressed 500px JPEG thumbnails and JSON EXIF metadata sidecars in <code>C:\GPhotos_VirtualMirrors\[storage_name]</code>.</li>
+        <li><strong>Offline Browsing</strong>: Browse your entire 500,000+ photo collection smoothly even when disconnected from your local network.</li>
+        <li><strong>Instant Full-Res On-Demand</strong>: Clicking a photo immediately fetches the original high-resolution camera file from the network share when online.</li>
+        <li><strong>Direct Folder Tree Explorer</strong>: Browse folder subtrees directly even before a full background scan completes.</li>
+      </ul>
+    </section>
+
+    <!-- 6. Storage Deletion Section -->
+    <section id="storage-deletion">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(244, 63, 94, 0.15); color: var(--rose);">🗑️</div>
+        <h2 class="section-title">Configured Storage Deletion & Unlinked Filter</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        When you remove a network storage in the <strong>Network Mirrors</strong> tab:
+      </p>
+      <ul>
+        <li><strong>Delete Storage & Free Disk Space</strong>: Safely deletes the local 500px mirror cache in <code>C:\GPhotos_VirtualMirrors</code> without ever touching your original network files.</li>
+        <li><strong>Remove from List Only</strong>: Keeps thumbnails on disk but unlinks the storage from the app interface.</li>
+        <li><strong>Unlinked Blacklist Guarantee</strong>: The storage name is added to a persistent blacklist (<code>gphotos_unlinked_storages_v1</code>) so automatic mirror discovery will <strong>never resurrect</strong> deleted storages.</li>
+      </ul>
+    </section>
+
+    <!-- Split-Pane Date Organizer Section -->
+    <section id="split-organizer">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(245, 158, 11, 0.15); color: var(--amber);">🗂️</div>
+        <h2 class="section-title">Split-Pane Physical Date Organizer & Dry-Run Review</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Re-structure messy camera dumps into clean chronological folders with complete visual verification before touching disk:
+      </p>
+      <ul>
+        <li><strong>Hierarchical Folder Tree (Left Pane)</strong>: Displays collapsible Year and Month nodes with photo count badges. Click any node to instantly filter photos.</li>
+        <li><strong>Photo Review Grid (Right Pane)</strong>: Shows genuine thumbnails with capture date, file size, target destination, and status (<code>COPY</code>, <code>MOVE</code>, <code>SKIP Duplicate</code>).</li>
+        <li><strong>High-Resolution Previews</strong>: Click any thumbnail in the review grid to inspect the photo in high resolution.</li>
+        <li><strong>Grid vs. Table Views</strong>: Switch between visual thumbnail cards and detailed tabular metadata.</li>
+        <li><strong>Safe Copy Mode</strong>: Preserves original files untouched, or choose Move mode to save disk space.</li>
+      </ul>
+    </section>
+
+    <!-- Free OpenStreetMap & Places Section -->
+    <section id="places-map">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(16, 185, 129, 0.15); color: var(--emerald);">🗺️</div>
+        <h2 class="section-title">Free OpenStreetMap & Interactive Places Map</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Explore your photos geographically with Apple Photos / iOS-style bubble pins:
+      </p>
+      <ul>
+        <li><strong>100% Free OpenStreetMap Tiles</strong>: Powered by <code>tile.openstreetmap.org</code>. Zero API keys, credit cards, or CARTO tokens required.</li>
+        <li><strong>Bubble Cluster Pins</strong>: Group nearby photos into circular pins showing the latest thumbnail and photo count.</li>
+        <li><strong>Cluster Location Renaming</strong>: Click a pin to open the bottom photo drawer, click the pencil icon, and assign a custom friendly name (e.g. <em>"Trip to Paris"</em>) to all photos at that spot.</li>
+        <li><strong>Assign Locations to Unlocated Photos</strong>: If photos lack GPS EXIF tags, search any city or landmark and apply coordinates in 1 click.</li>
+      </ul>
+    </section>
+
+    <!-- 7. Photo Editing Section -->
+    <section id="photo-editing">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(59, 130, 246, 0.15); color: var(--blue);">✏️</div>
+        <h2 class="section-title">Safe In-App Photo Editing & Backup Preservation</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Quickly correct orientation or crop photos directly inside the Lightbox:
+      </p>
+      <ul>
+        <li><strong>Rotate & Flip</strong>: Rotate 90°, 180°, 270°, or flip horizontally.</li>
+        <li><strong>Non-Destructive .bak Protection</strong>: When you overwrite an original file, the engine automatically creates a <code>[filename].jpg.bak</code> backup first.</li>
+        <li><strong>Save as Copy</strong>: Choose <em>"Save Copy"</em> to export a new <code>[filename]_edited.jpg</code> file while preserving the original unmodified.</li>
+      </ul>
+    </section>
+
+    <!-- 8. Filtering & Organization Section -->
+    <section id="filtering">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(16, 185, 129, 0.15); color: var(--emerald);">🏷️</div>
+        <h2 class="section-title">Quick Filtering, Multi-Select & Zoom Controls</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Curate your gallery smoothly and efficiently:
+      </p>
+      <ul>
+        <li><strong>Portraits Tab</strong>: Filter photos that have at least one recognized face.</li>
+        <li><strong>No Faces Tab</strong>: Filter landscape, document, or object photos with zero faces.</li>
+        <li><strong>Multi-Select Exclude</strong>: Select multiple photos and click <em>"Exclude from Library"</em>. They are hidden from the application without being deleted from your computer.</li>
+        <li><strong>Dynamic Zoom Wheel</strong>: Hold <kbd>Ctrl</kbd> and scroll your mouse wheel in the gallery to zoom dynamically between Small, Medium, and Large views.</li>
+      </ul>
+    </section>
+
+    <!-- 9. Error Handling & Fault Isolation Section -->
+    <section id="error-handling">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(239, 68, 68, 0.15); color: var(--rose);">🛡️</div>
+        <h2 class="section-title">Defensive Error Handling & Crash Recovery</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Enterprise-grade stability guarantees to keep your photos and library safe:
+      </p>
+      <ul>
+        <li><strong>React Error Boundary</strong>: If any component encounters an unexpected rendering error, a recovery screen appears with diagnostic details, a <em>"Try Again"</em> button, and a <em>"Reload Window"</em> button. The app will never show a blank screen.</li>
+        <li><strong>Guarded IPC Handlers</strong>: Every native call between the UI and the Windows backend is guarded with try/catch blocks and safe fallback values.</li>
+        <li><strong>Atomic Database Writes</strong>: Library state saves use atomic file replacement (<code>.tmp</code> &rarr; rename), preventing corruption during unexpected shutdowns.</li>
+        <li><strong>Safe OS Trashing</strong>: File deletions are routed to the Windows Recycle Bin so you can restore items anytime.</li>
+      </ul>
+    </section>
+
+    <footer>
+      <div>Google Photos Desktop Edition • 100% Local & Private</div>
+      <div>Press <kbd style="background: #1e293b; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--border);">Esc</kbd> to close help</div>
+    </footer>
+
+  </main>
+
+  <script>
+    // Highlight active sidebar links on scroll
+    const links = document.querySelectorAll('.nav-link');
+    const sections = document.querySelectorAll('section');
+
+    window.addEventListener('scroll', () => {
+      let current = '';
+      sections.forEach((section) => {
+        const top = section.offsetTop - 80;
+        if (pageYOffset >= top) {
+          current = section.getAttribute('id');
+        }
+      });
+
+      links.forEach((link) => {
+        link.classList.remove('active');
+        if (link.getAttribute('href') === `#${current}`) {
+          link.classList.add('active');
+        }
+      });
+    });
+  </script>
+</body>
+</html>
