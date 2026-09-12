@@ -616,6 +616,12 @@ function startServer(port) {
 }
 
 if (require.main === module) {
+  process.on('uncaughtException', (err) => {
+    console.error('[MobileServer] Uncaught Exception:', err);
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error('[MobileServer] Unhandled Rejection:', reason);
+  });
   startServer(PORT);
 }
 
