@@ -85,12 +85,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
         width: '260px',
         minWidth: '260px',
         height: '100%',
+        maxHeight: '100vh',
         backgroundColor: 'var(--bg-surface)',
         borderRight: '1px solid var(--border-subtle)',
         display: 'flex',
         flexDirection: 'column',
         padding: '20px 14px',
-        gap: '20px',
+        gap: '16px',
+        overflowY: 'auto',
+        overflowX: 'hidden',
+        boxSizing: 'border-box',
       }}
     >
       {/* Brand Header */}
@@ -200,7 +204,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       {/* Navigation Sections */}
-      <nav style={{ display: 'flex', flexDirection: 'column', gap: '12px', flex: 1, minHeight: 0 }}>
+      <nav style={{ display: 'flex', flexDirection: 'column', gap: '12px', flexShrink: 0 }}>
         {/* Section 1: Collapsible Library */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
           <button
@@ -496,6 +500,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           flexDirection: 'column',
           gap: '6px',
           flexShrink: 0,
+          marginTop: 'auto',
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>

@@ -73,8 +73,10 @@ export function getLocalPhotoUrl(
   preferOriginal: boolean = false
 ): string {
   if (typeof window !== 'undefined') {
-    // If running in browser dev environment (HTTP/HTTPS)
-    if (window.location?.protocol?.startsWith('http')) {
+    const isElectron = !!(window.electronAPI && !(window.electronAPI as any).isBrowserShim);
+
+    // If running in browser outside Electron (HTTP/HTTPS mobile or desktop web)
+    if (!isElectron && window.location?.protocol?.startsWith('http')) {
       let url = `/api/photo?path=${encodeURIComponent(filePath)}`;
       if (originalRemotePath) {
         url += `&originalPath=${encodeURIComponent(originalRemotePath)}`;
@@ -84,9 +86,22 @@ export function getLocalPhotoUrl(
       }
       return url;
     }
-    // If running in Electron
-    if (window.electronAPI) {
+
+    // If running in native Electron
+    if (isElectron) {
       let url = `gphoto://load?path=${encodeURIComponent(filePath)}`;
+      if (originalRemotePath) {
+        url += `&originalPath=${encodeURIComponent(originalRemotePath)}`;
+        if (preferOriginal) {
+          url += `&preferOriginal=1`;
+        }
+      }
+      return url;
+    }
+
+    // Generic web fallback
+    if (window.location?.protocol?.startsWith('http')) {
+      let url = `/api/photo?path=${encodeURIComponent(filePath)}`;
       if (originalRemotePath) {
         url += `&originalPath=${encodeURIComponent(originalRemotePath)}`;
         if (preferOriginal) {
@@ -186,13 +201,29 @@ export class LibraryManager {
   /**
    * Instant startup loader: immediately displays all cached photos and metadata
    * (<10ms first paint) and defers disk/orphan verification to a non-blocking background task.
+   * Can be called whenever the app mounts or when refreshing in browser environments.
    */
-  private async loadPersistedData() {
+  public async loadPersistedData() {
     try {
       let data: any = null;
       if (typeof window !== 'undefined' && window.electronAPI) {
         data = await window.electronAPI.loadLibraryData(STORAGE_KEY);
       }
+
+      // Browser fallback: direct fetch from /api/library ONLY if in browser/shim over HTTP
+      const isBrowser = typeof window !== 'undefined' && (!window.electronAPI || (window.electronAPI as any).isBrowserShim);
+      if (isBrowser && !data && window.location?.protocol?.startsWith('http')) {
+        try {
+          const res = await fetch('/api/library', { signal: AbortSignal.timeout(2000) });
+          if (res.ok) {
+            const full = await res.json();
+            data = full[STORAGE_KEY] || (full.photos ? full : null);
+          }
+        } catch (fetchErr) {
+          // Silent catch for test environments or offline state
+        }
+      }
+
       if (!data && typeof localStorage !== 'undefined') {
         const raw = localStorage.getItem(STORAGE_KEY);
         if (raw) data = JSON.parse(raw);

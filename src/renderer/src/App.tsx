@@ -58,8 +58,9 @@ export const App: React.FC = () => {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // Subscribe to library store updates
+  // Subscribe to library store updates and ensure persisted data is fetched on mount
   useEffect(() => {
+    libraryStore.loadPersistedData();
     return libraryStore.subscribe(() => {
       setLibraryState({ ...libraryStore.getState() });
     });

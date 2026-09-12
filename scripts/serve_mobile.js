@@ -148,6 +148,22 @@ async function handleRequest(req, res) {
 
   const parsedUrl = new URL(req.url || '/', `http://localhost:${PORT}`);
   const pathname = parsedUrl.pathname;
+  // Endpoint: /api/status
+  if (pathname === '/api/status') {
+    res.setHeader('Content-Type', 'application/json');
+    const ips = getNetworkIps();
+    res.end(
+      JSON.stringify({
+        enabled: true,
+        isRunning: true,
+        port: PORT,
+        primaryIp: ips.length > 0 ? ips[0].address : '127.0.0.1',
+        primaryUrl: `http://${ips.length > 0 ? ips[0].address : '127.0.0.1'}:${PORT}/`,
+        allUrls: ips.map((i) => ({ name: i.name, ip: i.address, url: `http://${i.address}:${PORT}/` })),
+      })
+    );
+    return;
+  }
 
   // Endpoint: /api/library
   if (pathname === '/api/library') {
@@ -334,5 +350,9 @@ function startServer(port) {
   });
 }
 
-startServer(PORT);
+if (require.main === module) {
+  startServer(PORT);
+}
+
+module.exports = { startServer, handleRequest, getLibraryPath };
 
