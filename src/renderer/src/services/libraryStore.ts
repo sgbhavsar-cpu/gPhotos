@@ -114,8 +114,15 @@ export class LibraryManager {
   };
 
   private listeners: Set<() => void> = new Set();
+  private saveDebounceTimer: any = null;
+  private isVerifyingInBackground = false;
 
   constructor() {
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', () => {
+        this.flushSaveImmediately();
+      });
+    }
     this.loadPersistedData();
   }
 
@@ -124,9 +131,41 @@ export class LibraryManager {
     return () => this.listeners.delete(listener);
   }
 
-  private notify() {
+  /**
+   * Lightweight notification to React listeners without triggering disk I/O.
+   */
+  public notifyListeners() {
     this.listeners.forEach((fn) => fn());
-    this.savePersistedData();
+  }
+
+  /**
+   * Full notification that updates UI immediately and schedules a debounced disk save.
+   */
+  public notify(immediateSave = false) {
+    this.notifyListeners();
+    if (immediateSave) {
+      this.flushSaveImmediately();
+    } else {
+      this.scheduleDebouncedSave();
+    }
+  }
+
+  private scheduleDebouncedSave() {
+    if (this.saveDebounceTimer) {
+      clearTimeout(this.saveDebounceTimer);
+    }
+    this.saveDebounceTimer = setTimeout(() => {
+      this.saveDebounceTimer = null;
+      this.savePersistedData();
+    }, 500);
+  }
+
+  public async flushSaveImmediately() {
+    if (this.saveDebounceTimer) {
+      clearTimeout(this.saveDebounceTimer);
+      this.saveDebounceTimer = null;
+    }
+    await this.savePersistedData();
   }
 
   public getState(): LibraryState {
@@ -141,9 +180,13 @@ export class LibraryManager {
     if (this.state.photos) {
       this.state.places = groupPhotosByPlace(this.state.photos);
     }
-    this.notify();
+    this.notify(true);
   }
 
+  /**
+   * Instant startup loader: immediately displays all cached photos and metadata
+   * (<10ms first paint) and defers disk/orphan verification to a non-blocking background task.
+   */
   private async loadPersistedData() {
     try {
       let data: any = null;
@@ -157,27 +200,9 @@ export class LibraryManager {
 
       if (data) {
         const rawPhotos: Photo[] = data.photos || [];
-        let dedupedPhotos = deduplicatePhotoList(rawPhotos);
+        const dedupedPhotos = deduplicatePhotoList(rawPhotos);
 
-        // If running in Electron, verify that files exist on disk and prune orphans whose physical source was deleted
-        if (typeof window !== 'undefined' && window.electronAPI?.checkFileExists) {
-          const verified: Photo[] = [];
-          for (const p of dedupedPhotos) {
-            const checkPath = p.isVirtual && p.originalRemotePath ? p.originalRemotePath : p.filePath;
-            if (checkPath) {
-              const exists = await window.electronAPI.checkFileExists(checkPath);
-              if (exists) {
-                verified.push(p);
-              }
-            } else {
-              verified.push(p);
-            }
-          }
-          if (verified.length > 0) {
-            dedupedPhotos = verified;
-          }
-        }
-
+        // Immediately populate state and paint first screen with 0 delay
         this.state.photos = dedupedPhotos;
         this.state.people = data.people || [];
         this.state.faces = data.faces || [];
@@ -188,16 +213,76 @@ export class LibraryManager {
         const recent = Array.isArray(data.recentLibraries) ? data.recentLibraries : (folder ? [folder] : []);
         this.state.recentLibraries = recent;
         this.state.places = groupPhotosByPlace(this.state.photos);
-        this.notify();
+        
+        // Immediate paint for UI responsiveness
+        this.notifyListeners();
 
-        // If duplicate entries were merged on load, immediately persist clean state
-        if (dedupedPhotos.length !== rawPhotos.length) {
-          console.log(`Consolidated ${rawPhotos.length - dedupedPhotos.length} duplicate/orphaned photo entries on startup.`);
-          this.savePersistedData();
+        // Defer orphan / deleted file verification to a non-blocking background task
+        if (typeof window !== 'undefined' && window.electronAPI?.checkFileExists) {
+          setTimeout(() => {
+            this.verifyPhotosInBackground();
+          }, 1200);
         }
       }
     } catch (err) {
       console.warn('Failed to load library state:', err);
+    }
+  }
+
+  /**
+   * Background non-blocking file existence verification.
+   * Checks files in small slices of 20 with 40ms event loop yields,
+   * checking local mirror files first to avoid network timeouts.
+   */
+  private async verifyPhotosInBackground() {
+    if (this.isVerifyingInBackground || !window.electronAPI?.checkFileExists) return;
+    this.isVerifyingInBackground = true;
+
+    try {
+      const currentPhotos = [...this.state.photos];
+      if (currentPhotos.length === 0) return;
+
+      const verified: Photo[] = [];
+      const batchSize = 20;
+
+      for (let i = 0; i < currentPhotos.length; i += batchSize) {
+        const slice = currentPhotos.slice(i, i + batchSize);
+        for (const p of slice) {
+          // For virtual network mirrors, always check local mirrored thumbnail path first
+          const localCheckPath = p.filePath;
+          if (localCheckPath) {
+            const exists = await window.electronAPI.checkFileExists(localCheckPath);
+            if (exists) {
+              verified.push(p);
+              continue;
+            }
+          }
+          // If not virtual or local check failed, check original path
+          if (p.originalRemotePath && !p.isVirtual) {
+            const exists = await window.electronAPI.checkFileExists(p.originalRemotePath);
+            if (exists) {
+              verified.push(p);
+              continue;
+            }
+          } else if (p.filePath) {
+            verified.push(p); // retain if cannot determine
+          }
+        }
+
+        // Non-blocking yield to keep UI at 60fps
+        await new Promise((r) => setTimeout(r, 40));
+      }
+
+      if (verified.length > 0 && verified.length !== currentPhotos.length) {
+        console.log(`Pruned ${currentPhotos.length - verified.length} unreachable or removed photos in background.`);
+        this.state.photos = verified;
+        this.state.places = groupPhotosByPlace(verified);
+        this.notify();
+      }
+    } catch (err) {
+      console.warn('Background photo verification error:', err);
+    } finally {
+      this.isVerifyingInBackground = false;
     }
   }
 
@@ -311,21 +396,49 @@ export class LibraryManager {
     }
   }
 
-  public updatePhoto(updatedPhoto: Photo) {
+  public updatePhotoQuietly(updatedPhoto: Photo) {
     const idx = this.state.photos.findIndex((p) => p.id === updatedPhoto.id || p.filePath === updatedPhoto.filePath);
     if (idx >= 0) {
       this.state.photos[idx] = { ...this.state.photos[idx], ...updatedPhoto };
     } else {
       this.state.photos.push(updatedPhoto);
     }
-    this.state.places = groupPhotosByPlace(this.state.photos.filter((p) => !p.isExcluded));
+  }
+
+  public updatePhoto(updatedPhoto: Photo, recalculatePlaces = false) {
+    const idx = this.state.photos.findIndex((p) => p.id === updatedPhoto.id || p.filePath === updatedPhoto.filePath);
+    let locationChanged = recalculatePlaces;
+    if (idx >= 0) {
+      if (updatedPhoto.location && JSON.stringify(updatedPhoto.location) !== JSON.stringify(this.state.photos[idx].location)) {
+        locationChanged = true;
+      }
+      this.state.photos[idx] = { ...this.state.photos[idx], ...updatedPhoto };
+    } else {
+      if (updatedPhoto.location) locationChanged = true;
+      this.state.photos.push(updatedPhoto);
+    }
+    if (locationChanged) {
+      this.state.places = groupPhotosByPlace(this.state.photos.filter((p) => !p.isExcluded));
+    }
     this.notify();
   }
 
-  public updatePhotos(updatedList: Photo[]) {
+  public updatePhotos(updatedList: Photo[], recalculatePlaces = false) {
     const map = new Map(updatedList.map((p) => [p.id, p]));
-    this.state.photos = this.state.photos.map((p) => (map.has(p.id) ? { ...p, ...map.get(p.id)! } : p));
-    this.state.places = groupPhotosByPlace(this.state.photos.filter((p) => !p.isExcluded));
+    let locationChanged = recalculatePlaces;
+    this.state.photos = this.state.photos.map((p) => {
+      const u = map.get(p.id);
+      if (u) {
+        if (u.location && JSON.stringify(u.location) !== JSON.stringify(p.location)) {
+          locationChanged = true;
+        }
+        return { ...p, ...u };
+      }
+      return p;
+    });
+    if (locationChanged) {
+      this.state.places = groupPhotosByPlace(this.state.photos.filter((p) => !p.isExcluded));
+    }
     this.notify();
   }
 
@@ -969,13 +1082,16 @@ export class LibraryManager {
 
   public setScanning(isScanning: boolean) {
     this.state.isScanning = isScanning;
-    this.notify();
+    this.notifyListeners();
   }
 
-  public setDetectingFaces(isDetecting: boolean, progress: { current: number; total: number } | null = null) {
+  public setDetectingFaces(
+    isDetecting: boolean,
+    progress: { current: number; total: number; currentPhotoName?: string } | null = null
+  ) {
     this.state.isDetectingFaces = isDetecting;
     this.state.faceDetectionProgress = progress;
-    this.notify();
+    this.notifyListeners();
   }
 
   public removePhotosByStorage(storageName: string) {

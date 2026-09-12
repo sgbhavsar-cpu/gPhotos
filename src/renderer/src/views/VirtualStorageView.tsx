@@ -21,7 +21,7 @@ import {
   Play,
   Radio,
 } from 'lucide-react';
-import { VirtualStorageConfig, MirrorProgress, BackgroundServiceStatus } from '../../types';
+import { VirtualStorageConfig, MirrorProgress, BackgroundServiceStatus, NetworkStorageProgress } from '../../types';
 import { DeleteStorageModal } from '../components/DeleteStorageModal';
 import { libraryStore } from '../services/libraryStore';
 
@@ -29,6 +29,7 @@ interface VirtualStorageViewProps {
   onLoadMirroredPhotos: (mirrorRootPath: string) => void;
   onStoragesUpdated?: (storages: VirtualStorageConfig[]) => void;
   onBrowseFolderTree?: (folderPath: string) => void;
+  storageProgressMap?: Record<string, NetworkStorageProgress>;
 }
 
 const STORAGE_CONFIGS_KEY = 'gphotos_virtual_storages_v1';
@@ -38,6 +39,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
   onLoadMirroredPhotos,
   onStoragesUpdated,
   onBrowseFolderTree,
+  storageProgressMap = {},
 }) => {
   const [storages, setStorages] = useState<VirtualStorageConfig[]>([]);
   const storagesRef = useRef<VirtualStorageConfig[]>([]);
@@ -717,6 +719,51 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                       </button>
                     </div>
                   </div>
+
+                  {/* Live Progress for Thumbnails and Face Recognition */}
+                  {(() => {
+                    const prog = storageProgressMap[s.name] || storageProgressMap[s.id];
+                    if (!prog || !prog.phase || prog.phase === 'idle') return null;
+                    return (
+                      <div style={{
+                        backgroundColor: 'rgba(15, 23, 42, 0.6)',
+                        border: '1px solid rgba(255, 255, 255, 0.08)',
+                        borderRadius: 'var(--radius-md)',
+                        padding: '10px 14px',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '6px',
+                      }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem' }}>
+                          <span style={{
+                            color: prog.phase === 'faces' ? '#f472b6' : prog.phase === 'completed' ? '#10b981' : 'var(--accent-cyan)',
+                            fontWeight: 600,
+                          }}>
+                            {prog.phase === 'scanning' && 'Scanning remote folder...'}
+                            {prog.phase === 'thumbnails' && `Generating Thumbnails: ${prog.thumbnailCurrent}/${prog.thumbnailTotal || '?'}`}
+                            {prog.phase === 'faces' && `Recognizing Faces: ${prog.faceCurrent}/${prog.faceTotal || '?'}`}
+                            {prog.phase === 'completed' && '✓ Up to date'}
+                            {prog.currentFile && ` (${prog.currentFile})`}
+                          </span>
+                          <span style={{ fontWeight: 600, color: 'var(--text-muted)' }}>{prog.percent}%</span>
+                        </div>
+                        <div style={{ height: '6px', borderRadius: '3px', backgroundColor: 'rgba(255, 255, 255, 0.1)', overflow: 'hidden' }}>
+                          <div style={{
+                            height: '100%',
+                            width: `${Math.min(100, Math.max(prog.phase === 'scanning' ? 12 : 0, prog.percent))}%`,
+                            background: prog.phase === 'faces'
+                              ? 'linear-gradient(90deg, #ec4899, #a855f7)'
+                              : prog.phase === 'completed'
+                              ? '#10b981'
+                              : prog.phase === 'error'
+                              ? '#ef4444'
+                              : 'var(--accent-cyan)',
+                            transition: 'width 0.2s ease',
+                          }} />
+                        </div>
+                      </div>
+                    );
+                  })()}
 
                   {/* Mirror Location & Space Saved Pill */}
                   <div style={{

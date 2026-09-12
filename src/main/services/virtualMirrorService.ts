@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { parsePhotoMetadata } from './exifParser';
 import { isImageFile, scanDirectoryRecursive } from './fileOrganizer';
+import { getOrGenerateHeicThumbnail500 } from './heicService';
 import {
   VirtualStorageConfig,
   SyncVirtualStorageResult,
@@ -207,10 +208,13 @@ export async function syncVirtualStorage(
 
   if (onProgress) {
     onProgress({
+      storageName: config.name,
+      phase: 'scanning',
       current: 0,
       total: 0,
       currentFile: 'Scanning network storage...',
       status: 'scanning',
+      percent: 0,
     });
   }
 
@@ -233,12 +237,16 @@ export async function syncVirtualStorage(
     const baseName = path.basename(fileName, path.extname(fileName));
     const localMetaPath = path.join(targetLocalDir, `${baseName}.json`);
 
+    const percent = Math.round(((i + 1) / Math.max(1, total)) * 100);
     if (onProgress) {
       onProgress({
+        storageName: config.name,
+        phase: 'thumbnails',
         current: i + 1,
         total,
         currentFile: fileName,
         status: 'syncing',
+        percent,
       });
     }
 
@@ -257,8 +265,19 @@ export async function syncVirtualStorage(
         }
       }
 
-      // 1. Generate 500px thumbnail
-      const thumbBuffer = generateThumbnailBuffer(remoteFile, 500);
+      // 1. Generate 500px thumbnail (supporting HEIC and standard formats)
+      let thumbBuffer: Buffer | null = null;
+      const isHeic = /\.(heic|heif)$/i.test(remoteFile);
+      if (isHeic) {
+        try {
+          thumbBuffer = await getOrGenerateHeicThumbnail500(remoteFile);
+        } catch (heicErr) {
+          console.warn(`HEIC thumbnail generation notice for ${remoteFile}:`, heicErr);
+        }
+      }
+      if (!thumbBuffer) {
+        thumbBuffer = generateThumbnailBuffer(remoteFile, 500);
+      }
       if (!thumbBuffer) {
         throw new Error(`Failed to generate thumbnail for ${remoteFile}`);
       }
@@ -292,6 +311,21 @@ export async function syncVirtualStorage(
       console.error(msg);
       errors.push(msg);
     }
+
+    // Micro-yield to Node/Electron event loop every file so UI remains 100% responsive
+    await new Promise((r) => setTimeout(r, 4));
+  }
+
+  if (onProgress) {
+    onProgress({
+      storageName: config.name,
+      phase: 'completed',
+      current: total,
+      total,
+      currentFile: 'Completed',
+      status: 'completed',
+      percent: 100,
+    });
   }
 
   // Prune deleted files: if the source path is accessible, clean up mirror files whose remote file no longer exists

@@ -170,11 +170,27 @@ export interface VirtualPhotoMetadata {
 }
 
 export interface MirrorProgress {
+  storageName?: string;
+  phase?: 'scanning' | 'thumbnails' | 'faces' | 'completed' | 'error';
   current: number;
   total: number;
   currentFile: string;
   status: 'scanning' | 'syncing' | 'completed' | 'error';
   errorMessage?: string;
+  percent?: number;
+}
+
+export interface NetworkStorageProgress {
+  storageName: string;
+  phase: 'idle' | 'scanning' | 'thumbnails' | 'faces' | 'completed' | 'error';
+  thumbnailCurrent: number;
+  thumbnailTotal: number;
+  faceCurrent: number;
+  faceTotal: number;
+  percent: number;
+  message?: string;
+  currentFile?: string;
+  error?: string;
 }
 
 export interface PlaceAlbum {

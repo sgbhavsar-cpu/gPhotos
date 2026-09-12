@@ -469,15 +469,15 @@ ipcMain.handle('storage:save', async (_event, key: string, data: any) => {
     let currentData: Record<string, any> = {};
     if (fs.existsSync(storePath)) {
       try {
-        currentData = JSON.parse(fs.readFileSync(storePath, 'utf-8'));
+        currentData = JSON.parse(await fs.promises.readFile(storePath, 'utf-8'));
       } catch (parseErr) {
         console.warn('Failed to parse existing library.json, starting fresh:', parseErr);
       }
     }
     currentData[key] = data;
     const tempPath = `${storePath}.tmp`;
-    fs.writeFileSync(tempPath, JSON.stringify(currentData, null, 2), 'utf-8');
-    fs.renameSync(tempPath, storePath);
+    await fs.promises.writeFile(tempPath, JSON.stringify(currentData, null, 2), 'utf-8');
+    await fs.promises.rename(tempPath, storePath);
     return true;
   } catch (err) {
     console.error('Failed to save library data:', err);
@@ -618,7 +618,18 @@ ipcMain.handle('mirror:start-bg-scan', async (event, sourcePath: string, mirrorR
             };
           } catch {}
         } else {
-          const thumbBuf = generateThumbnailBuffer(remoteFile, 500);
+          let thumbBuf: Buffer | null = null;
+          const isHeic = /\.(heic|heif)$/i.test(remoteFile);
+          if (isHeic) {
+            try {
+              thumbBuf = await getOrGenerateHeicThumbnail500(remoteFile);
+            } catch (heicErr) {
+              console.warn(`HEIC thumbnail generation notice for ${remoteFile}:`, heicErr);
+            }
+          }
+          if (!thumbBuf) {
+            thumbBuf = generateThumbnailBuffer(remoteFile, 500);
+          }
           if (thumbBuf) {
             fs.writeFileSync(localThumbPath, thumbBuf);
             const exif = await parsePhotoMetadata(remoteFile);
@@ -672,11 +683,15 @@ ipcMain.handle('mirror:start-bg-scan', async (event, sourcePath: string, mirrorR
           event.sender.send('mirror:bg-scan-progress', {
             jobId,
             sourcePath,
+            storageName: name,
+            phase: 'thumbnails',
             currentFile: fileName,
             processedCount: i + 1,
             totalDiscovered: total,
             isComplete: i === total - 1,
+            percent: Math.round(((i + 1) / Math.max(1, total)) * 100),
             newlyAddedPhotos: [...batch],
+            newPhotos: [...batch],
           });
           batch = [];
           await new Promise((r) => setTimeout(r, 6));
@@ -686,9 +701,12 @@ ipcMain.handle('mirror:start-bg-scan', async (event, sourcePath: string, mirrorR
       event.sender.send('mirror:bg-scan-progress', {
         jobId,
         sourcePath,
+        storageName: name,
+        phase: 'completed',
         currentFile: 'Complete',
         processedCount: total,
         totalDiscovered: total,
+        percent: 100,
         isComplete: true,
       });
     } catch (err: any) {

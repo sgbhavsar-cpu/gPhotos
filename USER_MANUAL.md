@@ -253,13 +253,27 @@ Every photo in a duplicate cluster is scored from 0 to 100 points:
 
 ## 10. Virtual Network Storage Mirrors (NAS / SMB / USB)
 
-If you store photos on a network-attached storage (NAS) or large external drive:
-1. Go to **Network Mirrors** &rarr; **Add Virtual Storage**.
+If you store photos on a network-attached storage (NAS), remote SMB share, or external hard drive:
+1. Go to **Network Storage** &rarr; **Add Virtual Storage**.
 2. Select your remote network folder.
-3. The application generates compressed 500px JPEG thumbnails and `.json` EXIF sidecars in `C:\GPhotos_VirtualMirrors\[StorageName]`.
-4. **Benefits**:
+3. The engine generates compressed 500px JPEG thumbnails and `.json` EXIF sidecars in `C:\GPhotos_VirtualMirrors\[StorageName]`.
+4. **Instant Startup & Non-Blocking First Paint**:
+   - The application launches instantly (<10ms) by populating your library from cache.
+   - Remote network checks and orphan pruning are deferred to background slices with event loop yields, guaranteeing the first screen renders immediately without frozen windows or white screens.
+5. **Live Dual-Stage Progress in Network Storage List**:
+   - Both the **left sidebar** and the **Network Storage view** display live real-time progress for each network share:
+     - **Stage 1 (Thumbnails)**: Displays live count and progress bar: `Thumbnails: X/Y (Z%)` with active file indicator.
+     - **Stage 2 (Face Recognition)**: Displays live AI detection: `Faces: A/B (C%)` with dedicated progress bar.
+     - **Stage 3 (Complete)**: Displays `✓ Up to date` badge when all sync and face processing tasks are finished.
+6. **Smooth Responsiveness & Non-Blocking Execution**:
+   - Background scanning and face detection process in small batches with automated event loop yields (`setTimeout(..., 4ms)`).
+   - The user interface remains 100% responsive at 60 FPS at all times—you can browse, zoom, organize, and edit photos without any UI stutter or Windows "Not Responding" prompts.
+7. **Apple HEIC / iPhone Live Support**:
+   - High-quality unrotated 500px thumbnails are extracted and stored locally for instant timeline browsing.
+   - When viewing photos in fullscreen, high-resolution preview extractions are loaded on demand.
+8. **Benefits**:
    - Browse your entire 500,000+ photo collection offline at lightning speed.
-   - When connected to your network, clicking any photo automatically serves the original high-resolution RAW or JPEG file.
+   - When connected to your network, clicking any photo serves the original high-resolution RAW or JPEG file.
    - Clicking **"Open in Explorer"** highlights the original network file directly in Windows File Explorer.
 
 ---

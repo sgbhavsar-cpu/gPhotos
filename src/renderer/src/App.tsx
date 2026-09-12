@@ -19,7 +19,7 @@ import { MobileMenuDrawer } from './components/MobileMenuDrawer';
 import { libraryStore, LibraryState, getLocalPhotoUrl } from './services/libraryStore';
 import { detectFacesInImage, loadFaceModels } from './services/faceEngine';
 import { faceQueue } from './services/faceQueue';
-import { Photo, DetectedFace, VirtualStorageConfig, BackgroundScanProgress } from '../types';
+import { Photo, DetectedFace, VirtualStorageConfig, BackgroundScanProgress, NetworkStorageProgress } from '../types';
 import { AiPhotoFilter } from './services/aiSearchService';
 import { RefreshCw, CheckCircle2, X } from 'lucide-react';
 
@@ -29,6 +29,8 @@ export const App: React.FC = () => {
   const [activeLightboxPhoto, setActiveLightboxPhoto] = useState<Photo | null>(null);
   const [selectedPersonIdForView, setSelectedPersonIdForView] = useState<string | null>(null);
   const [virtualStorages, setVirtualStorages] = useState<VirtualStorageConfig[]>([]);
+  const [storageProgressMap, setStorageProgressMap] = useState<Record<string, NetworkStorageProgress>>({});
+  const [toastMessage, setToastMessage] = useState<{ message: string; type?: 'info' | 'success' | 'warning' } | null>(null);
   const [selectedFolderForTree, setSelectedFolderForTree] = useState<string | null>(null);
   const [showDuplicateCleaner, setShowDuplicateCleaner] = useState(false);
   const [showHelpModal, setShowHelpModal] = useState(false);
@@ -39,6 +41,13 @@ export const App: React.FC = () => {
   const [activeAiFilter, setActiveAiFilter] = useState<AiPhotoFilter | null>(null);
   const [aiFilteredPhotos, setAiFilteredPhotos] = useState<Photo[] | null>(null);
   const [bgScanProgress, setBgScanProgress] = useState<BackgroundScanProgress | null>(null);
+
+  const showToast = (message: string, type: 'info' | 'success' | 'warning' = 'info') => {
+    setToastMessage({ message, type });
+    setTimeout(() => {
+      setToastMessage((cur) => (cur?.message === message ? null : cur));
+    }, 4500);
+  };
 
   // Detect mobile viewport on mount and resize
   useEffect(() => {
@@ -114,15 +123,32 @@ export const App: React.FC = () => {
   // Listen for non-blocking background folder/drive scan events
   useEffect(() => {
     if (!window.electronAPI?.onBackgroundScanProgress) return;
-    const unsubscribe = window.electronAPI.onBackgroundScanProgress((progress) => {
+    const unsubscribe = window.electronAPI.onBackgroundScanProgress((progress: any) => {
       setBgScanProgress(progress);
-      if (progress.newPhotos && progress.newPhotos.length > 0) {
-        libraryStore.addPhotos(progress.newPhotos, progress.mirrorDirPath);
-        faceQueue.enqueue(progress.newPhotos);
+      const photosToAdd = progress.newPhotos || progress.newlyAddedPhotos;
+      if (photosToAdd && photosToAdd.length > 0) {
+        libraryStore.addPhotos(photosToAdd, progress.mirrorDirPath);
+        faceQueue.enqueue(photosToAdd);
       }
-      if (progress.status === 'completed') {
+      if (progress.storageName) {
+        const pct = progress.percent || Math.round((progress.processedCount / Math.max(1, progress.totalDiscovered)) * 100);
+        setStorageProgressMap((prev) => ({
+          ...prev,
+          [progress.storageName]: {
+            storageName: progress.storageName,
+            phase: progress.isComplete ? 'completed' : 'thumbnails',
+            thumbnailCurrent: progress.processedCount,
+            thumbnailTotal: progress.totalDiscovered,
+            faceCurrent: prev[progress.storageName]?.faceCurrent || 0,
+            faceTotal: prev[progress.storageName]?.faceTotal || 0,
+            percent: pct,
+            currentFile: progress.currentFile,
+          },
+        }));
+      }
+      if (progress.status === 'completed' || progress.isComplete) {
         setTimeout(() => {
-          setBgScanProgress((p) => (p?.status === 'completed' ? null : p));
+          setBgScanProgress((p) => (p?.status === 'completed' || p?.isComplete ? null : p));
         }, 5000);
       }
     });
@@ -131,10 +157,54 @@ export const App: React.FC = () => {
     };
   }, []);
 
+  // Listen for granular network storage thumbnail sync progress
+  useEffect(() => {
+    if (!window.electronAPI?.onMirrorProgress) return;
+    const unsubscribe = window.electronAPI.onMirrorProgress((progress: any) => {
+      const storageName = progress.storageName || 'Network Storage';
+      const pct = progress.percent ?? (progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0);
+      setStorageProgressMap((prev) => ({
+        ...prev,
+        [storageName]: {
+          storageName,
+          phase: (progress.phase as any) || (progress.status === 'completed' ? 'completed' : 'thumbnails'),
+          thumbnailCurrent: progress.current,
+          thumbnailTotal: progress.total,
+          faceCurrent: prev[storageName]?.faceCurrent || 0,
+          faceTotal: prev[storageName]?.faceTotal || 0,
+          percent: pct,
+          currentFile: progress.currentFile,
+        },
+      }));
+
+      if (progress.status === 'completed' && progress.phase === 'completed') {
+        setTimeout(() => {
+          setStorageProgressMap((prev) => {
+            const cur = prev[storageName];
+            if (cur && cur.phase === 'completed') {
+              const copy = { ...prev };
+              delete copy[storageName];
+              return copy;
+            }
+            return prev;
+          });
+        }, 4000);
+      }
+    });
+    return () => {
+      if (typeof unsubscribe === 'function') unsubscribe();
+    };
+  }, []);
+
   // Run AI face detection helper for any given batch of photos
-  const runFaceDetectionForPhotos = async (photosToScan: Photo[], isManualTrigger = false) => {
+  // Run AI face detection helper for any given batch of photos
+  const runFaceDetectionForPhotos = async (
+    photosToScan: Photo[],
+    isManualTrigger = false,
+    storageName?: string
+  ) => {
     if (photosToScan.length === 0) {
-      if (isManualTrigger) alert('No photos in library to scan.');
+      if (isManualTrigger) showToast('No photos in library to scan.', 'info');
       return;
     }
 
@@ -147,7 +217,7 @@ export const App: React.FC = () => {
 
     if (candidates.length === 0) {
       if (isManualTrigger) {
-        alert('All photos in this library have already been scanned for faces.\n\n(If you wish to re-scan all photos from scratch, click "Reset & Rescan" in the People tab.)');
+        showToast('All photos in this library have already been scanned for faces.', 'info');
       }
       return;
     }
@@ -158,11 +228,27 @@ export const App: React.FC = () => {
       currentPhotoName: 'Loading AI face models...',
     });
 
+    if (storageName) {
+      setStorageProgressMap((prev) => ({
+        ...prev,
+        [storageName]: {
+          storageName,
+          phase: 'faces',
+          thumbnailCurrent: prev[storageName]?.thumbnailTotal || photosToScan.length,
+          thumbnailTotal: prev[storageName]?.thumbnailTotal || photosToScan.length,
+          faceCurrent: 0,
+          faceTotal: candidates.length,
+          percent: 0,
+          message: `Recognizing faces: 0/${candidates.length}`,
+        },
+      }));
+    }
+
     const loaded = await loadFaceModels();
     if (!loaded) {
       console.warn('Face models could not be loaded.');
       if (isManualTrigger) {
-        alert('Failed to load Face-API neural network models. Make sure model weights are present.');
+        showToast('Failed to load Face-API neural network models. Make sure model weights are present.', 'warning');
       }
       libraryStore.setDetectingFaces(false, null);
       return;
@@ -179,6 +265,23 @@ export const App: React.FC = () => {
           currentPhotoName: photo.fileName,
         });
 
+        if (storageName) {
+          const facePct = Math.round(((i + 1) / Math.max(1, candidates.length)) * 100);
+          setStorageProgressMap((prev) => ({
+            ...prev,
+            [storageName]: {
+              ...prev[storageName],
+              storageName,
+              phase: 'faces',
+              faceCurrent: i + 1,
+              faceTotal: candidates.length,
+              percent: facePct,
+              currentFile: photo.fileName,
+              message: `Recognizing faces: ${i + 1}/${candidates.length}`,
+            },
+          }));
+        }
+
         try {
           let preferOriginal = false;
           if (photo.isVirtual && photo.originalRemotePath && window.electronAPI?.checkFileExists) {
@@ -193,7 +296,7 @@ export const App: React.FC = () => {
           );
           photo.faces = detectedFaces;
           photo.faceScanCompleted = true;
-          libraryStore.updatePhoto(photo);
+          libraryStore.updatePhotoQuietly(photo);
 
           if (detectedFaces.length > 0) {
             allNewFaces.push(...detectedFaces);
@@ -201,20 +304,51 @@ export const App: React.FC = () => {
         } catch (err) {
           console.warn(`Face detection skipped for ${photo.fileName}:`, err);
           photo.faceScanCompleted = true;
-          libraryStore.updatePhoto(photo);
+          libraryStore.updatePhotoQuietly(photo);
+        }
+
+        // Repaint UI periodically without triggering heavy full clusters or disk writes
+        if ((i + 1) % 4 === 0 || i === candidates.length - 1) {
+          libraryStore.notifyListeners();
         }
 
         // Non-blocking yield to event loop for smooth background execution and 60fps UI
-        await new Promise((r) => setTimeout(r, 16));
+        await new Promise((r) => setTimeout(r, 20));
       }
 
       if (allNewFaces.length > 0) {
         libraryStore.updateFacesAndPeople(allNewFaces);
         if (isManualTrigger) {
-          alert(`Face recognition complete! Detected ${allNewFaces.length} new face instances.`);
+          showToast(`Face recognition complete! Detected ${allNewFaces.length} new face instances.`, 'success');
         }
       } else if (isManualTrigger) {
-        alert('Face recognition finished. No faces detected.');
+        showToast('Face recognition finished. No faces detected.', 'info');
+      }
+
+      if (storageName) {
+        setStorageProgressMap((prev) => ({
+          ...prev,
+          [storageName]: {
+            ...prev[storageName],
+            storageName,
+            phase: 'completed',
+            faceCurrent: candidates.length,
+            faceTotal: candidates.length,
+            percent: 100,
+            message: '✓ Up to date',
+          },
+        }));
+        setTimeout(() => {
+          setStorageProgressMap((prev) => {
+            const cur = prev[storageName];
+            if (cur && cur.phase === 'completed') {
+              const copy = { ...prev };
+              delete copy[storageName];
+              return copy;
+            }
+            return prev;
+          });
+        }, 4000);
       }
     } finally {
       libraryStore.setDetectingFaces(false, null);
@@ -223,7 +357,7 @@ export const App: React.FC = () => {
 
   const handleOpenFolder = async () => {
     if (!window.electronAPI) {
-      alert('Native folder selection is available in the Electron desktop app.');
+      showToast('Native folder selection is available in the Electron desktop app.', 'warning');
       return;
     }
 
@@ -251,7 +385,7 @@ export const App: React.FC = () => {
       setActiveTab('photos');
       await runFaceDetectionForPhotos(photos, false);
     } catch (err: any) {
-      alert(`Failed to load selected library: ${err.message}`);
+      showToast(`Failed to load selected library: ${err.message}`, 'warning');
     } finally {
       libraryStore.setScanning(false);
     }
@@ -333,11 +467,25 @@ export const App: React.FC = () => {
     }
 
     if (!config) {
-      alert('No network mirrors configured yet. Go to Network Mirrors tab to connect a remote or cloud folder.');
+      showToast('No network mirrors configured yet. Go to Network Mirrors tab to connect a remote or cloud folder.', 'warning');
       return;
     }
 
-    libraryStore.setScanning(true);
+    // Set live initial progress in network storage list
+    setStorageProgressMap((prev) => ({
+      ...prev,
+      [config!.name]: {
+        storageName: config!.name,
+        phase: 'scanning',
+        thumbnailCurrent: 0,
+        thumbnailTotal: 0,
+        faceCurrent: 0,
+        faceTotal: 0,
+        percent: 0,
+        message: 'Scanning remote directory...',
+      },
+    }));
+
     try {
       // 1. Sync any new photos from remote source, generate 500px local thumbnails & EXIF metadata sidecars
       const res = await window.electronAPI.syncVirtualStorage(config);
@@ -361,23 +509,50 @@ export const App: React.FC = () => {
       );
       setVirtualStorages(updatedList);
       await window.electronAPI.saveLibraryData('gphotos_virtual_storages_v1', updatedList);
-      libraryStore.setScanning(false);
 
-      // 4. Automatically recognize faces on any newly added photos
-      if (res.newlyAdded > 0) {
-        alert(`Rescan Complete! Found and mirrored ${res.newlyAdded} new photos from ${config.name}. Starting face recognition...`);
-        await runFaceDetectionForPhotos(updatedPhotos, false);
+      // 4. Automatically recognize faces on any newly added photos or unscanned photos
+      const photosNeedingFaces = updatedPhotos.filter((p) => !p.faces || p.faces.length === 0);
+      if (res.newlyAdded > 0 || photosNeedingFaces.length > 0) {
+        showToast(`Mirrored ${res.newlyAdded} new photos from ${config.name}. Starting face recognition...`, 'info');
+        await runFaceDetectionForPhotos(updatedPhotos, false, config.name);
       } else {
-        const photosNeedingFaces = updatedPhotos.filter((p) => !p.faces || p.faces.length === 0);
-        if (photosNeedingFaces.length > 0) {
-          await runFaceDetectionForPhotos(updatedPhotos, false);
-        } else {
-          alert(`Rescan Complete: ${config.name} is up-to-date (${res.totalSynced} photos). No new photos found.`);
-        }
+        setStorageProgressMap((prev) => ({
+          ...prev,
+          [config!.name]: {
+            storageName: config!.name,
+            phase: 'completed',
+            thumbnailCurrent: res.totalSynced,
+            thumbnailTotal: res.totalSynced,
+            faceCurrent: 0,
+            faceTotal: 0,
+            percent: 100,
+            message: '✓ Up to date',
+          },
+        }));
+        showToast(`Rescan Complete: ${config.name} is up-to-date (${res.totalSynced} photos).`, 'success');
+        setTimeout(() => {
+          setStorageProgressMap((prev) => {
+            const copy = { ...prev };
+            delete copy[config!.name];
+            return copy;
+          });
+        }, 4000);
       }
     } catch (err: any) {
-      libraryStore.setScanning(false);
-      alert(`Error refreshing network storage: ${err.message}`);
+      setStorageProgressMap((prev) => ({
+        ...prev,
+        [config!.name]: {
+          storageName: config!.name,
+          phase: 'error',
+          thumbnailCurrent: 0,
+          thumbnailTotal: 0,
+          faceCurrent: 0,
+          faceTotal: 0,
+          percent: 0,
+          error: err.message,
+        },
+      }));
+      showToast(`Error refreshing network storage: ${err.message}`, 'warning');
     }
   };
 
@@ -415,6 +590,7 @@ export const App: React.FC = () => {
           onOpenFolder={handleOpenFolder}
           onTriggerFaceDetection={handleTriggerFaceDetection}
           virtualStorages={virtualStorages}
+          storageProgressMap={storageProgressMap}
           onSelectStorage={handleSelectVirtualStorage}
           onRefreshStorage={handleRefreshNetworkStorage}
           onOpenDuplicateCleaner={() => setShowDuplicateCleaner(true)}
@@ -533,6 +709,7 @@ export const App: React.FC = () => {
           <VirtualStorageView
             onLoadMirroredPhotos={handleLoadMirroredPhotos}
             onStoragesUpdated={(storages) => setVirtualStorages(storages)}
+            storageProgressMap={storageProgressMap}
             onBrowseFolderTree={(folderPath) => {
               setSelectedFolderForTree(folderPath);
               setActiveTab('folders');
@@ -631,6 +808,63 @@ export const App: React.FC = () => {
             className="btn btn-ghost btn-icon"
             onClick={() => setBgScanProgress(null)}
             style={{ width: '24px', height: '24px', padding: 0 }}
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
+      {/* Non-blocking Floating Toast Feedback Notification */}
+      {toastMessage && (
+        <div
+          style={{
+            position: 'fixed',
+            top: '20px',
+            right: '24px',
+            zIndex: 1000,
+            backgroundColor:
+              toastMessage.type === 'success'
+                ? 'rgba(6, 78, 59, 0.95)'
+                : toastMessage.type === 'warning'
+                ? 'rgba(120, 53, 15, 0.95)'
+                : 'rgba(15, 23, 42, 0.95)',
+            border: `1px solid ${
+              toastMessage.type === 'success'
+                ? '#10b981'
+                : toastMessage.type === 'warning'
+                ? '#f59e0b'
+                : 'var(--accent-primary)'
+            }`,
+            borderRadius: 'var(--radius-md)',
+            padding: '10px 16px',
+            boxShadow: '0 8px 30px rgba(0,0,0,0.5)',
+            backdropFilter: 'blur(12px)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '10px',
+            fontSize: '0.85rem',
+            color: 'white',
+            maxWidth: '420px',
+            animation: 'fadeIn 0.2s ease',
+          }}
+        >
+          {toastMessage.type === 'success' ? (
+            <CheckCircle2 size={18} color="#34d399" style={{ flexShrink: 0 }} />
+          ) : (
+            <RefreshCw size={18} color="var(--accent-primary)" style={{ flexShrink: 0 }} />
+          )}
+          <span style={{ flex: 1 }}>{toastMessage.message}</span>
+          <button
+            onClick={() => setToastMessage(null)}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: 'rgba(255,255,255,0.7)',
+              cursor: 'pointer',
+              padding: 0,
+              display: 'flex',
+              alignItems: 'center',
+            }}
           >
             <X size={14} />
           </button>

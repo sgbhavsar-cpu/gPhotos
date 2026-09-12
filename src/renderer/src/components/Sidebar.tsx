@@ -19,7 +19,7 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import { LibraryState } from '../services/libraryStore';
-import { VirtualStorageConfig } from '../../types';
+import { VirtualStorageConfig, NetworkStorageProgress } from '../../types';
 
 export type ActiveTab =
   | 'photos'
@@ -39,6 +39,7 @@ interface SidebarProps {
   onOpenFolder: () => void;
   onTriggerFaceDetection: () => void;
   virtualStorages?: VirtualStorageConfig[];
+  storageProgressMap?: Record<string, NetworkStorageProgress>;
   onSelectStorage?: (storage: VirtualStorageConfig) => void;
   onRefreshStorage?: (storage: VirtualStorageConfig) => void;
   onOpenDuplicateCleaner?: () => void;
@@ -54,6 +55,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onOpenFolder,
   onTriggerFaceDetection,
   virtualStorages = [],
+  storageProgressMap = {},
   onSelectStorage,
   onRefreshStorage,
   onOpenDuplicateCleaner,
@@ -340,55 +342,139 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     state.selectedFolder &&
                     (state.selectedFolder.toLowerCase().includes(storage.name.toLowerCase()) ||
                       state.photos.some((p) => p.isVirtual && p.storageName === storage.name));
+                  const prog = storageProgressMap[storage.name] || storageProgressMap[storage.id];
+                  const isProgressActive = prog && prog.phase && prog.phase !== 'idle';
 
                   return (
                     <div
                       key={storage.id}
                       style={{
                         display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'space-between',
+                        flexDirection: 'column',
                         padding: '7px 10px',
                         borderRadius: 'var(--radius-md)',
                         backgroundColor: isStorageActive ? 'rgba(6, 182, 212, 0.12)' : 'transparent',
                         border: isStorageActive ? '1px solid rgba(6, 182, 212, 0.3)' : '1px solid transparent',
                         cursor: 'pointer',
                         transition: 'all var(--transition-fast)',
+                        gap: isProgressActive ? '6px' : '0px',
                       }}
                       onClick={() => onSelectStorage && onSelectStorage(storage)}
                       title={`Source: ${storage.networkSourcePath}\nClick to browse photos`}
                     >
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
-                        <HardDrive size={15} color={isStorageActive ? 'var(--accent-cyan)' : 'var(--text-muted)'} />
-                        <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                          <div
-                            style={{
-                              fontSize: '0.8rem',
-                              fontWeight: isStorageActive ? 600 : 500,
-                              color: isStorageActive ? 'var(--text-primary)' : 'var(--text-secondary)',
-                              overflow: 'hidden',
-                              textOverflow: 'ellipsis',
-                            }}
-                          >
-                            {storage.name}
-                          </div>
-                          <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>
-                            {storage.totalItems || 0} photos
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0, flex: 1 }}>
+                          <HardDrive size={15} color={isStorageActive ? 'var(--accent-cyan)' : 'var(--text-muted)'} style={{ flexShrink: 0 }} />
+                          <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>
+                            <div
+                              style={{
+                                fontSize: '0.8rem',
+                                fontWeight: isStorageActive ? 600 : 500,
+                                color: isStorageActive ? 'var(--text-primary)' : 'var(--text-secondary)',
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                              }}
+                            >
+                              {storage.name}
+                            </div>
+                            <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>
+                              {storage.totalItems || 0} photos
+                            </div>
                           </div>
                         </div>
+
+                        <button
+                          className="btn btn-ghost btn-icon"
+                          style={{
+                            width: '24px',
+                            height: '24px',
+                            padding: 0,
+                            color: isProgressActive ? '#f472b6' : 'var(--accent-cyan)',
+                            flexShrink: 0,
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (onRefreshStorage) onRefreshStorage(storage);
+                          }}
+                          title="Rescan remote folder for new photos & detect faces"
+                        >
+                          <RefreshCw
+                            size={12}
+                            style={{
+                              animation: isProgressActive && prog.phase !== 'completed' ? 'spin 1.5s linear infinite' : 'none',
+                            }}
+                          />
+                        </button>
                       </div>
 
-                      <button
-                        className="btn btn-ghost btn-icon"
-                        style={{ width: '24px', height: '24px', padding: 0, color: 'var(--accent-cyan)', flexShrink: 0 }}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          if (onRefreshStorage) onRefreshStorage(storage);
-                        }}
-                        title="Rescan remote folder for new photos & detect faces"
-                      >
-                        <RefreshCw size={12} />
-                      </button>
+                      {/* Live Thumbnail & Face Recognition Progress Indicators */}
+                      {isProgressActive && (
+                        <div
+                          style={{
+                            width: '100%',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '3px',
+                            paddingTop: '2px',
+                          }}
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.65rem' }}>
+                            <span
+                              style={{
+                                color:
+                                  prog.phase === 'faces'
+                                    ? '#f472b6'
+                                    : prog.phase === 'completed'
+                                    ? '#10b981'
+                                    : prog.phase === 'error'
+                                    ? '#ef4444'
+                                    : 'var(--accent-cyan)',
+                                fontWeight: 600,
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                                whiteSpace: 'nowrap',
+                                maxWidth: '140px',
+                              }}
+                            >
+                              {prog.phase === 'scanning' && 'Scanning remote folder...'}
+                              {prog.phase === 'thumbnails' && `Thumbnails: ${prog.thumbnailCurrent}/${prog.thumbnailTotal || '?'}`}
+                              {prog.phase === 'faces' && `Faces: ${prog.faceCurrent}/${prog.faceTotal || '?'}`}
+                              {prog.phase === 'completed' && '✓ Up to date'}
+                              {prog.phase === 'error' && 'Sync error'}
+                            </span>
+                            <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 600 }}>
+                              {prog.percent}%
+                            </span>
+                          </div>
+
+                          <div
+                            style={{
+                              width: '100%',
+                              height: '4px',
+                              borderRadius: '2px',
+                              backgroundColor: 'rgba(255, 255, 255, 0.08)',
+                              overflow: 'hidden',
+                            }}
+                          >
+                            <div
+                              style={{
+                                height: '100%',
+                                width: `${Math.min(100, Math.max(prog.phase === 'scanning' ? 12 : 0, prog.percent))}%`,
+                                background:
+                                  prog.phase === 'faces'
+                                    ? 'linear-gradient(90deg, #ec4899, #a855f7)'
+                                    : prog.phase === 'completed'
+                                    ? '#10b981'
+                                    : prog.phase === 'error'
+                                    ? '#ef4444'
+                                    : 'var(--accent-cyan)',
+                                transition: 'width 0.25s ease',
+                              }}
+                            />
+                          </div>
+                        </div>
+                      )}
                     </div>
                   );
                 })}

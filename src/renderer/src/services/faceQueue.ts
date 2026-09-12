@@ -115,6 +115,8 @@ class FaceQueueService {
     this.notify();
   }
 
+  private newFacesBatch: DetectedFace[] = [];
+
   private async processNext() {
     if (this.isRunning || this.isPaused || this.queue.length === 0) {
       return;
@@ -153,23 +155,38 @@ class FaceQueueService {
       photo.faces = detectedFaces;
       photo.faceScanCompleted = true;
 
-      // Update libraryStore
-      libraryStore.updatePhoto(photo);
+      // Update libraryStore photo state quietly (in memory)
+      libraryStore.updatePhotoQuietly(photo);
 
-      // Re-cluster faces across library seamlessly
-      const state = libraryStore.getState();
-      const allFaces: DetectedFace[] = [];
-      for (const p of state.photos) {
-        if (p.faces) {
-          allFaces.push(...p.faces);
-        }
+      if (detectedFaces.length > 0) {
+        this.newFacesBatch.push(...detectedFaces);
       }
-      const { people, updatedFaces } = clusterFaces(allFaces, state.people, 0.55, false);
-      state.people = people;
-      state.faces = updatedFaces;
-      libraryStore.notify();
 
       this.completedInSession++;
+
+      // Batch clustering: re-cluster only every 8 photos, or when queue empties, or when 10+ new faces are found
+      const shouldCluster =
+        this.newFacesBatch.length >= 10 ||
+        this.completedInSession % 8 === 0 ||
+        this.queue.length === 0;
+
+      if (shouldCluster) {
+        const state = libraryStore.getState();
+        const allFaces: DetectedFace[] = [];
+        for (const p of state.photos) {
+          if (p.faces) {
+            allFaces.push(...p.faces);
+          }
+        }
+        const { people, updatedFaces } = clusterFaces(allFaces, state.people, 0.55, false);
+        state.people = people;
+        state.faces = updatedFaces;
+        this.newFacesBatch = [];
+        libraryStore.notify();
+      } else {
+        // Lightweight UI repaint without full cluster and without disk write
+        libraryStore.notifyListeners();
+      }
     } catch (err) {
       console.warn(`Error processing face queue for ${photo.fileName}:`, err);
     } finally {
@@ -179,10 +196,22 @@ class FaceQueueService {
       this.notify();
 
       if (this.queue.length > 0) {
-        // Yield 25ms to event loop so browser / UI never lags
-        setTimeout(() => this.processNext(), 25);
+        // Yield 35ms to event loop so browser / UI never lags at 60fps
+        setTimeout(() => this.processNext(), 35);
       } else {
-        // Reset session counts when queue is empty
+        // Flush any remaining cluster and reset session counts when queue is empty
+        if (this.newFacesBatch.length > 0) {
+          const state = libraryStore.getState();
+          const allFaces: DetectedFace[] = [];
+          for (const p of state.photos) {
+            if (p.faces) allFaces.push(...p.faces);
+          }
+          const { people, updatedFaces } = clusterFaces(allFaces, state.people, 0.55, false);
+          state.people = people;
+          state.faces = updatedFaces;
+          this.newFacesBatch = [];
+          libraryStore.notify(true);
+        }
         this.totalInSession = 0;
         this.completedInSession = 0;
         this.notify();
