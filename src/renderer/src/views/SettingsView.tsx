@@ -17,9 +17,15 @@ import {
   FileText,
   Key,
   Archive,
-  FolderDown
+  FolderDown,
+  Smartphone,
+  Globe,
+  Copy,
+  ExternalLink,
+  Wifi,
+  Check
 } from 'lucide-react';
-import { BackgroundServiceStatus, BackgroundServiceSettings } from '../../types';
+import { BackgroundServiceStatus, BackgroundServiceSettings, WebServerStatus } from '../../types';
 import { aiSearchService, AiSearchConfig, AiProvider } from '../services/aiSearchService';
 
 interface SettingsViewProps {
@@ -39,6 +45,60 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [syncFeedback, setSyncFeedback] = useState<string | null>(null);
   const [aiConfig, setAiConfig] = useState<AiSearchConfig>(aiSearchService.getConfig());
   const [aiFeedback, setAiFeedback] = useState<string | null>(null);
+
+  // Mobile Web Server state
+  const [webServerStatus, setWebServerStatus] = useState<WebServerStatus | null>(null);
+  const [webServerPortInput, setWebServerPortInput] = useState<string>('5173');
+  const [webServerEnabled, setWebServerEnabled] = useState<boolean>(true);
+  const [isUpdatingWebServer, setIsUpdatingWebServer] = useState<boolean>(false);
+  const [copiedUrl, setCopiedUrl] = useState<boolean>(false);
+  const [webServerFeedback, setWebServerFeedback] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (window.electronAPI?.getWebServerStatus) {
+      window.electronAPI.getWebServerStatus().then((status) => {
+        if (status) {
+          setWebServerStatus(status);
+          setWebServerPortInput(String(status.port || 5173));
+          setWebServerEnabled(status.enabled);
+        }
+      });
+    }
+  }, []);
+
+  const handleSaveWebServerSettings = async () => {
+    const portNum = parseInt(webServerPortInput, 10);
+    if (isNaN(portNum) || portNum < 1024 || portNum > 65535) {
+      alert('Please enter a valid port number between 1024 and 65535.');
+      return;
+    }
+    setIsUpdatingWebServer(true);
+    setWebServerFeedback(null);
+    try {
+      if (window.electronAPI?.setWebServerSettings) {
+        const updated = await window.electronAPI.setWebServerSettings({
+          enabled: webServerEnabled,
+          port: portNum,
+        });
+        setWebServerStatus(updated);
+        setWebServerFeedback(
+          updated.isRunning
+            ? `✓ Mobile server successfully running on port ${updated.port}!`
+            : `✓ Mobile server settings saved (currently disabled).`
+        );
+      }
+    } catch (err: any) {
+      alert('Failed to update web server settings: ' + err.message);
+    } finally {
+      setIsUpdatingWebServer(false);
+    }
+  };
+
+  const handleCopyMobileUrl = (url: string) => {
+    navigator.clipboard.writeText(url);
+    setCopiedUrl(true);
+    setTimeout(() => setCopiedUrl(false), 2000);
+  };
 
   // Backup in .zip format state
   const [isBackingUp, setIsBackingUp] = useState<boolean>(false);
@@ -243,6 +303,174 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <span>{syncFeedback}</span>
           </div>
         )}
+
+        {/* Section 0: Mobile Access & Local Web Server (Wi-Fi Sharing) */}
+        <div style={{
+          backgroundColor: 'var(--bg-surface)',
+          border: '1px solid var(--border-subtle)',
+          borderRadius: 'var(--radius-lg)',
+          padding: '24px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '20px',
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
+            <div>
+              <h2 style={{ fontSize: '1.15rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '10px', margin: 0 }}>
+                <Smartphone size={20} color="var(--accent-cyan)" />
+                Mobile Access & Local Web Server (Wi-Fi Sharing)
+              </h2>
+              <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', margin: '4px 0 0 0' }}>
+                Self-host your photo collection directly from this application. When running on this PC, browse photos from your iPhone, Android, or any web browser on your Wi-Fi network!
+              </p>
+            </div>
+
+            <div style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '8px',
+              padding: '6px 14px',
+              borderRadius: '9999px',
+              fontSize: '0.82rem',
+              fontWeight: 600,
+              backgroundColor: webServerStatus?.isRunning ? 'rgba(16, 185, 129, 0.15)' : 'rgba(239, 68, 68, 0.15)',
+              color: webServerStatus?.isRunning ? '#10b981' : '#ef4444',
+              border: `1px solid ${webServerStatus?.isRunning ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)'}`,
+            }}>
+              <span style={{
+                width: '8px',
+                height: '8px',
+                borderRadius: '50%',
+                backgroundColor: webServerStatus?.isRunning ? '#10b981' : '#ef4444',
+              }} />
+              {webServerStatus?.isRunning ? `Running (Port ${webServerStatus.port})` : 'Server Stopped'}
+            </div>
+          </div>
+
+          {/* Configuration Controls */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '16px' }}>
+            <div>
+              <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, marginBottom: '8px' }}>
+                Self-Hosted Web Server
+              </label>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', height: '40px' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.9rem' }}>
+                  <input
+                    type="checkbox"
+                    checked={webServerEnabled}
+                    onChange={(e) => setWebServerEnabled(e.target.checked)}
+                    style={{ width: '18px', height: '18px', accentColor: 'var(--accent-cyan)' }}
+                  />
+                  <span>Run Web Server automatically when app is open</span>
+                </label>
+              </div>
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, marginBottom: '8px' }}>
+                Server Port Configuration
+              </label>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <input
+                  type="number"
+                  className="input"
+                  value={webServerPortInput}
+                  onChange={(e) => setWebServerPortInput(e.target.value)}
+                  placeholder="5173"
+                  min={1024}
+                  max={65535}
+                  style={{ height: '40px', width: '130px' }}
+                />
+                <button
+                  className="btn btn-primary"
+                  onClick={handleSaveWebServerSettings}
+                  disabled={isUpdatingWebServer}
+                  style={{ height: '40px', padding: '0 16px', fontSize: '0.85rem' }}
+                >
+                  {isUpdatingWebServer ? <RotateCw size={15} className="animate-spin" /> : <Check size={15} />}
+                  Save & Restart
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Active Connection URL for Mobile */}
+          {webServerStatus?.isRunning && (
+            <div style={{
+              backgroundColor: 'var(--bg-surface-elevated)',
+              border: '1px solid var(--border-subtle)',
+              borderRadius: 'var(--radius-md)',
+              padding: '16px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '12px',
+            }}>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Wifi size={16} color="var(--accent-cyan)" />
+                📱 Connect from your Phone (Same Wi-Fi Network):
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                <div style={{
+                  backgroundColor: '#0a0f1d',
+                  border: '1px solid rgba(255, 255, 255, 0.1)',
+                  padding: '8px 14px',
+                  borderRadius: 'var(--radius-md)',
+                  fontFamily: 'monospace',
+                  fontSize: '0.95rem',
+                  color: 'var(--accent-cyan)',
+                  fontWeight: 700,
+                  userSelect: 'all',
+                }}>
+                  {webServerStatus.primaryUrl}
+                </div>
+
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => handleCopyMobileUrl(webServerStatus.primaryUrl)}
+                  style={{ height: '36px', padding: '0 14px', fontSize: '0.8rem', gap: '6px' }}
+                >
+                  {copiedUrl ? <CheckCircle2 size={14} color="#10b981" /> : <Copy size={14} />}
+                  {copiedUrl ? 'Copied!' : 'Copy Mobile Link'}
+                </button>
+
+                <a
+                  href={webServerStatus.primaryUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="btn btn-ghost"
+                  style={{ height: '36px', padding: '0 12px', fontSize: '0.8rem', gap: '6px' }}
+                >
+                  <ExternalLink size={14} />
+                  Open in Browser
+                </a>
+              </div>
+
+              <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
+                💡 <strong>iPhone Safari:</strong> Tap the <em>Share</em> icon at the bottom → tap <em>"Add to Home Screen"</em> to install as a full-screen app.<br />
+                💡 <strong>Android Chrome:</strong> Tap the <em>Three Dots (⋮)</em> → tap <em>"Install App"</em> or <em>"Add to Home Screen"</em>.<br />
+                📸 <strong>Apple iPhone HEIC Support:</strong> All `.heic` and `.heif` files from iPhone are automatically decoded into high-quality JPEG previews!
+              </div>
+            </div>
+          )}
+
+          {webServerFeedback && (
+            <div style={{
+              backgroundColor: 'rgba(16, 185, 129, 0.15)',
+              border: '1px solid rgba(16, 185, 129, 0.4)',
+              color: '#10b981',
+              borderRadius: 'var(--radius-md)',
+              padding: '10px 14px',
+              fontSize: '0.85rem',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+            }}>
+              <CheckCircle2 size={16} />
+              <span>{webServerFeedback}</span>
+            </div>
+          )}
+        </div>
 
         {/* Section 1: Background Service & Engine Mode */}
         <div style={{

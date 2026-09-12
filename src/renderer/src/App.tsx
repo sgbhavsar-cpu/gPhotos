@@ -13,6 +13,9 @@ import { HelpModal } from './components/HelpModal';
 import { AiAssistantModal } from './components/AiAssistantModal';
 import { LibrarySwitcherModal } from './components/LibrarySwitcherModal';
 import { SettingsView } from './views/SettingsView';
+import { MobileTopBar } from './components/MobileTopBar';
+import { MobileBottomNav } from './components/MobileBottomNav';
+import { MobileMenuDrawer } from './components/MobileMenuDrawer';
 import { libraryStore, LibraryState, getLocalPhotoUrl } from './services/libraryStore';
 import { detectFacesInImage, loadFaceModels } from './services/faceEngine';
 import { faceQueue } from './services/faceQueue';
@@ -31,9 +34,20 @@ export const App: React.FC = () => {
   const [showHelpModal, setShowHelpModal] = useState(false);
   const [showAiAssistant, setShowAiAssistant] = useState(false);
   const [showLibrarySwitcher, setShowLibrarySwitcher] = useState(false);
+  const [showMobileDrawer, setShowMobileDrawer] = useState(false);
+  const [isMobile, setIsMobile] = useState<boolean>(typeof window !== 'undefined' ? window.innerWidth <= 768 : false);
   const [activeAiFilter, setActiveAiFilter] = useState<AiPhotoFilter | null>(null);
   const [aiFilteredPhotos, setAiFilteredPhotos] = useState<Photo[] | null>(null);
   const [bgScanProgress, setBgScanProgress] = useState<BackgroundScanProgress | null>(null);
+
+  // Detect mobile viewport on mount and resize
+  useEffect(() => {
+    const handleResize = () => {
+      setIsMobile(window.innerWidth <= 768);
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   // Subscribe to library store updates
   useEffect(() => {
@@ -377,25 +391,49 @@ export const App: React.FC = () => {
   };
 
   return (
-    <div className="app-container">
-      {/* Sidebar Navigation */}
-      <Sidebar
-        activeTab={activeTab}
-        onSelectTab={handleSelectTab}
-        state={libraryState}
-        onOpenFolder={handleOpenFolder}
-        onTriggerFaceDetection={handleTriggerFaceDetection}
-        virtualStorages={virtualStorages}
-        onSelectStorage={handleSelectVirtualStorage}
-        onRefreshStorage={handleRefreshNetworkStorage}
-        onOpenDuplicateCleaner={() => setShowDuplicateCleaner(true)}
-        onOpenHelp={() => setShowHelpModal(true)}
-        onOpenAiAssistant={() => setShowAiAssistant(true)}
-        onOpenLibrarySwitcher={() => setShowLibrarySwitcher(true)}
-      />
+    <div
+      className="app-container"
+      style={{
+        flexDirection: isMobile ? 'column' : 'row',
+      }}
+    >
+      {/* Top Bar for Mobile */}
+      {isMobile ? (
+        <MobileTopBar
+          selectedFolder={libraryState.selectedFolder}
+          onOpenLibrarySwitcher={() => setShowLibrarySwitcher(true)}
+          onOpenAiAssistant={() => setShowAiAssistant(true)}
+          onOpenDuplicateCleaner={() => setShowDuplicateCleaner(true)}
+          onToggleDrawer={() => setShowMobileDrawer(true)}
+        />
+      ) : (
+        /* Sidebar Navigation for Desktop */
+        <Sidebar
+          activeTab={activeTab}
+          onSelectTab={handleSelectTab}
+          state={libraryState}
+          onOpenFolder={handleOpenFolder}
+          onTriggerFaceDetection={handleTriggerFaceDetection}
+          virtualStorages={virtualStorages}
+          onSelectStorage={handleSelectVirtualStorage}
+          onRefreshStorage={handleRefreshNetworkStorage}
+          onOpenDuplicateCleaner={() => setShowDuplicateCleaner(true)}
+          onOpenHelp={() => setShowHelpModal(true)}
+          onOpenAiAssistant={() => setShowAiAssistant(true)}
+          onOpenLibrarySwitcher={() => setShowLibrarySwitcher(true)}
+        />
+      )}
 
       {/* Main View Area */}
-      <main style={{ flex: 1, height: '100%', overflow: 'hidden', position: 'relative' }}>
+      <main
+        style={{
+          flex: 1,
+          height: isMobile ? 'calc(100% - 56px)' : '100%',
+          overflow: 'hidden',
+          position: 'relative',
+          paddingBottom: isMobile ? '64px' : '0',
+        }}
+      >
         {activeTab === 'photos' && (
           <GalleryView
             photos={aiFilteredPhotos || libraryState.photos}
@@ -622,6 +660,28 @@ export const App: React.FC = () => {
           onBrowseNewLibrary={handleOpenFolder}
           onSelectVirtualStorage={handleSelectVirtualStorage}
           onClose={() => setShowLibrarySwitcher(false)}
+        />
+      )}
+      {/* Mobile Bottom Navigation Bar */}
+      {isMobile && (
+        <MobileBottomNav
+          activeTab={activeTab}
+          onSelectTab={handleSelectTab}
+        />
+      )}
+
+      {/* Mobile Menu Drawer */}
+      {isMobile && (
+        <MobileMenuDrawer
+          isOpen={showMobileDrawer}
+          onClose={() => setShowMobileDrawer(false)}
+          activeTab={activeTab}
+          onSelectTab={handleSelectTab}
+          state={libraryState}
+          onOpenLibrarySwitcher={() => setShowLibrarySwitcher(true)}
+          onOpenDuplicateCleaner={() => setShowDuplicateCleaner(true)}
+          onOpenHelp={() => setShowHelpModal(true)}
+          onOpenAiAssistant={() => setShowAiAssistant(true)}
         />
       )}
     </div>

@@ -62,11 +62,67 @@ const MIME_TYPES = {
   '.ttf': 'font/ttf',
 };
 
-// Lazy-loaded exifr for iPhone HEIC embedded JPEG extraction
+// Lazy-loaded exifr and heic-convert for iPhone HEIC decoding
 let exifr = null;
 try {
   exifr = require('exifr');
 } catch {}
+
+let heicConvert = null;
+try {
+  heicConvert = require('heic-convert');
+} catch {}
+
+const heicCache = new Map();
+const MAX_HEIC_CACHE = 100;
+
+async function getHeicBuffer(targetPath) {
+  const stat = fs.statSync(targetPath);
+  const cacheKey = `${targetPath}:${stat.mtimeMs}`;
+  if (heicCache.has(cacheKey)) {
+    return heicCache.get(cacheKey);
+  }
+
+  const fileBuf = fs.readFileSync(targetPath);
+
+  // 1. Fast path: embedded EXIF JPEG
+  if (exifr && typeof exifr.thumbnail === 'function') {
+    try {
+      const thumb = await exifr.thumbnail(fileBuf);
+      if (thumb && thumb.length > 0) {
+        const res = Buffer.from(thumb);
+        if (heicCache.size >= MAX_HEIC_CACHE) {
+          const first = heicCache.keys().next().value;
+          if (first) heicCache.delete(first);
+        }
+        heicCache.set(cacheKey, res);
+        return res;
+      }
+    } catch {}
+  }
+
+  // 2. Fallback: full bitstream decode
+  if (heicConvert) {
+    try {
+      const converted = await heicConvert({
+        buffer: fileBuf,
+        format: 'JPEG',
+        quality: 0.88,
+      });
+      const res = Buffer.from(converted);
+      if (heicCache.size >= MAX_HEIC_CACHE) {
+        const first = heicCache.keys().next().value;
+        if (first) heicCache.delete(first);
+      }
+      heicCache.set(cacheKey, res);
+      return res;
+    } catch (err) {
+      console.warn('heicConvert failed:', err);
+    }
+  }
+
+  return null;
+}
 
 async function handleRequest(req, res) {
   // Enable CORS for all requests
@@ -142,19 +198,13 @@ async function handleRequest(req, res) {
     if (targetPath && fs.existsSync(targetPath)) {
       const ext = path.extname(targetPath).toLowerCase();
 
-      // Handle iPhone HEIC/HEIF photos by extracting embedded JPEG preview
+      // Handle iPhone HEIC/HEIF photos by extracting embedded preview or decoding bitstream
       if (ext === '.heic' || ext === '.heif') {
-        if (exifr && typeof exifr.thumbnail === 'function') {
-          try {
-            const thumbBuffer = await exifr.thumbnail(targetPath);
-            if (thumbBuffer && thumbBuffer.length > 0) {
-              res.setHeader('Content-Type', 'image/jpeg');
-              res.end(Buffer.from(thumbBuffer));
-              return;
-            }
-          } catch (heicErr) {
-            console.warn('Failed to extract embedded JPEG from HEIC:', heicErr);
-          }
+        const heicBuf = await getHeicBuffer(targetPath);
+        if (heicBuf && heicBuf.length > 0) {
+          res.setHeader('Content-Type', 'image/jpeg');
+          res.end(heicBuf);
+          return;
         }
       }
 

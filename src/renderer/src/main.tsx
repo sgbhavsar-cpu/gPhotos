@@ -68,6 +68,39 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     scanVirtualMirror: async () => [],
     openOriginalFile: async () => {},
     onMirrorProgress: () => () => {},
+    getWebServerStatus: async () => {
+      try {
+        const res = await fetch('/api/status');
+        if (res.ok) return await res.json();
+      } catch {}
+      const port = window.location.port ? parseInt(window.location.port, 10) : 80;
+      return {
+        enabled: true,
+        isRunning: true,
+        port,
+        primaryIp: window.location.hostname,
+        primaryUrl: window.location.origin,
+        allUrls: [{ name: 'Current', url: window.location.origin, ip: window.location.hostname }],
+      };
+    },
+    setWebServerSettings: async (settings: { enabled: boolean; port: number }) => {
+      try {
+        const res = await fetch('/api/webserver-settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(settings),
+        });
+        if (res.ok) return await res.json();
+      } catch {}
+      return {
+        enabled: settings.enabled,
+        isRunning: true,
+        port: settings.port,
+        primaryIp: window.location.hostname,
+        primaryUrl: window.location.origin,
+        allUrls: [{ name: 'Current', url: window.location.origin, ip: window.location.hostname }],
+      };
+    },
   };
 }
 

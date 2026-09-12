@@ -61,6 +61,8 @@ const electronAPI: IElectronAPI = {
   openHelpInBrowser: () => ipcRenderer.invoke('help:open-in-browser'),
   createLibraryBackupZip: (customPath?: string) => ipcRenderer.invoke('backup:export-zip', customPath),
   openItemInFolder: (filePath: string) => ipcRenderer.invoke('shell:show-item-in-folder', filePath),
+  getWebServerStatus: () => ipcRenderer.invoke('webserver:get-status'),
+  setWebServerSettings: (settings) => ipcRenderer.invoke('webserver:set-settings', settings),
 };
 
 contextBridge.exposeInMainWorld('electronAPI', electronAPI);

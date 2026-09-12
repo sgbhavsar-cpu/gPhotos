@@ -95,7 +95,8 @@ export async function parsePhotoMetadata(filePath: string): Promise<{
   let height: number | undefined;
 
   try {
-    const raw = await exifr.parse(filePath, {
+    const fileBuffer = fs.readFileSync(filePath);
+    const raw = await exifr.parse(fileBuffer, {
       tiff: true,
       exif: true,
       gps: true,

@@ -285,6 +285,18 @@ export interface IElectronAPI {
     error?: string;
   }>;
   openItemInFolder: (filePath: string) => Promise<boolean>;
+  getWebServerStatus: () => Promise<WebServerStatus>;
+  setWebServerSettings: (settings: { enabled: boolean; port: number }) => Promise<WebServerStatus>;
+}
+
+export interface WebServerStatus {
+  enabled: boolean;
+  isRunning: boolean;
+  port: number;
+  primaryIp: string;
+  primaryUrl: string;
+  allUrls: Array<{ name: string; url: string; ip: string }>;
+  error?: string;
 }
 
 export interface BackgroundServiceStatus {

@@ -25,7 +25,7 @@ function photoApiPlugin() {
   return {
     name: 'photo-api-plugin',
     configureServer(server: any) {
-      server.middlewares.use((req: any, res: any, next: any) => {
+      server.middlewares.use(async (req: any, res: any, next: any) => {
         const urlObj = new URL(req.url || '', 'http://localhost:5173');
 
         if (urlObj.pathname === '/api/library') {
@@ -83,6 +83,32 @@ function photoApiPlugin() {
 
           if (targetPath && fs.existsSync(targetPath)) {
             const ext = path.extname(targetPath).toLowerCase();
+
+            if (ext === '.heic' || ext === '.heif') {
+              try {
+                const exifr = require('exifr');
+                const thumb = await exifr.thumbnail(fs.readFileSync(targetPath));
+                if (thumb && thumb.length > 0) {
+                  res.setHeader('Content-Type', 'image/jpeg');
+                  res.setHeader('Access-Control-Allow-Origin', '*');
+                  res.end(Buffer.from(thumb));
+                  return;
+                }
+              } catch {}
+              try {
+                const heicConvert = require('heic-convert');
+                const converted = await heicConvert({
+                  buffer: fs.readFileSync(targetPath),
+                  format: 'JPEG',
+                  quality: 0.88,
+                });
+                res.setHeader('Content-Type', 'image/jpeg');
+                res.setHeader('Access-Control-Allow-Origin', '*');
+                res.end(Buffer.from(converted));
+                return;
+              } catch {}
+            }
+
             const mimeMap: Record<string, string> = {
               '.jpg': 'image/jpeg',
               '.jpeg': 'image/jpeg',
