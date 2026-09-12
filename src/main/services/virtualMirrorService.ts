@@ -312,8 +312,11 @@ export async function syncVirtualStorage(
       errors.push(msg);
     }
 
-    // Micro-yield to Node/Electron event loop every file so UI remains 100% responsive
-    await new Promise((r) => setTimeout(r, 4));
+    // Configurable delay between photos to prevent bandwidth saturation and keep desktop 100% responsive
+    const delayMs = config.delayBetweenPhotosSec && config.delayBetweenPhotosSec > 0
+      ? Math.round(config.delayBetweenPhotosSec * 1000)
+      : 4;
+    await new Promise((r) => setTimeout(r, delayMs));
   }
 
   if (onProgress) {

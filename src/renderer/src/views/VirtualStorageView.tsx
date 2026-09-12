@@ -48,6 +48,8 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
   const [name, setName] = useState('');
   const [networkSourcePath, setNetworkSourcePath] = useState('');
   const [localMirrorRoot, setLocalMirrorRoot] = useState('C:\\GPhotos_VirtualMirrors');
+  const [delaySec, setDelaySec] = useState<number>(0.5);
+  const [bandwidthLimit, setBandwidthLimit] = useState<number>(0);
   const [isSyncing, setIsSyncing] = useState(false);
   const [activeSyncStorageId, setActiveSyncStorageId] = useState<string | null>(null);
   const [progress, setProgress] = useState<MirrorProgress | null>(null);
@@ -186,6 +188,8 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
       lastSynced: undefined,
       totalItems: 0,
       totalSizeSaved: 0,
+      delayBetweenPhotosSec: delaySec,
+      bandwidthLimitMbps: bandwidthLimit,
     };
 
     await saveStorages((prev) => {
@@ -510,6 +514,46 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
             </div>
             <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '4px' }}>
               Folder structure will be mirrored at: <code style={{ color: 'var(--accent-cyan)' }}>{localMirrorRoot}\{name || '[StorageName]'}\...</code>
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+            <div>
+              <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '6px', color: 'var(--text-secondary)' }}>
+                Scan Delay Per Photo (seconds)
+              </label>
+              <input
+                type="number"
+                min="0"
+                max="10"
+                step="0.5"
+                value={delaySec}
+                onChange={(e) => setDelaySec(parseFloat(e.target.value) || 0)}
+                placeholder="0 = fastest, 0.5 - 1.0 = gentle"
+                className="input"
+              />
+              <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '4px' }}>
+                Pause between files so background scanning never saturates network bandwidth or freezes work.
+              </div>
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '6px', color: 'var(--text-secondary)' }}>
+                Bandwidth Limit (Mbps)
+              </label>
+              <input
+                type="number"
+                min="0"
+                max="1000"
+                step="5"
+                value={bandwidthLimit}
+                onChange={(e) => setBandwidthLimit(parseInt(e.target.value, 10) || 0)}
+                placeholder="0 = unlimited"
+                className="input"
+              />
+              <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '4px' }}>
+                Optional bandwidth limit per network connection.
+              </div>
             </div>
           </div>
 

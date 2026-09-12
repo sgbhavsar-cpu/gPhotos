@@ -11,6 +11,7 @@ import {
   cleanupHeicHqTemp,
 } from './heicService';
 import { scanPhotoDirectory } from './fileOrganizer';
+import { scanVirtualMirrorDirectory, syncVirtualStorage } from './virtualMirrorService';
 import { WebServerStatus } from '../../types';
 
 let serverInstance: http.Server | null = null;
@@ -205,6 +206,47 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
       res.end(JSON.stringify({ error: 'Invalid or missing directory path' }));
       return;
     }
+  }
+
+  // Endpoint: /api/scan-mirror?path=...
+  if (pathname === '/api/scan-mirror') {
+    const mirrorPath = parsedUrl.searchParams.get('path');
+    if (mirrorPath && fs.existsSync(mirrorPath)) {
+      try {
+        const photos = scanVirtualMirrorDirectory(mirrorPath);
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify(photos));
+        return;
+      } catch (err: any) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: err.message }));
+        return;
+      }
+    } else {
+      res.statusCode = 400;
+      res.end(JSON.stringify({ error: 'Invalid or missing mirror directory path' }));
+      return;
+    }
+  }
+
+  // Endpoint: /api/sync-virtual-storage (POST)
+  if (pathname === '/api/sync-virtual-storage' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', async () => {
+      try {
+        const config = JSON.parse(body);
+        const result = await syncVirtualStorage(config);
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify(result));
+      } catch (err: any) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
   }
 
   // Endpoint: /api/photo?path=...

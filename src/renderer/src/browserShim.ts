@@ -96,8 +96,30 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     executeOrganize: async () => ({ success: true, processedCount: 0, errors: [] }),
     onOrganizeProgress: () => () => {},
     readFileAsBase64: async () => '',
-    syncVirtualStorage: async () => ({ success: true, newMirroredCount: 0, totalMirroredCount: 0, totalSizeSaved: 0 }),
-    scanVirtualMirror: async () => [],
+    syncVirtualStorage: async (config: any) => {
+      try {
+        const res = await fetch('/api/sync-virtual-storage', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(config),
+        });
+        if (!res.ok) return { success: false, newMirroredCount: 0, totalMirroredCount: 0, totalSizeSaved: 0 };
+        return await res.json();
+      } catch {
+        return { success: false, newMirroredCount: 0, totalMirroredCount: 0, totalSizeSaved: 0 };
+      }
+    },
+    scanVirtualMirror: async (dirPath?: string) => {
+      try {
+        if (!dirPath) return [];
+        const res = await fetch(`/api/scan-mirror?path=${encodeURIComponent(dirPath)}`);
+        if (!res.ok) return [];
+        return await res.json();
+      } catch (err) {
+        console.warn('[browserShim] Failed to scan virtual mirror:', err);
+        return [];
+      }
+    },
     openOriginalFile: async () => {},
     onMirrorProgress: () => () => {},
 

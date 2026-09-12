@@ -144,6 +144,8 @@ export interface VirtualStorageConfig {
   totalItems?: number;
   totalSizeSaved?: number;
   newlyAdded?: number;
+  delayBetweenPhotosSec?: number;
+  bandwidthLimitMbps?: number;
 }
 
 export interface SyncVirtualStorageResult {

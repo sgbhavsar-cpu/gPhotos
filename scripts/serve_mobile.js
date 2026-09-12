@@ -204,6 +204,63 @@ async function handleRequest(req, res) {
     }
   }
 
+  // Endpoint: /api/scan-mirror?path=...
+  if (pathname === '/api/scan-mirror') {
+    const mirrorPath = parsedUrl.searchParams.get('path');
+    if (mirrorPath && fs.existsSync(mirrorPath)) {
+      try {
+        const photos = [];
+        function scanDir(current) {
+          const entries = fs.readdirSync(current, { withFileTypes: true });
+          for (const entry of entries) {
+            const fullPath = path.join(current, entry.name);
+            if (entry.isDirectory()) {
+              if (!entry.name.startsWith('.')) scanDir(fullPath);
+            } else if (entry.isFile() && entry.name.endsWith('.json')) {
+              try {
+                const meta = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
+                if (fs.existsSync(meta.thumbnailPath)) {
+                  const date = new Date(meta.dateTaken);
+                  photos.push({
+                    id: Buffer.from(meta.thumbnailPath).toString('base64'),
+                    filePath: meta.thumbnailPath,
+                    fileName: meta.fileName,
+                    fileSize: meta.originalFileSize,
+                    fileDate: meta.dateTaken,
+                    dateTaken: meta.dateTaken,
+                    year: date.getFullYear(),
+                    month: date.getMonth() + 1,
+                    day: date.getDate(),
+                    width: meta.width,
+                    height: meta.height,
+                    exif: meta.exif,
+                    location: meta.location,
+                    isVirtual: true,
+                    originalRemotePath: meta.originalFilePath,
+                    storageName: meta.storageName,
+                    isFavorite: false,
+                  });
+                }
+              } catch {}
+            }
+          }
+        }
+        scanDir(mirrorPath);
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify(photos));
+        return;
+      } catch (err) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: err.message }));
+        return;
+      }
+    } else {
+      res.statusCode = 400;
+      res.end(JSON.stringify({ error: 'Invalid or missing mirror directory path' }));
+      return;
+    }
+  }
+
   // Endpoint: /api/photo?path=...
   if (pathname === '/api/photo') {
     const filePath = parsedUrl.searchParams.get('path');

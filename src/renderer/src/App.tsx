@@ -117,6 +117,27 @@ export const App: React.FC = () => {
         }
       }
       setVirtualStorages(combined);
+
+      // If no photos currently in library but we have configured mirrors or an active mirror folder, auto-load them
+      const curPhotos = libraryStore.getState().photos;
+      if (curPhotos.length === 0 && combined.length > 0 && window.electronAPI?.scanVirtualMirror) {
+        const curFolder = libraryStore.getState().selectedFolder;
+        const target = combined.find(
+          (s) => curFolder && `${s.localMirrorRoot}\\${s.name}`.toLowerCase() === curFolder.toLowerCase()
+        ) || combined.find((s) => (s.totalItems || 0) > 0) || combined[0];
+
+        if (target) {
+          const mirrorPath = `${target.localMirrorRoot}\\${target.name}`;
+          try {
+            const mirroredPhotos = await window.electronAPI.scanVirtualMirror(mirrorPath);
+            if (mirroredPhotos && mirroredPhotos.length > 0) {
+              libraryStore.setPhotos(mirroredPhotos, mirrorPath);
+            }
+          } catch (loadErr) {
+            console.warn('Failed to auto-load mirrored photos on startup:', loadErr);
+          }
+        }
+      }
     };
     loadStorages();
   }, []);

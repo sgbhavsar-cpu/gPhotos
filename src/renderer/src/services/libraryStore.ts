@@ -248,6 +248,26 @@ export class LibraryManager {
         // Immediate paint for UI responsiveness
         this.notifyListeners();
 
+        // Auto-restore photos if store was empty but folder is configured
+        if (this.state.photos.length === 0 && this.state.selectedFolder && typeof window !== 'undefined' && window.electronAPI) {
+          try {
+            const isMirror = /virtualmirrors/i.test(this.state.selectedFolder);
+            if (isMirror && typeof window.electronAPI.scanVirtualMirror === 'function') {
+              const restored = await window.electronAPI.scanVirtualMirror(this.state.selectedFolder);
+              if (restored && restored.length > 0) {
+                this.setPhotos(restored, this.state.selectedFolder);
+              }
+            } else if (typeof window.electronAPI.scanDirectory === 'function') {
+              const restored = await window.electronAPI.scanDirectory(this.state.selectedFolder);
+              if (restored && restored.length > 0) {
+                this.setPhotos(restored, this.state.selectedFolder);
+              }
+            }
+          } catch (autoLoadErr) {
+            console.warn('Auto-loading photos for selected folder failed:', autoLoadErr);
+          }
+        }
+
         // Defer orphan / deleted file verification to a non-blocking background task
         if (typeof window !== 'undefined' && window.electronAPI?.checkFileExists) {
           setTimeout(() => {
