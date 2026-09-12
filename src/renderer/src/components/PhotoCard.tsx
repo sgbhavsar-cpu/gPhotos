@@ -37,10 +37,18 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
     day: 'numeric',
   });
 
+  const pixelSizeMap: Record<string, number> = {
+    very_small: 150,
+    small: 200,
+    medium: 300,
+    large: 500,
+  };
+
   const displayUrl = getLocalPhotoUrl(
     photo.thumbnailPath || photo.filePath,
     photo.originalRemotePath,
-    false
+    false,
+    pixelSizeMap[size] || 250
   );
 
   return (
@@ -66,6 +74,7 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
         src={displayUrl}
         alt={photo.fileName}
         loading="lazy"
+        decoding="async"
         onLoad={() => setIsLoaded(true)}
         style={{
           width: '100%',

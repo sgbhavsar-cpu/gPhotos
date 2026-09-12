@@ -14,6 +14,15 @@ if (typeof window !== 'undefined') {
   window.addEventListener('unhandledrejection', (event) => {
     console.error('[Global Unhandled Promise Rejection]:', event.reason);
   });
+
+  // Register client-side Service Worker for blazing-fast photo thumbnail caching
+  if ('serviceWorker' in navigator && window.location?.protocol?.startsWith('http')) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js').catch((err) => {
+        console.warn('[ServiceWorker] Registration notice:', err);
+      });
+    });
+  }
 }
 
 const rootElement = document.getElementById('root');

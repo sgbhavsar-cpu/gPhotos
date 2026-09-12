@@ -83,6 +83,56 @@ try {
   heicConvert = require('heic-convert');
 } catch {}
 
+let sharp = null;
+try {
+  sharp = require('sharp');
+} catch {}
+
+const crypto = require('crypto');
+
+function getThumbCacheDir(size) {
+  const appData =
+    process.env.APPDATA ||
+    (process.platform === 'darwin'
+      ? path.join(os.homedir(), 'Library/Application Support')
+      : path.join(os.homedir(), '.config'));
+  const d = path.join(appData, 'gPhotos', 'cache', 'thumbnails', String(size));
+  if (!fs.existsSync(d)) {
+    fs.mkdirSync(d, { recursive: true });
+  }
+  return d;
+}
+
+async function getCachedThumb(sourcePath, size) {
+  try {
+    const stat = fs.statSync(sourcePath);
+    const key = crypto.createHash('sha1').update(`${sourcePath}:${stat.mtimeMs}:${size}`).digest('hex');
+    const cacheFile = path.join(getThumbCacheDir(size), `${key}.jpg`);
+
+    if (fs.existsSync(cacheFile)) {
+      const cStat = fs.statSync(cacheFile);
+      return {
+        filePath: cacheFile,
+        etag: `"${cStat.mtimeMs.toString(36)}-${cStat.size.toString(36)}"`,
+      };
+    }
+
+    if (sharp) {
+      const buf = await sharp(sourcePath)
+        .rotate()
+        .resize(size, size, { fit: 'inside', withoutEnlargement: true })
+        .jpeg({ quality: size > 500 ? 86 : 82, mozjpeg: true })
+        .toBuffer();
+      fs.writeFileSync(cacheFile, buf);
+      return {
+        filePath: cacheFile,
+        etag: `"${stat.mtimeMs.toString(36)}-${buf.length.toString(36)}"`,
+      };
+    }
+  } catch {}
+  return null;
+}
+
 const heicCache = new Map();
 const MAX_HEIC_CACHE = 100;
 
@@ -268,6 +318,9 @@ async function handleRequest(req, res) {
     const preferOriginal =
       parsedUrl.searchParams.get('preferOriginal') === '1' ||
       parsedUrl.searchParams.get('preferOriginal') === 'true';
+    const quality = parsedUrl.searchParams.get('quality');
+    const sizeParam = parsedUrl.searchParams.get('size');
+    const requestedSize = sizeParam ? parseInt(sizeParam, 10) : 0;
 
     let targetPath = null;
     if (preferOriginal && originalPath && fs.existsSync(originalPath)) {
@@ -281,19 +334,76 @@ async function handleRequest(req, res) {
     if (targetPath && fs.existsSync(targetPath)) {
       const ext = path.extname(targetPath).toLowerCase();
 
-      // Handle iPhone HEIC/HEIF photos by extracting embedded preview or decoding bitstream
-      if (ext === '.heic' || ext === '.heif') {
-        const heicBuf = await getHeicBuffer(targetPath);
-        if (heicBuf && heicBuf.length > 0) {
-          res.setHeader('Content-Type', 'image/jpeg');
-          res.end(heicBuf);
+      // 1. Raw original full resolution
+      if (preferOriginal) {
+        if (ext === '.heic' || ext === '.heif') {
+          const heicBuf = await getHeicBuffer(targetPath);
+          if (heicBuf && heicBuf.length > 0) {
+            res.setHeader('Content-Type', 'image/jpeg');
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+            res.end(heicBuf);
+            return;
+          }
+        }
+
+        try {
+          const stat = fs.statSync(targetPath);
+          const etag = `"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}"`;
+          if (req.headers['if-none-match'] === etag) {
+            res.statusCode = 304;
+            res.end();
+            return;
+          }
+          res.setHeader('ETag', etag);
+          res.setHeader('Content-Type', MIME_TYPES[ext] || 'image/jpeg');
+          res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          fs.createReadStream(targetPath).pipe(res);
+          return;
+        } catch {
+          res.statusCode = 500;
+          res.end('Failed reading photo');
           return;
         }
       }
 
-      res.setHeader('Content-Type', MIME_TYPES[ext] || 'image/jpeg');
-      fs.createReadStream(targetPath).pipe(res);
-      return;
+      // 2. Multi-tier thumbnail caching
+      const targetSize = requestedSize > 0
+        ? requestedSize
+        : (quality === 'high' ? 1600 : 250);
+
+      const thumb = await getCachedThumb(targetPath, targetSize);
+      if (thumb) {
+        if (req.headers['if-none-match'] === thumb.etag) {
+          res.statusCode = 304;
+          res.end();
+          return;
+        }
+        res.setHeader('ETag', thumb.etag);
+        res.setHeader('Content-Type', 'image/jpeg');
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        fs.createReadStream(thumb.filePath).pipe(res);
+        return;
+      }
+
+      // 3. Fallback direct stream
+      try {
+        const stat = fs.statSync(targetPath);
+        const etag = `"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}"`;
+        if (req.headers['if-none-match'] === etag) {
+          res.statusCode = 304;
+          res.end();
+          return;
+        }
+        res.setHeader('ETag', etag);
+        res.setHeader('Content-Type', MIME_TYPES[ext] || 'image/jpeg');
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        fs.createReadStream(targetPath).pipe(res);
+        return;
+      } catch {
+        res.statusCode = 500;
+        res.end('Error streaming file');
+        return;
+      }
     } else {
       res.statusCode = 404;
       res.end('Photo not found');

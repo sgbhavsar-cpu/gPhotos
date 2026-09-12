@@ -12,6 +12,7 @@ import {
 } from './heicService';
 import { scanPhotoDirectory } from './fileOrganizer';
 import { scanVirtualMirrorDirectory, syncVirtualStorage } from './virtualMirrorService';
+import { getOrGenerateCachedThumbnail, clearThumbnailCache } from './thumbnailCacheService';
 import { WebServerStatus } from '../../types';
 
 let serverInstance: http.Server | null = null;
@@ -257,6 +258,8 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
       parsedUrl.searchParams.get('preferOriginal') === '1' ||
       parsedUrl.searchParams.get('preferOriginal') === 'true';
     const quality = parsedUrl.searchParams.get('quality');
+    const sizeParam = parsedUrl.searchParams.get('size');
+    const requestedSize = sizeParam ? parseInt(sizeParam, 10) : 0;
 
     let targetPath: string | null = null;
     if (preferOriginal && originalPath && fs.existsSync(originalPath)) {
@@ -270,27 +273,85 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     if (targetPath && fs.existsSync(targetPath)) {
       const ext = path.extname(targetPath).toLowerCase();
 
-      // Robust Apple iPhone HEIC/HEIF Handling:
-      // When quality is high or preferOriginal is requested (e.g. fullscreen lightbox), serve HQ JPEG.
-      // Otherwise, serve fast, disk-cached 500px auto-oriented thumbnail.
-      if (ext === '.heic' || ext === '.heif') {
-        const isHq = preferOriginal || quality === 'high';
-        const jpegBuf = isHq
-          ? await getHeicHighQualityJpegBuffer(targetPath)
-          : await getOrGenerateHeicThumbnail500(targetPath);
+      // 1. Raw original full-resolution requested (e.g. download or 100% zoom)
+      if (preferOriginal) {
+        if (ext === '.heic' || ext === '.heif') {
+          const jpegBuf = await getHeicHighQualityJpegBuffer(targetPath);
+          if (jpegBuf && jpegBuf.length > 0) {
+            res.setHeader('Content-Type', 'image/jpeg');
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+            res.end(jpegBuf);
+            return;
+          }
+        }
 
-        if (jpegBuf && jpegBuf.length > 0) {
-          res.setHeader('Content-Type', 'image/jpeg');
-          res.setHeader('Cache-Control', 'public, max-age=86400');
-          res.end(jpegBuf);
+        try {
+          const stat = fs.statSync(targetPath);
+          const etag = `"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}"`;
+          if (req.headers['if-none-match'] === etag) {
+            res.statusCode = 304;
+            res.end();
+            return;
+          }
+          res.setHeader('ETag', etag);
+          res.setHeader('Content-Type', MIME_TYPES[ext] || 'image/jpeg');
+          res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          fs.createReadStream(targetPath).pipe(res);
+          return;
+        } catch {
+          res.statusCode = 500;
+          res.end('Failed reading photo');
           return;
         }
       }
 
-      res.setHeader('Content-Type', MIME_TYPES[ext] || 'image/jpeg');
-      res.setHeader('Cache-Control', 'public, max-age=86400');
-      fs.createReadStream(targetPath).pipe(res);
-      return;
+      // 2. Multi-tier thumbnail caching (250px grid, 500px medium, 1600px preview)
+      const targetSize = requestedSize > 0
+        ? requestedSize
+        : (quality === 'high' ? 1600 : 250);
+
+      const thumbResult = await getOrGenerateCachedThumbnail(targetPath, targetSize);
+      if (thumbResult) {
+        if (req.headers['if-none-match'] === thumbResult.etag) {
+          res.statusCode = 304;
+          res.end();
+          return;
+        }
+
+        res.setHeader('ETag', thumbResult.etag);
+        res.setHeader('Content-Type', thumbResult.mime || 'image/jpeg');
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+
+        if (thumbResult.filePath && fs.existsSync(thumbResult.filePath)) {
+          fs.createReadStream(thumbResult.filePath).pipe(res);
+        } else if (thumbResult.buffer) {
+          res.end(thumbResult.buffer);
+        } else {
+          res.statusCode = 500;
+          res.end('Thumbnail unavailable');
+        }
+        return;
+      }
+
+      // 3. Fallback direct stream if thumbnail generation was skipped
+      try {
+        const stat = fs.statSync(targetPath);
+        const etag = `"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}"`;
+        if (req.headers['if-none-match'] === etag) {
+          res.statusCode = 304;
+          res.end();
+          return;
+        }
+        res.setHeader('ETag', etag);
+        res.setHeader('Content-Type', MIME_TYPES[ext] || 'image/jpeg');
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        fs.createReadStream(targetPath).pipe(res);
+        return;
+      } catch {
+        res.statusCode = 500;
+        res.end('Error streaming file');
+        return;
+      }
     } else {
       res.statusCode = 404;
       res.end('Photo not found');

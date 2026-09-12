@@ -46,6 +46,7 @@ import {
   updateEmbeddedWebServerSettings,
   loadSavedWebServerSettings,
 } from './services/embeddedWebServer';
+import { getOrGenerateCachedThumbnail, clearThumbnailCache } from './services/thumbnailCacheService';
 
 app.name = 'gPhotos';
 app.setName('gPhotos');
@@ -73,6 +74,8 @@ if (!gotSingleInstanceLock) {
       if (mainWindow.isMinimized()) mainWindow.restore();
       if (!mainWindow.isVisible()) mainWindow.show();
       mainWindow.focus();
+    } else {
+      createWindow();
     }
   });
 }
@@ -252,6 +255,9 @@ function createWindow() {
       const preferOriginal =
         url.searchParams.get('preferOriginal') === '1' ||
         url.searchParams.get('preferOriginal') === 'true';
+      const sizeParam = url.searchParams.get('size');
+      const requestedSize = sizeParam ? parseInt(sizeParam, 10) : 0;
+      const quality = url.searchParams.get('quality');
 
       let targetPath: string | null = null;
       // When network storage source is available, serve original high-res photo!
@@ -266,25 +272,61 @@ function createWindow() {
       if (targetPath && fs.existsSync(targetPath)) {
         const ext = path.extname(targetPath).toLowerCase();
 
-        // Direct support for Apple iPhone HEIC/HEIF files:
-        // Automatically extract embedded EXIF preview or decode via libheif WASM
-        if (ext === '.heic' || ext === '.heif') {
-          const isHq = preferOriginal || url.searchParams.get('quality') === 'high';
-          const heicBuf = isHq
-            ? await getHeicHighQualityJpegBuffer(targetPath)
-            : await getOrGenerateHeicThumbnail500(targetPath);
-          if (heicBuf && heicBuf.length > 0) {
-            return new Response(heicBuf as any, {
+        // 1. Raw original full resolution requested
+        if (preferOriginal) {
+          if (ext === '.heic' || ext === '.heif') {
+            const heicBuf = await getHeicHighQualityJpegBuffer(targetPath);
+            if (heicBuf && heicBuf.length > 0) {
+              return new Response(heicBuf as any, {
+                headers: {
+                  'Content-Type': 'image/jpeg',
+                  'Access-Control-Allow-Origin': '*',
+                  'Cache-Control': 'public, max-age=31536000, immutable',
+                },
+              });
+            }
+          }
+
+          const mimeMap: Record<string, string> = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.webp': 'image/webp',
+            '.gif': 'image/gif',
+            '.bmp': 'image/bmp',
+          };
+          const contentType = mimeMap[ext] || 'image/jpeg';
+          const buffer = fs.readFileSync(targetPath);
+          return new Response(buffer, {
+            headers: {
+              'Content-Type': contentType,
+              'Access-Control-Allow-Origin': '*',
+              'Cache-Control': 'public, max-age=31536000, immutable',
+            },
+          });
+        }
+
+        // 2. Fast multi-tier cached thumbnail (250px grid, 500px medium, 1600px preview)
+        const targetSize = requestedSize > 0
+          ? requestedSize
+          : (quality === 'high' ? 1600 : 250);
+
+        const thumbResult = await getOrGenerateCachedThumbnail(targetPath, targetSize);
+        if (thumbResult) {
+          const buf = thumbResult.buffer || (thumbResult.filePath ? fs.readFileSync(thumbResult.filePath) : null);
+          if (buf) {
+            return new Response(buf as any, {
               headers: {
-                'Content-Type': 'image/jpeg',
+                'Content-Type': thumbResult.mime || 'image/jpeg',
                 'Access-Control-Allow-Origin': '*',
-                'Cache-Control': 'public, max-age=86400',
+                'Cache-Control': 'public, max-age=31536000, immutable',
+                'ETag': thumbResult.etag,
               },
             });
           }
-          return new Response('Unable to decode HEIC image', { status: 500 });
         }
 
+        // 3. Fallback direct file read
         const mimeMap: Record<string, string> = {
           '.jpg': 'image/jpeg',
           '.jpeg': 'image/jpeg',
@@ -293,12 +335,12 @@ function createWindow() {
           '.gif': 'image/gif',
           '.bmp': 'image/bmp',
         };
-        const contentType = mimeMap[ext] || 'image/jpeg';
         const buffer = fs.readFileSync(targetPath);
-        return new Response(buffer, {
+        return new Response(buffer as any, {
           headers: {
-            'Content-Type': contentType,
+            'Content-Type': mimeMap[ext] || 'image/jpeg',
             'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=31536000, immutable',
           },
         });
       }

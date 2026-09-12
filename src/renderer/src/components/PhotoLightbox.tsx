@@ -871,8 +871,9 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
             <img
               ref={imgRef}
               crossOrigin="anonymous"
-              src={getLocalPhotoUrl(photo.filePath, photo.originalRemotePath, true)}
+              src={getLocalPhotoUrl(photo.filePath, photo.originalRemotePath, zoom > 1.2, zoom > 1.2 ? 0 : 1600)}
               alt={photo.fileName}
+              decoding="async"
               onLoad={onImageLoad}
               draggable={false}
               style={{

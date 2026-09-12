@@ -70,7 +70,8 @@ const STORAGE_KEY = 'gphotos_library_v1';
 export function getLocalPhotoUrl(
   filePath: string,
   originalRemotePath?: string,
-  preferOriginal: boolean = false
+  preferOriginal: boolean = false,
+  size: number = 250
 ): string {
   if (typeof window !== 'undefined') {
     const isElectron = !!(window.electronAPI && !(window.electronAPI as any).isBrowserShim);
@@ -80,9 +81,11 @@ export function getLocalPhotoUrl(
       let url = `/api/photo?path=${encodeURIComponent(filePath)}`;
       if (originalRemotePath) {
         url += `&originalPath=${encodeURIComponent(originalRemotePath)}`;
-        if (preferOriginal) {
-          url += `&preferOriginal=1`;
-        }
+      }
+      if (preferOriginal) {
+        url += `&preferOriginal=1`;
+      } else if (size > 0) {
+        url += `&size=${size}`;
       }
       return url;
     }
@@ -92,9 +95,11 @@ export function getLocalPhotoUrl(
       let url = `gphoto://load?path=${encodeURIComponent(filePath)}`;
       if (originalRemotePath) {
         url += `&originalPath=${encodeURIComponent(originalRemotePath)}`;
-        if (preferOriginal) {
-          url += `&preferOriginal=1`;
-        }
+      }
+      if (preferOriginal) {
+        url += `&preferOriginal=1`;
+      } else if (size > 0) {
+        url += `&size=${size}`;
       }
       return url;
     }
@@ -104,9 +109,11 @@ export function getLocalPhotoUrl(
       let url = `/api/photo?path=${encodeURIComponent(filePath)}`;
       if (originalRemotePath) {
         url += `&originalPath=${encodeURIComponent(originalRemotePath)}`;
-        if (preferOriginal) {
-          url += `&preferOriginal=1`;
-        }
+      }
+      if (preferOriginal) {
+        url += `&preferOriginal=1`;
+      } else if (size > 0) {
+        url += `&size=${size}`;
       }
       return url;
     }
