@@ -68,11 +68,25 @@ npm run build
 npm start
 ```
 
-### Packaging Windows Standalone `.exe`:
+### Packaging Windows Standalone Installers:
 ```powershell
-npx electron-builder --win
+npm run dist:win
 ```
-The resulting installer or portable `.exe` will be located in the `release/` folder.
+The command builds standard 64-bit Windows executables into the `release/` directory:
+- **`Google Photos Desktop-Setup-1.0.0.exe`**: Full Windows NSIS setup wizard with Desktop and Start Menu shortcuts, custom install directory selection, and uninstaller.
+- **`Google Photos Desktop-Portable-1.0.0.exe`**: Self-contained single-file portable executable. Runs immediately without installation or admin privileges (ideal for USB drives).
+
+### Mobile Access via Local Web Server:
+You can access your complete desktop photo library directly from your mobile phone (iPhone or Android) on your local Wi-Fi:
+```powershell
+npm run serve:mobile
+```
+- The server auto-detects your local network IP (e.g. `http://192.168.29.30:5173/`).
+- Open this URL in **Safari** (iOS) or **Chrome** (Android).
+- **Add to Home Screen**:
+  - On **iPhone**: Tap Share button → "Add to Home Screen" to run as a full-screen app.
+  - On **Android**: Tap Menu (⋮) → "Install App" or "Add to Home Screen".
+- **iPhone HEIC / HEIF Support**: All `.heic` and `.heif` photos from iOS are automatically displayed via real-time embedded EXIF preview extraction.
 
 ---
 
