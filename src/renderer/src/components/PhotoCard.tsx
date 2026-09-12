@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { Heart, MapPin, Users, Check, EyeOff } from 'lucide-react';
+import { Heart, MapPin, Users, Check, EyeOff, Image as ImageIcon, ImageOff } from 'lucide-react';
 import { Photo } from '../../types';
 import { getLocalPhotoUrl } from '../services/libraryStore';
+import { useBatchThumbnail } from '../services/asyncImageLoader';
 
 interface PhotoCardProps {
   photo: Photo;
@@ -22,8 +23,8 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
   onToggleSelect,
   isSelectMode = false,
 }) => {
-  const [isLoaded, setIsLoaded] = useState(false);
   const [isHovered, setIsHovered] = useState(false);
+  const [imgElementLoaded, setImgElementLoaded] = useState(false);
 
   const heightMap: Record<string, string> = {
     very_small: '80px',
@@ -44,12 +45,28 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
     large: 500,
   };
 
-  const displayUrl = getLocalPhotoUrl(
-    photo.thumbnailPath || photo.filePath,
+  const photoPath = photo.thumbnailPath || photo.filePath;
+  const targetPixelSize = pixelSizeMap[size] || 250;
+
+  // 1. Batch thumbnail loader (0ms from memory when pre-fetched, 1 HTTP call for 100 photos!)
+  const { src: batchSrc, isLoading: isBatchLoading, hasError: isBatchError } = useBatchThumbnail(
+    photoPath,
+    photo.originalRemotePath,
+    targetPixelSize
+  );
+
+  // 2. Fallback direct URL if running in native Electron
+  const directUrl = getLocalPhotoUrl(
+    photoPath,
     photo.originalRemotePath,
     false,
-    pixelSizeMap[size] || 250
+    targetPixelSize
   );
+
+  const isElectron = typeof window !== 'undefined' && !!(window.electronAPI && !(window.electronAPI as any).isBrowserShim);
+  const displaySrc = batchSrc || (isElectron ? directUrl : null);
+  const isLoading = !displaySrc && isBatchLoading;
+  const hasError = !displaySrc && isBatchError;
 
   return (
     <div
@@ -70,21 +87,73 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
         opacity: photo.isExcluded ? 0.55 : 1,
       }}
     >
-      <img
-        src={displayUrl}
-        alt={photo.fileName}
-        loading="lazy"
-        decoding="async"
-        onLoad={() => setIsLoaded(true)}
-        style={{
-          width: '100%',
-          height: '100%',
-          objectFit: 'cover',
-          opacity: isLoaded ? 1 : 0,
-          transition: 'opacity var(--transition-normal)',
-          imageOrientation: 'from-image' as any,
-        }}
-      />
+      {/* Asynchronous Skeleton Shimmer Loading Placeholder */}
+      {isLoading && (
+        <div
+          className="skeleton-shimmer"
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            width: '100%',
+            height: '100%',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            backgroundColor: 'var(--bg-surface-elevated)',
+            zIndex: 1,
+          }}
+        >
+          <ImageIcon size={26} color="rgba(255, 255, 255, 0.18)" />
+        </div>
+      )}
+
+      {/* Graceful Fallback if Image is Unavailable or Timed Out */}
+      {hasError && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            width: '100%',
+            height: '100%',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: '6px',
+            backgroundColor: 'var(--bg-surface-elevated)',
+            color: 'var(--text-muted)',
+            padding: '8px',
+            textAlign: 'center',
+            zIndex: 1,
+          }}
+        >
+          <ImageOff size={22} color="rgba(255, 255, 255, 0.25)" />
+          <span style={{ fontSize: '10px', color: 'var(--text-muted)', maxWidth: '90%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {photo.fileName}
+          </span>
+        </div>
+      )}
+
+      {displaySrc && !hasError && (
+        <img
+          src={displaySrc}
+          alt={photo.fileName}
+          decoding="async"
+          onLoad={() => setImgElementLoaded(true)}
+          style={{
+            width: '100%',
+            height: '100%',
+            objectFit: 'cover',
+            opacity: imgElementLoaded ? 1 : 0,
+            transition: 'opacity 0.2s ease-out',
+            imageOrientation: 'from-image' as any,
+            position: 'relative',
+            zIndex: 2,
+          }}
+        />
+      )}
 
       {/* Multi-Selection Checkbox */}
       {(isSelectMode || isHovered || isSelected) && onToggleSelect && (

@@ -307,6 +307,10 @@ export interface IElectronAPI {
   setWebServerSettings: (settings: { enabled: boolean; port: number }) => Promise<WebServerStatus>;
   prepareHeicHq?: (filePath: string, photoId: string) => Promise<string | null>;
   cleanupHeicHq?: (photoId: string) => Promise<boolean>;
+  getBatchThumbnails: (params: {
+    items: Array<{ path: string; originalPath?: string }>;
+    size?: number;
+  }) => Promise<{ thumbnails: Record<string, string> }>;
 }
 
 export interface WebServerStatus {

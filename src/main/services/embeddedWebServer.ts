@@ -250,6 +250,58 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     return;
   }
 
+  // Endpoint: /api/batch-thumbnails (POST) - Fetch up to 100 thumbnails in one single async request
+  if (pathname === '/api/batch-thumbnails' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', async () => {
+      try {
+        const { items, size } = JSON.parse(body || '{}');
+        const targetSize = typeof size === 'number' && size > 0 ? size : 250;
+        const requestedItems: Array<{ path: string; originalPath?: string }> = Array.isArray(items)
+          ? items.slice(0, 100) // Cap at 100 items per batch
+          : [];
+
+        const thumbnails: Record<string, string> = {};
+
+        // Fetch/generate thumbnails concurrently without blocking
+        await Promise.all(
+          requestedItems.map(async (item) => {
+            if (!item || !item.path) return;
+            const targetPath = (item.path && fs.existsSync(item.path))
+              ? item.path
+              : (item.originalPath && fs.existsSync(item.originalPath) ? item.originalPath : null);
+
+            if (!targetPath) return;
+
+            try {
+              const resThumb = await getOrGenerateCachedThumbnail(targetPath, targetSize);
+              if (resThumb) {
+                let buf: Buffer | null = resThumb.buffer || null;
+                if (!buf && resThumb.filePath) {
+                  buf = await fs.promises.readFile(resThumb.filePath);
+                }
+                if (buf) {
+                  thumbnails[item.path] = `data:${resThumb.mime || 'image/jpeg'};base64,${buf.toString('base64')}`;
+                }
+              }
+            } catch {}
+          })
+        );
+
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(JSON.stringify({ thumbnails }));
+      } catch (err: any) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
   // Endpoint: /api/photo?path=...
   if (pathname === '/api/photo') {
     const filePath = parsedUrl.searchParams.get('path');
@@ -286,7 +338,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
         }
 
         try {
-          const stat = fs.statSync(targetPath);
+          const stat = await fs.promises.stat(targetPath);
           const etag = `"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}"`;
           if (req.headers['if-none-match'] === etag) {
             res.statusCode = 304;
@@ -296,7 +348,14 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
           res.setHeader('ETag', etag);
           res.setHeader('Content-Type', MIME_TYPES[ext] || 'image/jpeg');
           res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-          fs.createReadStream(targetPath).pipe(res);
+          const stream = fs.createReadStream(targetPath);
+          stream.on('error', () => {
+            if (!res.headersSent) {
+              res.statusCode = 500;
+              res.end('Failed reading photo');
+            }
+          });
+          stream.pipe(res);
           return;
         } catch {
           res.statusCode = 500;
@@ -323,7 +382,14 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
         res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
 
         if (thumbResult.filePath && fs.existsSync(thumbResult.filePath)) {
-          fs.createReadStream(thumbResult.filePath).pipe(res);
+          const stream = fs.createReadStream(thumbResult.filePath);
+          stream.on('error', () => {
+            if (!res.headersSent) {
+              res.statusCode = 500;
+              res.end('Error streaming thumbnail');
+            }
+          });
+          stream.pipe(res);
         } else if (thumbResult.buffer) {
           res.end(thumbResult.buffer);
         } else {
@@ -335,7 +401,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
 
       // 3. Fallback direct stream if thumbnail generation was skipped
       try {
-        const stat = fs.statSync(targetPath);
+        const stat = await fs.promises.stat(targetPath);
         const etag = `"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}"`;
         if (req.headers['if-none-match'] === etag) {
           res.statusCode = 304;
@@ -345,7 +411,14 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
         res.setHeader('ETag', etag);
         res.setHeader('Content-Type', MIME_TYPES[ext] || 'image/jpeg');
         res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-        fs.createReadStream(targetPath).pipe(res);
+        const stream = fs.createReadStream(targetPath);
+        stream.on('error', () => {
+          if (!res.headersSent) {
+            res.statusCode = 500;
+            res.end('Error streaming file');
+          }
+        });
+        stream.pipe(res);
         return;
       } catch {
         res.statusCode = 500;
@@ -485,7 +558,22 @@ export function startEmbeddedWebServer(port: number = 5173): Promise<WebServerSt
     serverEnabled = true;
 
     function tryPort(targetPort: number) {
-      const srv = http.createServer(handleHttpRequest);
+      const srv = http.createServer((req, res) => {
+        req.setTimeout(12000, () => {
+          if (!res.headersSent) {
+            res.statusCode = 408;
+            res.end('Request Timeout');
+          }
+        });
+
+        handleHttpRequest(req, res).catch((err) => {
+          console.error('[EmbeddedWebServer] Unhandled request error:', err);
+          if (!res.headersSent) {
+            res.statusCode = 500;
+            res.end('Internal Server Error');
+          }
+        });
+      });
 
       srv.on('error', (err: any) => {
         if (err.code === 'EADDRINUSE') {

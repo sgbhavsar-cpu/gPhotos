@@ -91,6 +91,20 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
       } catch {}
     },
 
+    getBatchThumbnails: async (params: { items: Array<{ path: string; originalPath?: string }>; size?: number }) => {
+      try {
+        const res = await fetch('/api/batch-thumbnails', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(params),
+        });
+        if (res.ok) return await res.json();
+      } catch (err) {
+        console.warn('[browserShim] Batch thumbnails fetch failed:', err);
+      }
+      return { thumbnails: {} };
+    },
+
     readExif: async () => ({}),
     analyzeDryRun: async () => ({ totalFiles: 0, byYearMonth: {}, duplicateCount: 0, previewFiles: [] }),
     executeOrganize: async () => ({ success: true, processedCount: 0, errors: [] }),

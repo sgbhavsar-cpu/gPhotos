@@ -31,7 +31,8 @@ import {
   Copy,
   Sliders,
   FolderPlus,
-  Check
+  Check,
+  AlertCircle
 } from 'lucide-react';
 import { Photo, Person, DetectedFace, LocationMetadata } from '../../types';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
@@ -138,6 +139,8 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
 
   // Check if original full-resolution photo is available on network storage
   const [isOriginalAvailable, setIsOriginalAvailable] = useState<boolean | null>(null);
+  const [isLightboxImgLoaded, setIsLightboxImgLoaded] = useState(false);
+  const [lightboxImgError, setLightboxImgError] = useState(false);
 
   useEffect(() => {
     let isMounted = true;
@@ -164,6 +167,8 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     setEditRotation(0);
     setEditFlipH(false);
     setIsEditingLocation(false);
+    setIsLightboxImgLoaded(false);
+    setLightboxImgError(false);
   }, [photo.id]);
 
   // Album states
@@ -858,6 +863,65 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
             </div>
           )}
 
+          {/* Centered Asynchronous Loading Indicator */}
+          {!isLightboxImgLoaded && !lightboxImgError && (
+            <div
+              style={{
+                position: 'absolute',
+                top: '50%',
+                left: '50%',
+                transform: 'translate(-50%, -50%)',
+                zIndex: 40,
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                gap: '12px',
+                padding: '16px 24px',
+                borderRadius: 'var(--radius-lg)',
+                backgroundColor: 'rgba(15, 23, 42, 0.85)',
+                backdropFilter: 'blur(8px)',
+                boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
+                pointerEvents: 'none',
+              }}
+            >
+              <Sparkles size={24} color="var(--accent-primary)" className="animate-spin" />
+              <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', fontWeight: 500 }}>
+                Loading preview...
+              </span>
+            </div>
+          )}
+
+          {/* Graceful Fallback if preview fails or times out */}
+          {lightboxImgError && (
+            <div
+              style={{
+                position: 'absolute',
+                top: '50%',
+                left: '50%',
+                transform: 'translate(-50%, -50%)',
+                zIndex: 40,
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                gap: '12px',
+                padding: '24px 32px',
+                borderRadius: 'var(--radius-lg)',
+                backgroundColor: 'rgba(15, 23, 42, 0.95)',
+                border: '1px solid var(--border-subtle)',
+                color: 'var(--text-secondary)',
+                textAlign: 'center',
+              }}
+            >
+              <AlertCircle size={32} color="var(--accent-rose)" />
+              <span style={{ fontSize: '0.95rem', color: 'var(--text-primary)', fontWeight: 600 }}>
+                Photo Preview Unavailable
+              </span>
+              <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', maxWidth: '280px' }}>
+                The storage drive or network location may be offline or taking too long.
+              </span>
+            </div>
+          )}
+
           {/* Transformed Stage holding BOTH Image and Face Overlays in lockstep */}
           <div
             style={{
@@ -874,7 +938,14 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
               src={getLocalPhotoUrl(photo.filePath, photo.originalRemotePath, zoom > 1.2, zoom > 1.2 ? 0 : 1600)}
               alt={photo.fileName}
               decoding="async"
-              onLoad={onImageLoad}
+              onLoad={() => {
+                setIsLightboxImgLoaded(true);
+                onImageLoad();
+              }}
+              onError={() => {
+                setLightboxImgError(true);
+                setIsLightboxImgLoaded(false);
+              }}
               draggable={false}
               style={{
                 maxWidth: '100%',
@@ -884,8 +955,9 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                 boxShadow: '0 16px 48px rgba(0, 0, 0, 0.7)',
                 display: 'block',
                 pointerEvents: 'none',
+                opacity: isLightboxImgLoaded ? 1 : 0,
+                transition: 'opacity 0.2s ease-out, transform 0.15s ease-out',
                 transform: `rotate(${editRotation}deg) ${editFlipH ? 'scaleX(-1)' : ''}`,
-                transition: 'transform 0.15s ease-out',
               }}
             />
 

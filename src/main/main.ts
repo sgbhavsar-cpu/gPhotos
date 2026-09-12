@@ -296,7 +296,7 @@ function createWindow() {
             '.bmp': 'image/bmp',
           };
           const contentType = mimeMap[ext] || 'image/jpeg';
-          const buffer = fs.readFileSync(targetPath);
+          const buffer = await fs.promises.readFile(targetPath);
           return new Response(buffer, {
             headers: {
               'Content-Type': contentType,
@@ -313,7 +313,7 @@ function createWindow() {
 
         const thumbResult = await getOrGenerateCachedThumbnail(targetPath, targetSize);
         if (thumbResult) {
-          const buf = thumbResult.buffer || (thumbResult.filePath ? fs.readFileSync(thumbResult.filePath) : null);
+          const buf = thumbResult.buffer || (thumbResult.filePath ? await fs.promises.readFile(thumbResult.filePath) : null);
           if (buf) {
             return new Response(buf as any, {
               headers: {
@@ -335,7 +335,7 @@ function createWindow() {
           '.gif': 'image/gif',
           '.bmp': 'image/bmp',
         };
-        const buffer = fs.readFileSync(targetPath);
+        const buffer = await fs.promises.readFile(targetPath);
         return new Response(buffer as any, {
           headers: {
             'Content-Type': mimeMap[ext] || 'image/jpeg',
@@ -985,6 +985,44 @@ ipcMain.handle('heic:cleanup-hq', async (_event, photoId: string) => {
   } catch (err) {
     console.error('heic:cleanup-hq error:', err);
     return false;
+  }
+});
+
+ipcMain.handle('thumbnails:get-batch', async (_event, params: { items: Array<{ path: string; originalPath?: string }>; size?: number }) => {
+  try {
+    const { items, size } = params || {};
+    const targetSize = typeof size === 'number' && size > 0 ? size : 250;
+    const requestedItems = Array.isArray(items) ? items.slice(0, 100) : [];
+    const thumbnails: Record<string, string> = {};
+
+    await Promise.all(
+      requestedItems.map(async (item) => {
+        if (!item || !item.path) return;
+        const targetPath = (item.path && fs.existsSync(item.path))
+          ? item.path
+          : (item.originalPath && fs.existsSync(item.originalPath) ? item.originalPath : null);
+
+        if (!targetPath) return;
+
+        try {
+          const resThumb = await getOrGenerateCachedThumbnail(targetPath, targetSize);
+          if (resThumb) {
+            let buf: Buffer | null = resThumb.buffer || null;
+            if (!buf && resThumb.filePath) {
+              buf = await fs.promises.readFile(resThumb.filePath);
+            }
+            if (buf) {
+              thumbnails[item.path] = `data:${resThumb.mime || 'image/jpeg'};base64,${buf.toString('base64')}`;
+            }
+          }
+        } catch {}
+      })
+    );
+
+    return { thumbnails };
+  } catch (err: any) {
+    console.error('thumbnails:get-batch error:', err);
+    return { thumbnails: {} };
   }
 });
 

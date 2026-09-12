@@ -103,31 +103,50 @@ function getThumbCacheDir(size) {
   return d;
 }
 
+const inFlightMobileJobs = new Map();
+
 async function getCachedThumb(sourcePath, size) {
   try {
-    const stat = fs.statSync(sourcePath);
+    const stat = await fs.promises.stat(sourcePath);
     const key = crypto.createHash('sha1').update(`${sourcePath}:${stat.mtimeMs}:${size}`).digest('hex');
-    const cacheFile = path.join(getThumbCacheDir(size), `${key}.jpg`);
+    const cacheDir = getThumbCacheDir(size);
+    const cacheFile = path.join(cacheDir, `${key}.jpg`);
 
-    if (fs.existsSync(cacheFile)) {
-      const cStat = fs.statSync(cacheFile);
+    // Check cache
+    try {
+      const cStat = await fs.promises.stat(cacheFile);
       return {
         filePath: cacheFile,
         etag: `"${cStat.mtimeMs.toString(36)}-${cStat.size.toString(36)}"`,
       };
+    } catch {}
+
+    const jobKey = `${key}:${size}`;
+    if (inFlightMobileJobs.has(jobKey)) {
+      return inFlightMobileJobs.get(jobKey);
     }
 
-    if (sharp) {
-      const buf = await sharp(sourcePath)
-        .rotate()
-        .resize(size, size, { fit: 'inside', withoutEnlargement: true })
-        .jpeg({ quality: size > 500 ? 86 : 82, mozjpeg: true })
-        .toBuffer();
-      fs.writeFileSync(cacheFile, buf);
-      return {
-        filePath: cacheFile,
-        etag: `"${stat.mtimeMs.toString(36)}-${buf.length.toString(36)}"`,
-      };
+    const job = (async () => {
+      if (sharp) {
+        const buf = await sharp(sourcePath)
+          .rotate()
+          .resize(size, size, { fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: size > 500 ? 86 : 82, mozjpeg: true })
+          .toBuffer();
+        await fs.promises.writeFile(cacheFile, buf);
+        return {
+          filePath: cacheFile,
+          etag: `"${stat.mtimeMs.toString(36)}-${buf.length.toString(36)}"`,
+        };
+      }
+      return null;
+    })();
+
+    inFlightMobileJobs.set(jobKey, job);
+    try {
+      return await job;
+    } finally {
+      inFlightMobileJobs.delete(jobKey);
     }
   } catch {}
   return null;
@@ -311,6 +330,49 @@ async function handleRequest(req, res) {
     }
   }
 
+  // Endpoint: /api/batch-thumbnails (POST)
+  if (pathname === '/api/batch-thumbnails' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', async () => {
+      try {
+        const { items, size } = JSON.parse(body || '{}');
+        const targetSize = typeof size === 'number' && size > 0 ? size : 250;
+        const requestedItems = Array.isArray(items) ? items.slice(0, 100) : [];
+        const thumbnails = {};
+
+        await Promise.all(
+          requestedItems.map(async (item) => {
+            if (!item || !item.path) return;
+            const targetPath = (item.path && fs.existsSync(item.path))
+              ? item.path
+              : (item.originalPath && fs.existsSync(item.originalPath) ? item.originalPath : null);
+
+            if (!targetPath) return;
+
+            try {
+              const resThumb = await getCachedThumb(targetPath, targetSize);
+              if (resThumb && resThumb.filePath && fs.existsSync(resThumb.filePath)) {
+                const buf = await fs.promises.readFile(resThumb.filePath);
+                thumbnails[item.path] = `data:image/jpeg;base64,${buf.toString('base64')}`;
+              }
+            } catch {}
+          })
+        );
+
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(JSON.stringify({ thumbnails }));
+      } catch (err) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
   // Endpoint: /api/photo?path=...
   if (pathname === '/api/photo') {
     const filePath = parsedUrl.searchParams.get('path');
@@ -347,7 +409,7 @@ async function handleRequest(req, res) {
         }
 
         try {
-          const stat = fs.statSync(targetPath);
+          const stat = await fs.promises.stat(targetPath);
           const etag = `"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}"`;
           if (req.headers['if-none-match'] === etag) {
             res.statusCode = 304;
@@ -357,7 +419,14 @@ async function handleRequest(req, res) {
           res.setHeader('ETag', etag);
           res.setHeader('Content-Type', MIME_TYPES[ext] || 'image/jpeg');
           res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-          fs.createReadStream(targetPath).pipe(res);
+          const stream = fs.createReadStream(targetPath);
+          stream.on('error', () => {
+            if (!res.headersSent) {
+              res.statusCode = 500;
+              res.end('Failed reading photo');
+            }
+          });
+          stream.pipe(res);
           return;
         } catch {
           res.statusCode = 500;
@@ -381,13 +450,20 @@ async function handleRequest(req, res) {
         res.setHeader('ETag', thumb.etag);
         res.setHeader('Content-Type', 'image/jpeg');
         res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-        fs.createReadStream(thumb.filePath).pipe(res);
+        const stream = fs.createReadStream(thumb.filePath);
+        stream.on('error', () => {
+          if (!res.headersSent) {
+            res.statusCode = 500;
+            res.end('Error streaming thumbnail');
+          }
+        });
+        stream.pipe(res);
         return;
       }
 
       // 3. Fallback direct stream
       try {
-        const stat = fs.statSync(targetPath);
+        const stat = await fs.promises.stat(targetPath);
         const etag = `"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}"`;
         if (req.headers['if-none-match'] === etag) {
           res.statusCode = 304;
@@ -397,7 +473,14 @@ async function handleRequest(req, res) {
         res.setHeader('ETag', etag);
         res.setHeader('Content-Type', MIME_TYPES[ext] || 'image/jpeg');
         res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-        fs.createReadStream(targetPath).pipe(res);
+        const stream = fs.createReadStream(targetPath);
+        stream.on('error', () => {
+          if (!res.headersSent) {
+            res.statusCode = 500;
+            res.end('Error streaming file');
+          }
+        });
+        stream.pipe(res);
         return;
       } catch {
         res.statusCode = 500;
@@ -479,7 +562,22 @@ async function handleRequest(req, res) {
 }
 
 function startServer(port) {
-  const srv = http.createServer(handleRequest);
+  const srv = http.createServer((req, res) => {
+    req.setTimeout(12000, () => {
+      if (!res.headersSent) {
+        res.statusCode = 408;
+        res.end('Request Timeout');
+      }
+    });
+
+    handleRequest(req, res).catch((err) => {
+      console.error('[MobileServer] Unhandled request error:', err);
+      if (!res.headersSent) {
+        res.statusCode = 500;
+        res.end('Internal Server Error');
+      }
+    });
+  });
   srv.once('error', (err) => {
     if (err.code === 'EADDRINUSE') {
       console.warn(`  ⚠️ Port ${port} is already in use, trying port ${port + 1}...`);
