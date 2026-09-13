@@ -7,8 +7,9 @@
   "scripts": {
     "dev": "vite",
     "build:ui": "vite build",
-    "build:electron": "tsc -p tsconfig.electron.json",
-    "build": "vite build && tsc -p tsconfig.electron.json",
+    "copy:splash": "node -e \"const fs=require('fs'); fs.mkdirSync('dist-electron/main', {recursive:true}); fs.copyFileSync('src/main/splash.html', 'dist-electron/main/splash.html');\"",
+    "build:electron": "tsc -p tsconfig.electron.json && npm run copy:splash",
+    "build": "vite build && tsc -p tsconfig.electron.json && npm run copy:splash",
     "dist:win": "npm run build && electron-builder --win",
     "serve:mobile": "node scripts/serve_mobile.js",
     "start": "electron ."

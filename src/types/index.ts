@@ -311,6 +311,7 @@ export interface IElectronAPI {
     items: Array<{ path: string; originalPath?: string }>;
     size?: number;
   }) => Promise<{ thumbnails: Record<string, string> }>;
+  sendAppReady?: () => void;
 }
 
 export interface WebServerStatus {

@@ -66,6 +66,7 @@ const electronAPI: IElectronAPI = {
   prepareHeicHq: (filePath: string, photoId: string) => ipcRenderer.invoke('heic:prepare-hq', filePath, photoId),
   cleanupHeicHq: (photoId: string) => ipcRenderer.invoke('heic:cleanup-hq', photoId),
   getBatchThumbnails: (params) => ipcRenderer.invoke('thumbnails:get-batch', params),
+  sendAppReady: () => ipcRenderer.send('app:ready'),
 };
 
 contextBridge.exposeInMainWorld('electronAPI', electronAPI);

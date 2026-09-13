@@ -188,5 +188,6 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
       window.open('https://github.com/sgbhavsar-cpu/gPhotos', '_blank');
       return true;
     },
+    sendAppReady: () => {},
   };
 }

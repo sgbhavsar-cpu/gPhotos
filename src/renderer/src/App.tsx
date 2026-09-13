@@ -60,7 +60,19 @@ export const App: React.FC = () => {
 
   // Subscribe to library store updates and ensure persisted data is fetched on mount
   useEffect(() => {
-    libraryStore.loadPersistedData();
+    libraryStore.loadPersistedData().finally(() => {
+      // Smoothly dismiss browser inline splash screen
+      const splash = document.getElementById('app-splash-screen');
+      if (splash) {
+        splash.classList.add('loaded');
+        setTimeout(() => splash.remove(), 600);
+      }
+      // Notify Electron main process that renderer has mounted and is interactive
+      if (window.electronAPI?.sendAppReady) {
+        window.electronAPI.sendAppReady();
+      }
+    });
+
     return libraryStore.subscribe(() => {
       setLibraryState({ ...libraryStore.getState() });
     });

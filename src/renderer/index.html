@@ -10,8 +10,142 @@
     <link rel="icon" type="image/png" href="/icon.png" />
     <link rel="apple-touch-icon" href="/icon.png" />
     <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: gphoto: https://*.tile.openstreetmap.org https://*.basemaps.cartocdn.com https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob: gphoto: https:; frame-src 'self' gphoto: data: blob:; connect-src 'self' data: blob: gphoto: https:;" />
+    <style>
+      #app-splash-screen {
+        position: fixed;
+        inset: 0;
+        z-index: 99999;
+        background: #0f172a;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        color: #ffffff;
+        transition: opacity 0.45s ease, visibility 0.45s ease;
+      }
+      #app-splash-screen.loaded {
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+      }
+      .inline-splash-pinwheel {
+        position: relative;
+        width: 58px;
+        height: 58px;
+        margin-bottom: 20px;
+        animation: inline-spin 10s linear infinite;
+      }
+      .inline-blade {
+        position: absolute;
+        width: 25px;
+        height: 25px;
+        border-radius: 50% 50% 0 50%;
+      }
+      .inline-blade-red {
+        top: 0; left: 4px;
+        background: linear-gradient(135deg, #f87171, #ef4444);
+        box-shadow: 0 0 14px rgba(239, 68, 68, 0.45);
+      }
+      .inline-blade-yellow {
+        top: 4px; right: 0;
+        background: linear-gradient(135deg, #fbbf24, #f59e0b);
+        transform: rotate(90deg);
+        box-shadow: 0 0 14px rgba(245, 158, 11, 0.45);
+      }
+      .inline-blade-green {
+        bottom: 0; right: 4px;
+        background: linear-gradient(135deg, #34d399, #10b981);
+        transform: rotate(180deg);
+        box-shadow: 0 0 14px rgba(16, 185, 129, 0.45);
+      }
+      .inline-blade-blue {
+        bottom: 4px; left: 0;
+        background: linear-gradient(135deg, #60a5fa, #3b82f6);
+        transform: rotate(270deg);
+        box-shadow: 0 0 14px rgba(59, 130, 246, 0.45);
+      }
+      .inline-dot {
+        position: absolute;
+        top: 50%; left: 50%;
+        transform: translate(-50%, -50%);
+        width: 14px; height: 14px;
+        background: #ffffff;
+        border-radius: 50%;
+        box-shadow: 0 0 10px rgba(255,255,255,0.8);
+      }
+      @keyframes inline-spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
+      .inline-title {
+        font-size: 22px;
+        font-weight: 700;
+        letter-spacing: -0.5px;
+        margin-bottom: 6px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .inline-badge {
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        padding: 2px 7px;
+        border-radius: 6px;
+        background: rgba(59, 130, 246, 0.2);
+        color: #93c5fd;
+        border: 1px solid rgba(59, 130, 246, 0.35);
+      }
+      .inline-sub {
+        font-size: 13px;
+        color: #94a3b8;
+        margin-bottom: 24px;
+      }
+      .inline-bar-wrap {
+        width: 220px;
+        height: 4px;
+        background: rgba(255, 255, 255, 0.08);
+        border-radius: 9999px;
+        overflow: hidden;
+        position: relative;
+      }
+      .inline-bar-fill {
+        position: absolute;
+        top: 0; bottom: 0; left: 0;
+        width: 40%;
+        background: linear-gradient(90deg, #3b82f6, #8b5cf6, #ec4899);
+        border-radius: 9999px;
+        animation: inline-shimmer 1.5s ease-in-out infinite;
+        box-shadow: 0 0 10px rgba(139, 92, 246, 0.6);
+      }
+      @keyframes inline-shimmer {
+        0% { left: -40%; width: 30%; }
+        50% { left: 30%; width: 55%; }
+        100% { left: 105%; width: 30%; }
+      }
+    </style>
   </head>
   <body>
+    <!-- Instant 0ms Animated Splash Screen for Browser & Desktop Cold Start -->
+    <div id="app-splash-screen">
+      <div class="inline-splash-pinwheel">
+        <div class="inline-blade inline-blade-red"></div>
+        <div class="inline-blade inline-blade-yellow"></div>
+        <div class="inline-blade inline-blade-green"></div>
+        <div class="inline-blade inline-blade-blue"></div>
+        <div class="inline-dot"></div>
+      </div>
+      <div class="inline-title">
+        <span>gPhotos</span>
+        <span class="inline-badge">Desktop</span>
+      </div>
+      <div class="inline-sub">Loading photos and albums...</div>
+      <div class="inline-bar-wrap">
+        <div class="inline-bar-fill"></div>
+      </div>
+    </div>
+
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

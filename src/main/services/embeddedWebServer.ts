@@ -577,6 +577,9 @@ export function startEmbeddedWebServer(port: number = 5173): Promise<WebServerSt
 
       srv.on('error', (err: any) => {
         if (err.code === 'EADDRINUSE') {
+          try {
+            srv.close();
+          } catch {}
           console.warn(`[EmbeddedWebServer] Port ${targetPort} in use, trying ${targetPort + 1}...`);
           tryPort(targetPort + 1);
         } else {

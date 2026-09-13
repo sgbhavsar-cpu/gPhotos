@@ -121,6 +121,59 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   // (groupedPhotos & gridColumns are handled internally with virtualized windowing by VirtualizedTimelineGallery)
 
   if (photos.length === 0) {
+    const isScanning = libraryStore.getState().isScanning;
+    if (isScanning) {
+      return (
+        <div style={{
+          height: '100%',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '32px',
+          textAlign: 'center',
+        }}>
+          <div style={{
+            width: '64px',
+            height: '64px',
+            borderRadius: '50%',
+            background: 'rgba(59, 130, 246, 0.12)',
+            border: '1px solid rgba(59, 130, 246, 0.3)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            marginBottom: '20px',
+            color: 'var(--accent-primary)',
+          }}>
+            <RefreshCw size={28} className="animate-spin" />
+          </div>
+          <h2 style={{ fontSize: '1.3rem', fontWeight: 700, marginBottom: '8px' }}>
+            Preparing Your Library...
+          </h2>
+          <p style={{ color: 'var(--text-muted)', maxWidth: '420px', fontSize: '0.9rem', marginBottom: '16px' }}>
+            Scanning photos and building local thumbnail cache. Your gallery will appear automatically.
+          </p>
+          <div style={{
+            width: '200px',
+            height: '4px',
+            background: 'rgba(255,255,255,0.08)',
+            borderRadius: '9999px',
+            overflow: 'hidden',
+            position: 'relative',
+          }}>
+            <div style={{
+              position: 'absolute',
+              top: 0, bottom: 0, left: 0,
+              width: '40%',
+              background: 'linear-gradient(90deg, #3b82f6, #8b5cf6, #ec4899)',
+              borderRadius: '9999px',
+              animation: 'inline-shimmer 1.5s infinite ease-in-out',
+            }} />
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div style={{
         height: '100%',

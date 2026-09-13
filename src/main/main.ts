@@ -75,12 +75,93 @@ if (!gotSingleInstanceLock) {
       if (!mainWindow.isVisible()) mainWindow.show();
       mainWindow.focus();
     } else {
+      createSplashWindow();
       createWindow();
     }
   });
 }
 
 let mainWindow: BrowserWindow | null = null;
+let splashWindow: BrowserWindow | null = null;
+let isAppReadyFired = false;
+
+function createSplashWindow() {
+  if (splashWindow && !splashWindow.isDestroyed()) {
+    splashWindow.focus();
+    return;
+  }
+
+  splashWindow = new BrowserWindow({
+    width: 440,
+    height: 270,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    center: true,
+    show: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    backgroundColor: '#00000000',
+    icon: path.join(__dirname, '../../public/icon.png'),
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+    },
+  });
+
+  const candidates = [
+    path.join(__dirname, 'splash.html'),
+    path.join(__dirname, '../main/splash.html'),
+    path.join(__dirname, '../../src/main/splash.html'),
+    path.join(__dirname, '../../public/splash.html'),
+    path.join(app.getAppPath(), 'dist/splash.html'),
+    path.join(app.getAppPath(), 'public/splash.html'),
+    path.join(app.getAppPath(), 'src/main/splash.html'),
+  ];
+
+  let loaded = false;
+  for (const p of candidates) {
+    if (fs.existsSync(p)) {
+      splashWindow.loadFile(p);
+      loaded = true;
+      break;
+    }
+  }
+
+  if (!loaded) {
+    splashWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(`
+      <!DOCTYPE html><html><body style="background:#0f172a;color:white;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;border-radius:16px;border:1px solid #334155;">
+      <div style="text-align:center;"><h2>gPhotos</h2><p style="color:#94a3b8;font-size:12px;">Starting services...</p></div>
+      </body></html>
+    `)}`);
+  }
+
+  splashWindow.once('ready-to-show', () => {
+    splashWindow?.show();
+  });
+
+  splashWindow.on('closed', () => {
+    splashWindow = null;
+  });
+}
+
+function revealMainWindow() {
+  if (isAppReadyFired) return;
+  isAppReadyFired = true;
+
+  // Gentle 400ms delay to ensure smooth visual transition
+  setTimeout(() => {
+    if (splashWindow && !splashWindow.isDestroyed()) {
+      splashWindow.close();
+      splashWindow = null;
+    }
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.show();
+      mainWindow.focus();
+      mainWindow.webContents.focus();
+    }
+  }, 400);
+}
 
 // Register custom protocol scheme before app is ready
 protocol.registerSchemesAsPrivileged([
@@ -106,12 +187,14 @@ function getStoragePath(): string {
 }
 
 function createWindow() {
+  isAppReadyFired = false;
   mainWindow = new BrowserWindow({
     width: 1360,
     height: 900,
     minWidth: 1024,
     minHeight: 700,
     title: 'gPhotos',
+    show: false, // Keep hidden during startup while splash animation is showing
     backgroundColor: '#0f172a', // sleek dark slate
     icon: path.join(__dirname, '../../public/icon.png'),
     webPreferences: {
@@ -122,11 +205,11 @@ function createWindow() {
     },
   });
 
-  // Ensure Window and WebContents receive native keyboard focus on show and focus
+  // Safety fallback: if renderer doesn't send 'app:ready' within 4.5s, reveal main window automatically
   mainWindow.once('ready-to-show', () => {
-    mainWindow?.show();
-    mainWindow?.focus();
-    mainWindow?.webContents.focus();
+    setTimeout(() => {
+      revealMainWindow();
+    }, 4500);
   });
 
   mainWindow.on('focus', () => {
@@ -386,10 +469,12 @@ app.whenReady().then(() => {
     // Run autonomous daemon without opening the GUI window
     initBackgroundDaemon(null);
   } else {
+    createSplashWindow();
     createWindow();
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) {
+        createSplashWindow();
         createWindow();
       }
     });
@@ -403,6 +488,11 @@ app.on('window-all-closed', () => {
 });
 
 // ---------------- IPC Handlers ----------------
+
+// Signal from renderer that UI has finished mounting and is ready to show
+ipcMain.on('app:ready', () => {
+  revealMainWindow();
+});
 
 ipcMain.handle('dialog:select-directory', async () => {
   try {
