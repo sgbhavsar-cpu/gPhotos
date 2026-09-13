@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { X, UserCheck, Plus, AlertCircle, Check } from 'lucide-react';
 import { DetectedFace, Person, Photo } from '../../types';
 import { FaceAvatar } from './FaceAvatar';

@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { X, Merge, AlertCircle, Check, Users, ExternalLink } from 'lucide-react';
 import { Person, Photo } from '../../types';
 import { FaceAvatar } from './FaceAvatar';

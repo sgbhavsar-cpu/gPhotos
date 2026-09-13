@@ -6,10 +6,14 @@
   "main": "dist-electron/main/main.js",
   "scripts": {
     "dev": "vite",
+    "test:imports": "node test/verify_imports_and_runtime.js",
+    "test:render": "npx tsx test/test_rendered_app_startup.ts",
+    "test:smoke": "node test/smoke_test_app_ready.js",
+    "test": "npm run test:imports && npm run test:render && npm run test:smoke",
     "build:ui": "vite build",
     "copy:splash": "node -e \"const fs=require('fs'); fs.mkdirSync('dist-electron/main', {recursive:true}); fs.copyFileSync('src/main/splash.html', 'dist-electron/main/splash.html');\"",
     "build:electron": "tsc -p tsconfig.electron.json && npm run copy:splash",
-    "build": "vite build && tsc -p tsconfig.electron.json && npm run copy:splash",
+    "build": "node test/verify_imports_and_runtime.js && vite build && tsc -p tsconfig.electron.json && npm run copy:splash",
     "dist:win": "npm run build && electron-builder --win",
     "serve:mobile": "node scripts/serve_mobile.js",
     "start": "electron ."

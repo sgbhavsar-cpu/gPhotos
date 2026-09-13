@@ -24,6 +24,8 @@ import { Person, Photo, DetectedFace } from '../../types';
 import { PhotoCard } from '../components/PhotoCard';
 import { FaceAvatar } from '../components/FaceAvatar';
 import { ChangeCoverFaceModal } from '../components/ChangeCoverFaceModal';
+import { ReassignFaceModal } from '../components/ReassignFaceModal';
+import { MergePeopleModal } from '../components/MergePeopleModal';
 import { PersonNameInput } from '../components/PersonNameInput';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { VirtualizedTimelineGallery, GalleryZoomLevel, ZOOM_LEVELS } from '../components/VirtualizedTimelineGallery';
