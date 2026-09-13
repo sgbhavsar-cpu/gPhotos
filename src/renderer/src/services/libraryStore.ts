@@ -548,6 +548,7 @@ export class LibraryManager {
 
     const finalDeduped = deduplicatePhotoList(preserved);
     this.state.photos = finalDeduped;
+    this.state.totalCount = finalDeduped.length;
 
     if (folderPath) {
       this.state.selectedFolder = folderPath;
@@ -616,8 +617,6 @@ export class LibraryManager {
     const idx = this.state.photos.findIndex((p) => p.id === updatedPhoto.id || p.filePath === updatedPhoto.filePath);
     if (idx >= 0) {
       this.state.photos[idx] = { ...this.state.photos[idx], ...updatedPhoto };
-    } else {
-      this.state.photos.push(updatedPhoto);
     }
   }
 
@@ -629,9 +628,6 @@ export class LibraryManager {
         locationChanged = true;
       }
       this.state.photos[idx] = { ...this.state.photos[idx], ...updatedPhoto };
-    } else {
-      if (updatedPhoto.location) locationChanged = true;
-      this.state.photos.push(updatedPhoto);
     }
     if (locationChanged) {
       this.state.places = groupPhotosByPlace(this.state.photos.filter((p) => !p.isExcluded));
@@ -661,6 +657,7 @@ export class LibraryManager {
   public removePhotos(photoIds: string[]) {
     const idSet = new Set(photoIds);
     this.state.photos = this.state.photos.filter((p) => !idSet.has(p.id));
+    this.state.totalCount = Math.max(0, (this.state.totalCount || this.state.photos.length) - photoIds.length);
     this.state.faces = this.state.faces.filter((f) => !idSet.has(f.photoId));
     this.state.places = groupPhotosByPlace(this.state.photos.filter((p) => !p.isExcluded));
     this.notify();

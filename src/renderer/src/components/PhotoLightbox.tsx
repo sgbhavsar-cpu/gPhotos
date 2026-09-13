@@ -141,6 +141,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   const [isOriginalAvailable, setIsOriginalAvailable] = useState<boolean | null>(null);
   const [isLightboxImgLoaded, setIsLightboxImgLoaded] = useState(false);
   const [lightboxImgError, setLightboxImgError] = useState(false);
+  const [fallbackToThumbnail, setFallbackToThumbnail] = useState(false);
 
   useEffect(() => {
     let isMounted = true;
@@ -148,6 +149,9 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
       window.electronAPI.checkFileExists(photo.originalRemotePath).then((exists) => {
         if (isMounted) setIsOriginalAvailable(exists);
       });
+    } else if (!photo.isVirtual) {
+      // Regular local photo stored on current machine is always available
+      setIsOriginalAvailable(true);
     } else {
       setIsOriginalAvailable(false);
     }
@@ -169,6 +173,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     setIsEditingLocation(false);
     setIsLightboxImgLoaded(false);
     setLightboxImgError(false);
+    setFallbackToThumbnail(false);
   }, [photo.id]);
 
   // Album states
@@ -933,10 +938,38 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
               transition: isDragging ? 'none' : 'transform 0.08s ease-out',
             }}
           >
+            {/* Immediate blur thumbnail placeholder while high-res original loads */}
+            {!isLightboxImgLoaded && !lightboxImgError && (
+              <img
+                src={getLocalPhotoUrl(photo.thumbnailPath || photo.filePath, undefined, false, 500)}
+                alt={photo.fileName}
+                aria-hidden="true"
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  width: '100%',
+                  height: '100%',
+                  objectFit: 'contain',
+                  borderRadius: 'var(--radius-sm)',
+                  display: 'block',
+                  filter: 'blur(3px)',
+                  opacity: 0.7,
+                  pointerEvents: 'none',
+                  transform: `rotate(${editRotation}deg) ${editFlipH ? 'scaleX(-1)' : ''}`,
+                }}
+              />
+            )}
+
             <img
               ref={imgRef}
               crossOrigin="anonymous"
-              src={getLocalPhotoUrl(photo.filePath, photo.originalRemotePath, zoom > 1.2, zoom > 1.2 ? 0 : 1600)}
+              src={getLocalPhotoUrl(
+                photo.filePath,
+                photo.originalRemotePath,
+                (isOriginalAvailable !== false) && !fallbackToThumbnail,
+                ((isOriginalAvailable !== false) && !fallbackToThumbnail) ? 0 : 1600
+              )}
               alt={photo.fileName}
               decoding="async"
               onLoad={() => {
@@ -944,8 +977,13 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                 onImageLoad();
               }}
               onError={() => {
-                setLightboxImgError(true);
-                setIsLightboxImgLoaded(false);
+                if (isOriginalAvailable !== false && !fallbackToThumbnail && photo.isVirtual) {
+                  // If high-res original remote load fails, fall back to local cached mirror thumbnail
+                  setFallbackToThumbnail(true);
+                } else {
+                  setLightboxImgError(true);
+                  setIsLightboxImgLoaded(false);
+                }
               }}
               draggable={false}
               style={{
@@ -1427,17 +1465,20 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                   </button>
                 )}
 
-                {photo.isVirtual && photo.originalRemotePath && (
-                  <button
-                    className="btn btn-ghost btn-icon"
-                    onClick={() => photo.originalRemotePath && window.electronAPI?.openOriginalFile(photo.originalRemotePath)}
-                    disabled={!isOriginalAvailable}
-                    style={{ width: '32px', height: '32px', padding: 0, color: isOriginalAvailable ? '#10b981' : 'var(--text-muted)' }}
-                    title={isOriginalAvailable ? 'Show Original in Explorer' : 'Original file unavailable'}
-                  >
-                    <ExternalLink size={16} />
-                  </button>
-                )}
+                <button
+                  className="btn btn-ghost btn-icon"
+                  onClick={() => {
+                    const pathToOpen = photo.isVirtual ? photo.originalRemotePath : photo.filePath;
+                    if (pathToOpen && window.electronAPI?.openOriginalFile) {
+                      window.electronAPI.openOriginalFile(pathToOpen);
+                    }
+                  }}
+                  disabled={!isOriginalAvailable}
+                  style={{ width: '32px', height: '32px', padding: 0, color: isOriginalAvailable ? '#10b981' : 'var(--text-muted)' }}
+                  title={isOriginalAvailable ? 'Show Original in Explorer' : 'Original file unavailable'}
+                >
+                  <ExternalLink size={16} />
+                </button>
               </div>
             </div>
 

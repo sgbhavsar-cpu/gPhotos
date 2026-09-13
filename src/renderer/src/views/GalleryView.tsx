@@ -44,6 +44,7 @@ interface GalleryViewProps {
   activeAiFilter?: AiPhotoFilter | null;
   onClearAiFilter?: () => void;
   resetTrigger?: number;
+  totalCount?: number;
 }
 
 export const GalleryView: React.FC<GalleryViewProps> = ({
@@ -61,6 +62,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   activeAiFilter,
   onClearAiFilter,
   resetTrigger,
+  totalCount,
 }) => {
   const [zoomLevel, setZoomLevel] = useState<GalleryZoomLevel>('medium');
   const [filterType, setFilterType] = useState<'all' | 'faces' | 'nofaces' | 'excluded'>('all');
@@ -89,6 +91,13 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       return next;
     });
     if (!isSelectMode) {
+      setIsSelectMode(true);
+    }
+  };
+
+  const handleSelectionChange = (newSelected: Set<string>) => {
+    setSelectedIds(newSelected);
+    if (!isSelectMode && newSelected.size > 0) {
       setIsSelectMode(true);
     }
   };
@@ -436,7 +445,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
               {filterFavorite ? 'Favorite Photos' : 'Timeline'}
             </span>
             <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-              ({filteredPhotos.length})
+              ({filterFavorite || filterType !== 'all' ? filteredPhotos.length : (totalCount || filteredPhotos.length)})
             </span>
 
             {filteredPhotos.some((p) => p.isVirtual) && (
@@ -842,6 +851,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
         selectedIds={selectedIds}
         onToggleSelect={toggleSelectPhoto}
         onDragSelect={handleDragSelect}
+        onSelectionChange={handleSelectionChange}
         emptyMessage="No photos found matching the selected filter."
       />
 

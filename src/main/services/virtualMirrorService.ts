@@ -1035,6 +1035,11 @@ export async function rotatePhotoFile(
       sharpLib = require('sharp');
     } catch {}
 
+    let prevMtime: number | undefined;
+    try {
+      prevMtime = fs.statSync(filePath).mtimeMs;
+    } catch {}
+
     const inputBuf = fs.readFileSync(filePath);
 
     if (sharpLib) {
@@ -1052,6 +1057,12 @@ export async function rotatePhotoFile(
     }
 
     fs.writeFileSync(filePath, outputBuffer);
+
+    // Purge cached thumbnails on disk so fresh orientation displays immediately
+    try {
+      const { purgeCachedThumbnailsForFile } = require('./thumbnailCacheService');
+      await purgeCachedThumbnailsForFile(filePath, prevMtime);
+    } catch {}
 
     return { success: true, newPath: filePath };
   } catch (err: any) {

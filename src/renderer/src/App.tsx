@@ -720,6 +720,66 @@ export const App: React.FC = () => {
     }
   };
 
+  // 30-Second Auto-Resume on Startup: Resumes background caching and face detection without user intervention
+  useEffect(() => {
+    const autoResumeTimer = setTimeout(async () => {
+      console.log('[AUTO-RESUME] 30 seconds elapsed since startup. Checking for background tasks to auto-resume...');
+
+      const currentPhotos = libraryStore.getState().photos || [];
+      const isCurrentlyScanning = libraryStore.getState().isScanning;
+      const isCurrentlyDetecting = libraryStore.getState().isDetectingFaces;
+
+      // 1. Auto-resume thumbnail pre-caching if photos exist
+      if (currentPhotos.length > 0 && window.electronAPI?.startThumbnailPreCache) {
+        try {
+          console.log(`[AUTO-RESUME] Resuming thumbnail pre-caching for ${currentPhotos.length} photos...`);
+          window.electronAPI.startThumbnailPreCache(currentPhotos).catch(() => {});
+        } catch (err) {
+          console.warn('[AUTO-RESUME] Thumbnail pre-cache resume error:', err);
+        }
+      }
+
+      // 2. Auto-resume face detection if unscanned photos exist
+      if (!isCurrentlyScanning && !isCurrentlyDetecting && currentPhotos.length > 0) {
+        const unscanned = currentPhotos.filter(
+          (p) => !p.faceScanCompleted && (!p.faces || p.faces.length === 0)
+        );
+        if (unscanned.length > 0) {
+          console.log(`[AUTO-RESUME] Resuming background face detection for ${unscanned.length} unscanned photos...`);
+          runFaceDetectionForPhotos(currentPhotos, false).catch((err) => {
+            console.warn('[AUTO-RESUME] Face detection resume error:', err);
+          });
+        }
+      }
+
+      // 3. Auto-resume any interrupted network storages
+      if (window.electronAPI?.getAllLibraryStatuses) {
+        try {
+          const statuses = await window.electronAPI.getAllLibraryStatuses();
+          const storages = (await window.electronAPI.listVirtualStorages?.()) || [];
+          for (const st of statuses) {
+            if (!st.thumbnailCompleted || !st.faceCompleted) {
+              const matchedStorage = storages.find(
+                (s: any) => s.networkSourcePath === st.libraryPath || s.name === st.libraryName
+              );
+              if (matchedStorage && !isCurrentlyScanning) {
+                console.log(`[AUTO-RESUME] Auto-resuming interrupted storage: ${matchedStorage.name}`);
+                handleRefreshNetworkStorage(matchedStorage);
+                break;
+              }
+            }
+          }
+        } catch (err) {
+          console.warn('[AUTO-RESUME] Storage status resume check error:', err);
+        }
+      }
+    }, 30000); // 30 seconds
+
+    return () => {
+      clearTimeout(autoResumeTimer);
+    };
+  }, []);
+
   const [tabResetTrigger, setTabResetTrigger] = useState<number>(0);
 
   const handleSelectTab = (tab: ActiveTab) => {
@@ -778,6 +838,7 @@ export const App: React.FC = () => {
         {activeTab === 'photos' && (
           <GalleryView
             photos={aiFilteredPhotos || libraryState.photos}
+            totalCount={libraryState.totalCount}
             onSelectPhoto={(p) => setActiveLightboxPhoto(p)}
             onToggleFavorite={handleToggleFavorite}
             onOpenFolder={handleOpenFolder}
@@ -799,6 +860,7 @@ export const App: React.FC = () => {
         {activeTab === 'favorites' && (
           <GalleryView
             photos={libraryState.photos}
+            totalCount={libraryState.totalCount}
             onSelectPhoto={(p) => setActiveLightboxPhoto(p)}
             onToggleFavorite={handleToggleFavorite}
             onOpenFolder={handleOpenFolder}

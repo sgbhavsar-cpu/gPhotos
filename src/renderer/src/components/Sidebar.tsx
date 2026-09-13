@@ -67,7 +67,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const [isNetworkStorageCollapsed, setIsNetworkStorageCollapsed] = useState(false);
 
   const navItems = [
-    { id: 'photos' as ActiveTab, label: 'Photos', icon: ImageIcon, count: state.photos.length },
+    { id: 'photos' as ActiveTab, label: 'Photos', icon: ImageIcon, count: state.totalCount || state.photos.length },
     { id: 'albums' as ActiveTab, label: 'Albums', icon: BookImage, count: (state.albums || []).length },
     { id: 'people' as ActiveTab, label: 'People', icon: Users, count: state.people.length },
     { id: 'places' as ActiveTab, label: 'Places', icon: MapPin, count: state.places.length },
@@ -242,7 +242,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 fontWeight: 600,
               }}
             >
-              {state.photos.length}
+              {state.totalCount || state.photos.length}
             </span>
           </button>
 

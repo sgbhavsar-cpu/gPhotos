@@ -45,7 +45,7 @@ export const MobileMenuDrawer: React.FC<MobileMenuDrawerProps> = ({
   if (!isOpen) return null;
 
   const navItems = [
-    { id: 'photos' as ActiveTab, label: 'Photos Gallery', icon: ImageIcon, count: state.photos.length },
+    { id: 'photos' as ActiveTab, label: 'Photos Gallery', icon: ImageIcon, count: state.totalCount || state.photos.length },
     { id: 'favorites' as ActiveTab, label: 'Favorites', icon: Heart, count: state.photos.filter((p) => p.isFavorite).length },
     { id: 'albums' as ActiveTab, label: 'Albums', icon: BookImage, count: (state.albums || []).length },
     { id: 'people' as ActiveTab, label: 'People & Faces', icon: Users, count: state.people.length },

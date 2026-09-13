@@ -35,6 +35,7 @@ interface VirtualizedTimelineGalleryProps {
   selectedIds?: Set<string>;
   onToggleSelect?: (photoId: string) => void;
   onDragSelect?: (photoId: string) => void;
+  onSelectionChange?: (selectedIds: Set<string>) => void;
   emptyMessage?: string;
 }
 
@@ -48,6 +49,7 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
   selectedIds = new Set(),
   onToggleSelect,
   onDragSelect,
+  onSelectionChange,
   emptyMessage = 'No photos found in this view.',
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -56,13 +58,22 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
   const [containerWidth, setContainerWidth] = useState(1200);
   const lastWheelZoomTime = useRef<number>(0);
 
-  // Mouse drag-selection tracking (mobile-style swipe/drag select)
+  // 2D Matrix Mouse drag-selection tracking
   const isMouseDownRef = useRef<boolean>(false);
   const isDragSelectingRef = useRef<boolean>(false);
+  const dragAnchorRef = useRef<{
+    groupKey: string;
+    photoId: string;
+    index: number;
+    row: number;
+    col: number;
+  } | null>(null);
+  const initialSelectedIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     const handleGlobalMouseUp = () => {
       isMouseDownRef.current = false;
+      dragAnchorRef.current = null;
       setTimeout(() => {
         isDragSelectingRef.current = false;
       }, 60);
@@ -599,17 +610,94 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
                     isSelectMode={isSelectMode || selectedIds.size > 0}
                     onToggleSelect={() => onToggleSelect && onToggleSelect(photo.id)}
                     onCardMouseDown={(_id, e) => {
-                      if (e.button === 0 && (isSelectMode || selectedIds.size > 0)) {
+                      if (e.button === 0) {
                         isMouseDownRef.current = true;
+                        const photoIdx = groupPhotos.findIndex((p) => p.id === photo.id);
+                        dragAnchorRef.current = {
+                          groupKey: item.key,
+                          photoId: photo.id,
+                          index: photoIdx,
+                          row: Math.floor(photoIdx / cols),
+                          col: photoIdx % cols,
+                        };
+                        initialSelectedIdsRef.current = new Set(selectedIds);
                       }
                     }}
                     onCardMouseEnter={(id) => {
-                      if (isMouseDownRef.current && (isSelectMode || selectedIds.size > 0)) {
+                      if (isMouseDownRef.current && dragAnchorRef.current) {
+                        if (id === dragAnchorRef.current.photoId && !isDragSelectingRef.current) {
+                          return;
+                        }
                         isDragSelectingRef.current = true;
-                        if (onDragSelect) {
-                          onDragSelect(id);
-                        } else if (onToggleSelect && !selectedIds.has(id)) {
-                          onToggleSelect(id);
+                        const anchor = dragAnchorRef.current;
+                        const currentIdx = groupPhotos.findIndex((p) => p.id === photo.id);
+                        const targetRow = Math.floor(currentIdx / cols);
+                        const targetCol = currentIdx % cols;
+
+                        const matrixIds = new Set<string>();
+
+                        if (anchor.groupKey === item.key) {
+                          // 2D Matrix Selection within the same group (e.g., 3x3 selects all 9 photos)
+                          const minRow = Math.min(anchor.row, targetRow);
+                          const maxRow = Math.max(anchor.row, targetRow);
+                          const minCol = Math.min(anchor.col, targetCol);
+                          const maxCol = Math.max(anchor.col, targetCol);
+
+                          groupPhotos.forEach((p, idx) => {
+                            const r = Math.floor(idx / cols);
+                            const c = idx % cols;
+                            if (r >= minRow && r <= maxRow && c >= minCol && c <= maxCol) {
+                              matrixIds.add(p.id);
+                            }
+                          });
+                        } else {
+                          // Cross-group 2D Matrix Selection
+                          const gStartIdx = monthGroups.findIndex((mg) => mg.key === anchor.groupKey);
+                          const gEndIdx = monthGroups.findIndex((mg) => mg.key === item.key);
+                          const minG = Math.min(gStartIdx, gEndIdx);
+                          const maxG = Math.max(gStartIdx, gEndIdx);
+                          const minCol = Math.min(anchor.col, targetCol);
+                          const maxCol = Math.max(anchor.col, targetCol);
+
+                          for (let gi = minG; gi <= maxG; gi++) {
+                            const mg = monthGroups[gi];
+                            if (!mg) continue;
+                            if (gi === minG) {
+                              const fromRow = minG === gStartIdx ? anchor.row : targetRow;
+                              mg.photos.forEach((p, idx) => {
+                                const r = Math.floor(idx / cols);
+                                const c = idx % cols;
+                                if (r >= fromRow && c >= minCol && c <= maxCol) {
+                                  matrixIds.add(p.id);
+                                }
+                              });
+                            } else if (gi === maxG) {
+                              const toRow = maxG === gStartIdx ? anchor.row : targetRow;
+                              mg.photos.forEach((p, idx) => {
+                                const r = Math.floor(idx / cols);
+                                const c = idx % cols;
+                                if (r <= toRow && c >= minCol && c <= maxCol) {
+                                  matrixIds.add(p.id);
+                                }
+                              });
+                            } else {
+                              mg.photos.forEach((p, idx) => {
+                                const c = idx % cols;
+                                if (c >= minCol && c <= maxCol) {
+                                  matrixIds.add(p.id);
+                                }
+                              });
+                            }
+                          }
+                        }
+
+                        const combined = new Set(initialSelectedIdsRef.current);
+                        matrixIds.forEach((mId) => combined.add(mId));
+
+                        if (onSelectionChange) {
+                          onSelectionChange(combined);
+                        } else if (onDragSelect) {
+                          matrixIds.forEach((mId) => onDragSelect(mId));
                         }
                       }
                     }}

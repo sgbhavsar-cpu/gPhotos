@@ -262,7 +262,7 @@ export async function clearThumbnailCache(): Promise<{ freedBytes: number; fileC
 /**
  * Purges cached thumbnails for a specific file across all standard size buckets.
  */
-export async function purgeCachedThumbnailsForFile(filePath: string): Promise<void> {
+export async function purgeCachedThumbnailsForFile(filePath: string, previousMtimeMs?: number): Promise<void> {
   if (!filePath) return;
 
   const isHeic = /\.(heic|heif)$/i.test(filePath);
@@ -273,14 +273,22 @@ export async function purgeCachedThumbnailsForFile(filePath: string): Promise<vo
   const root = getGlobalCacheDir();
   const knownSizes = [150, 200, 250, 300, 500, 1600];
 
-  let mtimeMs: number | null = null;
+  let currentMtimeMs: number | null = null;
   try {
-    mtimeMs = (await fs.promises.stat(filePath)).mtimeMs;
+    currentMtimeMs = (await fs.promises.stat(filePath)).mtimeMs;
   } catch {}
 
-  for (const size of knownSizes) {
-    if (mtimeMs !== null) {
-      const key = getCacheKey(filePath, mtimeMs, size);
+  const mtimesToPurge: number[] = [];
+  if (previousMtimeMs !== undefined && previousMtimeMs !== null) {
+    mtimesToPurge.push(previousMtimeMs);
+  }
+  if (currentMtimeMs !== null && !mtimesToPurge.includes(currentMtimeMs)) {
+    mtimesToPurge.push(currentMtimeMs);
+  }
+
+  for (const mtime of mtimesToPurge) {
+    for (const size of knownSizes) {
+      const key = getCacheKey(filePath, mtime, size);
       const targetFile = path.join(root, `${size}`, `${key}.jpg`);
       try {
         await fs.promises.unlink(targetFile);

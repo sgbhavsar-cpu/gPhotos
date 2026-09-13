@@ -195,6 +195,30 @@ export function requestBatchThumbnails(
 }
 
 /**
+ * Evicts a thumbnail from the in-memory batch store and immediately re-fetches
+ * the fresh thumbnail (e.g. after photo rotation or editing).
+ */
+export function evictAndRefreshThumbnail(
+  path: string,
+  originalPath?: string,
+  size: number = 250
+): void {
+  if (!path) return;
+  batchThumbnailStore.delete(path);
+  pendingBatchPaths.delete(path);
+
+  // Notify listeners that this path is invalidated and needs reload
+  for (const l of batchListeners) {
+    try {
+      l(new Set([path]));
+    } catch {}
+  }
+
+  // Force re-requesting the batch thumbnail
+  requestBatchThumbnails([{ path, originalPath }], size);
+}
+
+/**
  * React hook that uses the batch thumbnail store.
  * Renders instantly from memory if available, or automatically requests via batch.
  */
@@ -226,6 +250,19 @@ export function useBatchThumbnail(
     setIsLoading(true);
     setHasError(false);
 
+    let safetyTimeout: any = null;
+    const armTimeout = () => {
+      if (safetyTimeout) clearTimeout(safetyTimeout);
+      safetyTimeout = setTimeout(() => {
+        if (!batchThumbnailStore.has(path)) {
+          setIsLoading(false);
+          setHasError(true);
+        }
+      }, 10000);
+    };
+
+    armTimeout();
+
     // Subscribe to batch arrivals
     const unsubscribe = subscribeToBatchThumbnails((updatedPaths) => {
       if (updatedPaths.has(path)) {
@@ -234,6 +271,13 @@ export function useBatchThumbnail(
           setSrc(dataUrl);
           setIsLoading(false);
           setHasError(false);
+          if (safetyTimeout) clearTimeout(safetyTimeout);
+        } else {
+          // Path was invalidated, re-arm timeout and show loading
+          setSrc(null);
+          setIsLoading(true);
+          setHasError(false);
+          armTimeout();
         }
       }
     });
@@ -241,17 +285,9 @@ export function useBatchThumbnail(
     // Request as part of the debounced batch queue
     requestBatchThumbnails([{ path, originalPath }], size);
 
-    // Timeout safety: if not loaded in 8 seconds, stop loading spinner
-    const timeout = setTimeout(() => {
-      if (!batchThumbnailStore.has(path)) {
-        setIsLoading(false);
-        setHasError(true);
-      }
-    }, 8000);
-
     return () => {
       unsubscribe();
-      clearTimeout(timeout);
+      if (safetyTimeout) clearTimeout(safetyTimeout);
     };
   }, [path, originalPath, size]);
 

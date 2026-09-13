@@ -1,8 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Heart, MapPin, Users, Check, EyeOff, Image as ImageIcon, ImageOff, RotateCw } from 'lucide-react';
 import { Photo } from '../../types';
-import { getLocalPhotoUrl } from '../services/libraryStore';
-import { useBatchThumbnail, useSpriteCoordinate, getSpriteUrl, batchThumbnailStore } from '../services/asyncImageLoader';
+import { useBatchThumbnail, useSpriteCoordinate, getSpriteUrl, batchThumbnailStore, evictAndRefreshThumbnail } from '../services/asyncImageLoader';
 
 interface PhotoCardProps {
   photo: Photo;
@@ -132,8 +131,8 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
           });
           if (fetchRes.ok) res = await fetchRes.json();
         }
-        // Invalidate in-memory thumbnail store so new orientation loads
-        batchThumbnailStore.delete(photoPath);
+        // Evict and immediately re-request fresh batch thumbnail from backend
+        evictAndRefreshThumbnail(photoPath, remotePath, targetPixelSize);
         // Reset CSS rotation because image file itself is physically rotated
         setVisualRotation(0);
         setCacheBuster(Date.now());
@@ -239,7 +238,11 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
       {/* 2. Fallback Batch / Direct Photo Display */}
       {!spriteCoord && displaySrc && !hasError && (
         <img
-          src={cacheBuster ? `${displaySrc}${displaySrc.includes('?') ? '&' : '?'}cb=${cacheBuster}` : displaySrc}
+          src={
+            cacheBuster && !displaySrc.startsWith('data:')
+              ? `${displaySrc}${displaySrc.includes('?') ? '&' : '?'}cb=${cacheBuster}`
+              : displaySrc
+          }
           alt={photo.fileName}
           decoding="async"
           onLoad={() => setImgElementLoaded(true)}
