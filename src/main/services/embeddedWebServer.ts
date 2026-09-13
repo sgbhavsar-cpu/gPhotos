@@ -10,9 +10,11 @@ import {
   prepareHeicHqTemp,
   cleanupHeicHqTemp,
 } from './heicService';
-import { scanPhotoDirectory } from './fileOrganizer';
 import { scanVirtualMirrorDirectory, syncVirtualStorage } from './virtualMirrorService';
+import { scanPhotoDirectory } from './fileOrganizer';
 import { getOrGenerateCachedThumbnail, clearThumbnailCache } from './thumbnailCacheService';
+import { getCatalogMeta, getCatalogPage, switchCatalogLibrary } from './catalogService';
+import { getSpriteCoordinate, getSpritePath } from './spriteService';
 import { WebServerStatus } from '../../types';
 
 let serverInstance: http.Server | null = null;
@@ -300,6 +302,93 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
       }
     });
     return;
+  }
+
+  // Endpoint: /api/catalog-meta - Pre-computed lightweight index (<20 KB)
+  if (pathname === '/api/catalog-meta') {
+    try {
+      const meta = await getCatalogMeta();
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Cache-Control', 'public, max-age=60');
+      res.end(JSON.stringify(meta));
+      return;
+    } catch (err: any) {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: err.message }));
+      return;
+    }
+  }
+
+  // Endpoint: /api/catalog-page?page=0&size=100
+  if (pathname === '/api/catalog-page') {
+    const pageIndex = parseInt(parsedUrl.searchParams.get('page') || '0', 10);
+    const pageSize = parseInt(parsedUrl.searchParams.get('size') || '100', 10);
+    try {
+      const pageData = await getCatalogPage(pageIndex, pageSize);
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      res.end(JSON.stringify(pageData));
+      return;
+    } catch (err: any) {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: err.message }));
+      return;
+    }
+  }
+
+  // Endpoint: /api/switch-library (POST)
+  if (pathname === '/api/switch-library' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', async () => {
+      try {
+        const { targetPath } = JSON.parse(body);
+        if (!targetPath) {
+          res.statusCode = 400;
+          res.end(JSON.stringify({ error: 'targetPath required' }));
+          return;
+        }
+        const result = await switchCatalogLibrary(targetPath);
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify(result));
+      } catch (err: any) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // Endpoint: /api/sprites/:id.webp - Stream pre-baked static WebP sprite sheets
+  if (pathname && pathname.startsWith('/api/sprites/')) {
+    const filename = path.basename(pathname);
+    const spriteId = path.basename(filename, path.extname(filename));
+    const spriteFile = getSpritePath(spriteId);
+
+    if (fs.existsSync(spriteFile)) {
+      res.setHeader('Content-Type', 'image/webp');
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      fs.createReadStream(spriteFile).pipe(res);
+      return;
+    } else {
+      res.statusCode = 404;
+      res.end('Sprite not found');
+      return;
+    }
+  }
+
+  // Endpoint: /api/sprite-coord?path=...
+  if (pathname === '/api/sprite-coord') {
+    const photoPath = parsedUrl.searchParams.get('path');
+    if (photoPath) {
+      const coord = getSpriteCoordinate(photoPath);
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.end(JSON.stringify(coord || null));
+      return;
+    }
   }
 
   // Endpoint: /api/photo?path=...

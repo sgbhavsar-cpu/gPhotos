@@ -64,9 +64,12 @@ const electronAPI: IElectronAPI = {
   getWebServerStatus: () => ipcRenderer.invoke('webserver:get-status'),
   setWebServerSettings: (settings) => ipcRenderer.invoke('webserver:set-settings', settings),
   prepareHeicHq: (filePath: string, photoId: string) => ipcRenderer.invoke('heic:prepare-hq', filePath, photoId),
-  cleanupHeicHq: (photoId: string) => ipcRenderer.invoke('heic:cleanup-hq', photoId),
   getBatchThumbnails: (params) => ipcRenderer.invoke('thumbnails:get-batch', params),
   sendAppReady: () => ipcRenderer.send('app:ready'),
+  getCatalogMeta: (libraryDir?: string) => ipcRenderer.invoke('catalog:get-meta', libraryDir),
+  getCatalogPage: (params) => ipcRenderer.invoke('catalog:get-page', params),
+  switchLibrary: (targetPath: string) => ipcRenderer.invoke('catalog:switch-library', targetPath),
+  getSpriteCoordinate: (photoPath: string) => ipcRenderer.invoke('sprite:get-coordinate', photoPath),
 };
 
 contextBridge.exposeInMainWorld('electronAPI', electronAPI);

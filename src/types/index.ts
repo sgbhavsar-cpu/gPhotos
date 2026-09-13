@@ -312,6 +312,63 @@ export interface IElectronAPI {
     size?: number;
   }) => Promise<{ thumbnails: Record<string, string> }>;
   sendAppReady?: () => void;
+  getCatalogMeta: (libraryDir?: string) => Promise<CatalogMeta>;
+  getCatalogPage: (params: { pageIndex: number; pageSize?: number; libraryDir?: string }) => Promise<{ photos: Photo[]; totalPages: number; totalPhotos: number }>;
+  switchLibrary: (targetPath: string) => Promise<{ meta: CatalogMeta; firstPage: Photo[] }>;
+  getSpriteCoordinate?: (photoPath: string) => Promise<SpriteCoordinate | null>;
+}
+
+export interface TimelineMonthSummary {
+  year: number;
+  month: number;
+  label: string;
+  count: number;
+  firstPhotoIndex: number;
+}
+
+export interface PlaceSummaryItem {
+  id: string;
+  name: string;
+  city?: string;
+  country?: string;
+  latitude: number;
+  longitude: number;
+  photoCount: number;
+  coverPhotoId?: string;
+  coverFilePath?: string;
+}
+
+export interface CatalogMeta {
+  version: number;
+  totalPhotos: number;
+  totalAlbums: number;
+  totalPeople: number;
+  totalPlaces: number;
+  earliestDate?: string;
+  latestDate?: string;
+  timelineSummary: TimelineMonthSummary[];
+  placesSummary: PlaceSummaryItem[];
+  albumsSummary: Array<{ id: string; title: string; count: number; coverPhotoId?: string }>;
+  peopleSummary: Array<{ id: string; name: string; count: number }>;
+  recentLibraries: string[];
+  currentDirectory: string | null;
+  selectedFolder: string | null;
+  pageSize: number;
+  totalPages: number;
+  lastUpdated: string;
+}
+
+export interface SpriteCoordinate {
+  spriteId: string;
+  url: string;
+  col: number;
+  row: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  sheetWidth: number;
+  sheetHeight: number;
 }
 
 export interface WebServerStatus {

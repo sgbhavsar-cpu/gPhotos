@@ -88,6 +88,16 @@ try {
   sharp = require('sharp');
 } catch {}
 
+let catalogService = null;
+try {
+  catalogService = require('../dist-electron/main/services/catalogService');
+} catch {}
+
+let spriteService = null;
+try {
+  spriteService = require('../dist-electron/main/services/spriteService');
+} catch {}
+
 const crypto = require('crypto');
 
 function getThumbCacheDir(size) {
@@ -371,6 +381,100 @@ async function handleRequest(req, res) {
       }
     });
     return;
+  }
+
+  // Endpoint: /api/catalog-meta
+  if (pathname === '/api/catalog-meta') {
+    if (catalogService && catalogService.getCatalogMeta) {
+      try {
+        const meta = await catalogService.getCatalogMeta();
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'public, max-age=60');
+        res.end(JSON.stringify(meta));
+        return;
+      } catch (err) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: err.message }));
+        return;
+      }
+    }
+  }
+
+  // Endpoint: /api/catalog-page
+  if (pathname === '/api/catalog-page') {
+    const pageIndex = parseInt(parsedUrl.searchParams.get('page') || '0', 10);
+    const pageSize = parseInt(parsedUrl.searchParams.get('size') || '100', 10);
+    if (catalogService && catalogService.getCatalogPage) {
+      try {
+        const pageData = await catalogService.getCatalogPage(pageIndex, pageSize);
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'public, max-age=300');
+        res.end(JSON.stringify(pageData));
+        return;
+      } catch (err) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: err.message }));
+        return;
+      }
+    }
+  }
+
+  // Endpoint: /api/switch-library
+  if (pathname === '/api/switch-library' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk) => body += chunk);
+    req.on('end', async () => {
+      try {
+        const { targetPath } = JSON.parse(body);
+        if (catalogService && catalogService.switchCatalogLibrary) {
+          const result = await catalogService.switchCatalogLibrary(targetPath);
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify(result));
+          return;
+        }
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ success: true }));
+      } catch (err) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // Endpoint: /api/sprites/:id.webp
+  if (pathname && pathname.startsWith('/api/sprites/')) {
+    const filename = path.basename(pathname);
+    const spriteId = path.basename(filename, path.extname(filename));
+    const appData = process.env.APPDATA || (process.platform === 'darwin'
+      ? path.join(os.homedir(), 'Library/Application Support')
+      : path.join(os.homedir(), '.config'));
+    const spritePath = spriteService && spriteService.getSpritePath
+      ? spriteService.getSpritePath(spriteId)
+      : path.join(appData, 'gPhotos', 'cache', 'sprites', `${spriteId}.webp`);
+
+    if (fs.existsSync(spritePath)) {
+      res.setHeader('Content-Type', 'image/webp');
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      fs.createReadStream(spritePath).pipe(res);
+      return;
+    } else {
+      res.statusCode = 404;
+      res.end('Sprite not found');
+      return;
+    }
+  }
+
+  // Endpoint: /api/sprite-coord
+  if (pathname === '/api/sprite-coord') {
+    const photoPath = parsedUrl.searchParams.get('path');
+    if (photoPath && spriteService && spriteService.getSpriteCoordinate) {
+      const coord = spriteService.getSpriteCoordinate(photoPath);
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.end(JSON.stringify(coord || null));
+      return;
+    }
   }
 
   // Endpoint: /api/photo?path=...

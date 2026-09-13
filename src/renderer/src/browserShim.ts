@@ -189,5 +189,53 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
       return true;
     },
     sendAppReady: () => {},
+    getCatalogMeta: async () => {
+      try {
+        const res = await fetch('/api/catalog-meta');
+        if (res.ok) return await res.json();
+      } catch {}
+      return {
+        version: 2,
+        totalPhotos: 0,
+        totalAlbums: 0,
+        totalPeople: 0,
+        totalPlaces: 0,
+        timelineSummary: [],
+        placesSummary: [],
+        albumsSummary: [],
+        peopleSummary: [],
+        recentLibraries: [],
+        currentDirectory: null,
+        selectedFolder: null,
+        pageSize: 100,
+        totalPages: 0,
+        lastUpdated: new Date().toISOString(),
+      };
+    },
+    getCatalogPage: async (params: { pageIndex: number; pageSize?: number }) => {
+      try {
+        const res = await fetch(`/api/catalog-page?page=${params.pageIndex}&size=${params.pageSize || 100}`);
+        if (res.ok) return await res.json();
+      } catch {}
+      return { photos: [], totalPages: 0, totalPhotos: 0 };
+    },
+    switchLibrary: async (targetPath: string) => {
+      try {
+        const res = await fetch('/api/switch-library', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetPath }),
+        });
+        if (res.ok) return await res.json();
+      } catch {}
+      return null;
+    },
+    getSpriteCoordinate: async (photoPath: string) => {
+      try {
+        const res = await fetch(`/api/sprite-coord?path=${encodeURIComponent(photoPath)}`);
+        if (res.ok) return await res.json();
+      } catch {}
+      return null;
+    },
   };
 }

@@ -47,12 +47,25 @@ import {
   loadSavedWebServerSettings,
 } from './services/embeddedWebServer';
 import { getOrGenerateCachedThumbnail, clearThumbnailCache } from './services/thumbnailCacheService';
+import {
+  getCatalogMeta,
+  getCatalogPage,
+  switchCatalogLibrary,
+  buildAndSaveCatalog,
+} from './services/catalogService';
+import {
+  getSpriteCoordinate,
+  getSpritePath,
+} from './services/spriteService';
 
 app.name = 'gPhotos';
 app.setName('gPhotos');
 if (process.platform === 'win32') {
   app.setAppUserModelId('gPhotos');
 }
+
+const startupStartTime = Date.now();
+console.log(`[STARTUP AUDIT] T+0ms: Main process initialized.`);
 
 // Global Exception and Promise Rejection Handlers to eliminate unhandled errors
 process.on('uncaughtException', (error) => {
@@ -90,6 +103,8 @@ function createSplashWindow() {
     splashWindow.focus();
     return;
   }
+
+  console.log(`[STARTUP AUDIT] T+${Date.now() - startupStartTime}ms: Creating frameless splash window with loading animation...`);
 
   splashWindow = new BrowserWindow({
     width: 440,
@@ -137,6 +152,7 @@ function createSplashWindow() {
   }
 
   splashWindow.once('ready-to-show', () => {
+    console.log(`[STARTUP AUDIT] T+${Date.now() - startupStartTime}ms: Splash screen presented to user with smooth loading animation.`);
     splashWindow?.show();
   });
 
@@ -149,6 +165,8 @@ function revealMainWindow() {
   if (isAppReadyFired) return;
   isAppReadyFired = true;
 
+  console.log(`[STARTUP AUDIT] T+${Date.now() - startupStartTime}ms: Transitioning from splash to main application window...`);
+
   // Gentle 400ms delay to ensure smooth visual transition
   setTimeout(() => {
     if (splashWindow && !splashWindow.isDestroyed()) {
@@ -159,6 +177,7 @@ function revealMainWindow() {
       mainWindow.show();
       mainWindow.focus();
       mainWindow.webContents.focus();
+      console.log(`[STARTUP AUDIT] T+${Date.now() - startupStartTime}ms: Main window revealed and focused. Application is fully responsive!`);
     }
   }, 400);
 }
@@ -332,6 +351,23 @@ function createWindow() {
         return new Response('Help file not found', { status: 404 });
       }
 
+      // Serving Pre-baked Sprites: gphoto://sprite?id=page_sprite_0 or gphoto://sprites/page_sprite_0.webp
+      if (url.hostname === 'sprite' || url.hostname === 'sprites' || url.pathname.startsWith('/sprite')) {
+        const spriteId = url.searchParams.get('id') || path.basename(url.pathname, path.extname(url.pathname));
+        const spriteFile = getSpritePath(spriteId);
+        if (fs.existsSync(spriteFile)) {
+          const buffer = await fs.promises.readFile(spriteFile);
+          return new Response(buffer as any, {
+            headers: {
+              'Content-Type': 'image/webp',
+              'Access-Control-Allow-Origin': '*',
+              'Cache-Control': 'public, max-age=31536000, immutable',
+            },
+          });
+        }
+        return new Response('Sprite not found', { status: 404 });
+      }
+
       // 2. Serving Photos: gphoto://load?path=C%3A%5C... or gphoto://photo?path=...
       const filePath = url.searchParams.get('path');
       const originalPath = url.searchParams.get('originalPath');
@@ -491,6 +527,7 @@ app.on('window-all-closed', () => {
 
 // Signal from renderer that UI has finished mounting and is ready to show
 ipcMain.on('app:ready', () => {
+  console.log(`[STARTUP AUDIT] T+${Date.now() - startupStartTime}ms: 'app:ready' signal received from renderer. First screen mounted.`);
   revealMainWindow();
 });
 
@@ -610,6 +647,18 @@ ipcMain.handle('storage:save', async (_event, key: string, data: any) => {
     const tempPath = `${storePath}.tmp`;
     await fs.promises.writeFile(tempPath, JSON.stringify(currentData, null, 2), 'utf-8');
     await fs.promises.rename(tempPath, storePath);
+
+    // Asynchronously update 500K catalog index in background without blocking response
+    if (key === 'gphotos_library_v1' && data && Array.isArray(data.photos)) {
+      buildAndSaveCatalog(data.photos, {
+        recentLibraries: data.recentLibraries,
+        selectedFolder: data.selectedFolder,
+        currentDirectory: data.currentDirectory,
+        albums: data.albums,
+        people: data.people,
+      }).catch((err) => console.warn('[CatalogService] Auto-indexing on save failed:', err));
+    }
+
     return true;
   } catch (err) {
     console.error('Failed to save library data:', err);
@@ -627,6 +676,45 @@ ipcMain.handle('storage:load', async (_event, key: string) => {
     return null;
   } catch (err) {
     console.error('Failed to load library data:', err);
+    return null;
+  }
+});
+
+// 500K Scalable Catalog & Sprite IPC Handlers
+ipcMain.handle('catalog:get-meta', async (_event, customDir?: string) => {
+  try {
+    return await getCatalogMeta(customDir);
+  } catch (err) {
+    console.error('catalog:get-meta error:', err);
+    return null;
+  }
+});
+
+ipcMain.handle(
+  'catalog:get-page',
+  async (_event, params: { pageIndex: number; pageSize?: number; libraryDir?: string }) => {
+    try {
+      return await getCatalogPage(params.pageIndex, params.pageSize, params.libraryDir);
+    } catch (err) {
+      console.error('catalog:get-page error:', err);
+      return { photos: [], totalPages: 0, totalPhotos: 0 };
+    }
+  }
+);
+
+ipcMain.handle('catalog:switch-library', async (_event, targetPath: string) => {
+  try {
+    return await switchCatalogLibrary(targetPath);
+  } catch (err) {
+    console.error('catalog:switch-library error:', err);
+    return null;
+  }
+});
+
+ipcMain.handle('sprite:get-coordinate', async (_event, photoPath: string) => {
+  try {
+    return getSpriteCoordinate(photoPath);
+  } catch {
     return null;
   }
 });

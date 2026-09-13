@@ -395,29 +395,47 @@ export const App: React.FC = () => {
       return;
     }
 
-    libraryStore.setScanning(true);
     const dir = await window.electronAPI.selectDirectory();
-    if (dir) {
+    if (!dir) return;
+
+    libraryStore.setScanning(true);
+    try {
+      const switched = await libraryStore.switchLibrary(dir);
+      if (switched) {
+        setActiveTab('photos');
+        showToast(`Opened library: ${dir}`, 'success');
+        return;
+      }
+
       const photos = await window.electronAPI.scanDirectory(dir);
       libraryStore.setPhotos(photos, dir);
       setActiveTab('photos');
-      libraryStore.setScanning(false);
 
-      // Unified single-pass: automatically run face detection on the newly scanned photos!
+      // Unified single-pass: automatically run face detection on newly scanned photos
       await runFaceDetectionForPhotos(photos, false);
-      return;
+    } catch (err: any) {
+      showToast(`Error opening folder: ${err.message}`, 'warning');
+    } finally {
+      libraryStore.setScanning(false);
     }
-    libraryStore.setScanning(false);
   };
 
   const handleSelectLibrary = async (dirPath: string) => {
-    if (!window.electronAPI) return;
     libraryStore.setScanning(true);
     try {
-      const photos = await window.electronAPI.scanDirectory(dirPath);
-      libraryStore.setPhotos(photos, dirPath);
-      setActiveTab('photos');
-      await runFaceDetectionForPhotos(photos, false);
+      const switched = await libraryStore.switchLibrary(dirPath);
+      if (switched) {
+        setActiveTab('photos');
+        showToast(`Switched library: ${dirPath}`, 'success');
+        return;
+      }
+
+      if (window.electronAPI) {
+        const photos = await window.electronAPI.scanDirectory(dirPath);
+        libraryStore.setPhotos(photos, dirPath);
+        setActiveTab('photos');
+        await runFaceDetectionForPhotos(photos, false);
+      }
     } catch (err: any) {
       showToast(`Failed to load selected library: ${err.message}`, 'warning');
     } finally {

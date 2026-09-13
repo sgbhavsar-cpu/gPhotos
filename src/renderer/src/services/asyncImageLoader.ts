@@ -9,6 +9,87 @@
  */
 
 import { useState, useEffect, useRef } from 'react';
+import { SpriteCoordinate } from '../../types';
+
+// ============================================================================
+// 0. SPRITE COORDINATE STORE & HOOK (HIGH-SPEED 50-PHOTO STATIC SHEETS)
+// ============================================================================
+
+const spriteCoordCache = new Map<string, SpriteCoordinate | null>();
+const pendingCoordRequests = new Map<string, Promise<SpriteCoordinate | null>>();
+
+/**
+ * Returns the optimized URL to access the sprite sheet.
+ * In Electron uses gphoto://sprite?id=... and in web browser uses /api/sprites/...
+ */
+export function getSpriteUrl(coord: SpriteCoordinate): string {
+  const isElectron =
+    typeof window !== 'undefined' &&
+    !!(window.electronAPI && !(window.electronAPI as any).isBrowserShim);
+  if (isElectron) {
+    return `gphoto://sprite?id=${encodeURIComponent(coord.spriteId)}`;
+  }
+  return `/api/sprites/${encodeURIComponent(coord.spriteId)}.webp`;
+}
+
+/**
+ * Hook to retrieve pre-baked sprite coordinates for a photo thumbnail.
+ * Renders instantly from memory cache if available, or queries main/web service asynchronously.
+ */
+export function useSpriteCoordinate(photoPath: string | undefined | null): SpriteCoordinate | null {
+  const [coord, setCoord] = useState<SpriteCoordinate | null>(() => {
+    if (!photoPath) return null;
+    return spriteCoordCache.get(photoPath.toLowerCase()) || null;
+  });
+
+  useEffect(() => {
+    if (!photoPath) {
+      setCoord(null);
+      return;
+    }
+
+    const key = photoPath.toLowerCase();
+    if (spriteCoordCache.has(key)) {
+      setCoord(spriteCoordCache.get(key) || null);
+      return;
+    }
+
+    let isMounted = true;
+    let fetchPromise = pendingCoordRequests.get(key);
+
+    if (!fetchPromise) {
+      fetchPromise = (async () => {
+        try {
+          if (window.electronAPI?.getSpriteCoordinate) {
+            return await window.electronAPI.getSpriteCoordinate(photoPath);
+          }
+          if (window.location?.protocol?.startsWith('http')) {
+            const res = await fetch(`/api/sprite-coord?path=${encodeURIComponent(photoPath)}`);
+            if (res.ok) {
+              return await res.json();
+            }
+          }
+        } catch {}
+        return null;
+      })();
+      pendingCoordRequests.set(key, fetchPromise);
+    }
+
+    fetchPromise.then((result) => {
+      spriteCoordCache.set(key, result);
+      pendingCoordRequests.delete(key);
+      if (isMounted) {
+        setCoord(result);
+      }
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [photoPath]);
+
+  return coord;
+}
 
 // ============================================================================
 // 1. GLOBAL BATCH THUMBNAIL STORE & BATCH REQUEST MANAGER
