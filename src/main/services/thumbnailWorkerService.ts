@@ -41,6 +41,7 @@ class ThumbnailWorkerService {
   private processedCount = 0;
   private currentFileName?: string;
   private currentLibraryPath?: string;
+  private testCheckpointDir: string | null = null;
 
   private limits: WorkerLimits = {
     maxCpuPercent: 40,
@@ -62,6 +63,10 @@ class ThumbnailWorkerService {
   }
 
   private getCheckpointFilePath(): string {
+    if (this.testCheckpointDir) {
+      return path.join(this.testCheckpointDir, 'thumbnail_worker_checkpoint.json');
+    }
+
     try {
       const electron = require('electron');
       if (electron.app && typeof electron.app.getPath === 'function' && electron.app.isReady()) {
@@ -75,6 +80,24 @@ class ThumbnailWorkerService {
       try { fs.mkdirSync(fallback, { recursive: true }); } catch {}
     }
     return path.join(fallback, 'thumbnail_worker_checkpoint.json');
+  }
+
+  /**
+   * Test-only: points this worker's checkpoint at an isolated directory (never
+   * the real userData/APPDATA checkpoint) and resets in-memory queue/progress
+   * state, so tests never read or write a real user's pre-cache progress.
+   */
+  public useIsolatedStateForTests(dir: string): void {
+    this.testCheckpointDir = dir;
+    this.queue = [];
+    this.queuedPaths.clear();
+    this.isProcessing = false;
+    this.isPaused = false;
+    this.totalQueuedCount = 0;
+    this.processedCount = 0;
+    this.currentFileName = undefined;
+    this.currentLibraryPath = undefined;
+    this.loadCheckpoint();
   }
 
   public loadCheckpoint(targetLibraryPath?: string): void {
@@ -127,14 +150,21 @@ class ThumbnailWorkerService {
 
       // Also persist to library status if libraryPath is known
       if (this.currentLibraryPath) {
-        const pct = this.totalQueuedCount > 0 ? Math.round((this.processedCount / this.totalQueuedCount) * 100) : 0;
+        // Cross-validate total: If the library actually has fewer photos on record, don't artificially blow it up
+        const existingStatus = libraryStatusService.getLibraryStatus(this.currentLibraryPath);
+        const effectiveTotal = (existingStatus?.totalPhotos && existingStatus.totalPhotos > 0 && existingStatus.totalPhotos < this.totalQueuedCount)
+          ? existingStatus.totalPhotos
+          : this.totalQueuedCount;
+        const effectiveCached = Math.min(this.processedCount, effectiveTotal);
+        const pct = effectiveTotal > 0 ? Math.round((effectiveCached / effectiveTotal) * 100) : 0;
+
         libraryStatusService.saveLibraryStatus({
           libraryPath: this.currentLibraryPath,
-          totalPhotos: this.totalQueuedCount,
-          thumbnailCachedCount: this.processedCount,
-          thumbnailTotalCount: this.totalQueuedCount,
+          totalPhotos: effectiveTotal,
+          thumbnailCachedCount: effectiveCached,
+          thumbnailTotalCount: effectiveTotal,
           thumbnailLastFile: this.currentFileName,
-          thumbnailCompleted: isFinished || (this.totalQueuedCount > 0 && this.processedCount >= this.totalQueuedCount),
+          thumbnailCompleted: isFinished || (effectiveTotal > 0 && effectiveCached >= effectiveTotal),
           thumbnailPercent: pct,
           phase: isFinished ? 'completed' : this.isPaused ? 'paused' : 'thumbnails',
         });
@@ -239,8 +269,10 @@ class ThumbnailWorkerService {
 
     if (libraryPath) {
       this.currentLibraryPath = libraryPath;
-    } else if (photos[0]?.storageName) {
+    } else if (photos.length > 0 && photos[0]?.storageName && photos.every(p => p.storageName === photos[0].storageName)) {
       this.currentLibraryPath = photos[0].storageName;
+    } else {
+      this.currentLibraryPath = undefined;
     }
 
     // Check existing library status to preserve accurate previous progress

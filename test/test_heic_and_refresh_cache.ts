@@ -36,19 +36,21 @@ async function runTests() {
     const mockHeicContent = Buffer.from('ftypheicMOCK_HEIC_FILE_HEADER_BYTES_DO_NOT_OVERWRITE');
     fs.writeFileSync(mockHeicPath, mockHeicContent);
 
-    // Test 1: rotatePhotoFile rejects HEIC
+    // Test 1: rotatePhotoFile routes raw HEIC through the cache-rotation path
+    // (Sharp cannot re-encode raw HEIC on this platform) rather than rewriting
+    // the file in place. The rotation *intent* is durably recorded even when,
+    // as here, the mock bytes cannot actually be decoded into a preview yet —
+    // matching the self-healing design also covered by
+    // test_selected_dedup_and_heic_rotate.ts.
     const rotateRes = await rotatePhotoFile(mockHeicPath, 90);
-    assert(!rotateRes.success, 'rotatePhotoFile returns success: false for HEIC image');
-    assert(
-      typeof rotateRes.error === 'string' && rotateRes.error.includes('HEIC/HEIF'),
-      `rotatePhotoFile provides explanatory error: "${rotateRes.error}"`
-    );
+    assert(rotateRes.success, `rotatePhotoFile succeeds for raw HEIC via the cache-rotation path (error: ${(rotateRes as any).error})`);
 
-    // Test 2: Source HEIC file content is completely intact and unchanged
+    // Test 2: Source HEIC file content is completely intact and unchanged —
+    // raw HEIC bytes are never rewritten in place, only cached previews are.
     const afterRotateContent = fs.readFileSync(mockHeicPath);
     assert(
       afterRotateContent.equals(mockHeicContent),
-      'Source HEIC file bytes are 100% preserved and untouched after rejected rotation'
+      'Source HEIC file bytes are 100% preserved and untouched by rotation (only cached previews change)'
     );
 
     // Test 3: editPhotoFile rejects HEIC
@@ -62,13 +64,17 @@ async function runTests() {
       `editPhotoFile provides explanatory error: "${editRes.error}"`
     );
 
-    // Test 4: rotatePhotoWithOfflineQueue rejects HEIC without queuing
+    // Test 4: rotatePhotoWithOfflineQueue treats a standalone raw-HEIC file (no
+    // originalRemotePath, i.e. not a Virtual Mirror thumbnail) as genuinely raw
+    // HEIC — it rotates via the cache-only path and is never queued for a
+    // remote sync, since there is no remote master to eventually reach.
     const queueRes = await rotatePhotoWithOfflineQueue({
       localFilePath: mockHeicPath,
       rotationDegrees: 90,
     });
-    assert(!queueRes.success, 'rotatePhotoWithOfflineQueue returns success: false for HEIC image');
-    assert(!queueRes.isQueued, 'rotatePhotoWithOfflineQueue does not enqueue HEIC rotation');
+    assert(queueRes.success, `rotatePhotoWithOfflineQueue succeeds for raw HEIC image (error: ${queueRes.error})`);
+    assert(!queueRes.isQueued, 'rotatePhotoWithOfflineQueue does not enqueue standalone raw-HEIC rotation');
+    assert(queueRes.isHeic === true, 'rotatePhotoWithOfflineQueue flags the result as isHeic: true');
 
     // -------------------------------------------------------------
     // 2. Cache Purge & Refresh Tests

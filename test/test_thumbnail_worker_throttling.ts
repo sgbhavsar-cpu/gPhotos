@@ -13,6 +13,13 @@ async function runThrottlingTest() {
   const testDir = path.join(os.tmpdir(), 'gphotos_worker_test_' + Date.now());
   fs.mkdirSync(testDir, { recursive: true });
 
+  // Isolate the worker's checkpoint from the real, persisted userData
+  // checkpoint — otherwise every test run permanently pollutes a real
+  // library's pre-cache progress tracking with synthetic test entries.
+  const checkpointDir = path.join(testDir, 'checkpoint');
+  fs.mkdirSync(checkpointDir, { recursive: true });
+  thumbnailWorker.useIsolatedStateForTests(checkpointDir);
+
   try {
     // ------------------------------------------------------------------------
     // Step 1: Create test sample images
@@ -71,30 +78,36 @@ async function runThrottlingTest() {
     // ------------------------------------------------------------------------
     console.log('\n⏱️ Step 3: Enqueuing Photos & Verifying Duty-Cycle Pacing...');
     const tStart = performance.now();
-    
-    // Pause immediately to verify queue holding
+
+    // The worker is a long-lived singleton with a disk-persisted checkpoint, so
+    // on a machine with a real, already-populated library (or mid-run) its
+    // total/current can be arbitrarily large before this test even starts.
+    // Assert against the delta this test itself introduces, not absolute values.
     thumbnailWorker.pause();
+    const baseline = thumbnailWorker.getStatus();
+
     thumbnailWorker.enqueuePhotos(testPhotos);
 
     status = thumbnailWorker.getStatus();
     console.log(`  After Enqueue (Paused): Total = ${status.total}, Current = ${status.current}, Paused = ${status.paused}`);
-    if (status.total !== 15) {
-      throw new Error(`Expected 15 queued photos, got ${status.total}`);
+    if (status.total !== baseline.total + testPhotos.length) {
+      throw new Error(`Expected total to grow by ${testPhotos.length} (from ${baseline.total}), got ${status.total}`);
     }
 
     // Resume worker with 40% CPU limit
     console.log('  Resuming worker with 40% CPU duty cycle...');
     thumbnailWorker.resume();
 
-    // Monitor progress until completion or timeout
-    let lastProcessed = 0;
+    // Monitor progress until this test's own 15 photos are processed, or timeout.
+    const targetCurrent = baseline.current + testPhotos.length;
+    let lastProcessed = -1;
     while (true) {
       status = thumbnailWorker.getStatus();
       if (status.current !== lastProcessed) {
         console.log(`  [Progress] Pre-cached: ${status.current}/${status.total} (RAM: ${status.ramMb} MB, CPU: ${status.cpuPercent}%)`);
         lastProcessed = status.current;
       }
-      if (status.current >= status.total && !status.isRunning) {
+      if (status.current >= targetCurrent) {
         break;
       }
       await new Promise(r => setTimeout(r, 100));

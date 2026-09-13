@@ -10,7 +10,10 @@
     "test:render": "npx tsx test/test_rendered_app_startup.ts",
     "test:smoke": "node test/smoke_test_app_ready.js",
     "test:workflow": "npx tsx test/test_5photo_library_workflow.ts",
-    "test": "npm run test:imports && npm run test:render && npm run test:smoke && npm run test:workflow",
+    "test:dedup-heic": "npx tsx test/test_selected_dedup_and_heic_rotate.ts",
+    "test:mobile-auth": "npx tsx test/test_mobile_web_server.ts",
+    "test:vitest": "cross-env ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron.exe node_modules/vitest/vitest.mjs run",
+    "test": "npm run test:imports && npm run test:render && npm run test:smoke && npm run test:workflow && npm run test:dedup-heic && npm run test:mobile-auth && npm run test:vitest",
     "build:ui": "vite build",
     "copy:splash": "node -e \"const fs=require('fs'); fs.mkdirSync('dist-electron/main', {recursive:true}); fs.copyFileSync('src/main/splash.html', 'dist-electron/main/splash.html');\"",
     "build:electron": "tsc -p tsconfig.electron.json && npm run copy:splash",
@@ -27,7 +30,7 @@
     "gps-map",
     "electron"
   ],
-  "author": "",
+  "author": "Sachin Bhavsar",
   "license": "MIT",
   "dependencies": {
     "@vladmandic/face-api": "^1.7.15",
@@ -37,6 +40,7 @@
     "lucide-react": "^1.45.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
+    "script-runner": "^0.1.8",
     "sharp": "^0.35.4"
   },
   "devDependencies": {
@@ -51,7 +55,9 @@
     "electron-builder": "^25.1.8",
     "jsdom": "^29.1.1",
     "playwright": "^1.63.0",
+    "tsx": "^4.23.13",
     "typescript": "^7.0.2",
-    "vite": "^8.3.0"
+    "vite": "^8.3.0",
+    "vitest": "^3.2.7"
   }
 }

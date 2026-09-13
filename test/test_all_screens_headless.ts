@@ -685,9 +685,11 @@ async function runPersonTestingSuite() {
     throw new Error('HelpModal failed to render title and header text!');
   }
 
-  // Check iframe exists
+  // Check iframe exists — src is `gphoto://help` in Electron (as mocked here via
+  // window.electronAPI) or `/help.html` when running as a plain web page.
   const iframe = container.querySelector('iframe');
-  if (!iframe || !iframe.getAttribute('src')?.includes('help.html')) {
+  const iframeSrc = iframe?.getAttribute('src') || '';
+  if (!iframe || !(iframeSrc.includes('help.html') || iframeSrc === 'gphoto://help')) {
     throw new Error('HelpModal iframe missing or invalid source URL!');
   }
 

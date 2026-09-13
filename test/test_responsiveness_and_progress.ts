@@ -63,6 +63,12 @@ async function runTests() {
   console.log(`  ✓ Library data retrieved in ${duration.toFixed(2)}ms with ${state.photos.length} photos ready for instant paint`);
   passed++;
 
+  // Let init()'s own fire-and-forget immediate save fully settle before Test 2
+  // swaps in a new electronAPI mock — otherwise that in-flight save's later
+  // awaits (each of which re-reads window.electronAPI fresh) can bleed into
+  // Test 2's call count.
+  await new Promise((r) => setTimeout(r, 50));
+
   // -------------------------------------------------------------
   // Test 2: Debounced Disk Persistence
   // -------------------------------------------------------------
@@ -89,10 +95,13 @@ async function runTests() {
   assert.strictEqual(saveCount, 0, 'saveLibraryData should NOT be called immediately upon rapid updates');
   console.log('  ✓ 25 rapid photo updates queued without triggering immediate disk write');
 
-  // Wait 600ms for debounce timer to fire
+  // Wait 600ms for debounce timer to fire. A single debounced save cycle makes
+  // exactly 3 saveLibraryData calls (main library, people registry, face cache) —
+  // the important invariant is that 25 rapid updates collapse into ONE cycle
+  // (3 calls), not 25 separate cycles (75 calls).
   await new Promise((r) => setTimeout(r, 650));
-  assert.strictEqual(saveCount, 1, `saveLibraryData should only be called ONCE after debounce (actual: ${saveCount})`);
-  console.log(`  ✓ Debounced save triggered exactly 1 time for 25 updates`);
+  assert.strictEqual(saveCount, 3, `saveLibraryData should be called exactly 3 times (1 debounced cycle × 3 keys) after debounce (actual: ${saveCount})`);
+  console.log(`  ✓ Debounced save triggered exactly 1 time (3 key writes) for 25 updates`);
   passed++;
 
   // -------------------------------------------------------------

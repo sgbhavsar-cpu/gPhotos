@@ -743,6 +743,18 @@ async function testRescan() {
   libraryStore.setPhotos([photoAliceConfirmed, photoAliceUnassigned]);
   libraryStore.getState().people = [testPersonAlice];
 
+  // setPhotos() already runs its own reconciliation pass, which (given these two
+  // faces share an identical descriptor) may have proactively matched them to each
+  // other under an auto-generated person id. Reset both the per-photo and flat face
+  // lists to the original, not-yet-propagated fixture objects so this test can
+  // verify that confirmFace() itself is what triggers the propagation/match below,
+  // rather than piggybacking on setPhotos()'s own auto-matching.
+  const stateConfirmedPhoto = libraryStore.getState().photos.find((p) => p.id === photoAliceConfirmed.id)!;
+  const stateUnassignedPhoto = libraryStore.getState().photos.find((p) => p.id === photoAliceUnassigned.id)!;
+  stateConfirmedPhoto.faces = [photoAliceConfirmed.faces![0]];
+  stateUnassignedPhoto.faces = [photoAliceUnassigned.faces![0]];
+  libraryStore.getState().faces = [...photoAliceConfirmed.faces!, ...photoAliceUnassigned.faces!];
+
   // Call confirmFace
   const confirmResult = libraryStore.confirmFace('face_alice_unconf');
   assert(confirmResult.newlyAssignedCount >= 1, 'confirmFace must automatically propagate learned centroid and match unassigned photos');

@@ -37,6 +37,14 @@ async function runTests() {
   const localMirrorRoot = path.join(tempDir, 'LocalMirrors');
   fs.mkdirSync(localMirrorRoot, { recursive: true });
 
+  // Isolate the shared thumbnailWorker singleton's checkpoint from the real,
+  // persisted userData checkpoint — otherwise this test both pollutes a real
+  // library's progress tracking and can take a very long time reconciling
+  // against a large real queue.
+  const workerCheckpointDir = path.join(tempDir, 'worker_checkpoint');
+  fs.mkdirSync(workerCheckpointDir, { recursive: true });
+  thumbnailWorker.useIsolatedStateForTests(workerCheckpointDir);
+
   try {
     // Generate 25 sample image files in networkSource
     const sampleJpg = await sharp({

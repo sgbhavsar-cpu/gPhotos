@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { Photo } from '../../types';
 import { PhotoCard } from './PhotoCard';
-import { getLocalPhotoUrl } from '../services/libraryStore';
+import { getLocalPhotoUrl, libraryStore } from '../services/libraryStore';
 import { requestBatchThumbnails } from '../services/asyncImageLoader';
 import {
   Calendar,
@@ -244,7 +244,85 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
     });
   }, [monthGroups, zoomLevel, gridConfig]);
 
+  // Automatically pre-fetch up to 100 thumbnails in 1 single async request for all
+  // visible rows. This hook must be called on every render regardless of zoomLevel
+  // or an empty photo list (React's Rules of Hooks) — it no-ops internally for the
+  // 'years'/'months' zoom levels via the early-return inside the effect body below,
+  // rather than skipping the hook call itself.
+  useEffect(() => {
+    if (zoomLevel === 'years' || zoomLevel === 'months') return;
+    if (virtualMonthData.length === 0) return;
+
+    const bufferPx = 800;
+    const viewportTop = Math.max(0, scrollTop - bufferPx);
+    const viewportBottom = scrollTop + containerHeight + bufferPx;
+    const { cols, itemHeight, gap, size } = gridConfig;
+
+    const pixelSizeMap: Record<string, number> = {
+      very_small: 150,
+      small: 200,
+      medium: 300,
+      large: 500,
+    };
+    const targetSize = pixelSizeMap[size] || 250;
+    const itemsToFetch: Array<{ path: string; originalPath?: string }> = [];
+
+    for (const item of virtualMonthData) {
+      const isVisible = item.bottom >= viewportTop && item.top <= viewportBottom;
+      if (isVisible) {
+        const groupPhotos = item.group.photos;
+        const totalRows = item.rows;
+        const relativeScrollTop = Math.max(0, viewportTop - item.top - item.headerHeight);
+        const relativeScrollBottom = Math.max(0, viewportBottom - item.top - item.headerHeight);
+        const startRow = Math.max(0, Math.floor(relativeScrollTop / (itemHeight + gap)));
+        const endRow = Math.min(totalRows, Math.ceil(relativeScrollBottom / (itemHeight + gap)));
+
+        const visibleSlice = groupPhotos.slice(startRow * cols, endRow * cols);
+        for (const p of visibleSlice) {
+          itemsToFetch.push({
+            path: p.thumbnailPath || p.filePath,
+            originalPath: p.originalRemotePath,
+          });
+        }
+      }
+    }
+
+    if (itemsToFetch.length > 0) {
+      requestBatchThumbnails(itemsToFetch, targetSize);
+    }
+  }, [virtualMonthData, scrollTop, containerHeight, gridConfig, zoomLevel]);
+
   if (photos.length === 0) {
+    const isInitialized = libraryStore.getState().isInitialized;
+    if (!isInitialized) {
+      return (
+        <div
+          style={{
+            flex: 1,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '60px 20px',
+            color: 'var(--text-muted)',
+            gap: '14px',
+          }}
+        >
+          <div
+            className="spinner"
+            style={{
+              width: '36px',
+              height: '36px',
+              border: '3px solid rgba(59, 130, 246, 0.2)',
+              borderTopColor: 'var(--accent-primary)',
+              borderRadius: '50%',
+              animation: 'spin 1s linear infinite',
+            }}
+          />
+          <span style={{ fontSize: '0.95rem' }}>Loading photo timeline...</span>
+        </div>
+      );
+    }
     return (
       <div
         style={{
@@ -479,45 +557,6 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
   const viewportBottom = scrollTop + containerHeight + bufferPx;
 
   const { cols, itemHeight, gap, size } = gridConfig;
-
-  // Automatically pre-fetch up to 100 thumbnails in 1 single async request for all visible rows
-  useEffect(() => {
-    if (zoomLevel === 'years' || zoomLevel === 'months') return;
-    if (virtualMonthData.length === 0) return;
-
-    const pixelSizeMap: Record<string, number> = {
-      very_small: 150,
-      small: 200,
-      medium: 300,
-      large: 500,
-    };
-    const targetSize = pixelSizeMap[size] || 250;
-    const itemsToFetch: Array<{ path: string; originalPath?: string }> = [];
-
-    for (const item of virtualMonthData) {
-      const isVisible = item.bottom >= viewportTop && item.top <= viewportBottom;
-      if (isVisible) {
-        const groupPhotos = item.group.photos;
-        const totalRows = item.rows;
-        const relativeScrollTop = Math.max(0, viewportTop - item.top - item.headerHeight);
-        const relativeScrollBottom = Math.max(0, viewportBottom - item.top - item.headerHeight);
-        const startRow = Math.max(0, Math.floor(relativeScrollTop / (itemHeight + gap)));
-        const endRow = Math.min(totalRows, Math.ceil(relativeScrollBottom / (itemHeight + gap)));
-
-        const visibleSlice = groupPhotos.slice(startRow * cols, endRow * cols);
-        for (const p of visibleSlice) {
-          itemsToFetch.push({
-            path: p.thumbnailPath || p.filePath,
-            originalPath: p.originalRemotePath,
-          });
-        }
-      }
-    }
-
-    if (itemsToFetch.length > 0) {
-      requestBatchThumbnails(itemsToFetch, targetSize);
-    }
-  }, [virtualMonthData, viewportTop, viewportBottom, cols, itemHeight, gap, size, zoomLevel]);
 
   return (
     <div
