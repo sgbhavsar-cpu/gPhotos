@@ -69,6 +69,18 @@ export function deduplicatePhotoList(photos: Photo[]): Photo[] {
 }
 
 const STORAGE_KEY = 'gphotos_library_v1';
+const GLOBAL_PEOPLE_KEY = 'gphotos_people_v2';
+const GLOBAL_FACE_CACHE_KEY = 'gphotos_face_cache_v2';
+
+export interface CachedFaceRecord {
+  faces: DetectedFace[];
+  faceScanCompleted: boolean;
+}
+
+export function normalizeFaceCacheKey(pathOrId?: string | null): string {
+  if (!pathOrId) return '';
+  return pathOrId.trim().toLowerCase().replace(/\\/g, '/');
+}
 
 export function getLocalPhotoUrl(
   filePath: string,
@@ -140,11 +152,47 @@ export class LibraryManager {
     totalCount: 0,
   };
 
+  private globalFaceCache: Map<string, CachedFaceRecord> = new Map();
   private currentCatalogPage = 0;
   private isLoadingCatalogPage = false;
   private listeners: Set<() => void> = new Set();
   private saveDebounceTimer: any = null;
   private isVerifyingInBackground = false;
+
+  public getCachedFaces(photo: { id?: string; filePath?: string; originalRemotePath?: string }): CachedFaceRecord | null {
+    const keys = [
+      normalizeFaceCacheKey(photo.originalRemotePath),
+      normalizeFaceCacheKey(photo.filePath),
+      photo.id,
+    ].filter(Boolean) as string[];
+
+    for (const k of keys) {
+      if (this.globalFaceCache.has(k)) {
+        return this.globalFaceCache.get(k)!;
+      }
+    }
+    return null;
+  }
+
+  public cachePhotoFaces(
+    photo: { id: string; filePath: string; originalRemotePath?: string },
+    faces: DetectedFace[],
+    faceScanCompleted = true
+  ) {
+    const record: CachedFaceRecord = {
+      faces: faces || [],
+      faceScanCompleted: Boolean(faceScanCompleted || (faces && faces.length > 0)),
+    };
+    const keys = [
+      normalizeFaceCacheKey(photo.originalRemotePath),
+      normalizeFaceCacheKey(photo.filePath),
+      photo.id,
+    ].filter(Boolean) as string[];
+
+    for (const k of keys) {
+      this.globalFaceCache.set(k, record);
+    }
+  }
 
   constructor() {
     if (typeof window !== 'undefined') {
@@ -360,6 +408,50 @@ export class LibraryManager {
     return modified;
   }
 
+  public async loadGlobalCache() {
+    try {
+      let globalPeopleData: any = null;
+      let globalFaceData: any = null;
+      if (typeof window !== 'undefined' && window.electronAPI) {
+        globalPeopleData = await window.electronAPI.loadLibraryData(GLOBAL_PEOPLE_KEY);
+        globalFaceData = await window.electronAPI.loadLibraryData(GLOBAL_FACE_CACHE_KEY);
+      } else if (typeof localStorage !== 'undefined') {
+        const rawP = localStorage.getItem(GLOBAL_PEOPLE_KEY);
+        if (rawP) globalPeopleData = JSON.parse(rawP);
+        const rawF = localStorage.getItem(GLOBAL_FACE_CACHE_KEY);
+        if (rawF) globalFaceData = JSON.parse(rawF);
+      }
+
+      if (Array.isArray(globalFaceData)) {
+        for (const [k, v] of globalFaceData) {
+          if (k && v) this.globalFaceCache.set(k, v);
+        }
+      } else if (globalFaceData && typeof globalFaceData === 'object') {
+        for (const [k, v] of Object.entries(globalFaceData)) {
+          if (k && v) this.globalFaceCache.set(k, v as any);
+        }
+      }
+
+      if (Array.isArray(globalPeopleData) && globalPeopleData.length > 0) {
+        const existingMap = new Map(this.state.people.map((p) => [p.id, p]));
+        for (const p of globalPeopleData) {
+          if (p && p.id) {
+            if (!existingMap.has(p.id)) {
+              this.state.people.push(p);
+            } else {
+              const cur = existingMap.get(p.id)!;
+              if (/^Person(\s+\d+)?$/i.test(cur.name) && !/^Person(\s+\d+)?$/i.test(p.name)) {
+                cur.name = p.name;
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to load global people / face cache:', err);
+    }
+  }
+
   /**
    * Instant startup loader:
    * 1. Reads pre-calculated catalog_meta.json (<25 KB, ~1ms)
@@ -368,6 +460,7 @@ export class LibraryManager {
    */
   public async loadPersistedData() {
     try {
+      await this.loadGlobalCache();
       // 1. FAST-PATH (500K Scalable Catalog): Load pre-calculated metadata in ~1ms
       if (typeof window !== 'undefined' && window.electronAPI?.getCatalogMeta) {
         try {
@@ -546,6 +639,9 @@ export class LibraryManager {
   public async switchLibrary(targetPath: string): Promise<boolean> {
     try {
       if (typeof window !== 'undefined') {
+        // Save current library before switching
+        await this.flushSaveImmediately();
+
         const tSwitch0 = performance.now();
         let result: { meta: CatalogMeta; firstPage: Photo[] } | null = null;
         if (window.electronAPI?.switchLibrary) {
@@ -568,8 +664,23 @@ export class LibraryManager {
           this.state.selectedFolder = targetPath;
           this.state.currentDirectory = targetPath;
           this.state.recentLibraries = result.meta.recentLibraries || [];
-          this.state.photos = result.firstPage || [];
+
+          // Restore faces from globalFaceCache for firstPage
+          const restoredFirstPage = (result.firstPage || []).map((p) => {
+            const cached = this.getCachedFaces(p);
+            if (cached) {
+              return {
+                ...p,
+                faces: (cached.faces || []).map((f) => ({ ...f, photoId: p.id })),
+                faceScanCompleted: cached.faceScanCompleted,
+              };
+            }
+            return p;
+          });
+
+          this.state.photos = restoredFirstPage;
           this.currentCatalogPage = 0;
+          this.reconcilePeopleAndFaces();
           this.notify(true);
           return true;
         }
@@ -673,6 +784,13 @@ export class LibraryManager {
 
   private async savePersistedData() {
     try {
+      // Always update globalFaceCache from current photos
+      for (const p of this.state.photos) {
+        if (p.faceScanCompleted || (p.faces && p.faces.length > 0)) {
+          this.cachePhotoFaces(p, p.faces || [], p.faceScanCompleted);
+        }
+      }
+
       // Safety guard: if photos contain faces but people is empty, reconcile first
       if (this.state.people.length === 0 && this.state.photos.some((p) => p.faces && p.faces.length > 0)) {
         this.reconcilePeopleAndFaces();
@@ -687,10 +805,16 @@ export class LibraryManager {
         recentLibraries: this.state.recentLibraries,
       };
 
+      const cacheEntries = Array.from(this.globalFaceCache.entries()).slice(-20000);
+
       if (typeof window !== 'undefined' && window.electronAPI && typeof window.electronAPI.saveLibraryData === 'function') {
         await window.electronAPI.saveLibraryData(STORAGE_KEY, dataToSave);
+        await window.electronAPI.saveLibraryData(GLOBAL_PEOPLE_KEY, this.state.people);
+        await window.electronAPI.saveLibraryData(GLOBAL_FACE_CACHE_KEY, cacheEntries);
       } else if (typeof localStorage !== 'undefined') {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(dataToSave));
+        localStorage.setItem(GLOBAL_PEOPLE_KEY, JSON.stringify(this.state.people));
+        localStorage.setItem(GLOBAL_FACE_CACHE_KEY, JSON.stringify(cacheEntries));
       }
     } catch (err) {
       console.warn('Failed to save library state:', err);
@@ -701,7 +825,7 @@ export class LibraryManager {
     return this.savePersistedData();
   }
 
-  public setPhotos(photos: Photo[], folderPath?: string) {
+  public setPhotos(photos: Photo[], folderPath?: string): Photo[] {
     // Deduplicate incoming photos first
     const cleanNew = deduplicatePhotoList(photos);
 
@@ -716,20 +840,35 @@ export class LibraryManager {
     const preserved = cleanNew.map((newPhoto) => {
       const key = (newPhoto.originalRemotePath || newPhoto.filePath || '').toLowerCase().replace(/\\/g, '/');
       const existing = existingPathMap.get(key) || existingPathMap.get(newPhoto.id);
+      const cached = this.getCachedFaces(newPhoto);
+
+      let faces = (newPhoto.faces && newPhoto.faces.length > 0) ? newPhoto.faces : undefined;
+      let faceScanCompleted = Boolean(newPhoto.faceScanCompleted);
+
       if (existing) {
-        const candidateFaces = (newPhoto.faces && newPhoto.faces.length > 0) ? newPhoto.faces : existing.faces;
-        const faces = (candidateFaces || []).map((f) => ({ ...f, photoId: newPhoto.id }));
-        return {
-          ...newPhoto,
-          isFavorite: newPhoto.isFavorite ?? existing.isFavorite,
-          faces,
-          faceScanCompleted: Boolean(newPhoto.faceScanCompleted || existing.faceScanCompleted || (faces && faces.length > 0)),
-          location: newPhoto.location || existing.location,
-          isExcluded: newPhoto.isExcluded ?? existing.isExcluded,
-          sharpnessScore: newPhoto.sharpnessScore ?? existing.sharpnessScore,
-        };
+        const candidateFaces = (faces && faces.length > 0) ? faces : existing.faces;
+        faces = (candidateFaces || []).map((f) => ({ ...f, photoId: newPhoto.id }));
+        faceScanCompleted = Boolean(faceScanCompleted || existing.faceScanCompleted || (faces && faces.length > 0));
+      } else if (cached) {
+        if (!faces || faces.length === 0) {
+          faces = (cached.faces || []).map((f) => ({ ...f, photoId: newPhoto.id }));
+        }
+        faceScanCompleted = Boolean(faceScanCompleted || cached.faceScanCompleted || (faces && faces.length > 0));
       }
-      return newPhoto;
+
+      if (faces && faces.length > 0) {
+        this.cachePhotoFaces(newPhoto, faces, faceScanCompleted);
+      }
+
+      return {
+        ...newPhoto,
+        isFavorite: newPhoto.isFavorite ?? existing?.isFavorite ?? false,
+        faces,
+        faceScanCompleted: Boolean(faceScanCompleted || (faces && faces.length > 0)),
+        location: newPhoto.location || existing?.location,
+        isExcluded: newPhoto.isExcluded ?? existing?.isExcluded,
+        sharpnessScore: newPhoto.sharpnessScore ?? existing?.sharpnessScore,
+      };
     });
 
     const finalDeduped = deduplicatePhotoList(preserved);
@@ -748,6 +887,8 @@ export class LibraryManager {
     if (typeof window !== 'undefined' && window.electronAPI?.startThumbnailPreCache) {
       window.electronAPI.startThumbnailPreCache(finalDeduped).catch(() => {});
     }
+
+    return finalDeduped;
   }
 
   public addPhotos(newPhotos: Photo[]) {
@@ -848,7 +989,43 @@ export class LibraryManager {
     this.state.totalCount = Math.max(0, (this.state.totalCount || this.state.photos.length) - photoIds.length);
     this.state.faces = this.state.faces.filter((f) => !idSet.has(f.photoId));
     this.state.places = groupPhotosByPlace(this.state.photos.filter((p) => !p.isExcluded));
-    this.notify();
+
+    // Update people identities and cover photos safely without losing names
+    const remainingFaces = this.state.faces;
+    const personFacesMap = new Map<string, DetectedFace[]>();
+    const personPhotosMap = new Map<string, Set<string>>();
+    for (const p of this.state.people) {
+      personFacesMap.set(p.id, []);
+      personPhotosMap.set(p.id, new Set());
+    }
+
+    for (const f of remainingFaces) {
+      if (f.personId && personFacesMap.has(f.personId)) {
+        personFacesMap.get(f.personId)!.push(f);
+        personPhotosMap.get(f.personId)!.add(f.photoId);
+      }
+    }
+
+    for (const person of this.state.people) {
+      const faces = personFacesMap.get(person.id) || [];
+      const photos = personPhotosMap.get(person.id) || new Set();
+      person.faceCount = faces.length;
+      person.photoCount = photos.size;
+
+      // If the deleted photo was the cover photo, pick another remaining photo that contains their face
+      if (person.coverPhotoId && idSet.has(person.coverPhotoId)) {
+        if (faces.length > 0) {
+          person.coverFaceId = faces[0].id;
+          person.coverPhotoId = faces[0].photoId;
+        } else {
+          // No remaining photos for this person in this library; keep custom name but clear broken cover reference
+          person.coverFaceId = undefined;
+          person.coverPhotoId = undefined;
+        }
+      }
+    }
+
+    this.notify(true);
   }
 
   public updatePersonName(
@@ -1283,7 +1460,12 @@ export class LibraryManager {
     }
 
     for (const photo of this.state.photos) {
-      photo.faces = photoFaceMap.get(photo.id) || [];
+      const faces = photoFaceMap.get(photo.id) || [];
+      photo.faces = faces;
+      if (faces.length > 0) {
+        photo.faceScanCompleted = true;
+        this.cachePhotoFaces(photo, faces, true);
+      }
     }
 
     this.notify();

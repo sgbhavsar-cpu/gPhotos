@@ -235,8 +235,16 @@ export function clusterFaces(
     }
   }
 
+  const existingPeopleIds = new Set(existingPeople.map((p) => p.id));
+
   return {
-    people: Array.from(peopleMap.values()).filter((p) => p.faceCount > 0),
+    people: Array.from(peopleMap.values()).filter((p) => {
+      if (p.faceCount > 0) return true;
+      if (existingPeopleIds.has(p.id)) return true;
+      const isGenericName = /^Person(\s+\d+)?$/i.test(p.name.trim());
+      if (!isGenericName) return true;
+      return false;
+    }),
     updatedFaces,
   };
 }

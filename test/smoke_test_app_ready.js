@@ -4,9 +4,9 @@ const path = require('path');
 console.log('=== Electron Smoke Test: Testing Renderer Mount & App Ready ===');
 
 const electronExecutable = require('electron');
-const appProcess = spawn(electronExecutable, ['.'], {
+const appProcess = spawn(electronExecutable, ['.', '--smoke-test'], {
   cwd: path.resolve(__dirname, '..'),
-  env: { ...process.env, NODE_ENV: 'production' },
+  env: { ...process.env, NODE_ENV: 'production', GPHOTOS_SMOKE_TEST: '1' },
   stdio: ['pipe', 'pipe', 'pipe'],
 });
 

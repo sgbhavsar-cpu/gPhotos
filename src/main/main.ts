@@ -1,6 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, protocol, net, shell, Menu } from 'electron';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { pathToFileURL } from 'url';
 import exifr from 'exifr';
 import { parsePhotoMetadata } from './services/exifParser';
@@ -85,12 +86,21 @@ process.on('unhandledRejection', (reason) => {
   console.error('[CRITICAL MAIN PROCESS UNHANDLED REJECTION]:', reason);
 });
 
-// Single Instance Lock: Ensure only one copy of application runs
-const gotSingleInstanceLock = app.requestSingleInstanceLock();
+// Single Instance Lock: Ensure only one copy of application runs in production, while allowing isolated smoke tests
+const isSmokeTest = process.argv.includes('--smoke-test') || process.env.GPHOTOS_SMOKE_TEST === '1';
+if (isSmokeTest) {
+  try {
+    const tempUserData = path.join(os.tmpdir(), `gphotos_smoke_ud_${Date.now()}`);
+    fs.mkdirSync(tempUserData, { recursive: true });
+    app.setPath('userData', tempUserData);
+  } catch {}
+}
+
+const gotSingleInstanceLock = isSmokeTest ? true : app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
   console.log('Another instance of gPhotos is already running. Quitting duplicate instance.');
   app.quit();
-} else {
+} else if (!isSmokeTest) {
   app.on('second-instance', () => {
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();

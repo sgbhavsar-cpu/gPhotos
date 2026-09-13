@@ -542,6 +542,9 @@ export function scanVirtualMirrorDirectory(mirrorDirPath: string): Photo[] {
             if (fs.existsSync(meta.thumbnailPath)) {
               const date = new Date(meta.dateTaken);
 
+              const faces = (meta.faces && meta.faces.length > 0) ? meta.faces : undefined;
+              const faceScanCompleted = Boolean(meta.faceScanCompleted || (faces && faces.length > 0));
+
               const photo: Photo = {
                 id: Buffer.from(meta.thumbnailPath).toString('base64'),
                 filePath: meta.thumbnailPath,
@@ -560,6 +563,8 @@ export function scanVirtualMirrorDirectory(mirrorDirPath: string): Photo[] {
                 originalRemotePath: meta.originalFilePath,
                 storageName: meta.storageName,
                 isFavorite: false,
+                faces,
+                faceScanCompleted,
               };
 
               photos.push(photo);

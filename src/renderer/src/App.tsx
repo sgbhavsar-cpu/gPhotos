@@ -660,11 +660,11 @@ export const App: React.FC = () => {
       }
 
       const photos = await window.electronAPI.scanDirectory(dir);
-      libraryStore.setPhotos(photos, dir);
+      const enriched = libraryStore.setPhotos(photos, dir);
       setActiveTab('photos');
 
-      // Unified single-pass: automatically run face detection on newly scanned photos
-      await runFaceDetectionForPhotos(photos, false);
+      // Unified single-pass: automatically run face detection on any remaining unscanned photos
+      await runFaceDetectionForPhotos(enriched, false);
     } catch (err: any) {
       showToast(`Error opening folder: ${err.message}`, 'warning');
     } finally {
@@ -685,9 +685,9 @@ export const App: React.FC = () => {
 
       if (window.electronAPI) {
         const photos = await window.electronAPI.scanDirectory(dirPath);
-        libraryStore.setPhotos(photos, dirPath);
+        const enriched = libraryStore.setPhotos(photos, dirPath);
         setActiveTab('photos');
-        await runFaceDetectionForPhotos(photos, false);
+        await runFaceDetectionForPhotos(enriched, false);
       }
     } catch (err: any) {
       showToast(`Failed to load selected library: ${err.message}`, 'warning');
@@ -742,12 +742,12 @@ export const App: React.FC = () => {
     if (window.electronAPI) {
       libraryStore.setScanning(true);
       const mirroredPhotos = await window.electronAPI.scanVirtualMirror(mirrorRootPath);
-      libraryStore.setPhotos(mirroredPhotos, mirrorRootPath);
+      const enriched = libraryStore.setPhotos(mirroredPhotos, mirrorRootPath);
       libraryStore.setScanning(false);
       setActiveTab('photos');
 
-      // Auto-run face detection on the local 500px thumbnails
-      await runFaceDetectionForPhotos(mirroredPhotos, false);
+      // Auto-run face detection on any remaining unscanned photos
+      await runFaceDetectionForPhotos(enriched, false);
     }
   };
 
@@ -799,7 +799,7 @@ export const App: React.FC = () => {
       const updatedPhotos = await window.electronAPI.scanVirtualMirror(mirrorLocalPath);
 
       // 2. Update library photos (preserves recognized faces and favorites)
-      libraryStore.setPhotos(updatedPhotos, mirrorLocalPath);
+      const enriched = libraryStore.setPhotos(updatedPhotos, mirrorLocalPath);
 
       // 3. Update storage metadata and persist
       const updatedList = virtualStorages.map((s) =>
@@ -817,10 +817,10 @@ export const App: React.FC = () => {
       await window.electronAPI.saveLibraryData('gphotos_virtual_storages_v1', updatedList);
 
       // 4. Automatically recognize faces on any newly added photos or unscanned photos
-      const photosNeedingFaces = updatedPhotos.filter((p) => !p.faces || p.faces.length === 0);
+      const photosNeedingFaces = enriched.filter((p) => !p.faceScanCompleted && (!p.faces || p.faces.length === 0));
       if (res.newlyAdded > 0 || photosNeedingFaces.length > 0) {
         showToast(`Mirrored ${res.newlyAdded} new photos from ${config.name}. Starting face recognition...`, 'info');
-        await runFaceDetectionForPhotos(updatedPhotos, false, config.name);
+        await runFaceDetectionForPhotos(enriched, false, config.name);
       } else {
         setStorageProgressMap((prev) => ({
           ...prev,

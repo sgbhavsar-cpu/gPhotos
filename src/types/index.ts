@@ -170,6 +170,8 @@ export interface VirtualPhotoMetadata {
   relativePath: string;
   exif?: ExifMetadata;
   location?: LocationMetadata;
+  faces?: DetectedFace[];
+  faceScanCompleted?: boolean;
 }
 
 export interface MirrorProgress {
