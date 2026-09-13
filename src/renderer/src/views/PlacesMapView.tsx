@@ -93,6 +93,27 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
     }
   }, [resetTrigger]);
 
+  // Handle Escape key navigation inside PlacesMapView
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+
+      if (showAssignModal) {
+        e.stopPropagation();
+        setShowAssignModal(false);
+      } else if (isEditingClusterLocation) {
+        e.stopPropagation();
+        setIsEditingClusterLocation(false);
+      } else if (selectedCluster) {
+        e.stopPropagation();
+        setSelectedCluster(null);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [showAssignModal, isEditingClusterLocation, selectedCluster]);
+
   // Unlocated photos
   const unlocatedPhotos = useMemo(() => {
     return photos.filter(

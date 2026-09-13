@@ -1,16 +1,19 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Users } from 'lucide-react';
-import { Photo } from '../../types';
+import { Photo, DetectedFace } from '../../types';
 import { getLocalPhotoUrl } from '../services/libraryStore';
 
 interface FaceAvatarProps {
   photo?: Photo;
+  face?: DetectedFace;
   box?: {
     x: number;
     y: number;
     width: number;
     height: number;
   };
+  imageWidth?: number;
+  imageHeight?: number;
   size?: number;
   alt?: string;
   borderRadius?: string;
@@ -18,13 +21,19 @@ interface FaceAvatarProps {
 
 export const FaceAvatar: React.FC<FaceAvatarProps> = ({
   photo,
-  box,
+  face,
+  box: explicitBox,
+  imageWidth,
+  imageHeight,
   size = 110,
   alt = 'Face Avatar',
   borderRadius = 'var(--radius-full)',
 }) => {
   const [croppedDataUrl, setCroppedDataUrl] = useState<string | null>(null);
   const [hasError, setHasError] = useState(false);
+
+  // Use explicit box if passed, or fall back to face.box
+  const box = explicitBox || face?.box;
 
   useEffect(() => {
     if (!photo) {
@@ -53,32 +62,70 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
 
-        // Scale box coordinates if detected on different resolution
-        let scaledBox = { ...box };
-        if (box.x + box.width > img.naturalWidth || box.y + box.height > img.naturalHeight) {
-          const photoW = photo.width || 4000;
-          const photoH = photo.height || 3000;
-          const scaleX = img.naturalWidth / photoW;
-          const scaleY = img.naturalHeight / photoH;
-          scaledBox = {
-            x: Math.round(box.x * scaleX),
-            y: Math.round(box.y * scaleY),
-            width: Math.round(box.width * scaleX),
-            height: Math.round(box.height * scaleY),
-          };
-        } else if (img.naturalWidth > 1000 && box.x + box.width <= 505 && photo.width && photo.width > 505) {
-          const scale = 500 / Math.max(photo.width, photo.height || 1);
-          const thumbW = Math.max(1, Math.round(photo.width * scale));
-          const thumbH = Math.max(1, Math.round((photo.height || photo.width) * scale));
-          const scaleX = img.naturalWidth / thumbW;
-          const scaleY = img.naturalHeight / thumbH;
-          scaledBox = {
-            x: Math.round(box.x * scaleX),
-            y: Math.round(box.y * scaleY),
-            width: Math.round(box.width * scaleX),
-            height: Math.round(box.height * scaleY),
-          };
+        // Determine the base resolution on which the face bounding box was detected
+        let baseW = face?.imageWidth || imageWidth;
+        let baseH = face?.imageHeight || imageHeight;
+
+        if (!baseW || !baseH) {
+          // Check if matching face exists in photo.faces
+          const matchedFace =
+            photo.faces?.find(
+              (f) => f.box && Math.abs(f.box.x - box.x) < 3 && Math.abs(f.box.y - box.y) < 3
+            ) || photo.faces?.[0];
+
+          if (matchedFace?.imageWidth && matchedFace?.imageHeight) {
+            baseW = matchedFace.imageWidth;
+            baseH = matchedFace.imageHeight;
+          } else if (photo.width && photo.height && photo.width > 0 && photo.height > 0) {
+            baseW = photo.width;
+            baseH = photo.height;
+          }
         }
+
+        // Calculate normalized 0..1 bounding box
+        let normX: number;
+        let normY: number;
+        let normW: number;
+        let normH: number;
+
+        if (baseW && baseH && baseW > 0 && baseH > 0) {
+          normX = box.x / baseW;
+          normY = box.y / baseH;
+          normW = box.width / baseW;
+          normH = box.height / baseH;
+        } else if (box.x + box.width <= 505 && box.y + box.height <= 505 && img.naturalWidth > 505) {
+          const scale = 500 / Math.max(img.naturalWidth, img.naturalHeight);
+          const thumbW = Math.max(1, Math.round(img.naturalWidth * scale));
+          const thumbH = Math.max(1, Math.round(img.naturalHeight * scale));
+          normX = box.x / thumbW;
+          normY = box.y / thumbH;
+          normW = box.width / thumbW;
+          normH = box.height / thumbH;
+        } else if (box.x + box.width <= img.naturalWidth && box.y + box.height <= img.naturalHeight) {
+          normX = box.x / img.naturalWidth;
+          normY = box.y / img.naturalHeight;
+          normW = box.width / img.naturalWidth;
+          normH = box.height / img.naturalHeight;
+        } else {
+          const estW = Math.max(img.naturalWidth, box.x + box.width);
+          const estH = Math.max(img.naturalHeight, box.y + box.height);
+          normX = box.x / estW;
+          normY = box.y / estH;
+          normW = box.width / estW;
+          normH = box.height / estH;
+        }
+
+        normX = Math.max(0, Math.min(1, normX));
+        normY = Math.max(0, Math.min(1, normY));
+        normW = Math.max(0, Math.min(1 - normX, normW));
+        normH = Math.max(0, Math.min(1 - normY, normH));
+
+        const scaledBox = {
+          x: Math.round(normX * img.naturalWidth),
+          y: Math.round(normY * img.naturalHeight),
+          width: Math.round(normW * img.naturalWidth),
+          height: Math.round(normH * img.naturalHeight),
+        };
 
         // Calculate face crop with 35% margin for portrait look
         const padding = 0.35;
@@ -111,7 +158,7 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
     return () => {
       isCancelled = true;
     };
-  }, [photo?.filePath, box?.x, box?.y, box?.width, box?.height, size]);
+  }, [photo?.filePath, box?.x, box?.y, box?.width, box?.height, face?.id, face?.imageWidth, face?.imageHeight, imageWidth, imageHeight, size]);
 
   if (!photo || hasError) {
     return (

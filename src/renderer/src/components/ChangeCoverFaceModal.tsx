@@ -60,6 +60,18 @@ export const ChangeCoverFaceModal: React.FC<ChangeCoverFaceModalProps> = ({
     return b.score - a.score;
   });
 
+  // Handle Escape key
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
+
   const handleSelectCover = (photoId: string, faceId: string) => {
     setSelectedPhotoId(photoId);
     setSelectedFaceId(faceId);
@@ -246,6 +258,7 @@ export const ChangeCoverFaceModal: React.FC<ChangeCoverFaceModalProps> = ({
                     <div style={{ marginBottom: '10px' }}>
                       <FaceAvatar
                         photo={photo}
+                        face={face}
                         box={face.box}
                         size={100}
                         alt={person.name}

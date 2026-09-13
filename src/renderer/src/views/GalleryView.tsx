@@ -83,6 +83,28 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   const [isRefreshingThumbnails, setIsRefreshingThumbnails] = useState(false);
   const [refreshToast, setRefreshToast] = useState<string | null>(null);
 
+  // Handle Escape key navigation inside GalleryView
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+
+      if (showAlbumDialog) {
+        e.stopPropagation();
+        setShowAlbumDialog(false);
+      } else if (showDeleteConfirmModal) {
+        e.stopPropagation();
+        setShowDeleteConfirmModal(false);
+      } else if (isSelectMode || selectedIds.size > 0) {
+        e.stopPropagation();
+        setIsSelectMode(false);
+        setSelectedIds(new Set());
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [showAlbumDialog, showDeleteConfirmModal, isSelectMode, selectedIds]);
+
   // Mobile-style mouse drag-selection handler
   const handleDragSelect = (photoId: string) => {
     setSelectedIds((prev) => {

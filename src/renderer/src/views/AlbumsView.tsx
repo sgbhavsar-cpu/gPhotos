@@ -45,6 +45,27 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
   const [photoSearchQuery, setPhotoSearchQuery] = useState('');
   const [selectedPhotoIdsToAdd, setSelectedPhotoIdsToAdd] = useState<Set<string>>(new Set());
 
+  // Handle Escape key navigation inside AlbumsView
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+
+      if (showAddPhotosModal) {
+        e.stopPropagation();
+        setShowAddPhotosModal(false);
+      } else if (showCreateModal) {
+        e.stopPropagation();
+        setShowCreateModal(false);
+      } else if (selectedAlbumId) {
+        e.stopPropagation();
+        setSelectedAlbumId(null);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [showAddPhotosModal, showCreateModal, selectedAlbumId]);
+
   // Form states for Create Album
   const [newTitle, setNewTitle] = useState('');
   const [newDescription, setNewDescription] = useState('');

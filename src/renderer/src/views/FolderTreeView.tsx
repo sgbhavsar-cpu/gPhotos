@@ -142,6 +142,21 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
     }
   }, [initialFolderPath]);
 
+  // Handle Escape key to clear selected folder drilldown
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (selectedFolderPath) {
+          e.stopPropagation();
+          setSelectedFolderPath(null);
+          setFolderPhotos([]);
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedFolderPath]);
+
   // Initial roots: Local drives and virtual storage mirror roots
   useEffect(() => {
     loadRoots();

@@ -95,6 +95,46 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
 
   const [personForCoverModal, setPersonForCoverModal] = useState<Person | null>(null);
 
+  // Handle Escape key navigation inside PeopleView
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+
+      if (reassignTarget) {
+        e.stopPropagation();
+        setReassignTarget(null);
+      } else if (personForCoverModal) {
+        e.stopPropagation();
+        setPersonForCoverModal(null);
+      } else if (mergeModalPair) {
+        e.stopPropagation();
+        setMergeModalPair(null);
+      } else if (editingPersonId) {
+        e.stopPropagation();
+        setEditingPersonId(null);
+      } else if (isMergeMode) {
+        e.stopPropagation();
+        setIsMergeMode(false);
+        setMergeSelection([]);
+      } else if (selectedPersonId) {
+        e.stopPropagation();
+        setSelectedPersonId(null);
+        if (onClearSelectedPerson) onClearSelectedPerson();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [
+    reassignTarget,
+    personForCoverModal,
+    mergeModalPair,
+    editingPersonId,
+    isMergeMode,
+    selectedPersonId,
+    onClearSelectedPerson,
+  ]);
+
   // If a person is selected, show their virtual album
   const selectedPerson = people.find((p) => p.id === selectedPersonId);
 
@@ -272,6 +312,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
             >
               <FaceAvatar
                 photo={coverPhoto}
+                face={coverFace}
                 box={coverFace?.box}
                 size={68}
                 alt={selectedPerson.name}
@@ -555,6 +596,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                   >
                     <FaceAvatar
                       photo={photo}
+                      face={face}
                       box={face.box}
                       size={210}
                       borderRadius="0px"
@@ -881,6 +923,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                   }}>
                     <FaceAvatar
                       photo={coverPhoto}
+                      face={coverFace}
                       box={coverFace?.box}
                       size={110}
                       alt={person.name}

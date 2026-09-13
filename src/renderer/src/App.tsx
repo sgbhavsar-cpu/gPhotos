@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Sidebar, ActiveTab } from './components/Sidebar';
 import { GalleryView } from './views/GalleryView';
 import { AlbumsView } from './views/AlbumsView';
@@ -43,6 +43,144 @@ export const App: React.FC = () => {
   const [activeAiFilter, setActiveAiFilter] = useState<AiPhotoFilter | null>(null);
   const [aiFilteredPhotos, setAiFilteredPhotos] = useState<Photo[] | null>(null);
   const [bgScanProgress, setBgScanProgress] = useState<BackgroundScanProgress | null>(null);
+
+  const tabHistoryRef = useRef<ActiveTab[]>(['photos']);
+
+  useEffect(() => {
+    const history = tabHistoryRef.current;
+    if (history[history.length - 1] !== activeTab) {
+      history.push(activeTab);
+    }
+  }, [activeTab]);
+
+  // Global Escape key navigation handler
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+
+      // 1. Close lightbox if active
+      if (activeLightboxPhoto) {
+        setActiveLightboxPhoto(null);
+        return;
+      }
+
+      // 2. Close global modals
+      if (showDuplicateCleaner) {
+        setShowDuplicateCleaner(false);
+        return;
+      }
+      if (showHelpModal) {
+        setShowHelpModal(false);
+        return;
+      }
+      if (showAiAssistant) {
+        setShowAiAssistant(false);
+        return;
+      }
+      if (showLibrarySwitcher) {
+        setShowLibrarySwitcher(false);
+        return;
+      }
+      if (showMobileDrawer) {
+        setShowMobileDrawer(false);
+        return;
+      }
+
+      // 3. Clear active AI search filter or tree folder selection
+      if (activeAiFilter || aiFilteredPhotos) {
+        setActiveAiFilter(null);
+        setAiFilteredPhotos(null);
+        return;
+      }
+      if (selectedFolderForTree) {
+        setSelectedFolderForTree(null);
+        return;
+      }
+      if (selectedPersonIdForView) {
+        setSelectedPersonIdForView(null);
+        return;
+      }
+
+      // 4. Pop tab navigation history back to previous tab
+      if (activeTab !== 'photos') {
+        const history = tabHistoryRef.current;
+        while (history.length > 0 && history[history.length - 1] === activeTab) {
+          history.pop();
+        }
+        const previousTab = history.length > 0 ? history.pop()! : 'photos';
+        setActiveTab(previousTab);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [
+    activeLightboxPhoto,
+    showDuplicateCleaner,
+    showHelpModal,
+    showAiAssistant,
+    showLibrarySwitcher,
+    showMobileDrawer,
+    activeAiFilter,
+    aiFilteredPhotos,
+    selectedFolderForTree,
+    selectedPersonIdForView,
+    activeTab,
+  ]);
+
+  // 30-Second Auto-Resume for Thumbnail Pre-Caching & Face Detection Queue
+  useEffect(() => {
+    const timer = setTimeout(async () => {
+      console.log('[AutoResume] 30s elapsed after startup: Auto-resuming caching & face detection queues...');
+
+      // 1. Resume / start background thumbnail pre-caching
+      const currentPhotos = libraryStore.getState().photos;
+      if (window.electronAPI?.startThumbnailPreCache && currentPhotos.length > 0) {
+        window.electronAPI.startThumbnailPreCache(currentPhotos).catch(() => {});
+      }
+
+      // 2. Resume background face detection queue
+      if (faceQueue.getStatus().isPaused) {
+        faceQueue.resume();
+      }
+      const unscannedPhotos = currentPhotos.filter(
+        (p) => !p.faceScanCompleted && (!p.faces || p.faces.length === 0)
+      );
+      if (unscannedPhotos.length > 0) {
+        faceQueue.enqueue(unscannedPhotos);
+      } else {
+        faceQueue.resume();
+      }
+
+      // 3. If library has no photos yet, check configured virtual storages/mirrors and auto-load
+      if (currentPhotos.length === 0 && window.electronAPI?.scanVirtualMirror) {
+        let configs: VirtualStorageConfig[] = virtualStorages;
+        if (configs.length === 0 && window.electronAPI.loadLibraryData) {
+          configs = (await window.electronAPI.loadLibraryData('gphotos_virtual_storages_v1')) || [];
+        }
+        if (configs.length > 0) {
+          const target = configs.find((s) => (s.totalItems || 0) > 0) || configs[0];
+          if (target) {
+            const mirrorPath = `${target.localMirrorRoot}\\${target.name}`;
+            try {
+              const mirrored = await window.electronAPI.scanVirtualMirror(mirrorPath);
+              if (mirrored && mirrored.length > 0) {
+                libraryStore.setPhotos(mirrored, mirrorPath);
+                if (window.electronAPI.startThumbnailPreCache) {
+                  window.electronAPI.startThumbnailPreCache(mirrored).catch(() => {});
+                }
+                faceQueue.enqueue(mirrored);
+              }
+            } catch (err) {
+              console.warn('[AutoResume] Failed to auto-load mirrored photos:', err);
+            }
+          }
+        }
+      }
+    }, 30000);
+
+    return () => clearTimeout(timer);
+  }, [virtualStorages]);
 
   const showToast = (message: string, type: 'info' | 'success' | 'warning' = 'info') => {
     setToastMessage({ message, type });

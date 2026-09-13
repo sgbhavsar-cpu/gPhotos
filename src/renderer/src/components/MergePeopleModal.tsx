@@ -55,11 +55,23 @@ export const MergePeopleModal: React.FC<MergePeopleModalProps> = ({
     const face = photo?.faces?.find(
       (f) => f.id === person.coverFaceId || f.personId === person.id
     );
-    return { photo, box: face?.box };
+    return { photo, face, box: face?.box };
   };
 
   const coverA = getCoverPhotoAndBox(personA);
-  const coverB = personB ? getCoverPhotoAndBox(personB) : { photo: undefined, box: undefined };
+  const coverB = personB ? getCoverPhotoAndBox(personB) : { photo: undefined, face: undefined, box: undefined };
+
+  // Handle Escape key
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
 
   const handleMerge = (e: React.FormEvent) => {
     e.preventDefault();
@@ -199,7 +211,7 @@ export const MergePeopleModal: React.FC<MergePeopleModalProps> = ({
               {/* Person A */}
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', textAlign: 'center', gap: '8px' }}>
                 <div style={{ borderRadius: 'var(--radius-full)', overflow: 'hidden' }}>
-                  <FaceAvatar photo={coverA.photo} box={coverA.box} size={68} alt={personA.name} />
+                  <FaceAvatar photo={coverA.photo} face={coverA.face} box={coverA.box} size={68} alt={personA.name} />
                 </div>
                 <div>
                   <div style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--text-primary)' }}>{personA.name}</div>
@@ -226,7 +238,7 @@ export const MergePeopleModal: React.FC<MergePeopleModalProps> = ({
               {/* Person B */}
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', textAlign: 'center', gap: '8px' }}>
                 <div style={{ borderRadius: 'var(--radius-full)', overflow: 'hidden' }}>
-                  <FaceAvatar photo={coverB.photo} box={coverB.box} size={68} alt={personB.name} />
+                  <FaceAvatar photo={coverB.photo} face={coverB.face} box={coverB.box} size={68} alt={personB.name} />
                 </div>
                 <div>
                   <div style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--text-primary)' }}>{personB.name}</div>

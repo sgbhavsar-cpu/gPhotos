@@ -41,6 +41,18 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
     p.name.toLowerCase().includes(searchFilter.toLowerCase().trim())
   );
 
+  // Handle Escape key
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
+
   const handleReassign = (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage(null);
@@ -144,7 +156,7 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
             }}
           >
             <div style={{ borderRadius: 'var(--radius-full)', overflow: 'hidden', flexShrink: 0 }}>
-              <FaceAvatar photo={photo} box={face.box} size={70} alt="Detected Face" />
+              <FaceAvatar photo={photo} face={face} box={face.box} size={70} alt="Detected Face" />
             </div>
             <div>
               <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Currently Assigned To:</div>
@@ -251,7 +263,7 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
                       >
                         <div style={{ position: 'relative', width: '64px', height: '64px', flexShrink: 0, borderRadius: '50%', overflow: 'hidden' }}>
                           {personPhoto ? (
-                            <FaceAvatar photo={personPhoto} box={personFace?.box} size={64} alt={p.name} />
+                            <FaceAvatar photo={personPhoto} face={personFace} box={personFace?.box} size={64} alt={p.name} />
                           ) : (
                             <div
                               style={{

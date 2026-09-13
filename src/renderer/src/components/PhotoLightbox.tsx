@@ -1797,7 +1797,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                           }}
                         >
                           <div style={{ borderRadius: 'var(--radius-full)', overflow: 'hidden', flexShrink: 0 }}>
-                            <FaceAvatar photo={photo} box={face.box} size={36} alt={personName} />
+                            <FaceAvatar photo={photo} face={face} box={face.box} size={36} alt={personName} />
                           </div>
                           <div style={{ overflow: 'hidden' }}>
                             <div style={{
