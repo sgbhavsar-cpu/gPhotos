@@ -12,8 +12,10 @@ import {
   FolderTreeNode,
   EditPhotoOptions,
   EditPhotoResult,
-  StorageSyncCheckpoint
+  StorageSyncCheckpoint,
+  StorageDetails,
 } from '../../types';
+import { libraryStatusService } from './libraryStatusService';
 
 // Dynamic import or require of electron nativeImage
 let nativeImage: any = null;
@@ -271,6 +273,110 @@ export function saveStorageCheckpoint(checkpoint: StorageSyncCheckpoint): void {
   } catch (err) {
     console.warn(`[StorageSync] Failed to save checkpoint for ${checkpoint.storageName}:`, err);
   }
+}
+
+export function getStorageDetails(storageName: string, mirrorRoot?: string): StorageDetails {
+  const root = mirrorRoot || 'C:\\GPhotos_VirtualMirrors';
+  const mirrorFolder = path.join(root, storageName);
+
+  let totalPhotos = 0;
+  let thumbnailCachedCount = 0;
+  let faceScannedCount = 0;
+  let facesDetectedCount = 0;
+
+  if (fs.existsSync(mirrorFolder)) {
+    function scan(dir: string, depth = 0) {
+      if (depth > 6) return;
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory() && !entry.name.startsWith('.')) {
+            scan(full, depth + 1);
+          } else if (entry.isFile() && entry.name.endsWith('.json') && !entry.name.startsWith('_')) {
+            totalPhotos++;
+            try {
+              const meta: VirtualPhotoMetadata = JSON.parse(fs.readFileSync(full, 'utf-8'));
+              if (meta.thumbnailPath && fs.existsSync(meta.thumbnailPath)) {
+                thumbnailCachedCount++;
+              }
+              if (meta.faceScanCompleted || (meta.faces && meta.faces.length > 0)) {
+                faceScannedCount++;
+              }
+              if (meta.faces && Array.isArray(meta.faces)) {
+                facesDetectedCount += meta.faces.length;
+              }
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+    scan(mirrorFolder);
+  }
+
+  // Cross-reference checkpoint
+  const cp = loadStorageCheckpoint(storageName, root);
+  if (cp) {
+    if (cp.totalDiscovered > totalPhotos) totalPhotos = cp.totalDiscovered;
+    if (cp.processedCount > thumbnailCachedCount) thumbnailCachedCount = cp.processedCount;
+  }
+
+  // Cross-reference library status
+  const libStatus = libraryStatusService.getLibraryStatus(mirrorFolder);
+  if (libStatus) {
+    if (libStatus.totalPhotos > totalPhotos) totalPhotos = libStatus.totalPhotos;
+    if (libStatus.thumbnailCachedCount > thumbnailCachedCount) thumbnailCachedCount = libStatus.thumbnailCachedCount;
+    if (libStatus.faceScannedCount > faceScannedCount) faceScannedCount = libStatus.faceScannedCount;
+    if (libStatus.faceDetectedCount > facesDetectedCount) facesDetectedCount = libStatus.faceDetectedCount;
+  }
+
+  let phase: 'completed' | 'thumbnails' | 'faces' | 'interrupted' | 'idle' = 'idle';
+  if (totalPhotos > 0) {
+    if (thumbnailCachedCount >= totalPhotos && faceScannedCount >= totalPhotos) {
+      phase = 'completed';
+    } else if (cp?.phase === 'interrupted' || (thumbnailCachedCount > 0 && thumbnailCachedCount < totalPhotos && cp?.phase !== 'completed')) {
+      phase = 'interrupted';
+    } else if (thumbnailCachedCount >= totalPhotos && faceScannedCount < totalPhotos) {
+      phase = 'faces';
+    } else {
+      phase = 'thumbnails';
+    }
+  }
+
+  const percent = totalPhotos > 0
+    ? Math.round(((thumbnailCachedCount + faceScannedCount) / (totalPhotos * 2)) * 100)
+    : 0;
+
+  return {
+    storageName,
+    totalPhotos,
+    thumbnailCachedCount,
+    thumbnailTotalCount: totalPhotos,
+    faceScannedCount,
+    faceTotalCount: totalPhotos,
+    facesDetectedCount,
+    phase,
+    percent,
+    canResume: phase === 'interrupted' || (totalPhotos > 0 && phase !== 'completed'),
+  };
+}
+
+export function getAllStorageDetails(mirrorRoot?: string): Record<string, StorageDetails> {
+  const root = mirrorRoot || 'C:\\GPhotos_VirtualMirrors';
+  const result: Record<string, StorageDetails> = {};
+  if (!fs.existsSync(root)) return result;
+
+  try {
+    const entries = fs.readdirSync(root, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory() && !entry.name.startsWith('.')) {
+        result[entry.name] = getStorageDetails(entry.name, root);
+      }
+    }
+  } catch (err) {
+    console.warn('[StorageSync] Failed to scan storage details:', err);
+  }
+  return result;
 }
 
 export async function syncVirtualStorage(

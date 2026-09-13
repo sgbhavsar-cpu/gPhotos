@@ -153,6 +153,7 @@ export class LibraryManager {
   };
 
   private globalFaceCache: Map<string, CachedFaceRecord> = new Map();
+  private globalPeopleRegistry: Map<string, Person> = new Map();
   private currentCatalogPage = 0;
   private isLoadingCatalogPage = false;
   private listeners: Set<() => void> = new Set();
@@ -325,18 +326,24 @@ export class LibraryManager {
     if (missingPersonFaces.size > 0) {
       let nextIndex = peopleMap.size + 1;
       for (const [pId, assignedFaces] of missingPersonFaces.entries()) {
+        const registered = this.globalPeopleRegistry.get(pId);
         const firstFace = assignedFaces[0];
         const uniquePhotos = new Set(assignedFaces.map((f) => f.photoId));
+        const personName = (registered && registered.name && !/^Person(\s+\d+)?$/i.test(registered.name))
+          ? registered.name
+          : `Person ${nextIndex++}`;
+
         const newPerson: Person = {
           id: pId,
-          name: `Person ${nextIndex++}`,
-          coverFaceId: firstFace.id,
-          coverPhotoId: firstFace.photoId,
+          name: personName,
+          coverFaceId: registered?.coverFaceId || firstFace.id,
+          coverPhotoId: registered?.coverPhotoId || firstFace.photoId,
           faceCount: assignedFaces.length,
           photoCount: uniquePhotos.size,
-          createdAt: new Date().toISOString(),
+          createdAt: registered?.createdAt || new Date().toISOString(),
         };
         peopleMap.set(pId, newPerson);
+        this.globalPeopleRegistry.set(pId, newPerson);
         modified = true;
       }
     }
@@ -347,7 +354,12 @@ export class LibraryManager {
       if (facesWithDesc.length > 0) {
         const { people, updatedFaces } = clusterFaces(allFaces, [], 0.55, true);
         for (const p of people) {
+          const registered = this.globalPeopleRegistry.get(p.id);
+          if (registered && !/^Person(\s+\d+)?$/i.test(registered.name)) {
+            p.name = registered.name;
+          }
           peopleMap.set(p.id, p);
+          this.globalPeopleRegistry.set(p.id, p);
         }
         this.state.faces = updatedFaces;
         modified = true;
@@ -356,10 +368,24 @@ export class LibraryManager {
       // If we have some unassigned faces, cluster them matching to existing people or create new clusters
       const { people, updatedFaces } = clusterFaces(allFaces, Array.from(peopleMap.values()), 0.55, true);
       for (const p of people) {
+        const registered = this.globalPeopleRegistry.get(p.id);
+        if (registered && !/^Person(\s+\d+)?$/i.test(registered.name)) {
+          p.name = registered.name;
+        }
         peopleMap.set(p.id, p);
+        this.globalPeopleRegistry.set(p.id, p);
       }
       this.state.faces = updatedFaces;
       modified = true;
+    }
+
+    // Never lose custom names: if any person in peopleMap has generic name but global registry has custom name, restore it!
+    for (const [pId, person] of peopleMap.entries()) {
+      const registered = this.globalPeopleRegistry.get(pId);
+      if (registered && !/^Person(\s+\d+)?$/i.test(registered.name) && /^Person(\s+\d+)?$/i.test(person.name)) {
+        person.name = registered.name;
+        modified = true;
+      }
     }
 
     // 6. Recalculate accurate faceCount and photoCount for all people
@@ -436,6 +462,7 @@ export class LibraryManager {
         const existingMap = new Map(this.state.people.map((p) => [p.id, p]));
         for (const p of globalPeopleData) {
           if (p && p.id) {
+            this.globalPeopleRegistry.set(p.id, p);
             if (!existingMap.has(p.id)) {
               this.state.people.push(p);
             } else {
@@ -1067,8 +1094,9 @@ export class LibraryManager {
     }
 
     person.name = cleanName;
+    this.globalPeopleRegistry.set(person.id, { ...person });
     this.state.people = [...this.state.people];
-    this.notify();
+    this.notify(true);
     return { success: true };
   }
 
@@ -1089,12 +1117,13 @@ export class LibraryManager {
   public resetAllPeopleAndFaces() {
     this.state.people = [];
     this.state.faces = [];
+    this.globalPeopleRegistry.clear();
+    this.globalFaceCache.clear();
     for (const photo of this.state.photos) {
       photo.faces = [];
       photo.faceScanCompleted = false;
     }
-    this.notify();
-    this.savePersistedData();
+    this.notify(true);
   }
 
   public propagateLearnedFaces(

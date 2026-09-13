@@ -111,6 +111,24 @@ async function testRender() {
   });
   console.log('✓ <AlbumsView /> rendered without ReferenceErrors.');
 
+  // 5. Mount VirtualStorageView directly
+  console.log('5. Mounting <VirtualStorageView />...');
+  const { VirtualStorageView } = await import('../src/renderer/src/views/VirtualStorageView');
+  const vsDiv = dom.window.document.createElement('div');
+  const vsRoot = ReactDOM.createRoot(vsDiv);
+  await React.act(async () => {
+    vsRoot.render(
+      React.createElement(VirtualStorageView, {
+        onLoadMirroredPhotos: () => {},
+        onStoragesUpdated: () => {},
+        onBrowseFolderTree: () => {},
+        onScanStorageFaces: () => {},
+        storageProgressMap: {},
+      })
+    );
+  });
+  console.log('✓ <VirtualStorageView /> rendered without ReferenceErrors.');
+
   console.log('\n🎉 ALL VIEWS MOUNTED AND EXECUTED WITH ZERO ERRORS!');
   process.exit(0);
 }

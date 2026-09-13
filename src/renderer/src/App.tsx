@@ -362,17 +362,7 @@ export const App: React.FC = () => {
       }));
 
       if (progress.status === 'completed' && progress.phase === 'completed') {
-        setTimeout(() => {
-          setStorageProgressMap((prev) => {
-            const cur = prev[storageName];
-            if (cur && cur.phase === 'completed') {
-              const copy = { ...prev };
-              delete copy[storageName];
-              return copy;
-            }
-            return prev;
-          });
-        }, 4000);
+        // Keep completed status persisted in storageProgressMap so UI stays up-to-date
       }
     });
     return () => {
@@ -549,7 +539,7 @@ export const App: React.FC = () => {
         }
 
         try {
-          let preferOriginal = false;
+          let preferOriginal = true;
           if (photo.isVirtual && photo.originalRemotePath && window.electronAPI?.checkFileExists) {
             preferOriginal = await window.electronAPI.checkFileExists(photo.originalRemotePath);
           }
@@ -623,17 +613,7 @@ export const App: React.FC = () => {
             message: '✓ Up to date',
           },
         }));
-        setTimeout(() => {
-          setStorageProgressMap((prev) => {
-            const cur = prev[storageName];
-            if (cur && cur.phase === 'completed') {
-              const copy = { ...prev };
-              delete copy[storageName];
-              return copy;
-            }
-            return prev;
-          });
-        }, 4000);
+        // Keep completed status in storageProgressMap
       }
     } finally {
       libraryStore.setDetectingFaces(false, null);
@@ -836,13 +816,6 @@ export const App: React.FC = () => {
           },
         }));
         showToast(`Rescan Complete: ${config.name} is up-to-date (${res.totalSynced} photos).`, 'success');
-        setTimeout(() => {
-          setStorageProgressMap((prev) => {
-            const copy = { ...prev };
-            delete copy[config!.name];
-            return copy;
-          });
-        }, 4000);
       }
     } catch (err: any) {
       setStorageProgressMap((prev) => ({
@@ -860,6 +833,17 @@ export const App: React.FC = () => {
       }));
       showToast(`Error refreshing network storage: ${err.message}`, 'warning');
     }
+  };
+
+  const handleScanStorageFaces = async (storage: VirtualStorageConfig) => {
+    if (!window.electronAPI) return;
+    const mirrorPath = `${storage.localMirrorRoot}\\${storage.name}`;
+    libraryStore.setScanning(true);
+    const mirroredPhotos = await window.electronAPI.scanVirtualMirror(mirrorPath);
+    const enriched = libraryStore.setPhotos(mirroredPhotos, mirrorPath);
+    libraryStore.setScanning(false);
+    showToast(`Starting face recognition for ${storage.name}...`, 'info');
+    await runFaceDetectionForPhotos(enriched, true, storage.name);
   };
 
   // 30-Second Auto-Resume on Startup: Resumes background caching and face detection without user intervention
@@ -1079,6 +1063,7 @@ export const App: React.FC = () => {
             onLoadMirroredPhotos={handleLoadMirroredPhotos}
             onStoragesUpdated={(storages) => setVirtualStorages(storages)}
             storageProgressMap={storageProgressMap}
+            onScanStorageFaces={handleScanStorageFaces}
             onBrowseFolderTree={(folderPath) => {
               setSelectedFolderForTree(folderPath);
               setActiveTab('folders');

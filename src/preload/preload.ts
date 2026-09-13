@@ -83,6 +83,10 @@ const electronAPI: IElectronAPI = {
   getAllLibraryStatuses: () => ipcRenderer.invoke('library:get-all-statuses'),
   refreshThumbnailsFromSource: (items: Array<{ filePath: string; originalRemotePath?: string }>) =>
     ipcRenderer.invoke('thumbnails:refresh-from-source', items),
+  getStorageDetails: (storageName: string, mirrorRoot?: string) =>
+    ipcRenderer.invoke('mirror:get-storage-details', storageName, mirrorRoot),
+  getAllStorageDetails: (mirrorRoot?: string) =>
+    ipcRenderer.invoke('mirror:get-all-storage-details', mirrorRoot),
 };
 
 contextBridge.exposeInMainWorld('electronAPI', electronAPI);

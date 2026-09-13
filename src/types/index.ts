@@ -387,6 +387,21 @@ export interface IElectronAPI {
   refreshThumbnailsFromSource?: (
     items: Array<{ filePath: string; originalRemotePath?: string }>
   ) => Promise<{ refreshedCount: number; errors: string[] }>;
+  getStorageDetails?: (storageName: string, mirrorRoot?: string) => Promise<StorageDetails | null>;
+  getAllStorageDetails?: (mirrorRoot?: string) => Promise<Record<string, StorageDetails>>;
+}
+
+export interface StorageDetails {
+  storageName: string;
+  totalPhotos: number;
+  thumbnailCachedCount: number;
+  thumbnailTotalCount: number;
+  faceScannedCount: number;
+  faceTotalCount: number;
+  facesDetectedCount: number;
+  phase: 'completed' | 'thumbnails' | 'faces' | 'interrupted' | 'idle';
+  percent: number;
+  canResume?: boolean;
 }
 
 export interface TimelineMonthSummary {

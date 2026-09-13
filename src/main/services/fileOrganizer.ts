@@ -25,6 +25,43 @@ export function isImageFile(filePath: string): boolean {
   return SUPPORTED_EXTENSIONS.has(ext);
 }
 
+const IGNORED_DIRECTORY_NAMES = new Set([
+  'node_modules',
+  '@eadir',
+  'thumbnails',
+  'thumbs',
+  'thumb',
+  '_thumbnails',
+  '_thumbs',
+  '.thumbnails',
+  '.thumbs',
+  '.gphotos',
+  'gphotos_virtualmirrors',
+  'virtualmirrors',
+  'virtual_mirror',
+  'virtual_mirrors',
+  'temp_hq',
+  'cache',
+  '.cache',
+  'preview',
+  'previews',
+  '.preview',
+  '#recycle',
+  '@recycle',
+  '$recycle.bin',
+  'system volume information',
+  '.trashes',
+  '.trash',
+  'deriveddata',
+  'previews.lrdata',
+  'appdata',
+  '.appdata',
+]);
+
+const RAW_OR_MASTER_EXTS = new Set([
+  '.heic', '.heif', '.dng', '.raw', '.cr2', '.nef', '.tif', '.tiff'
+]);
+
 export function scanDirectoryRecursive(dirPath: string): string[] {
   const results: string[] = [];
   if (!fs.existsSync(dirPath)) return results;
@@ -32,15 +69,56 @@ export function scanDirectoryRecursive(dirPath: string): string[] {
   function scan(current: string) {
     try {
       const entries = fs.readdirSync(current, { withFileTypes: true });
+      const dirImages: string[] = [];
+
       for (const entry of entries) {
         const fullPath = path.join(current, entry.name);
         if (entry.isDirectory()) {
-          // Skip hidden system or app folders
-          if (!entry.name.startsWith('.') && entry.name !== 'node_modules') {
+          const lowerName = entry.name.toLowerCase();
+          // Skip hidden, system, NAS thumbnail, and cache folders
+          if (!entry.name.startsWith('.') && !IGNORED_DIRECTORY_NAMES.has(lowerName)) {
             scan(fullPath);
           }
-        } else if (entry.isFile() && isImageFile(fullPath)) {
-          results.push(fullPath);
+        } else if (entry.isFile()) {
+          // Skip hidden files, system stream files (Synology NAS), and thumbnail artifacts
+          if (entry.name.startsWith('.') || entry.name.includes('@SynoEAStream')) continue;
+
+          const lowerName = entry.name.toLowerCase();
+          if (
+            lowerName.startsWith('synophoto_thumb_') ||
+            lowerName.includes('_thumb.') ||
+            lowerName.includes('_thumb_') ||
+            lowerName.endsWith('_500.jpg') ||
+            lowerName.endsWith('_250.jpg') ||
+            lowerName.endsWith('_500.webp') ||
+            lowerName.endsWith('_250.webp')
+          ) {
+            continue;
+          }
+
+          if (isImageFile(fullPath)) {
+            dirImages.push(fullPath);
+          }
+        }
+      }
+
+      // Deduplicate companion RAW/HEIC + JPEG pairs with the same base name in the same folder
+      const baseMap = new Map<string, string[]>();
+      for (const imgPath of dirImages) {
+        const ext = path.extname(imgPath).toLowerCase();
+        const base = path.basename(imgPath, ext).toLowerCase();
+        if (!baseMap.has(base)) baseMap.set(base, []);
+        baseMap.get(base)!.push(imgPath);
+      }
+
+      for (const [_, paths] of baseMap.entries()) {
+        if (paths.length === 1) {
+          results.push(paths[0]);
+        } else {
+          // Multiple companion files found (e.g. IMG_0001.HEIC and IMG_0001.JPG)
+          // Prefer the master RAW/HEIC original file over the companion JPEG
+          const master = paths.find((p) => RAW_OR_MASTER_EXTS.has(path.extname(p).toLowerCase()));
+          results.push(master || paths[0]);
         }
       }
     } catch (err) {

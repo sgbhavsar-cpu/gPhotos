@@ -21,8 +21,10 @@ import {
   Play,
   Pause,
   Radio,
+  Users,
+  Image,
 } from 'lucide-react';
-import { VirtualStorageConfig, MirrorProgress, BackgroundServiceStatus, NetworkStorageProgress } from '../../types';
+import { VirtualStorageConfig, MirrorProgress, BackgroundServiceStatus, NetworkStorageProgress, StorageDetails } from '../../types';
 import { DeleteStorageModal } from '../components/DeleteStorageModal';
 import { libraryStore } from '../services/libraryStore';
 
@@ -31,6 +33,7 @@ interface VirtualStorageViewProps {
   onStoragesUpdated?: (storages: VirtualStorageConfig[]) => void;
   onBrowseFolderTree?: (folderPath: string) => void;
   storageProgressMap?: Record<string, NetworkStorageProgress>;
+  onScanStorageFaces?: (storage: VirtualStorageConfig) => void;
 }
 
 const STORAGE_CONFIGS_KEY = 'gphotos_virtual_storages_v1';
@@ -41,10 +44,13 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
   onStoragesUpdated,
   onBrowseFolderTree,
   storageProgressMap = {},
+  onScanStorageFaces,
 }) => {
   const [storages, setStorages] = useState<VirtualStorageConfig[]>([]);
   const storagesRef = useRef<VirtualStorageConfig[]>([]);
   storagesRef.current = storages;
+
+  const [storageDetailsMap, setStorageDetailsMap] = useState<Record<string, StorageDetails>>({});
 
   const [name, setName] = useState('');
   const [networkSourcePath, setNetworkSourcePath] = useState('');
@@ -158,7 +164,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
     return () => unsub();
   }, []);
 
-  // Periodic polling of background service and thumbnail caching status
+  // Periodic polling of background service, thumbnail caching, and per-storage details
   useEffect(() => {
     const fetchStatus = async () => {
       try {
@@ -169,10 +175,23 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
       } catch {}
     };
 
+    const fetchStorageDetails = async () => {
+      try {
+        if (window.electronAPI?.getAllStorageDetails) {
+          const details = await window.electronAPI.getAllStorageDetails();
+          setStorageDetailsMap(details || {});
+        }
+      } catch {}
+    };
+
     fetchStatus();
-    const intervalId = setInterval(fetchStatus, 1500);
+    fetchStorageDetails();
+    const intervalId = setInterval(() => {
+      fetchStatus();
+      fetchStorageDetails();
+    }, 2000);
     return () => clearInterval(intervalId);
-  }, []);
+  }, [storages]);
 
   const handleTogglePreCachePause = async () => {
     setIsPreCachingActionBusy(true);
@@ -712,277 +731,6 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
         </div>
       )}
 
-      {/* Overall Background Thumbnail & Cache Status Card (User Requirement) */}
-      {(() => {
-        const cachedCount = serviceStatus?.thumbnailsPreCachedCount ?? 0;
-        const totalToCache = Math.max(cachedCount, serviceStatus?.thumbnailsPreCachedTotal ?? 0);
-        const percent = totalToCache > 0 ? Math.min(100, Math.round((cachedCount / totalToCache) * 100)) : (cachedCount > 0 ? 100 : 0);
-        const isPreCachingActive = !!serviceStatus?.isPreCachingActive;
-        const currentPreCacheFile = serviceStatus?.currentPreCacheFile;
-        const isPreCacheDisabled = serviceStatus?.enableThumbnailPreCache === false;
-        const totalNetworkPhotos = storages.reduce((acc, s) => acc + (s.totalItems || 0), 0);
-
-        return (
-          <div style={{
-            backgroundColor: 'var(--bg-surface)',
-            border: '1px solid var(--border-subtle)',
-            borderRadius: 'var(--radius-lg)',
-            padding: '24px',
-            boxShadow: 'var(--shadow-sm)',
-            maxWidth: '860px',
-            marginBottom: '32px',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: '20px',
-          }}>
-            {/* Top Header & Status Badge */}
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                <div style={{
-                  width: '42px',
-                  height: '42px',
-                  borderRadius: 'var(--radius-md)',
-                  backgroundColor: 'rgba(56, 189, 248, 0.15)',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  color: 'var(--accent-cyan)',
-                }}>
-                  <Layers size={22} />
-                </div>
-                <div>
-                  <h3 style={{ fontSize: '1.1rem', fontWeight: 700, margin: 0, color: 'var(--text-primary)' }}>
-                    Overall Background Thumbnail & Cache Status
-                  </h3>
-                  <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', margin: '3px 0 0' }}>
-                    Multi-tier thumbnail caching (250px grid & 500px mirror) running non-blocking in background threads
-                  </p>
-                </div>
-              </div>
-
-              {/* Live Status Pill */}
-              <div style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: '8px',
-                padding: '6px 14px',
-                borderRadius: '9999px',
-                fontSize: '0.8rem',
-                fontWeight: 700,
-                backgroundColor: isPreCachingActive
-                  ? 'rgba(16, 185, 129, 0.15)'
-                  : isPreCacheDisabled
-                  ? 'rgba(239, 68, 68, 0.15)'
-                  : (totalToCache > 0 && cachedCount >= totalToCache)
-                  ? 'rgba(16, 185, 129, 0.12)'
-                  : 'rgba(56, 189, 248, 0.12)',
-                color: isPreCachingActive
-                  ? '#10b981'
-                  : isPreCacheDisabled
-                  ? 'var(--accent-rose)'
-                  : (totalToCache > 0 && cachedCount >= totalToCache)
-                  ? 'var(--accent-emerald)'
-                  : 'var(--accent-cyan)',
-                border: '1px solid currentColor',
-              }}>
-                {isPreCachingActive ? (
-                  <>
-                    <RefreshCw size={13} className="animate-spin" />
-                    <span>Background Caching ({serviceStatus?.currentCpuPercent ?? 0}% CPU)</span>
-                  </>
-                ) : isPreCacheDisabled ? (
-                  <>
-                    <AlertCircle size={13} />
-                    <span>Pre-Caching Paused</span>
-                  </>
-                ) : (totalToCache > 0 && cachedCount >= totalToCache) ? (
-                  <>
-                    <CheckCircle2 size={13} />
-                    <span>✓ All Thumbnails Cached (100%)</span>
-                  </>
-                ) : (
-                  <>
-                    <Activity size={13} />
-                    <span>Background Worker Ready</span>
-                  </>
-                )}
-              </div>
-            </div>
-
-            {/* Overall Progress Bar & Numbers */}
-            <div style={{
-              backgroundColor: 'var(--bg-surface-elevated)',
-              border: '1px solid rgba(255, 255, 255, 0.05)',
-              borderRadius: 'var(--radius-md)',
-              padding: '16px 18px',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '10px',
-            }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.85rem' }}>
-                <span style={{ color: 'var(--text-secondary)', fontWeight: 600 }}>
-                  Overall Caching Progress
-                </span>
-                <span style={{ fontWeight: 700, fontFamily: 'var(--font-mono)', color: 'var(--text-primary)', fontSize: '0.9rem' }}>
-                  {cachedCount} of {totalToCache} photos cached ({percent}%)
-                </span>
-              </div>
-
-              <div style={{
-                height: '12px',
-                borderRadius: '6px',
-                backgroundColor: 'rgba(255, 255, 255, 0.08)',
-                overflow: 'hidden',
-                position: 'relative',
-              }}>
-                <div style={{
-                  height: '100%',
-                  width: `${percent}%`,
-                  background: 'linear-gradient(90deg, var(--accent-cyan), #10b981)',
-                  transition: 'width 0.3s ease',
-                }} />
-              </div>
-
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                <span>
-                  {isPreCachingActive && currentPreCacheFile ? (
-                    <>Generating thumbnail: <strong style={{ color: 'var(--accent-cyan)' }}>{currentPreCacheFile}</strong></>
-                  ) : (totalToCache > 0 && cachedCount >= totalToCache) ? (
-                    <span style={{ color: 'var(--accent-emerald)', fontWeight: 600 }}>All network storage photos are fully indexed & cached for instant 0ms browsing</span>
-                  ) : (
-                    <span>Background duty-cycle worker automatically caches newly synced mirror photos</span>
-                  )}
-                </span>
-                <span>
-                  Queue: {Math.max(0, totalToCache - cachedCount)} remaining
-                </span>
-              </div>
-            </div>
-
-            {/* 4-Item Duty-Cycle & Resource Safety Information Grid */}
-            <div style={{
-              display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
-              gap: '12px',
-            }}>
-              <div style={{
-                padding: '12px 14px',
-                backgroundColor: 'var(--bg-surface-elevated)',
-                borderRadius: 'var(--radius-md)',
-                border: '1px solid rgba(255, 255, 255, 0.05)',
-              }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', color: 'var(--accent-cyan)' }}>
-                  <Cpu size={15} />
-                  <span style={{ fontSize: '0.8rem', fontWeight: 700 }}>Duty-Cycle CPU Cap</span>
-                </div>
-                <div style={{ fontSize: '1rem', fontWeight: 800, color: 'var(--text-primary)' }}>
-                  ≤ {serviceStatus?.maxCpuPercent ?? 40}% Max CPU
-                </div>
-                <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '2px' }}>
-                  Proportional sleep leaves 60%+ CPU free for 60fps UI
-                </div>
-              </div>
-
-              <div style={{
-                padding: '12px 14px',
-                backgroundColor: 'var(--bg-surface-elevated)',
-                borderRadius: 'var(--radius-md)',
-                border: '1px solid rgba(255, 255, 255, 0.05)',
-              }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', color: 'var(--accent-emerald)' }}>
-                  <Database size={15} />
-                  <span style={{ fontSize: '0.8rem', fontWeight: 700 }}>RAM Ceiling Guard</span>
-                </div>
-                <div style={{ fontSize: '1rem', fontWeight: 800, color: 'var(--text-primary)' }}>
-                  ≤ {serviceStatus?.maxRamMb ?? 1024} MB RAM
-                </div>
-                <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '2px' }}>
-                  Current: {serviceStatus?.currentRamMb ?? 0} MB (Buffer flushing active)
-                </div>
-              </div>
-
-              <div style={{
-                padding: '12px 14px',
-                backgroundColor: 'var(--bg-surface-elevated)',
-                borderRadius: 'var(--radius-md)',
-                border: '1px solid rgba(255, 255, 255, 0.05)',
-              }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', color: '#a855f7' }}>
-                  <Sparkles size={15} />
-                  <span style={{ fontSize: '0.8rem', fontWeight: 700 }}>Multi-Tier Cache</span>
-                </div>
-                <div style={{ fontSize: '1rem', fontWeight: 800, color: 'var(--text-primary)' }}>
-                  250px + 500px
-                </div>
-                <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '2px' }}>
-                  Local mirror + fast grid WebP & JPEG thumbnails
-                </div>
-              </div>
-
-              <div style={{
-                padding: '12px 14px',
-                backgroundColor: 'var(--bg-surface-elevated)',
-                borderRadius: 'var(--radius-md)',
-                border: '1px solid rgba(255, 255, 255, 0.05)',
-              }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', color: '#f59e0b' }}>
-                  <HardDrive size={15} />
-                  <span style={{ fontSize: '0.8rem', fontWeight: 700 }}>Network Photos</span>
-                </div>
-                <div style={{ fontSize: '1rem', fontWeight: 800, color: 'var(--text-primary)' }}>
-                  {totalNetworkPhotos} Photos
-                </div>
-                <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '2px' }}>
-                  Across {storages.length} configured storage mirror(s)
-                </div>
-              </div>
-            </div>
-
-            {/* Controls & Informational Footer */}
-            <div style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              flexWrap: 'wrap',
-              gap: '12px',
-              paddingTop: '6px',
-              borderTop: '1px solid var(--border-subtle)',
-            }}>
-              <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <Zap size={14} color="var(--accent-cyan)" />
-                <span>Thumbnails are cached automatically in the background without freezing the UI or network connections.</span>
-              </div>
-
-              <div style={{ display: 'flex', gap: '8px' }}>
-                <button
-                  type="button"
-                  className="btn btn-secondary"
-                  onClick={handleTogglePreCachePause}
-                  disabled={isPreCachingActionBusy}
-                  style={{ fontSize: '0.8rem', padding: '6px 14px', gap: '6px' }}
-                  title={isPreCachingActive ? "Pause background thumbnail generation" : "Resume background thumbnail generation"}
-                >
-                  {isPreCachingActive ? <Pause size={14} /> : <Play size={14} />}
-                  <span>{isPreCachingActive ? 'Pause Caching' : 'Resume Caching'}</span>
-                </button>
-
-                <button
-                  type="button"
-                  className="btn btn-primary"
-                  onClick={handleCacheAllNetworkPhotos}
-                  disabled={isPreCachingActionBusy || (totalToCache > 0 && cachedCount >= totalToCache && !isPreCachingActive)}
-                  style={{ fontSize: '0.8rem', padding: '6px 14px', gap: '6px' }}
-                  title="Ensure all network storage mirror photos are queued and cached"
-                >
-                  <RefreshCw size={14} className={isPreCachingActive ? 'animate-spin' : ''} />
-                  <span>{isPreCachingActive ? 'Caching Active...' : 'Cache All Network Photos Now'}</span>
-                </button>
-              </div>
-            </div>
-          </div>
-        );
-      })()}
-
       {/* Configured Storages List */}
       <div style={{ maxWidth: '860px' }}>
         <h3 style={{ fontSize: '1.1rem', fontWeight: 700, marginBottom: '16px' }}>
@@ -1094,6 +842,23 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                         );
                       })()}
 
+                      {onScanStorageFaces && (
+                        <button
+                          className="btn btn-secondary"
+                          onClick={() => onScanStorageFaces(s)}
+                          disabled={isSyncing}
+                          style={{
+                            fontSize: '0.8rem',
+                            padding: '6px 12px',
+                            gap: '6px',
+                          }}
+                          title="Run face recognition on original photos in this storage"
+                        >
+                          <Sparkles size={14} color="#ec4899" />
+                          <span>Scan Faces</span>
+                        </button>
+                      )}
+
                       <button
                         className="btn btn-primary"
                         onClick={() => onLoadMirroredPhotos(fullLocalPath)}
@@ -1115,22 +880,65 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                     </div>
                   </div>
 
-                  {/* Live Progress for Thumbnails and Face Recognition */}
+                  {/* Dual Status: Thumbnail Caching & Face Detection */}
                   {(() => {
+                    const details = storageDetailsMap[s.name] || storageDetailsMap[s.id];
                     const prog = storageProgressMap[s.name] || storageProgressMap[s.id];
-                    if (!prog || !prog.phase || prog.phase === 'idle') return null;
+
+                    const totalPhotos = Math.max(
+                      s.totalItems || 0,
+                      details?.totalPhotos || 0,
+                      prog?.thumbnailTotal || 0,
+                      prog?.faceTotal || 0
+                    );
+
+                    // Thumbnail stats
+                    const cachedThumbnails = prog?.thumbnailCurrent !== undefined && (prog.phase === 'thumbnails' || prog.phase === 'interrupted' || prog.phase === 'completed')
+                      ? prog.thumbnailCurrent
+                      : (details?.cachedThumbnails !== undefined ? details.cachedThumbnails : (s.totalItems || 0));
+                    const thumbTotal = prog?.thumbnailTotal || totalPhotos;
+                    const thumbPercent = thumbTotal > 0
+                      ? Math.min(100, Math.round((cachedThumbnails / thumbTotal) * 100))
+                      : (cachedThumbnails > 0 ? 100 : 0);
+                    const isThumbActive = prog?.phase === 'thumbnails' || (isSyncing && activeSyncStorageId === s.id);
+
+                    // Face stats
+                    const facesScanned = prog?.faceCurrent !== undefined && (prog.phase === 'faces' || prog.phase === 'completed')
+                      ? prog.faceCurrent
+                      : (details?.facesScannedCount !== undefined ? details.facesScannedCount : 0);
+                    const faceTotal = prog?.faceTotal || totalPhotos;
+                    const facePercent = faceTotal > 0
+                      ? Math.min(100, Math.round((facesScanned / faceTotal) * 100))
+                      : (facesScanned > 0 && facesScanned >= faceTotal ? 100 : 0);
+                    const facesDetected = details?.facesDetectedCount ?? 0;
+                    const isFaceActive = prog?.phase === 'faces';
+
                     return (
                       <div style={{
-                        backgroundColor: 'rgba(15, 23, 42, 0.6)',
-                        border: '1px solid rgba(255, 255, 255, 0.08)',
-                        borderRadius: 'var(--radius-md)',
-                        padding: '10px 14px',
                         display: 'flex',
                         flexDirection: 'column',
-                        gap: '6px',
+                        gap: '10px',
+                        backgroundColor: 'rgba(15, 23, 42, 0.45)',
+                        border: '1px solid rgba(255, 255, 255, 0.06)',
+                        borderRadius: 'var(--radius-md)',
+                        padding: '14px 16px',
                       }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem' }}>
-                          <span style={{
+                        {/* Active Phase Banner (if active) */}
+                        {prog && prog.phase && prog.phase !== 'idle' && (
+                          <div style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            padding: '6px 12px',
+                            borderRadius: 'var(--radius-sm)',
+                            fontSize: '0.78rem',
+                            backgroundColor: prog.phase === 'faces'
+                              ? 'rgba(236, 72, 153, 0.12)'
+                              : prog.phase === 'completed'
+                              ? 'rgba(16, 185, 129, 0.12)'
+                              : prog.phase === 'interrupted'
+                              ? 'rgba(245, 158, 11, 0.12)'
+                              : 'rgba(56, 189, 248, 0.12)',
                             color: prog.phase === 'faces'
                               ? '#f472b6'
                               : prog.phase === 'completed'
@@ -1138,37 +946,130 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                               : prog.phase === 'interrupted'
                               ? '#f59e0b'
                               : 'var(--accent-cyan)',
-                            fontWeight: 600,
+                            border: '1px solid currentColor',
                           }}>
-                            {prog.phase === 'scanning' && 'Scanning remote folder...'}
-                            {prog.phase === 'thumbnails' && `Generating Thumbnails: ${prog.thumbnailCurrent}/${prog.thumbnailTotal || '?'}`}
-                            {prog.phase === 'faces' && `Recognizing Faces: ${prog.faceCurrent}/${prog.faceTotal || '?'}`}
-                            {prog.phase === 'interrupted' && `Sync Interrupted / Checkpoint Saved: ${prog.thumbnailCurrent}/${prog.thumbnailTotal || '?'}`}
-                            {prog.phase === 'completed' && '✓ Up to date'}
-                            {prog.currentFile && ` (${prog.currentFile})`}
-                          </span>
-                          <span style={{ fontWeight: 600, color: 'var(--text-muted)' }}>{prog.percent}%</span>
-                        </div>
-                        {prog.message && (
-                          <div style={{ fontSize: '0.74rem', color: prog.phase === 'interrupted' ? '#f59e0b' : 'var(--text-secondary)' }}>
-                            {prog.message}
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                              {(isThumbActive || isFaceActive) && <RefreshCw size={12} className="animate-spin" />}
+                              <span style={{ fontWeight: 700 }}>
+                                {prog.phase === 'scanning' && 'Scanning remote directory...'}
+                                {prog.phase === 'thumbnails' && `Caching Thumbnails (${prog.thumbnailCurrent}/${prog.thumbnailTotal || '?'})`}
+                                {prog.phase === 'faces' && `Recognizing Faces (${prog.faceCurrent}/${prog.faceTotal || '?'})`}
+                                {prog.phase === 'interrupted' && `Sync Interrupted / Checkpoint Saved at photo ${prog.thumbnailCurrent}`}
+                                {prog.phase === 'completed' && '✓ Sync and Processing Completed'}
+                                {prog.currentFile && ` • ${prog.currentFile}`}
+                              </span>
+                            </div>
+                            <span style={{ fontWeight: 700, fontFamily: 'var(--font-mono)' }}>{prog.percent}%</span>
                           </div>
                         )}
-                        <div style={{ height: '6px', borderRadius: '3px', backgroundColor: 'rgba(255, 255, 255, 0.1)', overflow: 'hidden' }}>
+
+                        {/* 2-Column Grid: Thumbnail Cache & Face Recognition */}
+                        <div style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+                          gap: '12px',
+                        }}>
+                          {/* Column 1: Thumbnail Caching */}
                           <div style={{
-                            height: '100%',
-                            width: `${Math.min(100, Math.max(prog.phase === 'scanning' ? 12 : 0, prog.percent))}%`,
-                            background: prog.phase === 'faces'
-                              ? 'linear-gradient(90deg, #ec4899, #a855f7)'
-                              : prog.phase === 'completed'
-                              ? '#10b981'
-                              : prog.phase === 'interrupted'
-                              ? '#f59e0b'
-                              : prog.phase === 'error'
-                              ? '#ef4444'
-                              : 'var(--accent-cyan)',
-                            transition: 'width 0.2s ease',
-                          }} />
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '6px',
+                            backgroundColor: 'var(--bg-surface-elevated)',
+                            borderRadius: 'var(--radius-sm)',
+                            padding: '10px 12px',
+                            border: '1px solid rgba(255, 255, 255, 0.04)',
+                          }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.8rem' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--accent-cyan)', fontWeight: 700 }}>
+                                <Image size={14} />
+                                <span>Thumbnails Cached</span>
+                              </div>
+                              <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem', color: 'var(--text-primary)', fontWeight: 600 }}>
+                                {cachedThumbnails.toLocaleString()} / {thumbTotal.toLocaleString()} ({thumbPercent}%)
+                              </span>
+                            </div>
+
+                            <div style={{ height: '7px', borderRadius: '4px', backgroundColor: 'rgba(255, 255, 255, 0.08)', overflow: 'hidden' }}>
+                              <div style={{
+                                height: '100%',
+                                width: `${thumbPercent}%`,
+                                background: 'linear-gradient(90deg, var(--accent-cyan), #10b981)',
+                                transition: 'width 0.3s ease',
+                              }} />
+                            </div>
+
+                            <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', display: 'flex', justifyContent: 'space-between' }}>
+                              <span>
+                                {isThumbActive
+                                  ? '⚡ Caching in progress...'
+                                  : thumbPercent >= 100 && totalPhotos > 0
+                                  ? '✓ 100% cached for 0ms browsing'
+                                  : cachedThumbnails < thumbTotal
+                                  ? `${(thumbTotal - cachedThumbnails).toLocaleString()} pending cache`
+                                  : 'Ready'}
+                              </span>
+                              <span style={{ color: 'var(--text-secondary)' }}>
+                                500px + 250px grid
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* Column 2: Face Detection & Recognition */}
+                          <div style={{
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '6px',
+                            backgroundColor: 'var(--bg-surface-elevated)',
+                            borderRadius: 'var(--radius-sm)',
+                            padding: '10px 12px',
+                            border: '1px solid rgba(255, 255, 255, 0.04)',
+                          }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.8rem' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#ec4899', fontWeight: 700 }}>
+                                <Users size={14} />
+                                <span>Face Recognition</span>
+                              </div>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                <span style={{
+                                  fontSize: '0.72rem',
+                                  fontWeight: 700,
+                                  padding: '1px 6px',
+                                  borderRadius: '4px',
+                                  backgroundColor: 'rgba(236, 72, 153, 0.15)',
+                                  color: '#f472b6',
+                                }}>
+                                  {facesDetected.toLocaleString()} faces detected
+                                </span>
+                                <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem', color: 'var(--text-primary)', fontWeight: 600 }}>
+                                  {facesScanned.toLocaleString()} / {faceTotal.toLocaleString()} ({facePercent}%)
+                                </span>
+                              </div>
+                            </div>
+
+                            <div style={{ height: '7px', borderRadius: '4px', backgroundColor: 'rgba(255, 255, 255, 0.08)', overflow: 'hidden' }}>
+                              <div style={{
+                                height: '100%',
+                                width: `${facePercent}%`,
+                                background: 'linear-gradient(90deg, #ec4899, #a855f7)',
+                                transition: 'width 0.3s ease',
+                              }} />
+                            </div>
+
+                            <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', display: 'flex', justifyContent: 'space-between' }}>
+                              <span>
+                                {isFaceActive
+                                  ? '⚡ Analyzing original photos...'
+                                  : facePercent >= 100 && totalPhotos > 0
+                                  ? '✓ Face scanning complete'
+                                  : facesScanned > 0
+                                  ? `${(faceTotal - facesScanned).toLocaleString()} photos remaining`
+                                  : 'Not yet scanned'}
+                              </span>
+                              <span style={{ color: 'var(--text-secondary)' }}>
+                                Full-res scan
+                              </span>
+                            </div>
+                          </div>
                         </div>
                       </div>
                     );

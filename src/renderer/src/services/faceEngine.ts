@@ -83,7 +83,7 @@ export async function detectFacesInImage(
   source: HTMLImageElement | HTMLCanvasElement | string,
   photoIdOrPath?: string,
   originalRemotePath?: string,
-  preferOriginal = false
+  preferOriginal = true
 ): Promise<DetectedFace[]> {
   const ready = await loadFaceModels();
   if (!ready) {
@@ -93,6 +93,7 @@ export async function detectFacesInImage(
 
   let targetElement: HTMLImageElement | HTMLCanvasElement;
   let actualPhotoId = 'unknown';
+  let resolvedFilePath = '';
 
   try {
     if (typeof source !== 'string') {
@@ -114,6 +115,7 @@ export async function detectFacesInImage(
         filePath = photoIdOrPath;
         actualPhotoId = source;
       }
+      resolvedFilePath = filePath;
 
       const isHeic = typeof filePath === 'string' && /\.(heic|heif)$/i.test(filePath);
       let preparedHqPathOrUrl: string | null = null;
@@ -123,12 +125,12 @@ export async function detectFacesInImage(
         } catch {}
       }
 
-      // Convert filePath to loadable URL (using original/HQ photo for HEIC or preferOriginal)
+      // Always load the full-resolution original image for face detection (or HQ temp JPEG for HEIC)
       const url = preparedHqPathOrUrl
         ? (preparedHqPathOrUrl.startsWith('http') || preparedHqPathOrUrl.startsWith('gphoto://')
             ? preparedHqPathOrUrl
             : getLocalPhotoUrl(preparedHqPathOrUrl, undefined, true))
-        : getLocalPhotoUrl(filePath, originalRemotePath, isHeic ? true : preferOriginal);
+        : getLocalPhotoUrl(filePath, originalRemotePath, true);
 
       const img = new Image();
       img.crossOrigin = 'anonymous';
@@ -232,7 +234,9 @@ export async function detectFacesInImage(
         };
       });
     } finally {
-      const isHeic = typeof source === 'string' && /\.(heic|heif)$/i.test(source);
+      const isHeic =
+        (typeof source === 'string' && /\.(heic|heif)$/i.test(source)) ||
+        (typeof resolvedFilePath === 'string' && /\.(heic|heif)$/i.test(resolvedFilePath));
       if (isHeic && typeof window !== 'undefined' && window.electronAPI?.cleanupHeicHq) {
         window.electronAPI.cleanupHeicHq(actualPhotoId).catch(() => {});
       }

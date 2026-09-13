@@ -342,5 +342,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
       } catch {}
       return { refreshedCount: 0, errors: [] };
     },
+    getStorageDetails: async (_storageName: string) => null,
+    getAllStorageDetails: async () => ({}),
   };
 }

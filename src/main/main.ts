@@ -26,7 +26,9 @@ import {
   generateThumbnailBuffer,
   saveStorageCheckpoint,
   loadStorageCheckpoint,
-  getAllStorageCheckpoints
+  getAllStorageCheckpoints,
+  getStorageDetails,
+  getAllStorageDetails
 } from './services/virtualMirrorService';
 import { Photo, OrganizeOptions, VirtualStorageConfig, EditPhotoOptions, BackgroundServiceSettings } from '../types';
 import {
@@ -861,6 +863,24 @@ ipcMain.handle('mirror:get-storage-checkpoints', async (_event, mirrorRoot?: str
     return getAllStorageCheckpoints(mirrorRoot);
   } catch (err) {
     console.error('mirror:get-storage-checkpoints error:', err);
+    return {};
+  }
+});
+
+ipcMain.handle('mirror:get-storage-details', async (_event, storageName: string, mirrorRoot?: string) => {
+  try {
+    return getStorageDetails(storageName, mirrorRoot);
+  } catch (err) {
+    console.error('mirror:get-storage-details error:', err);
+    return null;
+  }
+});
+
+ipcMain.handle('mirror:get-all-storage-details', async (_event, mirrorRoot?: string) => {
+  try {
+    return getAllStorageDetails(mirrorRoot);
+  } catch (err) {
+    console.error('mirror:get-all-storage-details error:', err);
     return {};
   }
 });
