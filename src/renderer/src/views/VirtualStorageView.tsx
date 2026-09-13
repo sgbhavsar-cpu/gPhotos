@@ -19,6 +19,7 @@ import {
   Settings2,
   Check,
   Play,
+  Pause,
   Radio,
 } from 'lucide-react';
 import { VirtualStorageConfig, MirrorProgress, BackgroundServiceStatus, NetworkStorageProgress } from '../../types';
@@ -64,6 +65,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
   const [storageToDelete, setStorageToDelete] = useState<VirtualStorageConfig | null>(null);
   const [serviceStatus, setServiceStatus] = useState<BackgroundServiceStatus | null>(null);
   const [isUpdatingService, setIsUpdatingService] = useState(false);
+  const [isPreCachingActionBusy, setIsPreCachingActionBusy] = useState(false);
 
   const saveStorages = async (updater: VirtualStorageConfig[] | ((prev: VirtualStorageConfig[]) => VirtualStorageConfig[])) => {
     const updated = typeof updater === 'function' ? updater(storagesRef.current) : updater;
@@ -155,6 +157,58 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
     });
     return () => unsub();
   }, []);
+
+  // Periodic polling of background service and thumbnail caching status
+  useEffect(() => {
+    const fetchStatus = async () => {
+      try {
+        if (window.electronAPI?.getBackgroundServiceStatus) {
+          const status = await window.electronAPI.getBackgroundServiceStatus();
+          setServiceStatus(status);
+        }
+      } catch {}
+    };
+
+    fetchStatus();
+    const intervalId = setInterval(fetchStatus, 1500);
+    return () => clearInterval(intervalId);
+  }, []);
+
+  const handleTogglePreCachePause = async () => {
+    setIsPreCachingActionBusy(true);
+    try {
+      if (serviceStatus?.isPreCachingActive) {
+        if (window.electronAPI?.pauseThumbnailPreCache) {
+          await window.electronAPI.pauseThumbnailPreCache();
+        }
+      } else {
+        if (window.electronAPI?.startThumbnailPreCache) {
+          await window.electronAPI.startThumbnailPreCache();
+        }
+      }
+      if (window.electronAPI?.getBackgroundServiceStatus) {
+        const updated = await window.electronAPI.getBackgroundServiceStatus();
+        setServiceStatus(updated);
+      }
+    } finally {
+      setIsPreCachingActionBusy(false);
+    }
+  };
+
+  const handleCacheAllNetworkPhotos = async () => {
+    setIsPreCachingActionBusy(true);
+    try {
+      if (window.electronAPI?.startThumbnailPreCache) {
+        await window.electronAPI.startThumbnailPreCache();
+      }
+      if (window.electronAPI?.getBackgroundServiceStatus) {
+        const updated = await window.electronAPI.getBackgroundServiceStatus();
+        setServiceStatus(updated);
+      }
+    } finally {
+      setIsPreCachingActionBusy(false);
+    }
+  };
 
   const handleSelectNetworkSource = async () => {
     if (window.electronAPI) {
@@ -658,6 +712,277 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
         </div>
       )}
 
+      {/* Overall Background Thumbnail & Cache Status Card (User Requirement) */}
+      {(() => {
+        const cachedCount = serviceStatus?.thumbnailsPreCachedCount ?? 0;
+        const totalToCache = Math.max(cachedCount, serviceStatus?.thumbnailsPreCachedTotal ?? 0);
+        const percent = totalToCache > 0 ? Math.min(100, Math.round((cachedCount / totalToCache) * 100)) : (cachedCount > 0 ? 100 : 0);
+        const isPreCachingActive = !!serviceStatus?.isPreCachingActive;
+        const currentPreCacheFile = serviceStatus?.currentPreCacheFile;
+        const isPreCacheDisabled = serviceStatus?.enableThumbnailPreCache === false;
+        const totalNetworkPhotos = storages.reduce((acc, s) => acc + (s.totalItems || 0), 0);
+
+        return (
+          <div style={{
+            backgroundColor: 'var(--bg-surface)',
+            border: '1px solid var(--border-subtle)',
+            borderRadius: 'var(--radius-lg)',
+            padding: '24px',
+            boxShadow: 'var(--shadow-sm)',
+            maxWidth: '860px',
+            marginBottom: '32px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '20px',
+          }}>
+            {/* Top Header & Status Badge */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                <div style={{
+                  width: '42px',
+                  height: '42px',
+                  borderRadius: 'var(--radius-md)',
+                  backgroundColor: 'rgba(56, 189, 248, 0.15)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: 'var(--accent-cyan)',
+                }}>
+                  <Layers size={22} />
+                </div>
+                <div>
+                  <h3 style={{ fontSize: '1.1rem', fontWeight: 700, margin: 0, color: 'var(--text-primary)' }}>
+                    Overall Background Thumbnail & Cache Status
+                  </h3>
+                  <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', margin: '3px 0 0' }}>
+                    Multi-tier thumbnail caching (250px grid & 500px mirror) running non-blocking in background threads
+                  </p>
+                </div>
+              </div>
+
+              {/* Live Status Pill */}
+              <div style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '8px',
+                padding: '6px 14px',
+                borderRadius: '9999px',
+                fontSize: '0.8rem',
+                fontWeight: 700,
+                backgroundColor: isPreCachingActive
+                  ? 'rgba(16, 185, 129, 0.15)'
+                  : isPreCacheDisabled
+                  ? 'rgba(239, 68, 68, 0.15)'
+                  : (totalToCache > 0 && cachedCount >= totalToCache)
+                  ? 'rgba(16, 185, 129, 0.12)'
+                  : 'rgba(56, 189, 248, 0.12)',
+                color: isPreCachingActive
+                  ? '#10b981'
+                  : isPreCacheDisabled
+                  ? 'var(--accent-rose)'
+                  : (totalToCache > 0 && cachedCount >= totalToCache)
+                  ? 'var(--accent-emerald)'
+                  : 'var(--accent-cyan)',
+                border: '1px solid currentColor',
+              }}>
+                {isPreCachingActive ? (
+                  <>
+                    <RefreshCw size={13} className="animate-spin" />
+                    <span>Background Caching ({serviceStatus?.currentCpuPercent ?? 0}% CPU)</span>
+                  </>
+                ) : isPreCacheDisabled ? (
+                  <>
+                    <AlertCircle size={13} />
+                    <span>Pre-Caching Paused</span>
+                  </>
+                ) : (totalToCache > 0 && cachedCount >= totalToCache) ? (
+                  <>
+                    <CheckCircle2 size={13} />
+                    <span>✓ All Thumbnails Cached (100%)</span>
+                  </>
+                ) : (
+                  <>
+                    <Activity size={13} />
+                    <span>Background Worker Ready</span>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {/* Overall Progress Bar & Numbers */}
+            <div style={{
+              backgroundColor: 'var(--bg-surface-elevated)',
+              border: '1px solid rgba(255, 255, 255, 0.05)',
+              borderRadius: 'var(--radius-md)',
+              padding: '16px 18px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '10px',
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.85rem' }}>
+                <span style={{ color: 'var(--text-secondary)', fontWeight: 600 }}>
+                  Overall Caching Progress
+                </span>
+                <span style={{ fontWeight: 700, fontFamily: 'var(--font-mono)', color: 'var(--text-primary)', fontSize: '0.9rem' }}>
+                  {cachedCount} of {totalToCache} photos cached ({percent}%)
+                </span>
+              </div>
+
+              <div style={{
+                height: '12px',
+                borderRadius: '6px',
+                backgroundColor: 'rgba(255, 255, 255, 0.08)',
+                overflow: 'hidden',
+                position: 'relative',
+              }}>
+                <div style={{
+                  height: '100%',
+                  width: `${percent}%`,
+                  background: 'linear-gradient(90deg, var(--accent-cyan), #10b981)',
+                  transition: 'width 0.3s ease',
+                }} />
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                <span>
+                  {isPreCachingActive && currentPreCacheFile ? (
+                    <>Generating thumbnail: <strong style={{ color: 'var(--accent-cyan)' }}>{currentPreCacheFile}</strong></>
+                  ) : (totalToCache > 0 && cachedCount >= totalToCache) ? (
+                    <span style={{ color: 'var(--accent-emerald)', fontWeight: 600 }}>All network storage photos are fully indexed & cached for instant 0ms browsing</span>
+                  ) : (
+                    <span>Background duty-cycle worker automatically caches newly synced mirror photos</span>
+                  )}
+                </span>
+                <span>
+                  Queue: {Math.max(0, totalToCache - cachedCount)} remaining
+                </span>
+              </div>
+            </div>
+
+            {/* 4-Item Duty-Cycle & Resource Safety Information Grid */}
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+              gap: '12px',
+            }}>
+              <div style={{
+                padding: '12px 14px',
+                backgroundColor: 'var(--bg-surface-elevated)',
+                borderRadius: 'var(--radius-md)',
+                border: '1px solid rgba(255, 255, 255, 0.05)',
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', color: 'var(--accent-cyan)' }}>
+                  <Cpu size={15} />
+                  <span style={{ fontSize: '0.8rem', fontWeight: 700 }}>Duty-Cycle CPU Cap</span>
+                </div>
+                <div style={{ fontSize: '1rem', fontWeight: 800, color: 'var(--text-primary)' }}>
+                  ≤ {serviceStatus?.maxCpuPercent ?? 40}% Max CPU
+                </div>
+                <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '2px' }}>
+                  Proportional sleep leaves 60%+ CPU free for 60fps UI
+                </div>
+              </div>
+
+              <div style={{
+                padding: '12px 14px',
+                backgroundColor: 'var(--bg-surface-elevated)',
+                borderRadius: 'var(--radius-md)',
+                border: '1px solid rgba(255, 255, 255, 0.05)',
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', color: 'var(--accent-emerald)' }}>
+                  <Database size={15} />
+                  <span style={{ fontSize: '0.8rem', fontWeight: 700 }}>RAM Ceiling Guard</span>
+                </div>
+                <div style={{ fontSize: '1rem', fontWeight: 800, color: 'var(--text-primary)' }}>
+                  ≤ {serviceStatus?.maxRamMb ?? 1024} MB RAM
+                </div>
+                <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '2px' }}>
+                  Current: {serviceStatus?.currentRamMb ?? 0} MB (Buffer flushing active)
+                </div>
+              </div>
+
+              <div style={{
+                padding: '12px 14px',
+                backgroundColor: 'var(--bg-surface-elevated)',
+                borderRadius: 'var(--radius-md)',
+                border: '1px solid rgba(255, 255, 255, 0.05)',
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', color: '#a855f7' }}>
+                  <Sparkles size={15} />
+                  <span style={{ fontSize: '0.8rem', fontWeight: 700 }}>Multi-Tier Cache</span>
+                </div>
+                <div style={{ fontSize: '1rem', fontWeight: 800, color: 'var(--text-primary)' }}>
+                  250px + 500px
+                </div>
+                <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '2px' }}>
+                  Local mirror + fast grid WebP & JPEG thumbnails
+                </div>
+              </div>
+
+              <div style={{
+                padding: '12px 14px',
+                backgroundColor: 'var(--bg-surface-elevated)',
+                borderRadius: 'var(--radius-md)',
+                border: '1px solid rgba(255, 255, 255, 0.05)',
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', color: '#f59e0b' }}>
+                  <HardDrive size={15} />
+                  <span style={{ fontSize: '0.8rem', fontWeight: 700 }}>Network Photos</span>
+                </div>
+                <div style={{ fontSize: '1rem', fontWeight: 800, color: 'var(--text-primary)' }}>
+                  {totalNetworkPhotos} Photos
+                </div>
+                <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '2px' }}>
+                  Across {storages.length} configured storage mirror(s)
+                </div>
+              </div>
+            </div>
+
+            {/* Controls & Informational Footer */}
+            <div style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              flexWrap: 'wrap',
+              gap: '12px',
+              paddingTop: '6px',
+              borderTop: '1px solid var(--border-subtle)',
+            }}>
+              <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <Zap size={14} color="var(--accent-cyan)" />
+                <span>Thumbnails are cached automatically in the background without freezing the UI or network connections.</span>
+              </div>
+
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={handleTogglePreCachePause}
+                  disabled={isPreCachingActionBusy}
+                  style={{ fontSize: '0.8rem', padding: '6px 14px', gap: '6px' }}
+                  title={isPreCachingActive ? "Pause background thumbnail generation" : "Resume background thumbnail generation"}
+                >
+                  {isPreCachingActive ? <Pause size={14} /> : <Play size={14} />}
+                  <span>{isPreCachingActive ? 'Pause Caching' : 'Resume Caching'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={handleCacheAllNetworkPhotos}
+                  disabled={isPreCachingActionBusy || (totalToCache > 0 && cachedCount >= totalToCache && !isPreCachingActive)}
+                  style={{ fontSize: '0.8rem', padding: '6px 14px', gap: '6px' }}
+                  title="Ensure all network storage mirror photos are queued and cached"
+                >
+                  <RefreshCw size={14} className={isPreCachingActive ? 'animate-spin' : ''} />
+                  <span>{isPreCachingActive ? 'Caching Active...' : 'Cache All Network Photos Now'}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {/* Configured Storages List */}
       <div style={{ maxWidth: '860px' }}>
         <h3 style={{ fontSize: '1.1rem', fontWeight: 700, marginBottom: '16px' }}>
@@ -732,16 +1057,42 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                         </button>
                       )}
 
-                      <button
-                        className="btn btn-secondary"
-                        onClick={() => handleSyncStorage(s)}
-                        disabled={isSyncing}
-                        style={{ fontSize: '0.8rem', padding: '6px 12px' }}
-                        title="Rescan network location to check if new photos were added"
-                      >
-                        <RefreshCw size={14} className={isThisSyncing ? 'animate-spin' : ''} />
-                        <span>{isThisSyncing ? 'Rescanning...' : 'Rescan / Refresh'}</span>
-                      </button>
+                      {(() => {
+                        const prog = storageProgressMap[s.name] || storageProgressMap[s.id];
+                        const canResume = prog?.canResume || prog?.phase === 'interrupted';
+
+                        return canResume ? (
+                          <button
+                            className="btn btn-primary"
+                            onClick={() => handleSyncStorage(s)}
+                            disabled={isSyncing}
+                            style={{
+                              fontSize: '0.8rem',
+                              padding: '6px 14px',
+                              gap: '6px',
+                              backgroundColor: '#f59e0b',
+                              borderColor: '#d97706',
+                              color: '#000',
+                              fontWeight: 700,
+                            }}
+                            title={`Resume sync from photo ${(prog?.thumbnailCurrent || 0) + 1} of ${prog?.thumbnailTotal || '?'}`}
+                          >
+                            <Play size={14} />
+                            <span>Resume Sync ({prog?.percent || 0}%)</span>
+                          </button>
+                        ) : (
+                          <button
+                            className="btn btn-secondary"
+                            onClick={() => handleSyncStorage(s)}
+                            disabled={isSyncing}
+                            style={{ fontSize: '0.8rem', padding: '6px 12px' }}
+                            title="Rescan network location to check if new photos were added"
+                          >
+                            <RefreshCw size={14} className={isThisSyncing ? 'animate-spin' : ''} />
+                            <span>{isThisSyncing ? 'Rescanning...' : 'Rescan / Refresh'}</span>
+                          </button>
+                        );
+                      })()}
 
                       <button
                         className="btn btn-primary"
@@ -780,17 +1131,29 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                       }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem' }}>
                           <span style={{
-                            color: prog.phase === 'faces' ? '#f472b6' : prog.phase === 'completed' ? '#10b981' : 'var(--accent-cyan)',
+                            color: prog.phase === 'faces'
+                              ? '#f472b6'
+                              : prog.phase === 'completed'
+                              ? '#10b981'
+                              : prog.phase === 'interrupted'
+                              ? '#f59e0b'
+                              : 'var(--accent-cyan)',
                             fontWeight: 600,
                           }}>
                             {prog.phase === 'scanning' && 'Scanning remote folder...'}
                             {prog.phase === 'thumbnails' && `Generating Thumbnails: ${prog.thumbnailCurrent}/${prog.thumbnailTotal || '?'}`}
                             {prog.phase === 'faces' && `Recognizing Faces: ${prog.faceCurrent}/${prog.faceTotal || '?'}`}
+                            {prog.phase === 'interrupted' && `Sync Interrupted / Checkpoint Saved: ${prog.thumbnailCurrent}/${prog.thumbnailTotal || '?'}`}
                             {prog.phase === 'completed' && '✓ Up to date'}
                             {prog.currentFile && ` (${prog.currentFile})`}
                           </span>
                           <span style={{ fontWeight: 600, color: 'var(--text-muted)' }}>{prog.percent}%</span>
                         </div>
+                        {prog.message && (
+                          <div style={{ fontSize: '0.74rem', color: prog.phase === 'interrupted' ? '#f59e0b' : 'var(--text-secondary)' }}>
+                            {prog.message}
+                          </div>
+                        )}
                         <div style={{ height: '6px', borderRadius: '3px', backgroundColor: 'rgba(255, 255, 255, 0.1)', overflow: 'hidden' }}>
                           <div style={{
                             height: '100%',
@@ -799,6 +1162,8 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                               ? 'linear-gradient(90deg, #ec4899, #a855f7)'
                               : prog.phase === 'completed'
                               ? '#10b981'
+                              : prog.phase === 'interrupted'
+                              ? '#f59e0b'
                               : prog.phase === 'error'
                               ? '#ef4444'
                               : 'var(--accent-cyan)',

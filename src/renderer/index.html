@@ -148,5 +148,15 @@
 
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+      // Fallback: Ensure splash screen never stays stuck even if an error occurs
+      setTimeout(function() {
+        var splash = document.getElementById('app-splash-screen');
+        if (splash && !splash.classList.contains('loaded')) {
+          splash.classList.add('loaded');
+          setTimeout(function() { if (splash && splash.parentNode) splash.parentNode.removeChild(splash); }, 600);
+        }
+      }, 1500);
+    </script>
   </body>
 </html>

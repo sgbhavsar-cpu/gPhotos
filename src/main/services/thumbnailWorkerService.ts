@@ -1,9 +1,10 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { Photo } from '../../types';
+import { Photo, ThumbnailWorkerCheckpoint } from '../../types';
 import { getOrGenerateCachedThumbnail } from './thumbnailCacheService';
 import { generateSpriteSheet } from './spriteService';
+import { libraryStatusService } from './libraryStatusService';
 
 let sharp: any = null;
 try {
@@ -27,6 +28,7 @@ interface WorkerStatus {
   total: number;
   cpuPercent: number;
   ramMb: number;
+  currentFile?: string;
   lastError?: string;
 }
 
@@ -37,6 +39,8 @@ class ThumbnailWorkerService {
   private isPaused = false;
   private totalQueuedCount = 0;
   private processedCount = 0;
+  private currentFileName?: string;
+  private currentLibraryPath?: string;
 
   private limits: WorkerLimits = {
     maxCpuPercent: 40,
@@ -50,10 +54,98 @@ class ThumbnailWorkerService {
   private statusListeners: Set<(status: WorkerStatus) => void> = new Set();
 
   constructor() {
+    this.loadCheckpoint();
     // Start periodic resource monitoring (every 2 seconds)
     setInterval(() => {
       this.updateResourceMetrics();
     }, 2000);
+  }
+
+  private getCheckpointFilePath(): string {
+    try {
+      const electron = require('electron');
+      if (electron.app && typeof electron.app.getPath === 'function' && electron.app.isReady()) {
+        return path.join(electron.app.getPath('userData'), 'thumbnail_worker_checkpoint.json');
+      }
+    } catch {}
+    const fallback = process.env.APPDATA
+      ? path.join(process.env.APPDATA, 'gPhotos')
+      : path.join(process.cwd(), '.temp');
+    if (!fs.existsSync(fallback)) {
+      try { fs.mkdirSync(fallback, { recursive: true }); } catch {}
+    }
+    return path.join(fallback, 'thumbnail_worker_checkpoint.json');
+  }
+
+  public loadCheckpoint(targetLibraryPath?: string): void {
+    try {
+      // 1. Check per-library status first if available
+      const libPath = targetLibraryPath || this.currentLibraryPath;
+      if (libPath) {
+        const libStatus = libraryStatusService.getLibraryStatus(libPath);
+        if (libStatus && libStatus.totalPhotos > 0) {
+          this.processedCount = libStatus.thumbnailCachedCount;
+          this.totalQueuedCount = libStatus.totalPhotos;
+          this.currentFileName = libStatus.thumbnailLastFile;
+          console.log(`[ThumbnailWorker] Restored library status for ${libPath}: ${this.processedCount}/${this.totalQueuedCount} (${libStatus.thumbnailPercent}%) cached.`);
+          return;
+        }
+      }
+
+      // 2. Global worker checkpoint fallback
+      const p = this.getCheckpointFilePath();
+      if (fs.existsSync(p)) {
+        const raw = fs.readFileSync(p, 'utf-8');
+        const data: ThumbnailWorkerCheckpoint = JSON.parse(raw);
+        if (data && typeof data.processedCount === 'number') {
+          this.processedCount = data.processedCount;
+          this.totalQueuedCount = data.totalQueuedCount || data.processedCount;
+          this.currentFileName = data.currentFileName;
+          if (data.libraryPath) this.currentLibraryPath = data.libraryPath;
+          console.log(`[ThumbnailWorker] Checkpoint restored: ${this.processedCount} of ${this.totalQueuedCount} photos pre-cached.`);
+        }
+      }
+    } catch (err) {
+      console.warn('[ThumbnailWorker] Failed to read checkpoint:', err);
+    }
+  }
+
+  public saveCheckpoint(isFinished = false): void {
+    try {
+      const p = this.getCheckpointFilePath();
+      const dir = path.dirname(p);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const checkpoint: ThumbnailWorkerCheckpoint = {
+        processedCount: this.processedCount,
+        totalQueuedCount: this.totalQueuedCount,
+        currentFileName: this.currentFileName,
+        lastSavedTime: Date.now(),
+        isFinished,
+        libraryPath: this.currentLibraryPath,
+      };
+      fs.writeFileSync(p, JSON.stringify(checkpoint, null, 2), 'utf-8');
+
+      // Also persist to library status if libraryPath is known
+      if (this.currentLibraryPath) {
+        const pct = this.totalQueuedCount > 0 ? Math.round((this.processedCount / this.totalQueuedCount) * 100) : 0;
+        libraryStatusService.saveLibraryStatus({
+          libraryPath: this.currentLibraryPath,
+          totalPhotos: this.totalQueuedCount,
+          thumbnailCachedCount: this.processedCount,
+          thumbnailTotalCount: this.totalQueuedCount,
+          thumbnailLastFile: this.currentFileName,
+          thumbnailCompleted: isFinished || (this.totalQueuedCount > 0 && this.processedCount >= this.totalQueuedCount),
+          thumbnailPercent: pct,
+          phase: isFinished ? 'completed' : this.isPaused ? 'paused' : 'thumbnails',
+        });
+      }
+    } catch (err) {
+      console.warn('[ThumbnailWorker] Failed to save checkpoint:', err);
+    }
+  }
+
+  public flushCheckpoint(): void {
+    this.saveCheckpoint(this.queue.length === 0);
   }
 
   /**
@@ -103,6 +195,7 @@ class ThumbnailWorkerService {
       total: this.totalQueuedCount,
       cpuPercent: this.currentCalculatedCpuPercent,
       ramMb: Math.round(mem.rss / (1024 * 1024)),
+      currentFile: this.isProcessing ? (this.currentFileName || 'Processing...') : undefined,
     };
   }
 
@@ -139,10 +232,33 @@ class ThumbnailWorkerService {
   }
 
   /**
-   * Enqueues photos for background thumbnail pre-caching.
+   * Enqueues photos for background thumbnail pre-caching with library tracking.
    */
-  public enqueuePhotos(photos: Photo[]): void {
+  public enqueuePhotos(photos: Photo[], libraryPath?: string): void {
     if (!photos || photos.length === 0) return;
+
+    if (libraryPath) {
+      this.currentLibraryPath = libraryPath;
+    } else if (photos[0]?.storageName) {
+      this.currentLibraryPath = photos[0].storageName;
+    }
+
+    // Check existing library status to preserve accurate previous progress
+    if (this.currentLibraryPath) {
+      const existingStatus = libraryStatusService.getLibraryStatus(this.currentLibraryPath);
+      if (existingStatus) {
+        if (existingStatus.thumbnailCompleted && existingStatus.totalPhotos === photos.length) {
+          this.processedCount = photos.length;
+          this.totalQueuedCount = photos.length;
+          console.log(`[ThumbnailWorker] Library ${this.currentLibraryPath} is already 100% pre-cached (${photos.length} photos). Skipping redundant queueing.`);
+          this.notifyStatus();
+          return;
+        }
+        if (existingStatus.thumbnailCachedCount > 0) {
+          this.processedCount = Math.max(this.processedCount, existingStatus.thumbnailCachedCount);
+        }
+      }
+    }
 
     let addedCount = 0;
     for (const photo of photos) {
@@ -156,8 +272,9 @@ class ThumbnailWorkerService {
     }
 
     if (addedCount > 0) {
-      this.totalQueuedCount = this.processedCount + this.queue.length;
-      console.log(`[ThumbnailWorker] Enqueued ${addedCount} photos for background pre-caching (Total queue: ${this.queue.length}).`);
+      this.totalQueuedCount = Math.max(this.totalQueuedCount, photos.length, this.processedCount + this.queue.length);
+      console.log(`[ThumbnailWorker] Enqueued ${addedCount} photos for background pre-caching (Total queue: ${this.queue.length}, Processed: ${this.processedCount}, Total: ${this.totalQueuedCount}).`);
+      this.saveCheckpoint(false);
       this.notifyStatus();
 
       if (this.limits.enabled && !this.isProcessing && !this.isPaused) {
@@ -169,6 +286,7 @@ class ThumbnailWorkerService {
   public pause(): void {
     this.isPaused = true;
     console.log('[ThumbnailWorker] Background pre-caching paused.');
+    this.saveCheckpoint(false);
     this.notifyStatus();
   }
 
@@ -182,54 +300,68 @@ class ThumbnailWorkerService {
   }
 
   /**
-   * Core processing loop with duty-cycle CPU regulation and RAM backoff
+   * Core processing loop with:
+   * 1. Fast-forward (0ms delay) on already-cached photos!
+   * 2. Duty-cycle CPU regulation on new thumbnail generations.
+   * 3. RAM backoff protection.
    */
   private async processQueue(): Promise<void> {
     if (this.isProcessing) return;
     this.isProcessing = true;
+
+    let fastForwardCount = 0;
 
     try {
       while (this.queue.length > 0 && !this.isPaused && this.limits.enabled) {
         const photo = this.queue.shift()!;
         this.queuedPaths.delete(photo.filePath.toLowerCase());
 
-        // 1. RAM Safety Check: if current RAM exceeds limit, pause and back off
+        // 1. Fast-path cache check: If already cached on disk, FAST FORWARD WITHOUT SLEEP!
+        const t0 = Date.now();
+        let isCached = false;
+        try {
+          const res = await getOrGenerateCachedThumbnail(photo.filePath, 250);
+          if (res?.isFromCache) {
+            isCached = true;
+          }
+        } catch {}
+
+        if (isCached) {
+          fastForwardCount++;
+          this.processedCount = Math.min(this.totalQueuedCount, this.processedCount + 1);
+
+          // Periodically save and notify every 50 fast-forwarded photos to avoid UI overhead
+          if (fastForwardCount % 50 === 0 || this.queue.length === 0) {
+            this.saveCheckpoint(false);
+            this.notifyStatus();
+          }
+          // Do NOT sleep! Continue immediately to next photo to skip already-cached files in milliseconds!
+          continue;
+        }
+
+        // New photo generation required:
+        this.currentFileName = photo.fileName || path.basename(photo.filePath);
+        this.processedCount = Math.min(this.totalQueuedCount, this.processedCount + 1);
+        const tWork = Math.max(1, Date.now() - t0);
+
+        if (this.processedCount % 5 === 0) {
+          this.saveCheckpoint(false);
+          this.notifyStatus();
+        }
+
+        // 2. RAM Safety Check: if current RAM exceeds limit, pause and back off
         const currentRssMb = Math.round(process.memoryUsage().rss / (1024 * 1024));
         if (currentRssMb >= this.limits.maxRamMb) {
           console.warn(`[ThumbnailWorker] RAM reached ${currentRssMb}MB (limit: ${this.limits.maxRamMb}MB). Backing off for 3 seconds...`);
           if (sharp?.cache) sharp.cache(false);
           await new Promise((r) => setTimeout(r, 3000));
-          // Put photo back at front of queue to retry
-          this.queue.unshift(photo);
-          this.queuedPaths.add(photo.filePath.toLowerCase());
-          continue;
         }
 
-        // 2. Measure execution time of thumbnail generation
-        const t0 = Date.now();
-        try {
-          // Pre-cache 250px grid thumbnail
-          await getOrGenerateCachedThumbnail(photo.filePath, 250);
-        } catch (thumbErr) {
-          // Ignore individual photo errors and continue
-        }
-        const tWork = Math.max(1, Date.now() - t0);
-
-        this.processedCount++;
-        if (this.processedCount % 10 === 0) {
-          this.notifyStatus();
-        }
-
-        // 3. CPU Duty Cycle Throttling (Cap CPU <= maxCpuPercent)
-        // Formula: sleepTime = tWork * ((100 - maxCpuPercent) / maxCpuPercent)
-        // Example: at 40% CPU, sleepTime = tWork * (60 / 40) = tWork * 1.5
+        // 3. CPU Duty Cycle Throttling on actual work (Cap CPU <= maxCpuPercent)
         const cpuCap = Math.max(10, Math.min(90, this.limits.maxCpuPercent));
         let sleepMs = Math.round(tWork * ((100 - cpuCap) / cpuCap));
-
-        // Ensure minimum 8ms rest to allow the Node.js event loop to process UI and IPC events
         sleepMs = Math.max(8, sleepMs);
 
-        // Adaptive regulation: if overall process CPU is running hot, increase sleep
         if (this.currentCalculatedCpuPercent > cpuCap) {
           sleepMs += Math.round((this.currentCalculatedCpuPercent - cpuCap) * 5);
         }
@@ -238,8 +370,11 @@ class ThumbnailWorkerService {
       }
     } finally {
       this.isProcessing = false;
+      this.currentFileName = undefined;
+      const isDone = this.queue.length === 0;
+      this.saveCheckpoint(isDone);
       this.notifyStatus();
-      if (this.queue.length === 0) {
+      if (isDone) {
         console.log(`[ThumbnailWorker] All ${this.processedCount} queued photos have been pre-cached to disk!`);
       }
     }

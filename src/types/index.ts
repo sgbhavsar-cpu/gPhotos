@@ -76,6 +76,7 @@ export interface Photo {
   isExcluded?: boolean;
   faceScanCompleted?: boolean;
   sharpnessScore?: number;
+  rotation?: number;
 }
 
 export interface FolderTreeNode {
@@ -184,7 +185,7 @@ export interface MirrorProgress {
 
 export interface NetworkStorageProgress {
   storageName: string;
-  phase: 'idle' | 'scanning' | 'thumbnails' | 'faces' | 'completed' | 'error';
+  phase: 'idle' | 'scanning' | 'thumbnails' | 'faces' | 'completed' | 'paused' | 'interrupted' | 'error';
   thumbnailCurrent: number;
   thumbnailTotal: number;
   faceCurrent: number;
@@ -193,6 +194,53 @@ export interface NetworkStorageProgress {
   message?: string;
   currentFile?: string;
   error?: string;
+  lastProcessedIndex?: number;
+  canResume?: boolean;
+}
+
+export interface StorageSyncCheckpoint {
+  storageName: string;
+  networkSourcePath: string;
+  localMirrorRoot: string;
+  phase: 'scanning' | 'thumbnails' | 'completed' | 'paused' | 'interrupted' | 'error';
+  processedCount: number;
+  totalDiscovered: number;
+  lastProcessedIndex: number;
+  lastProcessedFile?: string;
+  percent: number;
+  timestamp: number;
+  updatedAt: string;
+}
+
+export interface ThumbnailWorkerCheckpoint {
+  processedCount: number;
+  totalQueuedCount: number;
+  currentFileName?: string;
+  lastSavedTime: number;
+  isFinished: boolean;
+  libraryPath?: string;
+}
+
+export interface LibraryScanStatus {
+  libraryPath: string;
+  libraryName: string;
+  totalPhotos: number;
+  thumbnailCachedCount: number;
+  thumbnailTotalCount: number;
+  thumbnailLastIndex: number;
+  thumbnailLastFile?: string;
+  thumbnailCompleted: boolean;
+  thumbnailPercent: number;
+  faceScannedCount: number;
+  faceTotalCount: number;
+  faceDetectedCount: number;
+  faceLastIndex: number;
+  faceLastFile?: string;
+  faceCompleted: boolean;
+  facePercent: number;
+  phase: 'idle' | 'thumbnails' | 'faces' | 'completed' | 'paused' | 'interrupted' | 'error';
+  message?: string;
+  lastUpdated: string;
 }
 
 export interface PlaceAlbum {
@@ -282,6 +330,9 @@ export interface IElectronAPI {
   generateThumbnailOnTheFly: (sourceFilePath: string, mirrorDirPath?: string) => Promise<string | null>;
   editPhoto: (options: EditPhotoOptions) => Promise<EditPhotoResult>;
   trashFiles: (filePaths: string[]) => Promise<{ success: boolean; trashedCount: number; errors: string[] }>;
+  deleteFilesPermanently: (filePaths: string[]) => Promise<{ success: boolean; deletedCount: number; errors: string[] }>;
+  rotatePhoto: (filePath: string, rotationDegrees: number, originalRemotePath?: string) => Promise<{ success: boolean; isQueued?: boolean; newPath?: string; message?: string; error?: string }>;
+  processPendingRotations?: () => Promise<{ processed: number; remaining: number; error?: string }>;
   deleteVirtualStorage: (params: { storageName: string; localMirrorRoot?: string; deleteDiskFiles: boolean }) => Promise<{ success: boolean; error?: string }>;
 
   // Background Daemon & Tray Service capabilities
@@ -323,9 +374,17 @@ export interface IElectronAPI {
     cpuPercent: number;
     ramMb: number;
     paused: boolean;
+    currentFile?: string;
   }>;
   startThumbnailPreCache?: (photos?: Photo[]) => Promise<{ started: boolean }>;
-  pauseThumbnailPreCache?: () => Promise<{ paused: boolean }>;
+   pauseThumbnailPreCache?: () => Promise<{ paused: boolean }>;
+  getStorageCheckpoints?: () => Promise<Record<string, StorageSyncCheckpoint>>;
+  getLibraryStatus?: (libraryPath: string) => Promise<LibraryScanStatus | null>;
+  saveLibraryStatus?: (status: Partial<LibraryScanStatus> & { libraryPath: string }) => Promise<LibraryScanStatus>;
+  getAllLibraryStatuses?: () => Promise<Record<string, LibraryScanStatus>>;
+  refreshThumbnailsFromSource?: (
+    items: Array<{ filePath: string; originalRemotePath?: string }>
+  ) => Promise<{ refreshedCount: number; errors: string[] }>;
 }
 
 export interface TimelineMonthSummary {
@@ -412,6 +471,7 @@ export interface BackgroundServiceStatus {
   thumbnailsPreCachedCount?: number;
   thumbnailsPreCachedTotal?: number;
   isPreCachingActive?: boolean;
+  currentPreCacheFile?: string;
 }
 
 export interface BackgroundServiceSettings {

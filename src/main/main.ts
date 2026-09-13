@@ -18,7 +18,14 @@ import {
   generateThumbnailOnTheFly,
   editPhotoFile,
   trashFiles,
-  generateThumbnailBuffer
+  deleteFilesPermanently,
+  rotatePhotoFile,
+  rotatePhotoWithOfflineQueue,
+  processPendingRotations,
+  generateThumbnailBuffer,
+  saveStorageCheckpoint,
+  loadStorageCheckpoint,
+  getAllStorageCheckpoints
 } from './services/virtualMirrorService';
 import { Photo, OrganizeOptions, VirtualStorageConfig, EditPhotoOptions, BackgroundServiceSettings } from '../types';
 import {
@@ -46,7 +53,7 @@ import {
   updateEmbeddedWebServerSettings,
   loadSavedWebServerSettings,
 } from './services/embeddedWebServer';
-import { getOrGenerateCachedThumbnail, clearThumbnailCache } from './services/thumbnailCacheService';
+import { getOrGenerateCachedThumbnail, clearThumbnailCache, refreshThumbnailsFromSource } from './services/thumbnailCacheService';
 import {
   getCatalogMeta,
   getCatalogPage,
@@ -58,6 +65,7 @@ import {
   getSpritePath,
 } from './services/spriteService';
 import { thumbnailWorker } from './services/thumbnailWorkerService';
+import { libraryStatusService } from './services/libraryStatusService';
 
 app.name = 'gPhotos';
 app.setName('gPhotos');
@@ -168,7 +176,7 @@ function revealMainWindow() {
 
   console.log(`[STARTUP AUDIT] T+${Date.now() - startupStartTime}ms: Transitioning from splash to main application window...`);
 
-  // Gentle 400ms delay to ensure smooth visual transition
+  // Fast 50ms delay to ensure smooth visual transition
   setTimeout(() => {
     if (splashWindow && !splashWindow.isDestroyed()) {
       splashWindow.close();
@@ -180,7 +188,7 @@ function revealMainWindow() {
       mainWindow.webContents.focus();
       console.log(`[STARTUP AUDIT] T+${Date.now() - startupStartTime}ms: Main window revealed and focused. Application is fully responsive!`);
     }
-  }, 400);
+  }, 50);
 }
 
 // Register custom protocol scheme before app is ready
@@ -225,11 +233,11 @@ function createWindow() {
     },
   });
 
-  // Safety fallback: if renderer doesn't send 'app:ready' within 4.5s, reveal main window automatically
+  // Safety fallback: if renderer doesn't send 'app:ready' within 3.0s, reveal main window automatically
   mainWindow.once('ready-to-show', () => {
     setTimeout(() => {
       revealMainWindow();
-    }, 4500);
+    }, 3000);
   });
 
   mainWindow.on('focus', () => {
@@ -489,6 +497,9 @@ function createWindow() {
 app.on('before-quit', () => {
   markAsQuitting();
   stopEmbeddedWebServer();
+  try {
+    thumbnailWorker.flushCheckpoint();
+  } catch {}
 });
 
 app.whenReady().then(() => {
@@ -663,7 +674,8 @@ ipcMain.handle('storage:save', async (_event, key: string, data: any) => {
         people: data.people,
       }).catch((err) => console.warn('[CatalogService] Auto-indexing on save failed:', err));
 
-      thumbnailWorker.enqueuePhotos(data.photos);
+      const libPath = data.selectedFolder || data.currentDirectory;
+      thumbnailWorker.enqueuePhotos(data.photos, libPath);
     }
 
     return true;
@@ -733,11 +745,21 @@ ipcMain.handle('sprite:get-coordinate', async (_event, photoPath: string) => {
 // Virtual Mirror & Network Storage Handlers
 ipcMain.handle('mirror:sync-storage', async (event, config: VirtualStorageConfig) => {
   try {
-    return await syncVirtualStorage(config, (progress) => {
+    const result = await syncVirtualStorage(config, (progress) => {
       try {
         event.sender.send('mirror:progress', progress);
       } catch {}
     });
+
+    try {
+      const storageMirrorRoot = path.join(config.localMirrorRoot, config.name);
+      const mirroredPhotos = scanVirtualMirrorDirectory(storageMirrorRoot);
+      if (mirroredPhotos.length > 0) {
+        thumbnailWorker.enqueuePhotos(mirroredPhotos);
+      }
+    } catch {}
+
+    return result;
   } catch (err: any) {
     console.error('mirror:sync-storage error:', err);
     return { success: false, newMirroredCount: 0, totalMirroredCount: 0, totalSizeSaved: 0, error: err.message };
@@ -746,7 +768,16 @@ ipcMain.handle('mirror:sync-storage', async (event, config: VirtualStorageConfig
 
 ipcMain.handle('mirror:scan-virtual-mirror', async (_event, mirrorDirPath: string) => {
   try {
-    return scanVirtualMirrorDirectory(mirrorDirPath);
+    const photos = scanVirtualMirrorDirectory(mirrorDirPath);
+    if (photos && photos.length > 0) {
+      // Defer thumbnail pre-caching so initial startup and gallery paint are 100% fluid
+      setTimeout(() => {
+        try {
+          thumbnailWorker.enqueuePhotos(photos);
+        } catch {}
+      }, 4000);
+    }
+    return photos;
   } catch (err) {
     console.error('mirror:scan-virtual-mirror error:', err);
     return [];
@@ -762,9 +793,45 @@ ipcMain.handle('mirror:list-stored-mirrors', async (_event, rootPath?: string) =
   }
 });
 
+ipcMain.handle('mirror:get-storage-checkpoints', async (_event, mirrorRoot?: string) => {
+  try {
+    return getAllStorageCheckpoints(mirrorRoot);
+  } catch (err) {
+    console.error('mirror:get-storage-checkpoints error:', err);
+    return {};
+  }
+});
+
+ipcMain.handle('library:get-status', async (_event, libraryPath: string) => {
+  try {
+    return libraryStatusService.getLibraryStatus(libraryPath);
+  } catch (err) {
+    console.error('library:get-status error:', err);
+    return null;
+  }
+});
+
+ipcMain.handle('library:save-status', async (_event, status: any) => {
+  try {
+    return libraryStatusService.saveLibraryStatus(status);
+  } catch (err) {
+    console.error('library:save-status error:', err);
+    return status;
+  }
+});
+
+ipcMain.handle('library:get-all-statuses', async () => {
+  try {
+    return libraryStatusService.getAllLibraryStatuses();
+  } catch (err) {
+    console.error('library:get-all-statuses error:', err);
+    return {};
+  }
+});
+
 ipcMain.handle('mirror:open-original', async (_event, filePath: string) => {
   try {
-    if (fs.existsSync(filePath)) {
+    if (filePath && typeof filePath === 'string' && fs.existsSync(filePath)) {
       shell.showItemInFolder(filePath);
       return true;
     }
@@ -776,7 +843,7 @@ ipcMain.handle('mirror:open-original', async (_event, filePath: string) => {
 });
 
 ipcMain.handle('file:check-exists', async (_event, filePath: string) => {
-  if (!filePath) return false;
+  if (!filePath || typeof filePath !== 'string') return false;
   try {
     return fs.existsSync(filePath);
   } catch {
@@ -808,8 +875,39 @@ ipcMain.handle('mirror:start-bg-scan', async (event, sourcePath: string, mirrorR
       const total = allFiles.length;
       let batch: Photo[] = [];
 
-      for (let i = 0; i < total; i++) {
-        if (!activeScanJobs.get(jobId)) break;
+      // Intermittent checkpoint resumption check:
+      // If an interrupted checkpoint exists, resume directly from where it stopped!
+      const existingCp = loadStorageCheckpoint(name, finalMirrorRoot);
+      let startIndex = 0;
+      if (
+        existingCp &&
+        existingCp.phase !== 'completed' &&
+        existingCp.lastProcessedIndex > 0 &&
+        existingCp.lastProcessedIndex < total &&
+        existingCp.totalDiscovered === total
+      ) {
+        startIndex = existingCp.lastProcessedIndex + 1;
+        console.log(`[BackgroundScan] Resuming scan for ${name} from photo ${startIndex + 1} of ${total} (Saved progress: ${existingCp.percent}%)`);
+      }
+
+      for (let i = startIndex; i < total; i++) {
+        if (!activeScanJobs.get(jobId)) {
+          // Interrupted / canceled midway: save checkpoint so it can resume next time!
+          saveStorageCheckpoint({
+            storageName: name,
+            networkSourcePath: sourcePath,
+            localMirrorRoot: finalMirrorRoot,
+            phase: 'interrupted',
+            processedCount: i,
+            totalDiscovered: total,
+            lastProcessedIndex: Math.max(0, i - 1),
+            lastProcessedFile: path.basename(allFiles[Math.max(0, i - 1)]),
+            percent: Math.round((i / Math.max(1, total)) * 100),
+            timestamp: Date.now(),
+            updatedAt: new Date().toISOString(),
+          });
+          break;
+        }
 
         const remoteFile = allFiles[i];
         const fileName = path.basename(remoteFile);
@@ -910,7 +1008,27 @@ ipcMain.handle('mirror:start-bg-scan', async (event, sourcePath: string, mirrorR
           batch.push(photoEntry);
         }
 
+        // Intermittent checkpoint save every 10 photos
+        if ((i + 1) % 10 === 0 || i === total - 1) {
+          saveStorageCheckpoint({
+            storageName: name,
+            networkSourcePath: sourcePath,
+            localMirrorRoot: finalMirrorRoot,
+            phase: i === total - 1 ? 'completed' : 'thumbnails',
+            processedCount: i + 1,
+            totalDiscovered: total,
+            lastProcessedIndex: i,
+            lastProcessedFile: fileName,
+            percent: Math.round(((i + 1) / Math.max(1, total)) * 100),
+            timestamp: Date.now(),
+            updatedAt: new Date().toISOString(),
+          });
+        }
+
         if (batch.length >= 15 || i === total - 1) {
+          try {
+            thumbnailWorker.enqueuePhotos(batch);
+          } catch {}
           event.sender.send('mirror:bg-scan-progress', {
             jobId,
             sourcePath,
@@ -928,6 +1046,21 @@ ipcMain.handle('mirror:start-bg-scan', async (event, sourcePath: string, mirrorR
           await new Promise((r) => setTimeout(r, 6));
         }
       }
+
+      // Mark final completed checkpoint
+      saveStorageCheckpoint({
+        storageName: name,
+        networkSourcePath: sourcePath,
+        localMirrorRoot: finalMirrorRoot,
+        phase: 'completed',
+        processedCount: total,
+        totalDiscovered: total,
+        lastProcessedIndex: total - 1,
+        lastProcessedFile: 'Complete',
+        percent: 100,
+        timestamp: Date.now(),
+        updatedAt: new Date().toISOString(),
+      });
 
       event.sender.send('mirror:bg-scan-progress', {
         jobId,
@@ -1003,6 +1136,56 @@ ipcMain.handle('file:trash-files', async (_event, filePaths: string[]) => {
     return { success: false, trashedCount: 0, errors: [err.message] };
   }
 });
+
+ipcMain.handle('file:delete-permanently', async (_event, filePaths: string[]) => {
+  try {
+    return await deleteFilesPermanently(filePaths);
+  } catch (err: any) {
+    console.error('file:delete-permanently error:', err);
+    return { success: false, deletedCount: 0, errors: [err.message] };
+  }
+});
+
+ipcMain.handle(
+  'photo:rotate',
+  async (
+    _event,
+    params: { filePath: string; rotationDegrees: number; originalRemotePath?: string }
+  ) => {
+    try {
+      const res = await rotatePhotoWithOfflineQueue({
+        localFilePath: params.filePath,
+        originalRemotePath: params.originalRemotePath,
+        rotationDegrees: params.rotationDegrees,
+      });
+      return res;
+    } catch (err: any) {
+      console.error('photo:rotate error:', err);
+      return { success: false, isQueued: false, error: err.message };
+    }
+  }
+);
+
+ipcMain.handle('photo:process-pending-rotations', async () => {
+  try {
+    return await processPendingRotations();
+  } catch (err: any) {
+    console.error('photo:process-pending-rotations error:', err);
+    return { processed: 0, remaining: 0, error: err.message };
+  }
+});
+
+ipcMain.handle(
+  'thumbnails:refresh-from-source',
+  async (_event, items: Array<{ filePath: string; originalRemotePath?: string }>) => {
+    try {
+      return await refreshThumbnailsFromSource(items || []);
+    } catch (err: any) {
+      console.error('thumbnails:refresh-from-source error:', err);
+      return { refreshedCount: 0, errors: [err.message] };
+    }
+  }
+);
 
 ipcMain.handle('mirror:delete-storage', async (_event, params: { storageName: string; localMirrorRoot?: string; deleteDiskFiles: boolean }) => {
   try {
@@ -1094,6 +1277,23 @@ ipcMain.handle('service:start-precache', async (_event, photos?: Photo[]) => {
   try {
     if (photos && photos.length > 0) {
       thumbnailWorker.enqueuePhotos(photos);
+    } else {
+      try {
+        const mirrorRoot = 'C:\\GPhotos_VirtualMirrors';
+        if (fs.existsSync(mirrorRoot)) {
+          const subdirs = fs.readdirSync(mirrorRoot, { withFileTypes: true });
+          for (const dirent of subdirs) {
+            if (dirent.isDirectory() && !dirent.name.startsWith('.')) {
+              const mirrorPhotos = scanVirtualMirrorDirectory(path.join(mirrorRoot, dirent.name));
+              if (mirrorPhotos && mirrorPhotos.length > 0) {
+                thumbnailWorker.enqueuePhotos(mirrorPhotos);
+              }
+            }
+          }
+        }
+      } catch (mirrorErr) {
+        console.warn('Auto-enqueuing mirrors for pre-caching failed:', mirrorErr);
+      }
     }
     thumbnailWorker.resume();
     return { started: true };

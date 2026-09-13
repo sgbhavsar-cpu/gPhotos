@@ -1,8 +1,8 @@
-import React, { useState } from 'react';
-import { Heart, MapPin, Users, Check, EyeOff, Image as ImageIcon, ImageOff } from 'lucide-react';
+import React, { useState, useRef, useEffect } from 'react';
+import { Heart, MapPin, Users, Check, EyeOff, Image as ImageIcon, ImageOff, RotateCw } from 'lucide-react';
 import { Photo } from '../../types';
 import { getLocalPhotoUrl } from '../services/libraryStore';
-import { useBatchThumbnail, useSpriteCoordinate, getSpriteUrl } from '../services/asyncImageLoader';
+import { useBatchThumbnail, useSpriteCoordinate, getSpriteUrl, batchThumbnailStore } from '../services/asyncImageLoader';
 
 interface PhotoCardProps {
   photo: Photo;
@@ -12,6 +12,8 @@ interface PhotoCardProps {
   isSelected?: boolean;
   onToggleSelect?: (e: React.MouseEvent) => void;
   isSelectMode?: boolean;
+  onCardMouseDown?: (photoId: string, e: React.MouseEvent) => void;
+  onCardMouseEnter?: (photoId: string, e: React.MouseEvent) => void;
 }
 
 export const PhotoCard: React.FC<PhotoCardProps> = ({
@@ -22,9 +24,26 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
   isSelected = false,
   onToggleSelect,
   isSelectMode = false,
+  onCardMouseDown,
+  onCardMouseEnter,
 }) => {
   const [isHovered, setIsHovered] = useState(false);
   const [imgElementLoaded, setImgElementLoaded] = useState(false);
+
+  // Instant local visual rotation on thumbnail (0ms latency feedback)
+  const [visualRotation, setVisualRotation] = useState<number>(photo.rotation || 0);
+  const [cacheBuster, setCacheBuster] = useState<number>(0);
+  const debounceTimerRef = useRef<any>(null);
+  const pendingRotationDeltaRef = useRef<number>(0);
+
+  // Clean up timer on unmount
+  useEffect(() => {
+    return () => {
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+      }
+    };
+  }, []);
 
   const heightMap: Record<string, string> = {
     very_small: '80px',
@@ -46,9 +65,10 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
   };
 
   const photoPath = photo.thumbnailPath || photo.filePath;
+  const isHeic = /\.(heic|heif)$/i.test(photo.fileName || photo.filePath || photo.originalRemotePath || '');
   const targetPixelSize = pixelSizeMap[size] || 250;
 
-  // 0. High-Speed Static Sprite Sheet Coordinate (1 static WebP for 50 thumbnails, 0ms render)
+  // 0. High-Speed Static WebP Sprite Sheet Coordinate (1 static WebP for 50 thumbnails, 0ms render)
   const spriteCoord = useSpriteCoordinate(photoPath);
 
   // 1. Batch thumbnail loader (0ms from memory when pre-fetched, 1 HTTP call for 100 photos!)
@@ -72,11 +92,67 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
   const isLoading = !hasThumbnail && isBatchLoading;
   const hasError = !hasThumbnail && isBatchError;
 
+  /**
+   * Hover quick-rotate: Rotates thumbnail instantly in the UI.
+   * Debounces for 2 seconds; if no further rotate clicks occur, pushes rotation to actual image file on disk!
+   */
+  const handleQuickRotate = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+
+    const nextRot = (visualRotation + 90) % 360;
+    setVisualRotation(nextRot);
+    pendingRotationDeltaRef.current = (pendingRotationDeltaRef.current + 90) % 360;
+
+    // Reset 2-second debounce timer
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+
+    debounceTimerRef.current = setTimeout(async () => {
+      const degreesToRotate = pendingRotationDeltaRef.current;
+      if (degreesToRotate === 0) return;
+      pendingRotationDeltaRef.current = 0;
+
+      const localPath = photo.filePath;
+      const remotePath = photo.originalRemotePath;
+      try {
+        let res: any = null;
+        if (window.electronAPI?.rotatePhoto) {
+          res = await window.electronAPI.rotatePhoto(localPath, degreesToRotate, remotePath);
+        } else {
+          const fetchRes = await fetch('/api/rotate-photo', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              filePath: localPath,
+              originalRemotePath: remotePath,
+              rotationDegrees: degreesToRotate,
+            }),
+          });
+          if (fetchRes.ok) res = await fetchRes.json();
+        }
+        // Invalidate in-memory thumbnail store so new orientation loads
+        batchThumbnailStore.delete(photoPath);
+        // Reset CSS rotation because image file itself is physically rotated
+        setVisualRotation(0);
+        setCacheBuster(Date.now());
+      } catch (err) {
+        console.error('[PhotoCard] Failed to persist rotated photo to disk:', err);
+      }
+    }, 2000);
+  };
+
   return (
     <div
       onClick={onClick}
-      onMouseEnter={() => setIsHovered(true)}
+      onMouseDown={(e) => onCardMouseDown && onCardMouseDown(photo.id, e)}
+      onMouseEnter={(e) => {
+        setIsHovered(true);
+        if (onCardMouseEnter) onCardMouseEnter(photo.id, e);
+      }}
       onMouseLeave={() => setIsHovered(false)}
+      onDragStart={(e) => e.preventDefault()}
       style={{
         position: 'relative',
         height: heightMap[size] || '210px',
@@ -89,6 +165,7 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
         border: isSelected ? '2px solid var(--accent-primary)' : '2px solid transparent',
         transition: 'transform var(--transition-normal), box-shadow var(--transition-normal), border var(--transition-fast)',
         opacity: photo.isExcluded ? 0.55 : 1,
+        userSelect: 'none',
       }}
     >
       {/* Asynchronous Skeleton Shimmer Loading Placeholder */}
@@ -153,6 +230,8 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
             backgroundRepeat: 'no-repeat',
             position: 'relative',
             zIndex: 2,
+            transform: visualRotation ? `rotate(${visualRotation}deg)` : undefined,
+            transition: 'transform 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
           }}
         />
       )}
@@ -160,7 +239,7 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
       {/* 2. Fallback Batch / Direct Photo Display */}
       {!spriteCoord && displaySrc && !hasError && (
         <img
-          src={displaySrc}
+          src={cacheBuster ? `${displaySrc}${displaySrc.includes('?') ? '&' : '?'}cb=${cacheBuster}` : displaySrc}
           alt={photo.fileName}
           decoding="async"
           onLoad={() => setImgElementLoaded(true)}
@@ -169,10 +248,11 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
             height: '100%',
             objectFit: 'cover',
             opacity: imgElementLoaded ? 1 : 0,
-            transition: 'opacity 0.2s ease-out',
+            transition: 'opacity 0.2s ease-out, transform 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
             imageOrientation: 'from-image' as any,
             position: 'relative',
             zIndex: 2,
+            transform: visualRotation ? `rotate(${visualRotation}deg)` : undefined,
           }}
         />
       )}
@@ -207,6 +287,40 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
         </div>
       )}
 
+      {/* Quick Rotate Button on Hover (like checkbox for selection appears) - Hidden for HEIC */}
+      {!isHeic && (isHovered || visualRotation !== 0) && (
+        <div
+          onClick={handleQuickRotate}
+          style={{
+            position: 'absolute',
+            top: '8px',
+            right: '8px',
+            zIndex: 15,
+            width: '28px',
+            height: '28px',
+            borderRadius: '6px',
+            backgroundColor: visualRotation !== 0 ? 'var(--accent-primary)' : 'rgba(15, 23, 42, 0.85)',
+            border: visualRotation !== 0 ? '1px solid var(--accent-primary)' : '2px solid rgba(255, 255, 255, 0.9)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.6)',
+            cursor: 'pointer',
+            transition: 'all var(--transition-fast)',
+            color: 'white',
+          }}
+          title={visualRotation !== 0 ? `Rotating (saving in 2s)...` : "Quick Rotate (90° clockwise)"}
+        >
+          <RotateCw
+            size={16}
+            style={{
+              transform: visualRotation !== 0 ? 'rotate(90deg)' : 'none',
+              transition: 'transform 0.2s ease',
+            }}
+          />
+        </div>
+      )}
+
       {/* Hover Overlay */}
       <div style={{
         position: 'absolute',
@@ -223,7 +337,7 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
         padding: '10px',
         pointerEvents: isHovered ? 'auto' : 'none',
       }}>
-        {/* Top bar: Favorite heart & badges */}
+        {/* Top bar: Quick rotate, Badges, Favorite heart */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingLeft: onToggleSelect ? '28px' : '0' }}>
           <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
             {photo.location && (
@@ -294,27 +408,30 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
             )}
           </div>
 
-          <button
-            onClick={onToggleFavorite}
-            style={{
-              background: 'rgba(15, 23, 42, 0.75)',
-              backdropFilter: 'blur(6px)',
-              border: 'none',
-              borderRadius: 'var(--radius-full)',
-              width: '34px',
-              height: '34px',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              cursor: 'pointer',
-              color: photo.isFavorite ? 'var(--accent-rose)' : 'white',
-              transition: 'transform var(--transition-fast)',
-              boxShadow: '0 2px 6px rgba(0,0,0,0.5)',
-            }}
-            title={photo.isFavorite ? 'Remove from favorites' : 'Add to favorites'}
-          >
-            <Heart size={18} fill={photo.isFavorite ? 'currentColor' : 'none'} />
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginRight: '34px' }}>
+            {/* Favorite button */}
+            <button
+              onClick={onToggleFavorite}
+              style={{
+                background: 'rgba(15, 23, 42, 0.75)',
+                backdropFilter: 'blur(6px)',
+                border: 'none',
+                borderRadius: 'var(--radius-full)',
+                width: '32px',
+                height: '32px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: 'pointer',
+                color: photo.isFavorite ? 'var(--accent-rose)' : 'white',
+                transition: 'transform var(--transition-fast)',
+                boxShadow: '0 2px 6px rgba(0,0,0,0.5)',
+              }}
+              title={photo.isFavorite ? 'Remove from favorites' : 'Add to favorites'}
+            >
+              <Heart size={16} fill={photo.isFavorite ? 'currentColor' : 'none'} />
+            </button>
+          </div>
         </div>
 
         {/* Bottom bar: Date and filename */}

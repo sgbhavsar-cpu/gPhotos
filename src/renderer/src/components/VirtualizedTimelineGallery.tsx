@@ -34,6 +34,7 @@ interface VirtualizedTimelineGalleryProps {
   isSelectMode?: boolean;
   selectedIds?: Set<string>;
   onToggleSelect?: (photoId: string) => void;
+  onDragSelect?: (photoId: string) => void;
   emptyMessage?: string;
 }
 
@@ -46,6 +47,7 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
   isSelectMode = false,
   selectedIds = new Set(),
   onToggleSelect,
+  onDragSelect,
   emptyMessage = 'No photos found in this view.',
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -53,6 +55,24 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
   const [containerHeight, setContainerHeight] = useState(800);
   const [containerWidth, setContainerWidth] = useState(1200);
   const lastWheelZoomTime = useRef<number>(0);
+
+  // Mouse drag-selection tracking (mobile-style swipe/drag select)
+  const isMouseDownRef = useRef<boolean>(false);
+  const isDragSelectingRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    const handleGlobalMouseUp = () => {
+      isMouseDownRef.current = false;
+      setTimeout(() => {
+        isDragSelectingRef.current = false;
+      }, 60);
+    };
+
+    window.addEventListener('mouseup', handleGlobalMouseUp);
+    return () => {
+      window.removeEventListener('mouseup', handleGlobalMouseUp);
+    };
+  }, []);
 
   // ResizeObserver to track container dimensions
   useEffect(() => {
@@ -578,7 +598,23 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
                     isSelected={selectedIds.has(photo.id)}
                     isSelectMode={isSelectMode || selectedIds.size > 0}
                     onToggleSelect={() => onToggleSelect && onToggleSelect(photo.id)}
+                    onCardMouseDown={(_id, e) => {
+                      if (e.button === 0 && (isSelectMode || selectedIds.size > 0)) {
+                        isMouseDownRef.current = true;
+                      }
+                    }}
+                    onCardMouseEnter={(id) => {
+                      if (isMouseDownRef.current && (isSelectMode || selectedIds.size > 0)) {
+                        isDragSelectingRef.current = true;
+                        if (onDragSelect) {
+                          onDragSelect(id);
+                        } else if (onToggleSelect && !selectedIds.has(id)) {
+                          onToggleSelect(id);
+                        }
+                      }
+                    }}
                     onClick={() => {
+                      if (isDragSelectingRef.current) return;
                       if (isSelectMode || selectedIds.size > 0) {
                         onToggleSelect && onToggleSelect(photo.id);
                       } else {

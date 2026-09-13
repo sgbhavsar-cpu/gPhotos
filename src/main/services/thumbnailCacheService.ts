@@ -3,7 +3,7 @@ import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
 import { app } from 'electron';
-import { getHeicHighQualityJpegBuffer, getOrGenerateHeicThumbnail500 } from './heicService';
+import { getHeicHighQualityJpegBuffer, getOrGenerateHeicThumbnail500, purgeHeicCache } from './heicService';
 
 let sharp: any = null;
 try {
@@ -258,3 +258,91 @@ export async function clearThumbnailCache(): Promise<{ freedBytes: number; fileC
   await prune(root);
   return { freedBytes, fileCount };
 }
+
+/**
+ * Purges cached thumbnails for a specific file across all standard size buckets.
+ */
+export async function purgeCachedThumbnailsForFile(filePath: string): Promise<void> {
+  if (!filePath) return;
+
+  const isHeic = /\.(heic|heif)$/i.test(filePath);
+  if (isHeic) {
+    purgeHeicCache(filePath);
+  }
+
+  const root = getGlobalCacheDir();
+  const knownSizes = [150, 200, 250, 300, 500, 1600];
+
+  let mtimeMs: number | null = null;
+  try {
+    mtimeMs = (await fs.promises.stat(filePath)).mtimeMs;
+  } catch {}
+
+  for (const size of knownSizes) {
+    if (mtimeMs !== null) {
+      const key = getCacheKey(filePath, mtimeMs, size);
+      const targetFile = path.join(root, `${size}`, `${key}.jpg`);
+      try {
+        await fs.promises.unlink(targetFile);
+      } catch {}
+    }
+  }
+}
+
+/**
+ * Purges thumbnail caches and re-generates fresh thumbnails directly from source files
+ * for multiple selected images.
+ */
+export async function refreshThumbnailsFromSource(
+  items: { filePath: string; originalRemotePath?: string }[]
+): Promise<{ refreshedCount: number; errors: string[] }> {
+  let refreshedCount = 0;
+  const errors: string[] = [];
+
+  for (const item of items) {
+    try {
+      const source = (item.originalRemotePath && fs.existsSync(item.originalRemotePath))
+        ? item.originalRemotePath
+        : item.filePath;
+
+      if (!source || !fs.existsSync(source)) {
+        errors.push(`Source file not found for ${item.filePath}`);
+        continue;
+      }
+
+      // 1. Purge old caches for both paths
+      await purgeCachedThumbnailsForFile(item.filePath);
+      if (item.originalRemotePath && item.originalRemotePath !== item.filePath) {
+        await purgeCachedThumbnailsForFile(item.originalRemotePath);
+      }
+
+      // 2. If it's a virtual mirror thumbnail, re-generate mirror thumbnail file from source
+      if (item.originalRemotePath && item.originalRemotePath !== item.filePath && fs.existsSync(path.dirname(item.filePath))) {
+        const isHeic = /\.(heic|heif)$/i.test(source);
+        let freshMirrorBuf: Buffer | null = null;
+        if (isHeic) {
+          freshMirrorBuf = await getOrGenerateHeicThumbnail500(source);
+        } else {
+          try {
+            const { generateThumbnailBuffer } = require('./virtualMirrorService');
+            freshMirrorBuf = generateThumbnailBuffer(source, 500);
+          } catch {}
+        }
+        if (freshMirrorBuf) {
+          fs.writeFileSync(item.filePath, freshMirrorBuf);
+        }
+      }
+
+      // 3. Pre-generate fresh 250px and 500px cached thumbnails from source
+      await getOrGenerateCachedThumbnail(source, 250);
+      await getOrGenerateCachedThumbnail(source, 500);
+
+      refreshedCount++;
+    } catch (err: any) {
+      errors.push(`Failed refreshing ${item.filePath}: ${err.message}`);
+    }
+  }
+
+  return { refreshedCount, errors };
+}
+

@@ -51,6 +51,10 @@ const electronAPI: IElectronAPI = {
     ipcRenderer.invoke('storage:generate-thumb-on-the-fly', sourceFilePath, mirrorDirPath),
   editPhoto: (options) => ipcRenderer.invoke('photo:edit', options),
   trashFiles: (filePaths: string[]) => ipcRenderer.invoke('file:trash-files', filePaths),
+  deleteFilesPermanently: (filePaths: string[]) => ipcRenderer.invoke('file:delete-permanently', filePaths),
+  rotatePhoto: (filePath: string, rotationDegrees: number, originalRemotePath?: string) =>
+    ipcRenderer.invoke('photo:rotate', { filePath, rotationDegrees, originalRemotePath }),
+  processPendingRotations: () => ipcRenderer.invoke('photo:process-pending-rotations'),
   deleteVirtualStorage: (params) => ipcRenderer.invoke('mirror:delete-storage', params),
   getBackgroundServiceStatus: () => ipcRenderer.invoke('service:get-status'),
   setBackgroundServiceSettings: (settings) => ipcRenderer.invoke('service:set-settings', settings),
@@ -73,6 +77,12 @@ const electronAPI: IElectronAPI = {
   getThumbnailPreCacheStatus: () => ipcRenderer.invoke('service:get-precache-status'),
   startThumbnailPreCache: (photos) => ipcRenderer.invoke('service:start-precache', photos),
   pauseThumbnailPreCache: () => ipcRenderer.invoke('service:pause-precache'),
+  getStorageCheckpoints: () => ipcRenderer.invoke('mirror:get-storage-checkpoints'),
+  getLibraryStatus: (libraryPath: string) => ipcRenderer.invoke('library:get-status', libraryPath),
+  saveLibraryStatus: (status: any) => ipcRenderer.invoke('library:save-status', status),
+  getAllLibraryStatuses: () => ipcRenderer.invoke('library:get-all-statuses'),
+  refreshThumbnailsFromSource: (items: Array<{ filePath: string; originalRemotePath?: string }>) =>
+    ipcRenderer.invoke('thumbnails:refresh-from-source', items),
 };
 
 contextBridge.exposeInMainWorld('electronAPI', electronAPI);

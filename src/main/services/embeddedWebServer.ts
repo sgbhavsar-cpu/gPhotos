@@ -10,11 +10,13 @@ import {
   prepareHeicHqTemp,
   cleanupHeicHqTemp,
 } from './heicService';
-import { scanVirtualMirrorDirectory, syncVirtualStorage } from './virtualMirrorService';
+import { scanVirtualMirrorDirectory, syncVirtualStorage, deleteFilesPermanently, trashFiles, rotatePhotoFile, rotatePhotoWithOfflineQueue, processPendingRotations } from './virtualMirrorService';
 import { scanPhotoDirectory } from './fileOrganizer';
-import { getOrGenerateCachedThumbnail, clearThumbnailCache } from './thumbnailCacheService';
+import { getOrGenerateCachedThumbnail, clearThumbnailCache, refreshThumbnailsFromSource } from './thumbnailCacheService';
 import { getCatalogMeta, getCatalogPage, switchCatalogLibrary } from './catalogService';
 import { getSpriteCoordinate, getSpritePath } from './spriteService';
+import { thumbnailWorker } from './thumbnailWorkerService';
+import { getBackgroundServiceStatus } from './backgroundDaemon';
 import { WebServerStatus } from '../../types';
 
 let serverInstance: http.Server | null = null;
@@ -217,6 +219,9 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     if (mirrorPath && fs.existsSync(mirrorPath)) {
       try {
         const photos = scanVirtualMirrorDirectory(mirrorPath);
+        if (photos && photos.length > 0) {
+          thumbnailWorker.enqueuePhotos(photos);
+        }
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify(photos));
         return;
@@ -242,11 +247,91 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
       try {
         const config = JSON.parse(body);
         const result = await syncVirtualStorage(config);
+        try {
+          const mirrorPath = path.join(config.localMirrorRoot, config.name);
+          const photos = scanVirtualMirrorDirectory(mirrorPath);
+          if (photos && photos.length > 0) {
+            thumbnailWorker.enqueuePhotos(photos);
+          }
+        } catch {}
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify(result));
       } catch (err: any) {
         res.statusCode = 500;
         res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // Endpoint: /api/precache-status (GET)
+  if (pathname === '/api/precache-status') {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify(thumbnailWorker.getStatus()));
+    return;
+  }
+
+  // Endpoint: /api/background-service-status (GET)
+  if (pathname === '/api/background-service-status') {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify(getBackgroundServiceStatus()));
+    return;
+  }
+
+  // Endpoint: /api/start-precache (POST)
+  if (pathname === '/api/start-precache' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const { photos } = JSON.parse(body || '{}');
+        if (Array.isArray(photos) && photos.length > 0) {
+          thumbnailWorker.enqueuePhotos(photos);
+        }
+        thumbnailWorker.resume();
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ started: true }));
+      } catch (err: any) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ started: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // Endpoint: /api/pause-precache (POST)
+  if (pathname === '/api/pause-precache' && req.method === 'POST') {
+    thumbnailWorker.pause();
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ paused: true }));
+    return;
+  }
+
+  // Endpoint: /api/thumbnails/refresh-from-source (POST)
+  if (pathname === '/api/thumbnails/refresh-from-source' && (req.method === 'POST' || req.method === 'OPTIONS')) {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
+      });
+      res.end();
+      return;
+    }
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const { items } = JSON.parse(body || '{}');
+        const result = await refreshThumbnailsFromSource(Array.isArray(items) ? items : []);
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.end(JSON.stringify(result));
+      } catch (err: any) {
+        res.statusCode = 500;
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.end(JSON.stringify({ refreshedCount: 0, errors: [err.message] }));
       }
     });
     return;
@@ -301,6 +386,62 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
         res.end(JSON.stringify({ error: err.message }));
       }
     });
+    return;
+  }
+
+  // Endpoint: /api/delete-files (POST) - Delete files (Recycle Bin or permanently)
+  if (pathname === '/api/delete-files' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const { filePaths, permanent } = JSON.parse(body || '{}');
+        const paths = Array.isArray(filePaths) ? filePaths : [];
+        const result = permanent
+          ? await deleteFilesPermanently(paths)
+          : await trashFiles(paths);
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify(result));
+      } catch (err: any) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ success: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // Endpoint: /api/rotate-photo (POST) - Physically rotate image file on disk (with offline queue durability)
+  if (pathname === '/api/rotate-photo' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const { filePath, rotationDegrees, originalRemotePath } = JSON.parse(body || '{}');
+        const result = await rotatePhotoWithOfflineQueue({
+          localFilePath: filePath,
+          originalRemotePath,
+          rotationDegrees: rotationDegrees || 90,
+        });
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify(result));
+      } catch (err: any) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ success: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // Endpoint: /api/process-pending-rotations (POST) - Drain pending rotation queue
+  if (pathname === '/api/process-pending-rotations' && req.method === 'POST') {
+    try {
+      const result = await processPendingRotations();
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify(result));
+    } catch (err: any) {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ processed: 0, remaining: 0, error: err.message }));
+    }
     return;
   }
 

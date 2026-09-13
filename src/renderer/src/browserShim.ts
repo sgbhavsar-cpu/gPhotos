@@ -136,6 +136,54 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     },
     openOriginalFile: async () => {},
     onMirrorProgress: () => () => {},
+    getStorageCheckpoints: async () => ({}),
+    getLibraryStatus: async () => null,
+    saveLibraryStatus: async (s: any) => s,
+    getAllLibraryStatuses: async () => ({}),
+
+    trashFiles: async (filePaths: string[]) => {
+      try {
+        const res = await fetch('/api/delete-files', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filePaths, permanent: false }),
+        });
+        if (res.ok) return await res.json();
+      } catch {}
+      return { success: true, trashedCount: filePaths.length, errors: [] };
+    },
+
+    deleteFilesPermanently: async (filePaths: string[]) => {
+      try {
+        const res = await fetch('/api/delete-files', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filePaths, permanent: true }),
+        });
+        if (res.ok) return await res.json();
+      } catch {}
+      return { success: true, deletedCount: filePaths.length, errors: [] };
+    },
+
+    rotatePhoto: async (filePath: string, rotationDegrees: number, originalRemotePath?: string) => {
+      try {
+        const res = await fetch('/api/rotate-photo', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filePath, rotationDegrees, originalRemotePath }),
+        });
+        if (res.ok) return await res.json();
+      } catch {}
+      return { success: true, newPath: filePath };
+    },
+
+    processPendingRotations: async () => {
+      try {
+        const res = await fetch('/api/process-pending-rotations', { method: 'POST' });
+        if (res.ok) return await res.json();
+      } catch {}
+      return { processed: 0, remaining: 0 };
+    },
 
     getWebServerStatus: async () => {
       try {
@@ -237,15 +285,62 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
       } catch {}
       return null;
     },
-    getThumbnailPreCacheStatus: async () => ({
-      isRunning: false,
-      paused: false,
-      current: 0,
-      total: 0,
-      cpuPercent: 0,
-      ramMb: 0,
-    }),
-    startThumbnailPreCache: async () => ({ started: true }),
-    pauseThumbnailPreCache: async () => ({ paused: true }),
+    getThumbnailPreCacheStatus: async () => {
+      try {
+        const res = await fetch('/api/precache-status');
+        if (res.ok) return await res.json();
+      } catch {}
+      return {
+        isRunning: false,
+        paused: false,
+        current: 0,
+        total: 0,
+        cpuPercent: 0,
+        ramMb: 0,
+      };
+    },
+    startThumbnailPreCache: async (photos?: any[]) => {
+      try {
+        const res = await fetch('/api/start-precache', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ photos }),
+        });
+        if (res.ok) return await res.json();
+      } catch {}
+      return { started: true };
+    },
+    pauseThumbnailPreCache: async () => {
+      try {
+        const res = await fetch('/api/pause-precache', { method: 'POST' });
+        if (res.ok) return await res.json();
+      } catch {}
+      return { paused: true };
+    },
+    getBackgroundServiceStatus: async () => {
+      try {
+        const res = await fetch('/api/background-service-status');
+        if (res.ok) return await res.json();
+      } catch {}
+      return {
+        isRunning: true,
+        isPaused: false,
+        runAtStartup: false,
+        minimizeToTray: true,
+        syncIntervalMinutes: 15,
+        isScanningNow: false,
+      };
+    },
+    refreshThumbnailsFromSource: async (items: Array<{ filePath: string; originalRemotePath?: string }>) => {
+      try {
+        const res = await fetch('/api/thumbnails/refresh-from-source', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items }),
+        });
+        if (res.ok) return await res.json();
+      } catch {}
+      return { refreshedCount: 0, errors: [] };
+    },
   };
 }

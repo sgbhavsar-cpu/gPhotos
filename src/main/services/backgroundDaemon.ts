@@ -5,7 +5,7 @@ import { spawn, execSync } from 'child_process';
 import { BackgroundServiceStatus, BackgroundServiceSettings, VirtualStorageConfig } from '../../types';
 import { scanDirectoryRecursive } from './fileOrganizer';
 import { parsePhotoMetadata } from './exifParser';
-import { generateThumbnailBuffer } from './virtualMirrorService';
+import { generateThumbnailBuffer, scanVirtualMirrorDirectory, processPendingRotations } from './virtualMirrorService';
 import { thumbnailWorker } from './thumbnailWorkerService';
 
 let tray: Tray | null = null;
@@ -171,6 +171,13 @@ export function initBackgroundDaemon(mainWindow?: BrowserWindow | null) {
 
   // Start periodic background scanner
   restartSyncTimer(mainWindow);
+
+  // Periodic offline rotation sync check (every 30 seconds)
+  setInterval(async () => {
+    try {
+      await processPendingRotations();
+    } catch {}
+  }, 30000);
 }
 
 function updateTrayMenu(mainWindow?: BrowserWindow | null) {
@@ -278,6 +285,9 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
   if (mainWindow) updateTrayMenu(mainWindow);
 
   try {
+    // First drain any pending offline rotations if storage is available
+    await processPendingRotations();
+
     const storePath = getStoragePath();
     if (!fs.existsSync(storePath)) return;
 
@@ -353,6 +363,12 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
       if (newlySynced > 0) {
         storage.lastSynced = new Date().toISOString();
         storage.totalItems = (storage.totalItems || 0) + newlySynced;
+        try {
+          const mirroredPhotos = scanVirtualMirrorDirectory(mirrorDir);
+          if (mirroredPhotos && mirroredPhotos.length > 0) {
+            thumbnailWorker.enqueuePhotos(mirroredPhotos);
+          }
+        } catch {}
       }
     }
 
@@ -544,6 +560,7 @@ export function getBackgroundServiceStatus(): BackgroundServiceStatus {
     thumbnailsPreCachedCount: workerStatus.current,
     thumbnailsPreCachedTotal: workerStatus.total,
     isPreCachingActive: workerStatus.isRunning,
+    currentPreCacheFile: workerStatus.currentFile,
   };
 }
 

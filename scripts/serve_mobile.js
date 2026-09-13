@@ -283,6 +283,67 @@ async function handleRequest(req, res) {
     }
   }
 
+  // Endpoint: /api/delete-files (POST)
+  if (pathname === '/api/delete-files' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const { filePaths, permanent } = JSON.parse(body || '{}');
+        const paths = Array.isArray(filePaths) ? filePaths : [];
+        let deletedCount = 0;
+        const errors = [];
+        for (const fp of paths) {
+          if (!fs.existsSync(fp)) continue;
+          try {
+            fs.unlinkSync(fp);
+            const jsonSidecar = fp.replace(/\.[^/.]+$/, '') + '.json';
+            if (fs.existsSync(jsonSidecar)) {
+              try { fs.unlinkSync(jsonSidecar); } catch {}
+            }
+            deletedCount++;
+          } catch (e) {
+            errors.push(e.message);
+          }
+        }
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ success: errors.length === 0, deletedCount, errors }));
+      } catch (err) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ success: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // Endpoint: /api/rotate-photo (POST)
+  if (pathname === '/api/rotate-photo' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const { filePath, rotationDegrees } = JSON.parse(body || '{}');
+        let sharp = null;
+        try { sharp = require('sharp'); } catch {}
+        if (sharp && fs.existsSync(filePath)) {
+          const degrees = ((rotationDegrees % 360) + 360) % 360;
+          const bakPath = `${filePath}.bak`;
+          if (!fs.existsSync(bakPath)) {
+            try { fs.copyFileSync(filePath, bakPath); } catch {}
+          }
+          const buf = await sharp(filePath).rotate(degrees).withMetadata().toBuffer();
+          fs.writeFileSync(filePath, buf);
+        }
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ success: true, newPath: filePath }));
+      } catch (err) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ success: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
   // Endpoint: /api/scan-mirror?path=...
   if (pathname === '/api/scan-mirror') {
     const mirrorPath = parsedUrl.searchParams.get('path');
@@ -338,6 +399,45 @@ async function handleRequest(req, res) {
       res.end(JSON.stringify({ error: 'Invalid or missing mirror directory path' }));
       return;
     }
+  }
+
+  // Endpoint: /api/precache-status (GET)
+  if (pathname === '/api/precache-status') {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ isRunning: false, paused: false, current: 0, total: 0, cpuPercent: 0, ramMb: 0 }));
+    return;
+  }
+
+  // Endpoint: /api/background-service-status (GET)
+  if (pathname === '/api/background-service-status') {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({
+      isRunning: true,
+      isPaused: false,
+      runAtStartup: false,
+      minimizeToTray: true,
+      syncIntervalMinutes: 15,
+      isScanningNow: false,
+      enableThumbnailPreCache: true,
+      thumbnailsPreCachedCount: 0,
+      thumbnailsPreCachedTotal: 0,
+      isPreCachingActive: false,
+    }));
+    return;
+  }
+
+  // Endpoint: /api/start-precache (POST)
+  if (pathname === '/api/start-precache' && req.method === 'POST') {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ started: true }));
+    return;
+  }
+
+  // Endpoint: /api/pause-precache (POST)
+  if (pathname === '/api/pause-precache' && req.method === 'POST') {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ paused: true }));
+    return;
   }
 
   // Endpoint: /api/batch-thumbnails (POST)

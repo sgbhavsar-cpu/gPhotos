@@ -199,6 +199,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   };
 
   // In-App Editing states (Rotate, Crop, Save to Source)
+  const isHeic = /\.(heic|heif)$/i.test(photo.fileName || photo.filePath || photo.originalRemotePath || '');
   const [isEditing, setIsEditing] = useState(false);
   const [editRotation, setEditRotation] = useState<number>(0);
   const [editFlipH, setEditFlipH] = useState(false);
@@ -633,8 +634,8 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          {/* Edit photo button (available when local or online source) */}
-          {(!photo.isVirtual || isOriginalAvailable) && (
+          {/* Edit photo button (available when local or online source, disabled for HEIC) */}
+          {(!photo.isVirtual || isOriginalAvailable) && !isHeic && (
             <button
               className={`btn ${isEditing ? 'btn-primary' : 'btn-secondary'}`}
               onClick={() => {

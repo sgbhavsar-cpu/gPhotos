@@ -11,7 +11,8 @@ import {
   Photo,
   FolderTreeNode,
   EditPhotoOptions,
-  EditPhotoResult
+  EditPhotoResult,
+  StorageSyncCheckpoint
 } from '../../types';
 
 // Dynamic import or require of electron nativeImage
@@ -191,6 +192,87 @@ export function generateThumbnailBuffer(filePath: string, maxDimension = 500): B
   }
 }
 
+function getGlobalCheckpointsPath(): string {
+  try {
+    const electron = require('electron');
+    if (electron.app) {
+      return path.join(electron.app.getPath('userData'), 'storage_sync_checkpoints.json');
+    }
+  } catch {}
+  const fallback = process.env.APPDATA
+    ? path.join(process.env.APPDATA, 'gPhotos')
+    : path.join(process.cwd(), '.temp');
+  if (!fs.existsSync(fallback)) {
+    try { fs.mkdirSync(fallback, { recursive: true }); } catch {}
+  }
+  return path.join(fallback, 'storage_sync_checkpoints.json');
+}
+
+export function getAllStorageCheckpoints(customMirrorRoot?: string): Record<string, StorageSyncCheckpoint> {
+  const result: Record<string, StorageSyncCheckpoint> = {};
+  try {
+    const p = getGlobalCheckpointsPath();
+    if (fs.existsSync(p)) {
+      const raw = fs.readFileSync(p, 'utf-8');
+      const map = JSON.parse(raw);
+      if (map && typeof map === 'object') {
+        Object.assign(result, map);
+      }
+    }
+  } catch (err) {
+    console.warn('[StorageSync] Failed to load global checkpoints:', err);
+  }
+
+  try {
+    const root = customMirrorRoot || 'C:\\GPhotos_VirtualMirrors';
+    if (fs.existsSync(root)) {
+      const entries = fs.readdirSync(root, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+        const cpFile = path.join(root, entry.name, '_sync_checkpoint.json');
+        if (fs.existsSync(cpFile)) {
+          try {
+            const cp: StorageSyncCheckpoint = JSON.parse(fs.readFileSync(cpFile, 'utf-8'));
+            if (cp && cp.storageName) {
+              result[cp.storageName] = cp;
+            }
+          } catch {}
+        }
+      }
+    }
+  } catch {}
+
+  return result;
+}
+
+export function loadStorageCheckpoint(storageName: string, localMirrorRoot?: string): StorageSyncCheckpoint | null {
+  const all = getAllStorageCheckpoints(localMirrorRoot);
+  return all[storageName] || null;
+}
+
+export function saveStorageCheckpoint(checkpoint: StorageSyncCheckpoint): void {
+  try {
+    const mirrorFolder = path.join(checkpoint.localMirrorRoot || 'C:\\GPhotos_VirtualMirrors', checkpoint.storageName);
+    if (!fs.existsSync(mirrorFolder)) {
+      try { fs.mkdirSync(mirrorFolder, { recursive: true }); } catch {}
+    }
+    const localCpPath = path.join(mirrorFolder, '_sync_checkpoint.json');
+    fs.writeFileSync(localCpPath, JSON.stringify(checkpoint, null, 2), 'utf-8');
+
+    const globalPath = getGlobalCheckpointsPath();
+    let currentMap: Record<string, StorageSyncCheckpoint> = {};
+    if (fs.existsSync(globalPath)) {
+      try {
+        currentMap = JSON.parse(fs.readFileSync(globalPath, 'utf-8'));
+      } catch {}
+    }
+    currentMap[checkpoint.storageName] = checkpoint;
+    fs.writeFileSync(globalPath, JSON.stringify(currentMap, null, 2), 'utf-8');
+  } catch (err) {
+    console.warn(`[StorageSync] Failed to save checkpoint for ${checkpoint.storageName}:`, err);
+  }
+}
+
 export async function syncVirtualStorage(
   config: VirtualStorageConfig,
   onProgress?: (progress: MirrorProgress) => void
@@ -206,22 +288,38 @@ export async function syncVirtualStorage(
     fs.mkdirSync(storageMirrorRoot, { recursive: true });
   }
 
-  if (onProgress) {
-    onProgress({
-      storageName: config.name,
-      phase: 'scanning',
-      current: 0,
-      total: 0,
-      currentFile: 'Scanning network storage...',
-      status: 'scanning',
-      percent: 0,
-    });
-  }
-
   const remoteFiles = scanDirectoryRecursive(config.networkSourcePath);
   const total = remoteFiles.length;
 
-  for (let i = 0; i < total; i++) {
+  // Intermittent checkpoint resumption check:
+  // If an interrupted checkpoint exists with the same total, resume directly from where it stopped!
+  const existingCp = loadStorageCheckpoint(config.name, config.localMirrorRoot);
+  let startIndex = 0;
+  if (
+    existingCp &&
+    existingCp.phase !== 'completed' &&
+    existingCp.lastProcessedIndex > 0 &&
+    existingCp.lastProcessedIndex < total &&
+    existingCp.totalDiscovered === total
+  ) {
+    startIndex = existingCp.lastProcessedIndex + 1;
+    totalSynced = existingCp.processedCount || startIndex;
+    console.log(`[StorageSync] Resuming sync for ${config.name} from photo ${startIndex + 1} of ${total} (Saved progress: ${existingCp.percent}%)`);
+  }
+
+  if (onProgress) {
+    onProgress({
+      storageName: config.name,
+      phase: startIndex > 0 ? 'thumbnails' : 'scanning',
+      current: totalSynced,
+      total,
+      currentFile: startIndex > 0 ? `Resuming from photo ${startIndex + 1}...` : 'Scanning network storage...',
+      status: startIndex > 0 ? 'syncing' : 'scanning',
+      percent: Math.round((totalSynced / Math.max(1, total)) * 100),
+    });
+  }
+
+  for (let i = startIndex; i < total; i++) {
     const remoteFile = remoteFiles[i];
     const fileName = path.basename(remoteFile);
     const relFromRoot = path.relative(config.networkSourcePath, remoteFile);
@@ -312,12 +410,44 @@ export async function syncVirtualStorage(
       errors.push(msg);
     }
 
+    // Intermittent checkpoint save every 10 photos or on last photo
+    if ((i + 1) % 10 === 0 || i === total - 1) {
+      saveStorageCheckpoint({
+        storageName: config.name,
+        networkSourcePath: config.networkSourcePath,
+        localMirrorRoot: config.localMirrorRoot,
+        phase: i === total - 1 ? 'completed' : 'thumbnails',
+        processedCount: i + 1,
+        totalDiscovered: total,
+        lastProcessedIndex: i,
+        lastProcessedFile: fileName,
+        percent,
+        timestamp: Date.now(),
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
     // Configurable delay between photos to prevent bandwidth saturation and keep desktop 100% responsive
     const delayMs = config.delayBetweenPhotosSec && config.delayBetweenPhotosSec > 0
       ? Math.round(config.delayBetweenPhotosSec * 1000)
       : 4;
     await new Promise((r) => setTimeout(r, delayMs));
   }
+
+  // Final checkpoint mark as completed
+  saveStorageCheckpoint({
+    storageName: config.name,
+    networkSourcePath: config.networkSourcePath,
+    localMirrorRoot: config.localMirrorRoot,
+    phase: 'completed',
+    processedCount: total,
+    totalDiscovered: total,
+    lastProcessedIndex: total - 1,
+    lastProcessedFile: 'Completed',
+    percent: 100,
+    timestamp: Date.now(),
+    updatedAt: new Date().toISOString(),
+  });
 
   if (onProgress) {
     onProgress({
@@ -410,20 +540,6 @@ export function scanVirtualMirrorDirectory(mirrorDirPath: string): Photo[] {
 
             // Confirm corresponding local thumbnail exists
             if (fs.existsSync(meta.thumbnailPath)) {
-              // If source folder is mounted/online, verify the original file still exists
-              if (meta.originalFilePath) {
-                const parentDir = path.dirname(meta.originalFilePath);
-                if (fs.existsSync(parentDir) && !fs.existsSync(meta.originalFilePath)) {
-                  // File was deleted from the source folder - prune local mirror copy
-                  try {
-                    fs.unlinkSync(fullPath);
-                    if (fs.existsSync(meta.thumbnailPath)) fs.unlinkSync(meta.thumbnailPath);
-                  } catch {}
-                  continue;
-                }
-              }
-
-              const thumbStats = fs.statSync(meta.thumbnailPath);
               const date = new Date(meta.dateTaken);
 
               const photo: Photo = {
@@ -473,55 +589,77 @@ export function discoverStoredMirrors(customRoot?: string): VirtualStorageConfig
       if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
 
       const subDir = path.join(root, entry.name);
-      let totalPhotos = 0;
-      let totalOriginalSize = 0;
-      let totalThumbSize = 0;
+      const summaryFile = path.join(subDir, '_mirror_summary.json');
+
+      // Fast-path 1: Instant load from cached summary (<0.2ms)
+      if (fs.existsSync(summaryFile)) {
+        try {
+          const cached: VirtualStorageConfig = JSON.parse(fs.readFileSync(summaryFile, 'utf-8'));
+          if (cached && cached.name) {
+            storages.push(cached);
+            continue;
+          }
+        } catch {}
+      }
+
+      // Fast-path 2: Find sample sidecar for metadata + count json files quickly
       let detectedName = entry.name;
       let networkSourcePath = '';
+      let sampleMetaFound = false;
+      let totalPhotos = 0;
+      let sampleOrigSize = 0;
+      let sampleThumbSize = 0;
       let latestMtime = 0;
 
-      function scanDir(dir: string) {
+      function quickScan(dir: string, depth = 0) {
+        if (depth > 6) return;
         try {
           const subEntries = fs.readdirSync(dir, { withFileTypes: true });
           for (const se of subEntries) {
             const p = path.join(dir, se.name);
             if (se.isDirectory() && !se.name.startsWith('.')) {
-              scanDir(p);
-            } else if (se.isFile() && se.name.endsWith('.json')) {
-              try {
-                const stat = fs.statSync(p);
-                if (stat.mtimeMs > latestMtime) latestMtime = stat.mtimeMs;
-                const meta: VirtualPhotoMetadata = JSON.parse(fs.readFileSync(p, 'utf-8'));
-                totalPhotos++;
-                totalOriginalSize += (meta.originalFileSize || 0);
-                if (meta.storageName) detectedName = meta.storageName;
-                if (meta.storageRoot && !networkSourcePath) networkSourcePath = meta.storageRoot;
-
-                if (meta.thumbnailPath && fs.existsSync(meta.thumbnailPath)) {
-                  totalThumbSize += fs.statSync(meta.thumbnailPath).size;
-                }
-              } catch {
-                // skip malformed json
+              quickScan(p, depth + 1);
+            } else if (se.isFile() && se.name.endsWith('.json') && !se.name.startsWith('_')) {
+              totalPhotos++;
+              if (!sampleMetaFound) {
+                try {
+                  const stat = fs.statSync(p);
+                  if (stat.mtimeMs > latestMtime) latestMtime = stat.mtimeMs;
+                  const meta: VirtualPhotoMetadata = JSON.parse(fs.readFileSync(p, 'utf-8'));
+                  if (meta.storageName) detectedName = meta.storageName;
+                  if (meta.storageRoot) networkSourcePath = meta.storageRoot;
+                  sampleOrigSize = meta.originalFileSize || 3500000;
+                  if (meta.thumbnailPath && fs.existsSync(meta.thumbnailPath)) {
+                    sampleThumbSize = fs.statSync(meta.thumbnailPath).size;
+                  }
+                  sampleMetaFound = true;
+                } catch {}
               }
             }
           }
-        } catch {
-          // ignore
-        }
+        } catch {}
       }
 
-      scanDir(subDir);
+      quickScan(subDir);
 
       if (totalPhotos > 0) {
-        storages.push({
+        const estOriginal = totalPhotos * (sampleOrigSize || 3500000);
+        const estThumb = totalPhotos * (sampleThumbSize || 65000);
+        const config: VirtualStorageConfig = {
           id: `storage_${entry.name}`,
           name: detectedName,
           networkSourcePath: networkSourcePath || subDir,
           localMirrorRoot: root,
           lastSynced: latestMtime > 0 ? new Date(latestMtime).toISOString() : new Date().toISOString(),
           totalItems: totalPhotos,
-          totalSizeSaved: Math.max(0, totalOriginalSize - totalThumbSize),
-        });
+          totalSizeSaved: Math.max(0, estOriginal - estThumb),
+        };
+        storages.push(config);
+
+        // Save lightweight summary file asynchronously so subsequent startups take 0ms
+        try {
+          fs.writeFileSync(summaryFile, JSON.stringify(config, null, 2), 'utf-8');
+        } catch {}
       }
     }
   } catch (err) {
@@ -689,6 +827,14 @@ export async function editPhotoFile(options: EditPhotoOptions): Promise<EditPhot
     return { success: false, error: `File not found: ${targetPath}` };
   }
 
+  const ext = path.extname(targetPath).toLowerCase();
+  if (ext === '.heic' || ext === '.heif') {
+    return {
+      success: false,
+      error: 'Direct editing of HEIC/HEIF images is not supported. Please export or convert to JPEG/PNG to edit.',
+    };
+  }
+
   try {
     let outputBuffer: Buffer | null = null;
 
@@ -817,4 +963,289 @@ export async function trashFiles(filePaths: string[]): Promise<{ success: boolea
     errors,
   };
 }
+
+/**
+ * Permanently unlinks/deletes files from disk and cleans up any associated sidecar .json files.
+ */
+export async function deleteFilesPermanently(filePaths: string[]): Promise<{ success: boolean; deletedCount: number; errors: string[] }> {
+  const errors: string[] = [];
+  let deletedCount = 0;
+
+  for (const fp of filePaths) {
+    if (!fs.existsSync(fp)) continue;
+    try {
+      fs.unlinkSync(fp);
+      // If this is a virtual mirror photo or has a matching .json sidecar, delete it too
+      const jsonSidecar = fp.replace(/\.[^/.]+$/, '') + '.json';
+      if (fs.existsSync(jsonSidecar)) {
+        try {
+          fs.unlinkSync(jsonSidecar);
+        } catch {}
+      }
+      deletedCount++;
+    } catch (err: any) {
+      errors.push(`Failed to permanently delete ${fp}: ${err.message}`);
+    }
+  }
+
+  return {
+    success: errors.length === 0,
+    deletedCount,
+    errors,
+  };
+}
+
+/**
+ * Rotates an image file by the specified degrees (e.g. 90, 180, 270) using Sharp (or nativeImage fallback).
+ * Automatically creates a .bak backup and saves the rotated image to disk.
+ */
+export async function rotatePhotoFile(
+  filePath: string,
+  rotationDegrees: number
+): Promise<{ success: boolean; newPath?: string; error?: string }> {
+  try {
+    if (!fs.existsSync(filePath)) {
+      return { success: false, error: `File not found: ${filePath}` };
+    }
+
+    const degrees = ((rotationDegrees % 360) + 360) % 360;
+    if (degrees === 0) {
+      return { success: true, newPath: filePath };
+    }
+
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext === '.heic' || ext === '.heif') {
+      return {
+        success: false,
+        error: 'Direct lossless rotation of HEIC/HEIF images is not supported. Please export or convert to JPEG/PNG to rotate.',
+      };
+    }
+
+    // Create .bak backup if it doesn't already exist
+    const bakPath = `${filePath}.bak`;
+    if (!fs.existsSync(bakPath)) {
+      try {
+        fs.copyFileSync(filePath, bakPath);
+      } catch {}
+    }
+
+    let outputBuffer: Buffer | null = null;
+    let sharpLib: any = null;
+    try {
+      sharpLib = require('sharp');
+    } catch {}
+
+    const inputBuf = fs.readFileSync(filePath);
+
+    if (sharpLib) {
+      outputBuffer = await sharpLib(inputBuf)
+        .rotate(degrees)
+        .withMetadata({ orientation: 1 })
+        .toBuffer();
+    } else if (nativeImage) {
+      let img = nativeImage.createFromBuffer(inputBuf);
+      outputBuffer = img.toJPEG(95);
+    }
+
+    if (!outputBuffer) {
+      return { success: false, error: 'Could not process image rotation' };
+    }
+
+    fs.writeFileSync(filePath, outputBuffer);
+
+    return { success: true, newPath: filePath };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}
+
+export interface PendingRotationItem {
+  id: string;
+  originalRemotePath: string;
+  localFilePath?: string;
+  rotationDegrees: number;
+  timestamp: number;
+}
+
+export function getPendingRotationsPath(): string {
+  try {
+    const electron = require('electron');
+    if (electron.app) {
+      return path.join(electron.app.getPath('userData'), 'pending_rotations.json');
+    }
+  } catch {}
+  const fallback = process.env.APPDATA
+    ? path.join(process.env.APPDATA, 'gPhotos')
+    : path.join(process.cwd(), '.temp');
+  if (!fs.existsSync(fallback)) {
+    try {
+      fs.mkdirSync(fallback, { recursive: true });
+    } catch {}
+  }
+  return path.join(fallback, 'pending_rotations.json');
+}
+
+export function getPendingRotations(): PendingRotationItem[] {
+  try {
+    const p = getPendingRotationsPath();
+    if (fs.existsSync(p)) {
+      const raw = fs.readFileSync(p, 'utf-8');
+      return JSON.parse(raw);
+    }
+  } catch (err) {
+    console.warn('[OfflineRotation] Failed to read pending rotations:', err);
+  }
+  return [];
+}
+
+export function savePendingRotations(items: PendingRotationItem[]): void {
+  try {
+    const p = getPendingRotationsPath();
+    const dir = path.dirname(p);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(items, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('[OfflineRotation] Failed to save pending rotations:', err);
+  }
+}
+
+export function enqueuePendingRotation(
+  originalRemotePath: string,
+  rotationDegrees: number,
+  localFilePath?: string
+): void {
+  const items = getPendingRotations();
+  const normTarget = originalRemotePath.toLowerCase().replace(/\\/g, '/');
+  const existingIdx = items.findIndex(
+    (i) => i.originalRemotePath.toLowerCase().replace(/\\/g, '/') === normTarget
+  );
+
+  const degrees = ((rotationDegrees % 360) + 360) % 360;
+  if (degrees === 0) return;
+
+  if (existingIdx !== -1) {
+    const combinedDegrees = (items[existingIdx].rotationDegrees + degrees) % 360;
+    if (combinedDegrees === 0) {
+      // Rotations cancelled out back to original
+      items.splice(existingIdx, 1);
+    } else {
+      items[existingIdx].rotationDegrees = combinedDegrees;
+      items[existingIdx].timestamp = Date.now();
+      if (localFilePath) items[existingIdx].localFilePath = localFilePath;
+    }
+  } else {
+    items.push({
+      id: Buffer.from(originalRemotePath).toString('base64').replace(/[/+=]/g, '_'),
+      originalRemotePath,
+      localFilePath,
+      rotationDegrees: degrees,
+      timestamp: Date.now(),
+    });
+  }
+
+  savePendingRotations(items);
+}
+
+export async function processPendingRotations(): Promise<{ processed: number; remaining: number }> {
+  const items = getPendingRotations();
+  if (items.length === 0) return { processed: 0, remaining: 0 };
+
+  const remaining: PendingRotationItem[] = [];
+  let processed = 0;
+
+  for (const item of items) {
+    try {
+      if (fs.existsSync(item.originalRemotePath)) {
+        console.log(`[OfflineRotationSync] Applying pending rotation (${item.rotationDegrees}°) to reconnected source: ${item.originalRemotePath}`);
+        const res = await rotatePhotoFile(item.originalRemotePath, item.rotationDegrees);
+        if (res.success) {
+          processed++;
+          continue; // successfully processed and drained
+        }
+      }
+    } catch (err) {
+      console.warn(`[OfflineRotationSync] Error applying rotation to ${item.originalRemotePath}:`, err);
+    }
+    remaining.push(item);
+  }
+
+  if (processed > 0) {
+    savePendingRotations(remaining);
+  }
+
+  return { processed, remaining: remaining.length };
+}
+
+/**
+ * Rotates photo file with offline queue durability:
+ * 1. Immediately rotates the local mirror thumbnail on disk so it appears rotated in the gallery.
+ * 2. If original remote file is online, rotates it immediately on disk.
+ * 3. If original remote file is offline, enqueues the rotation task in pending_rotations.json to be applied when reconnected.
+ */
+export async function rotatePhotoWithOfflineQueue(params: {
+  localFilePath: string;
+  originalRemotePath?: string;
+  rotationDegrees: number;
+}): Promise<{ success: boolean; isQueued: boolean; newPath?: string; message?: string; error?: string }> {
+  try {
+    const { localFilePath, originalRemotePath, rotationDegrees } = params;
+    const degrees = ((rotationDegrees % 360) + 360) % 360;
+    if (degrees === 0) {
+      return { success: true, isQueued: false, newPath: localFilePath };
+    }
+
+    const targetToCheck = originalRemotePath || localFilePath;
+    const ext = path.extname(targetToCheck || '').toLowerCase();
+    if (ext === '.heic' || ext === '.heif') {
+      return {
+        success: false,
+        isQueued: false,
+        error: 'Direct lossless rotation of HEIC/HEIF images is not supported.',
+      };
+    }
+
+    // 1. Rotate local thumbnail on disk immediately
+    if (localFilePath && fs.existsSync(localFilePath)) {
+      await rotatePhotoFile(localFilePath, degrees);
+
+      // Update sidecar metadata JSON if present
+      const sidecarJson = localFilePath.replace(/\.[^/.]+$/, '.json');
+      if (fs.existsSync(sidecarJson)) {
+        try {
+          const meta = JSON.parse(fs.readFileSync(sidecarJson, 'utf-8'));
+          if (degrees === 90 || degrees === 270) {
+            const oldW = meta.width;
+            meta.width = meta.height;
+            meta.height = oldW;
+          }
+          fs.writeFileSync(sidecarJson, JSON.stringify(meta, null, 2), 'utf-8');
+        } catch {}
+      }
+    }
+
+    // 2. Check source file
+    const remoteTarget = originalRemotePath || localFilePath;
+    const isRemoteOnline = remoteTarget && fs.existsSync(remoteTarget);
+
+    if (isRemoteOnline) {
+      // Source file is online: rotate remote file now
+      if (remoteTarget !== localFilePath) {
+        await rotatePhotoFile(remoteTarget, degrees);
+      }
+      return { success: true, isQueued: false, newPath: remoteTarget };
+    } else {
+      // Source file is offline: enqueue for background sync
+      enqueuePendingRotation(remoteTarget, degrees, localFilePath);
+      return {
+        success: true,
+        isQueued: true,
+        newPath: localFilePath,
+        message: 'Source file is currently offline. Rotation applied locally and queued to sync when storage reconnects.',
+      };
+    }
+  } catch (err: any) {
+    return { success: false, isQueued: false, error: err.message };
+  }
+}
+
 

@@ -18,13 +18,16 @@ import {
   Plus,
   X,
   ZoomIn,
-  ZoomOut
+  ZoomOut,
+  Trash2,
+  AlertTriangle
 } from 'lucide-react';
 import { Photo, VirtualStorageConfig, Album } from '../../types';
 import { PhotoCard } from '../components/PhotoCard';
 import { libraryStore } from '../services/libraryStore';
 import { VirtualizedTimelineGallery, GalleryZoomLevel, ZOOM_LEVELS } from '../components/VirtualizedTimelineGallery';
 import { AiPhotoFilter } from '../services/aiSearchService';
+import { batchThumbnailStore, requestBatchThumbnails } from '../services/asyncImageLoader';
 
 interface GalleryViewProps {
   photos: Photo[];
@@ -69,6 +72,63 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   const [targetAlbumId, setTargetAlbumId] = useState<string>('new');
   const [newAlbumTitle, setNewAlbumTitle] = useState('');
   const [albumSuccessToast, setAlbumSuccessToast] = useState<string | null>(null);
+
+  // Permanent Deletion Confirmation Modal states
+  const [showDeleteConfirmModal, setShowDeleteConfirmModal] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+
+  // Thumbnail Cache Refreshing states
+  const [isRefreshingThumbnails, setIsRefreshingThumbnails] = useState(false);
+  const [refreshToast, setRefreshToast] = useState<string | null>(null);
+
+  // Mobile-style mouse drag-selection handler
+  const handleDragSelect = (photoId: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      next.add(photoId);
+      return next;
+    });
+    if (!isSelectMode) {
+      setIsSelectMode(true);
+    }
+  };
+
+  const handlePermanentDeleteSelected = async () => {
+    if (selectedIds.size === 0) return;
+    setIsDeleting(true);
+
+    const count = selectedIds.size;
+    const deleteIds = Array.from(selectedIds);
+    const toDelete = photos.filter((p) => selectedIds.has(p.id));
+    const filePaths = toDelete.map((p) => p.originalRemotePath || p.filePath);
+
+    try {
+      if (window.electronAPI?.deleteFilesPermanently) {
+        await window.electronAPI.deleteFilesPermanently(filePaths);
+      } else {
+        await fetch('/api/delete-files', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filePaths, permanent: true }),
+        });
+      }
+
+      // Remove photos from library store
+      libraryStore.removePhotos(deleteIds);
+
+      // Clear selection
+      setSelectedIds(new Set());
+      setIsSelectMode(false);
+      setShowDeleteConfirmModal(false);
+
+      setAlbumSuccessToast(`✓ Permanently deleted ${count} photo(s) from storage.`);
+      setTimeout(() => setAlbumSuccessToast(null), 3500);
+    } catch (err: any) {
+      alert(`Failed to permanently delete photos: ${err.message}`);
+    } finally {
+      setIsDeleting(false);
+    }
+  };
 
   const filteredPhotos = useMemo(() => {
     let result = photos;
@@ -116,6 +176,55 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
     libraryStore.excludePhotos(Array.from(selectedIds), exclude);
     setSelectedIds(new Set());
     setIsSelectMode(false);
+  };
+
+  const handleRefreshThumbnailsFromSource = async () => {
+    if (selectedIds.size === 0 || isRefreshingThumbnails) return;
+    setIsRefreshingThumbnails(true);
+
+    try {
+      const selectedPhotos = photos.filter((p) => selectedIds.has(p.id));
+      const itemsToRefresh = selectedPhotos.map((p) => ({
+        filePath: p.filePath,
+        originalRemotePath: p.originalRemotePath,
+      }));
+
+      // 1. Evict from frontend in-memory store so UI immediately requests fresh buffers
+      selectedPhotos.forEach((p) => {
+        if (p.thumbnailPath) batchThumbnailStore.delete(p.thumbnailPath);
+        if (p.filePath) batchThumbnailStore.delete(p.filePath);
+        if (p.originalRemotePath) batchThumbnailStore.delete(p.originalRemotePath);
+      });
+
+      // 2. Call backend to purge disk caches and regenerate fresh thumbnails
+      let result: { refreshedCount: number; errors: string[] } = { refreshedCount: 0, errors: [] };
+      if (window.electronAPI?.refreshThumbnailsFromSource) {
+        result = await window.electronAPI.refreshThumbnailsFromSource(itemsToRefresh);
+      } else {
+        const res = await fetch('/api/thumbnails/refresh-from-source', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: itemsToRefresh }),
+        });
+        if (res.ok) result = await res.json();
+      }
+
+      // 3. Immediately re-request fresh batch thumbnails for display
+      const batchItems = selectedPhotos.map((p) => ({
+        path: p.thumbnailPath || p.filePath,
+        originalPath: p.originalRemotePath,
+      }));
+      requestBatchThumbnails(batchItems, 250);
+
+      setRefreshToast(`✓ Refreshed thumbnail cache for ${selectedPhotos.length} photo(s) from source!`);
+      setTimeout(() => setRefreshToast(null), 4000);
+    } catch (err: any) {
+      console.error('[GalleryView] Error refreshing thumbnails from source:', err);
+      setRefreshToast(`Failed to refresh thumbnails: ${err.message || 'Unknown error'}`);
+      setTimeout(() => setRefreshToast(null), 4000);
+    } finally {
+      setIsRefreshingThumbnails(false);
+    }
   };
 
   // (groupedPhotos & gridColumns are handled internally with virtualized windowing by VirtualizedTimelineGallery)
@@ -571,6 +680,25 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            {/* Refresh Thumbnail Cache from Source Button */}
+            <button
+              className="btn btn-secondary"
+              onClick={handleRefreshThumbnailsFromSource}
+              disabled={isRefreshingThumbnails || selectedIds.size === 0}
+              style={{
+                fontSize: '0.85rem',
+                gap: '8px',
+                padding: '6px 14px',
+                borderColor: 'rgba(56, 189, 248, 0.4)',
+                backgroundColor: 'rgba(56, 189, 248, 0.1)',
+                color: 'var(--accent-cyan)',
+              }}
+              title="Purge cached thumbnails and regenerate fresh thumbnails directly from source files"
+            >
+              <RefreshCw size={16} className={isRefreshingThumbnails ? 'animate-spin' : ''} color="var(--accent-cyan)" />
+              <span>{isRefreshingThumbnails ? 'Refreshing...' : `Refresh Cache (${selectedIds.size})`}</span>
+            </button>
+
             {/* Add to Album Button */}
             <button
               className="btn btn-secondary"
@@ -581,6 +709,25 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
             >
               <FolderPlus size={16} color="var(--accent-primary)" />
               <span>Add to Album</span>
+            </button>
+
+            {/* Permanently Delete Selected Button */}
+            <button
+              className="btn btn-secondary"
+              onClick={() => setShowDeleteConfirmModal(true)}
+              disabled={selectedIds.size === 0}
+              style={{
+                fontSize: '0.85rem',
+                gap: '8px',
+                color: '#ef4444',
+                borderColor: 'rgba(239, 68, 68, 0.4)',
+                backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                padding: '6px 14px',
+              }}
+              title="Permanently delete selected photos from disk"
+            >
+              <Trash2 size={16} color="#ef4444" />
+              <span>Delete Selected ({selectedIds.size})</span>
             </button>
 
             {filterType === 'excluded' ? (
@@ -606,6 +753,39 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
               </button>
             )}
           </div>
+        </div>
+      )}
+
+      {/* Thumbnail Refresh Toast Notification */}
+      {refreshToast && (
+        <div
+          style={{
+            padding: '8px 24px',
+            backgroundColor: 'rgba(14, 165, 233, 0.15)',
+            borderBottom: '1px solid rgba(14, 165, 233, 0.4)',
+            color: 'var(--accent-cyan)',
+            fontSize: '0.85rem',
+            fontWeight: 500,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            zIndex: 19,
+          }}
+        >
+          <span>{refreshToast}</span>
+          <button
+            onClick={() => setRefreshToast(null)}
+            style={{
+              background: 'transparent',
+              border: 'none',
+              color: 'var(--text-muted)',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+            }}
+          >
+            <X size={15} />
+          </button>
         </div>
       )}
 
@@ -661,6 +841,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
         isSelectMode={isSelectMode || selectedIds.size > 0}
         selectedIds={selectedIds}
         onToggleSelect={toggleSelectPhoto}
+        onDragSelect={handleDragSelect}
         emptyMessage="No photos found matching the selected filter."
       />
 
@@ -800,6 +981,118 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Modal: Permanent Deletion Confirmation */}
+      {showDeleteConfirmModal && (
+        <div
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            backgroundColor: 'rgba(5, 8, 15, 0.88)',
+            backdropFilter: 'blur(10px)',
+            zIndex: 3600,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '24px',
+          }}
+          onClick={() => !isDeleting && setShowDeleteConfirmModal(false)}
+        >
+          <div
+            style={{
+              width: '100%',
+              maxWidth: '460px',
+              backgroundColor: 'var(--bg-surface)',
+              borderRadius: 'var(--radius-lg)',
+              border: '1px solid rgba(239, 68, 68, 0.4)',
+              boxShadow: '0 24px 60px rgba(0, 0, 0, 0.8), 0 0 25px rgba(239, 68, 68, 0.2)',
+              padding: '24px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '16px',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header with Warning Icon */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+              <div
+                style={{
+                  width: '46px',
+                  height: '46px',
+                  borderRadius: '50%',
+                  backgroundColor: 'rgba(239, 68, 68, 0.15)',
+                  border: '1px solid rgba(239, 68, 68, 0.4)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  flexShrink: 0,
+                }}
+              >
+                <AlertTriangle size={24} color="#ef4444" />
+              </div>
+              <div>
+                <h3 style={{ margin: 0, fontSize: '1.15rem', fontWeight: 700, color: 'var(--text-primary)' }}>
+                  Permanently Delete Photos?
+                </h3>
+                <span style={{ fontSize: '0.80rem', color: '#f87171', fontWeight: 600 }}>
+                  Irreversible Action
+                </span>
+              </div>
+            </div>
+
+            <p style={{ margin: 0, color: 'var(--text-secondary)', fontSize: '0.88rem', lineHeight: 1.5 }}>
+              Are you sure you want to delete <strong>{selectedIds.size}</strong> selected photo(s)?
+            </p>
+
+            <div
+              style={{
+                backgroundColor: 'rgba(239, 68, 68, 0.08)',
+                border: '1px solid rgba(239, 68, 68, 0.25)',
+                borderRadius: 'var(--radius-md)',
+                padding: '12px 14px',
+                fontSize: '0.82rem',
+                color: '#fca5a5',
+                lineHeight: 1.4,
+              }}
+            >
+              ⚠️ <strong>Warning:</strong> This will permanently delete this from your storage disk. This cannot be undone and files cannot be restored from the Recycle Bin.
+            </div>
+
+            {/* Action Buttons */}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '8px' }}>
+              <button
+                className="btn btn-secondary"
+                type="button"
+                onClick={() => setShowDeleteConfirmModal(false)}
+                disabled={isDeleting}
+                style={{ padding: '8px 16px' }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={handlePermanentDeleteSelected}
+                disabled={isDeleting}
+                style={{
+                  backgroundColor: '#dc2626',
+                  borderColor: '#b91c1c',
+                  color: 'white',
+                  gap: '8px',
+                  padding: '8px 18px',
+                  fontWeight: 600,
+                }}
+              >
+                <Trash2 size={16} />
+                <span>{isDeleting ? 'Deleting...' : `Permanently Delete (${selectedIds.size})`}</span>
+              </button>
+            </div>
           </div>
         </div>
       )}

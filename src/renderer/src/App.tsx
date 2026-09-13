@@ -22,6 +22,8 @@ import { faceQueue } from './services/faceQueue';
 import { Photo, DetectedFace, VirtualStorageConfig, BackgroundScanProgress, NetworkStorageProgress } from '../types';
 import { AiPhotoFilter } from './services/aiSearchService';
 import { RefreshCw, CheckCircle2, X } from 'lucide-react';
+import { ResponseActivityIndicator } from './components/ResponseActivityIndicator';
+import { responseTracker } from './services/responseTracker';
 
 export const App: React.FC = () => {
   const [libraryState, setLibraryState] = useState<LibraryState>(libraryStore.getState());
@@ -60,6 +62,7 @@ export const App: React.FC = () => {
 
   // Subscribe to library store updates and ensure persisted data is fetched on mount
   useEffect(() => {
+    responseTracker.installSafeFetchInterceptor();
     libraryStore.loadPersistedData().finally(() => {
       // Smoothly dismiss browser inline splash screen
       const splash = document.getElementById('app-splash-screen');
@@ -102,54 +105,63 @@ export const App: React.FC = () => {
         ? [...saved].filter((s) => !unlinkedSet.has(s.name.toLowerCase()))
         : [];
 
-      if (window.electronAPI?.discoverMirrors) {
-        try {
-          const discovered = await window.electronAPI.discoverMirrors();
-          if (discovered && discovered.length > 0) {
-            for (const disc of discovered) {
-              if (unlinkedSet.has(disc.name.toLowerCase())) continue; // Skip unlinked/deleted mirrors!
-
-              const idx = combined.findIndex(
-                (s) => s.name.toLowerCase() === disc.name.toLowerCase() || s.id === disc.id
-              );
-              if (idx === -1) {
-                combined.push(disc);
-              } else {
-                combined[idx] = {
-                  ...combined[idx],
-                  totalItems: disc.totalItems || combined[idx].totalItems,
-                  totalSizeSaved: disc.totalSizeSaved || combined[idx].totalSizeSaved,
-                  lastSynced: combined[idx].lastSynced || disc.lastSynced,
-                };
-              }
-            }
-          }
-        } catch (err) {
-          console.warn('Failed to auto-discover mirrors on startup:', err);
-        }
-      }
+      // Immediate paint of configured storages without blocking startup
       setVirtualStorages(combined);
 
-      // If no photos currently in library but we have configured mirrors or an active mirror folder, auto-load them
-      const curPhotos = libraryStore.getState().photos;
-      if (curPhotos.length === 0 && combined.length > 0 && window.electronAPI?.scanVirtualMirror) {
-        const curFolder = libraryStore.getState().selectedFolder;
-        const target = combined.find(
-          (s) => curFolder && `${s.localMirrorRoot}\\${s.name}`.toLowerCase() === curFolder.toLowerCase()
-        ) || combined.find((s) => (s.totalItems || 0) > 0) || combined[0];
-
-        if (target) {
-          const mirrorPath = `${target.localMirrorRoot}\\${target.name}`;
+      // Defer unneeded background discovery and auto-mirror scanning to 3.5s after mount
+      setTimeout(async () => {
+        if (window.electronAPI?.discoverMirrors) {
           try {
-            const mirroredPhotos = await window.electronAPI.scanVirtualMirror(mirrorPath);
-            if (mirroredPhotos && mirroredPhotos.length > 0) {
-              libraryStore.setPhotos(mirroredPhotos, mirrorPath);
+            const discovered = await window.electronAPI.discoverMirrors();
+            if (discovered && discovered.length > 0) {
+              let changed = false;
+              for (const disc of discovered) {
+                if (unlinkedSet.has(disc.name.toLowerCase())) continue;
+
+                const idx = combined.findIndex(
+                  (s) => s.name.toLowerCase() === disc.name.toLowerCase() || s.id === disc.id
+                );
+                if (idx === -1) {
+                  combined.push(disc);
+                  changed = true;
+                } else {
+                  combined[idx] = {
+                    ...combined[idx],
+                    totalItems: disc.totalItems || combined[idx].totalItems,
+                    totalSizeSaved: disc.totalSizeSaved || combined[idx].totalSizeSaved,
+                    lastSynced: combined[idx].lastSynced || disc.lastSynced,
+                  };
+                  changed = true;
+                }
+              }
+              if (changed) setVirtualStorages([...combined]);
             }
-          } catch (loadErr) {
-            console.warn('Failed to auto-load mirrored photos on startup:', loadErr);
+          } catch (err) {
+            console.warn('Failed to auto-discover mirrors:', err);
           }
         }
-      }
+
+        // If no photos currently in library but we have configured mirrors or an active mirror folder, auto-load them
+        const curPhotos = libraryStore.getState().photos;
+        if (curPhotos.length === 0 && combined.length > 0 && window.electronAPI?.scanVirtualMirror) {
+          const curFolder = libraryStore.getState().selectedFolder;
+          const target = combined.find(
+            (s) => curFolder && `${s.localMirrorRoot}\\${s.name}`.toLowerCase() === curFolder.toLowerCase()
+          ) || combined.find((s) => (s.totalItems || 0) > 0) || combined[0];
+
+          if (target) {
+            const mirrorPath = `${target.localMirrorRoot}\\${target.name}`;
+            try {
+              const mirroredPhotos = await window.electronAPI.scanVirtualMirror(mirrorPath);
+              if (mirroredPhotos && mirroredPhotos.length > 0) {
+                libraryStore.setPhotos(mirroredPhotos, mirrorPath);
+              }
+            } catch (loadErr) {
+              console.warn('Failed to auto-load mirrored photos:', loadErr);
+            }
+          }
+        }
+      }, 3500);
     };
     loadStorages();
   }, []);
@@ -230,6 +242,68 @@ export const App: React.FC = () => {
     };
   }, []);
 
+  // Load any previously saved/interrupted storage checkpoints and library statuses
+  useEffect(() => {
+    if (window.electronAPI?.getStorageCheckpoints) {
+      window.electronAPI.getStorageCheckpoints().then((checkpoints) => {
+        if (!checkpoints || typeof checkpoints !== 'object') return;
+        setStorageProgressMap((prev) => {
+          const next = { ...prev };
+          for (const [storageName, cp] of Object.entries(checkpoints)) {
+            if (cp && cp.phase !== 'completed' && cp.processedCount > 0) {
+              next[storageName] = {
+                storageName,
+                phase: 'interrupted',
+                thumbnailCurrent: cp.processedCount,
+                thumbnailTotal: cp.totalDiscovered,
+                faceCurrent: 0,
+                faceTotal: 0,
+                percent: cp.percent,
+                currentFile: cp.lastProcessedFile ? `Saved checkpoint: ${cp.lastProcessedFile}` : undefined,
+                message: `Interrupted at ${cp.percent}% (${cp.processedCount}/${cp.totalDiscovered}). Ready to resume from photo ${cp.lastProcessedIndex + 1}.`,
+                canResume: true,
+              };
+            }
+          }
+          return next;
+        });
+      }).catch(() => {});
+    }
+
+    if (window.electronAPI?.getAllLibraryStatuses) {
+      window.electronAPI.getAllLibraryStatuses().then((statuses) => {
+        if (!statuses || typeof statuses !== 'object') return;
+        setStorageProgressMap((prev) => {
+          const next = { ...prev };
+          for (const [_key, st] of Object.entries(statuses)) {
+            if (st && st.totalPhotos > 0 && (st.thumbnailCachedCount > 0 || st.faceScannedCount > 0)) {
+              const name = st.libraryName || 'Library';
+              const isCompleted = st.thumbnailCompleted && st.faceCompleted;
+              const phase = isCompleted ? 'completed' : 'interrupted';
+              if (!next[name] || next[name].phase === 'idle' || next[name].phase === 'interrupted') {
+                next[name] = {
+                  storageName: name,
+                  phase,
+                  thumbnailCurrent: st.thumbnailCachedCount,
+                  thumbnailTotal: st.thumbnailTotalCount || st.totalPhotos,
+                  faceCurrent: st.faceScannedCount,
+                  faceTotal: st.faceTotalCount || st.totalPhotos,
+                  percent: Math.min(100, Math.round(((st.thumbnailCachedCount + st.faceScannedCount) / Math.max(1, st.totalPhotos * 2)) * 100)),
+                  currentFile: st.thumbnailLastFile || st.faceLastFile,
+                  message: isCompleted
+                    ? '✓ 100% Caching & Face Scan Complete'
+                    : `Cached: ${st.thumbnailCachedCount}/${st.totalPhotos} • Faces: ${st.faceScannedCount}/${st.totalPhotos}. Ready to resume.`,
+                  canResume: !isCompleted,
+                };
+              }
+            }
+          }
+          return next;
+        });
+      }).catch(() => {});
+    }
+  }, []);
+
   // Run AI face detection helper for any given batch of photos
   // Run AI face detection helper for any given batch of photos
   const runFaceDetectionForPhotos = async (
@@ -249,16 +323,32 @@ export const App: React.FC = () => {
       return true;
     });
 
+    const totalPhotos = photosToScan.length;
+    const alreadyScannedCount = totalPhotos - candidates.length;
+    const initialPct = totalPhotos > 0 ? Math.round((alreadyScannedCount / totalPhotos) * 100) : 0;
+    const libraryPath = storageName || libraryStore.getState().selectedFolder || libraryStore.getState().currentDirectory || 'library';
+
     if (candidates.length === 0) {
       if (isManualTrigger) {
         showToast('All photos in this library have already been scanned for faces.', 'info');
+      }
+      if (window.electronAPI?.saveLibraryStatus) {
+        window.electronAPI.saveLibraryStatus({
+          libraryPath,
+          totalPhotos,
+          faceScannedCount: totalPhotos,
+          faceTotalCount: totalPhotos,
+          faceCompleted: true,
+          facePercent: 100,
+          phase: 'completed',
+        }).catch(() => {});
       }
       return;
     }
 
     libraryStore.setDetectingFaces(true, {
-      current: 0,
-      total: candidates.length,
+      current: alreadyScannedCount,
+      total: totalPhotos,
       currentPhotoName: 'Loading AI face models...',
     });
 
@@ -268,12 +358,14 @@ export const App: React.FC = () => {
         [storageName]: {
           storageName,
           phase: 'faces',
-          thumbnailCurrent: prev[storageName]?.thumbnailTotal || photosToScan.length,
-          thumbnailTotal: prev[storageName]?.thumbnailTotal || photosToScan.length,
-          faceCurrent: 0,
-          faceTotal: candidates.length,
-          percent: 0,
-          message: `Recognizing faces: 0/${candidates.length}`,
+          thumbnailCurrent: prev[storageName]?.thumbnailTotal || totalPhotos,
+          thumbnailTotal: prev[storageName]?.thumbnailTotal || totalPhotos,
+          faceCurrent: alreadyScannedCount,
+          faceTotal: totalPhotos,
+          percent: initialPct,
+          message: alreadyScannedCount > 0
+            ? `Resuming faces: ${alreadyScannedCount}/${totalPhotos} (${initialPct}%)`
+            : `Recognizing faces: 0/${totalPhotos}`,
         },
       }));
     }
@@ -293,25 +385,27 @@ export const App: React.FC = () => {
     try {
       for (let i = 0; i < candidates.length; i++) {
         const photo = candidates[i];
+        const currentScanned = alreadyScannedCount + i + 1;
+        const facePct = Math.round((currentScanned / Math.max(1, totalPhotos)) * 100);
+
         libraryStore.setDetectingFaces(true, {
-          current: i + 1,
-          total: candidates.length,
+          current: currentScanned,
+          total: totalPhotos,
           currentPhotoName: photo.fileName,
         });
 
         if (storageName) {
-          const facePct = Math.round(((i + 1) / Math.max(1, candidates.length)) * 100);
           setStorageProgressMap((prev) => ({
             ...prev,
             [storageName]: {
               ...prev[storageName],
               storageName,
               phase: 'faces',
-              faceCurrent: i + 1,
-              faceTotal: candidates.length,
+              faceCurrent: currentScanned,
+              faceTotal: totalPhotos,
               percent: facePct,
               currentFile: photo.fileName,
-              message: `Recognizing faces: ${i + 1}/${candidates.length}`,
+              message: `Recognizing faces: ${currentScanned}/${totalPhotos} (${facePct}%)`,
             },
           }));
         }
@@ -341,9 +435,24 @@ export const App: React.FC = () => {
           libraryStore.updatePhotoQuietly(photo);
         }
 
-        // Repaint UI periodically without triggering heavy full clusters or disk writes
-        if ((i + 1) % 4 === 0 || i === candidates.length - 1) {
+        // Intermittent persistence: save library photos and faces to disk every 8 photos so stopping never loses progress!
+        if ((i + 1) % 8 === 0 || i === candidates.length - 1) {
           libraryStore.notifyListeners();
+          await libraryStore.persistNow();
+          if (window.electronAPI?.saveLibraryStatus) {
+            await window.electronAPI.saveLibraryStatus({
+              libraryPath,
+              totalPhotos,
+              faceScannedCount: currentScanned,
+              faceTotalCount: totalPhotos,
+              faceDetectedCount: allNewFaces.length,
+              faceLastIndex: currentScanned - 1,
+              faceLastFile: photo.fileName,
+              faceCompleted: i === candidates.length - 1,
+              facePercent: facePct,
+              phase: i === candidates.length - 1 ? 'completed' : 'faces',
+            });
+          }
         }
 
         // Non-blocking yield to event loop for smooth background execution and 60fps UI
@@ -366,8 +475,8 @@ export const App: React.FC = () => {
             ...prev[storageName],
             storageName,
             phase: 'completed',
-            faceCurrent: candidates.length,
-            faceTotal: candidates.length,
+            faceCurrent: totalPhotos,
+            faceTotal: totalPhotos,
             percent: 100,
             message: '✓ Up to date',
           },
@@ -390,6 +499,7 @@ export const App: React.FC = () => {
   };
 
   const handleOpenFolder = async () => {
+    responseTracker.clearAll();
     if (!window.electronAPI) {
       showToast('Native folder selection is available in the Electron desktop app.', 'warning');
       return;
@@ -421,6 +531,7 @@ export const App: React.FC = () => {
   };
 
   const handleSelectLibrary = async (dirPath: string) => {
+    responseTracker.clearAll();
     libraryStore.setScanning(true);
     try {
       const switched = await libraryStore.switchLibrary(dirPath);
@@ -499,6 +610,7 @@ export const App: React.FC = () => {
   };
 
   const handleSelectVirtualStorage = async (config: VirtualStorageConfig) => {
+    responseTracker.clearAll();
     const mirrorLocalPath = `${config.localMirrorRoot}\\${config.name}`;
     await handleLoadMirroredPhotos(mirrorLocalPath);
   };
@@ -611,6 +723,7 @@ export const App: React.FC = () => {
   const [tabResetTrigger, setTabResetTrigger] = useState<number>(0);
 
   const handleSelectTab = (tab: ActiveTab) => {
+    responseTracker.clearAll();
     setSelectedPersonIdForView(null);
     setSelectedFolderForTree(null);
     setTabResetTrigger(Date.now());
@@ -970,6 +1083,9 @@ export const App: React.FC = () => {
           onOpenAiAssistant={() => setShowAiAssistant(true)}
         />
       )}
+
+      {/* Global 20ms Latency Response Indicator & Wait Dialog */}
+      <ResponseActivityIndicator />
     </div>
   );
 };

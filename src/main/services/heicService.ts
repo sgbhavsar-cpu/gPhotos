@@ -105,6 +105,21 @@ async function extractRawHeicJpeg(fileBuffer: Buffer, filePath: string): Promise
     }
   }
 
+  // Automatic self-healing: if file was corrupted and a .bak backup exists, restore it!
+  const bakPath = `${filePath}.bak`;
+  if (fs.existsSync(bakPath)) {
+    try {
+      const bakBuf = fs.readFileSync(bakPath);
+      // Fast check if backup is valid
+      const thumbBuffer = await exifr.thumbnail(bakBuf).catch(() => null);
+      if (thumbBuffer && thumbBuffer.length > 0) {
+        fs.copyFileSync(bakPath, filePath);
+        console.log(`[heicService] Self-healed corrupted HEIC from backup: ${filePath}`);
+        return { buffer: Buffer.from(thumbBuffer), fromThumbnail: true };
+      }
+    } catch {}
+  }
+
   return null;
 }
 
@@ -266,6 +281,29 @@ export function cleanupHeicHqTemp(photoId: string): void {
 }
 
 /**
+ * Purges cached thumbnails and memory entries for a specific HEIC file,
+ * forcing a fresh regeneration from the source file.
+ */
+export function purgeHeicCache(filePath: string): void {
+  try {
+    const hash = getFileCacheHash(filePath);
+    memoryCache.delete(`thumb500:${hash}`);
+    memoryCache.delete(`hq:${hash}`);
+
+    const thumbDir = getThumbnailsDir();
+    const thumbFileName = `${hash}_500.jpg`;
+    const thumbPath = path.join(thumbDir, thumbFileName);
+    if (fs.existsSync(thumbPath)) {
+      try {
+        fs.unlinkSync(thumbPath);
+      } catch {}
+    }
+  } catch (err) {
+    console.warn(`[heicService] Error purging cache for ${filePath}:`, err);
+  }
+}
+
+/**
  * Legacy compatibility alias for getHeicJpegBuffer:
  * When preferOriginal/hq is true, returns high quality; otherwise returns 500px thumbnail.
  */
@@ -275,3 +313,4 @@ export async function getHeicJpegBuffer(filePath: string, preferHq: boolean = fa
   }
   return getOrGenerateHeicThumbnail500(filePath);
 }
+

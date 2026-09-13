@@ -1,5 +1,6 @@
 import { Photo, Person, DetectedFace, PlaceAlbum, Album, CatalogMeta } from '../../types';
 import { groupPhotosByPlace } from './placesService';
+import { trackBackendCall } from './responseTracker';
 import {
   clusterFaces,
   euclideanDistance,
@@ -367,7 +368,7 @@ export class LibraryManager {
         const tSwitch0 = performance.now();
         let result: { meta: CatalogMeta; firstPage: Photo[] } | null = null;
         if (window.electronAPI?.switchLibrary) {
-          result = await window.electronAPI.switchLibrary(targetPath);
+          result = await trackBackendCall(window.electronAPI.switchLibrary(targetPath), 'Switching library...');
         } else if (window.location?.protocol?.startsWith('http')) {
           const res = await fetch('/api/switch-library', {
             method: 'POST',
@@ -411,7 +412,7 @@ export class LibraryManager {
       let newPhotos: Photo[] = [];
 
       if (window.electronAPI?.getCatalogPage) {
-        const res = await window.electronAPI.getCatalogPage({ pageIndex: this.currentCatalogPage });
+        const res = await trackBackendCall(window.electronAPI.getCatalogPage({ pageIndex: this.currentCatalogPage }), 'Loading photos...');
         if (res && res.photos) newPhotos = res.photos;
       } else if (window.location?.protocol?.startsWith('http')) {
         const res = await fetch(`/api/catalog-page?page=${this.currentCatalogPage}&size=100`);
@@ -510,6 +511,10 @@ export class LibraryManager {
     }
   }
 
+  public async persistNow(): Promise<void> {
+    return this.savePersistedData();
+  }
+
   public setPhotos(photos: Photo[], folderPath?: string) {
     // Deduplicate incoming photos first
     const cleanNew = deduplicatePhotoList(photos);
@@ -551,6 +556,10 @@ export class LibraryManager {
     }
     this.state.places = groupPhotosByPlace(finalDeduped);
     this.notify();
+
+    if (typeof window !== 'undefined' && window.electronAPI?.startThumbnailPreCache) {
+      window.electronAPI.startThumbnailPreCache(finalDeduped).catch(() => {});
+    }
   }
 
   public addPhotos(newPhotos: Photo[]) {
@@ -561,6 +570,10 @@ export class LibraryManager {
     this.state.photos = deduped;
     this.state.places = groupPhotosByPlace(deduped);
     this.notify();
+
+    if (typeof window !== 'undefined' && window.electronAPI?.startThumbnailPreCache && newPhotos.length > 0) {
+      window.electronAPI.startThumbnailPreCache(newPhotos).catch(() => {});
+    }
   }
 
   public addRecentLibrary(folderPath: string) {

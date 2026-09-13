@@ -10,6 +10,7 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { SpriteCoordinate } from '../../types';
+import { trackBackendCall } from './responseTracker';
 
 // ============================================================================
 // 0. SPRITE COORDINATE STORE & HOOK (HIGH-SPEED 50-PHOTO STATIC SHEETS)
@@ -132,10 +133,13 @@ async function flushBatchQueue(): Promise<void> {
     const chunk = currentItems.slice(i, i + CHUNK_SIZE);
     try {
       if (window.electronAPI?.getBatchThumbnails) {
-        const res = await window.electronAPI.getBatchThumbnails({
-          items: chunk,
-          size: currentSize,
-        });
+        const res = await trackBackendCall(
+          window.electronAPI.getBatchThumbnails({
+            items: chunk,
+            size: currentSize,
+          }),
+          'Loading thumbnail batch...'
+        );
 
         if (res && res.thumbnails) {
           const updated = new Set<string>();
