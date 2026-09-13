@@ -437,7 +437,11 @@ export const App: React.FC = () => {
 
         // Intermittent persistence: save library photos and faces to disk every 8 photos so stopping never loses progress!
         if ((i + 1) % 8 === 0 || i === candidates.length - 1) {
-          libraryStore.notifyListeners();
+          if (allNewFaces.length > 0) {
+            libraryStore.updateFacesAndPeople(allNewFaces);
+          } else {
+            libraryStore.notifyListeners();
+          }
           await libraryStore.persistNow();
           if (window.electronAPI?.saveLibraryStatus) {
             await window.electronAPI.saveLibraryStatus({

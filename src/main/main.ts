@@ -211,7 +211,27 @@ function getStoragePath(): string {
   if (!fs.existsSync(userDir)) {
     fs.mkdirSync(userDir, { recursive: true });
   }
-  return path.join(userDir, 'library.json');
+  const defaultPath = path.join(userDir, 'library.json');
+
+  // Cross-compatibility between dev environment (gphotos-desktop) and packaged exe (gPhotos):
+  if (!fs.existsSync(defaultPath)) {
+    try {
+      const appData = app.getPath('appData');
+      const isAppGPhotos = path.basename(userDir).toLowerCase() === 'gphotos';
+      const altDir = isAppGPhotos
+        ? path.join(appData, 'gphotos-desktop')
+        : path.join(appData, 'gPhotos');
+      const altPath = path.join(altDir, 'library.json');
+      if (fs.existsSync(altPath)) {
+        fs.copyFileSync(altPath, defaultPath);
+        console.log(`[Storage] Migrated library data from ${altPath} to ${defaultPath}`);
+      }
+    } catch (migErr) {
+      console.warn('[Storage] Fallback migration check failed:', migErr);
+    }
+  }
+
+  return defaultPath;
 }
 
 function createWindow() {
@@ -659,6 +679,39 @@ ipcMain.handle('storage:save', async (_event, key: string, data: any) => {
         console.warn('Failed to parse existing library.json, starting fresh:', parseErr);
       }
     }
+    // Merge guard: protect library data against inadvertent wiping or truncation
+    if (key === 'gphotos_library_v1' && data) {
+      const existingLib = currentData['gphotos_library_v1'];
+      if (existingLib) {
+        // If incoming photos is a small slice from catalog pagination, merge updates into existingLib.photos
+        if (
+          Array.isArray(data.photos) &&
+          Array.isArray(existingLib.photos) &&
+          existingLib.photos.length > data.photos.length &&
+          data.photos.length <= 100
+        ) {
+          const incomingMap = new Map(data.photos.map((p: any) => [p.id, p]));
+          data.photos = existingLib.photos.map((ep: any) => incomingMap.get(ep.id) || ep);
+        }
+        // Guard: do not wipe existing people if incoming has empty people but existing had people
+        if (
+          (!data.people || data.people.length === 0) &&
+          existingLib.people &&
+          existingLib.people.length > 0
+        ) {
+          data.people = existingLib.people;
+        }
+        // Guard: do not wipe existing faces if incoming has empty faces but existing had faces
+        if (
+          (!data.faces || data.faces.length === 0) &&
+          existingLib.faces &&
+          existingLib.faces.length > 0
+        ) {
+          data.faces = existingLib.faces;
+        }
+      }
+    }
+
     currentData[key] = data;
     const tempPath = `${storePath}.tmp`;
     await fs.promises.writeFile(tempPath, JSON.stringify(currentData, null, 2), 'utf-8');

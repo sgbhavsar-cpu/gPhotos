@@ -188,6 +188,12 @@ export async function buildAndSaveCatalog(
   // 3. Write metadata header (<25 KB)
   await fs.promises.writeFile(getMetaPath(catalogDir), JSON.stringify(meta, null, 2), 'utf8');
 
+  // Also persist full people identities in catalog directory if provided
+  if (options.people && options.people.length > 0) {
+    const peopleFile = path.join(catalogDir, 'catalog_people.json');
+    await fs.promises.writeFile(peopleFile, JSON.stringify(options.people, null, 2), 'utf8').catch(() => {});
+  }
+
   // 4. Write chunked pages in parallel (100 photos per file)
   const chunkPromises: Promise<void>[] = [];
   for (let page = 0; page < totalPages; page++) {
@@ -200,6 +206,21 @@ export async function buildAndSaveCatalog(
 
   await Promise.all(chunkPromises);
   return meta;
+}
+
+/**
+ * Loads full people identities from the catalog directory if available.
+ */
+export async function getCatalogPeople(customDir?: string): Promise<any[]> {
+  const catalogDir = getCatalogDir(customDir);
+  const peopleFile = path.join(catalogDir, 'catalog_people.json');
+  if (fs.existsSync(peopleFile)) {
+    try {
+      const raw = await fs.promises.readFile(peopleFile, 'utf8');
+      return JSON.parse(raw);
+    } catch {}
+  }
+  return [];
 }
 
 /**

@@ -178,11 +178,24 @@ class FaceQueueService {
             allFaces.push(...p.faces);
           }
         }
-        const { people, updatedFaces } = clusterFaces(allFaces, state.people, 0.55, false);
+        const { people, updatedFaces } = clusterFaces(allFaces, state.people, 0.55, true);
         state.people = people;
         state.faces = updatedFaces;
+
+        // Sync photo.faces with newly assigned personIds
+        const photoFaceMap = new Map<string, DetectedFace[]>();
+        for (const f of updatedFaces) {
+          if (!photoFaceMap.has(f.photoId)) photoFaceMap.set(f.photoId, []);
+          photoFaceMap.get(f.photoId)!.push(f);
+        }
+        for (const p of state.photos) {
+          if (photoFaceMap.has(p.id)) {
+            p.faces = photoFaceMap.get(p.id)!;
+          }
+        }
+
         this.newFacesBatch = [];
-        libraryStore.notify();
+        libraryStore.notify(true);
       } else {
         // Lightweight UI repaint without full cluster and without disk write
         libraryStore.notifyListeners();
@@ -206,9 +219,21 @@ class FaceQueueService {
           for (const p of state.photos) {
             if (p.faces) allFaces.push(...p.faces);
           }
-          const { people, updatedFaces } = clusterFaces(allFaces, state.people, 0.55, false);
+          const { people, updatedFaces } = clusterFaces(allFaces, state.people, 0.55, true);
           state.people = people;
           state.faces = updatedFaces;
+
+          const photoFaceMap = new Map<string, DetectedFace[]>();
+          for (const f of updatedFaces) {
+            if (!photoFaceMap.has(f.photoId)) photoFaceMap.set(f.photoId, []);
+            photoFaceMap.get(f.photoId)!.push(f);
+          }
+          for (const p of state.photos) {
+            if (photoFaceMap.has(p.id)) {
+              p.faces = photoFaceMap.get(p.id)!;
+            }
+          }
+
           this.newFacesBatch = [];
           libraryStore.notify(true);
         }

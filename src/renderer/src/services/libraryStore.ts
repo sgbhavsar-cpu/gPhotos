@@ -213,10 +213,158 @@ export class LibraryManager {
   }
 
   /**
+   * Reconciles and self-heals people and faces across all photos and the central store.
+   * Restores lost Person identities for photos that have faces with personId,
+   * clusters unassigned faces, synchronizes state.faces with photo.faces,
+   * and updates accurate face/photo counts.
+   */
+  public reconcilePeopleAndFaces(): boolean {
+    let modified = false;
+
+    // 1. Gather all faces from all photos and state.faces
+    const allFacesMap = new Map<string, DetectedFace>();
+    for (const f of this.state.faces) {
+      if (f && f.id) allFacesMap.set(f.id, f);
+    }
+    for (const photo of this.state.photos) {
+      if (photo.faces && Array.isArray(photo.faces)) {
+        for (const face of photo.faces) {
+          if (!face || !face.id) continue;
+          const existing = allFacesMap.get(face.id);
+          if (existing) {
+            if (!existing.personId && face.personId) existing.personId = face.personId;
+            if (!existing.descriptor && face.descriptor) existing.descriptor = face.descriptor;
+            if (face.isConfirmed) existing.isConfirmed = true;
+          } else {
+            allFacesMap.set(face.id, { ...face, photoId: photo.id });
+          }
+        }
+      }
+    }
+
+    const allFaces = Array.from(allFacesMap.values());
+    if (allFaces.length !== this.state.faces.length) {
+      this.state.faces = allFaces;
+      modified = true;
+    }
+
+    // 2. Build map of current known people
+    const peopleMap = new Map<string, Person>();
+    for (const p of this.state.people) {
+      if (p && p.id) {
+        peopleMap.set(p.id, { ...p });
+      }
+    }
+
+    // 3. Identify faces whose personId is missing from peopleMap
+    const missingPersonFaces = new Map<string, DetectedFace[]>();
+    const unassignedFaces: DetectedFace[] = [];
+
+    for (const face of allFaces) {
+      if (face.personId) {
+        if (!peopleMap.has(face.personId)) {
+          if (!missingPersonFaces.has(face.personId)) {
+            missingPersonFaces.set(face.personId, []);
+          }
+          missingPersonFaces.get(face.personId)!.push(face);
+        }
+      } else {
+        unassignedFaces.push(face);
+      }
+    }
+
+    // 4. Auto-reconstruct Person entities for faces that already had assigned personIds
+    if (missingPersonFaces.size > 0) {
+      let nextIndex = peopleMap.size + 1;
+      for (const [pId, assignedFaces] of missingPersonFaces.entries()) {
+        const firstFace = assignedFaces[0];
+        const uniquePhotos = new Set(assignedFaces.map((f) => f.photoId));
+        const newPerson: Person = {
+          id: pId,
+          name: `Person ${nextIndex++}`,
+          coverFaceId: firstFace.id,
+          coverPhotoId: firstFace.photoId,
+          faceCount: assignedFaces.length,
+          photoCount: uniquePhotos.size,
+          createdAt: new Date().toISOString(),
+        };
+        peopleMap.set(pId, newPerson);
+        modified = true;
+      }
+    }
+
+    // 5. If people is STILL empty and all faces have no personId, run clusterFaces
+    if (peopleMap.size === 0 && allFaces.length > 0) {
+      const facesWithDesc = allFaces.filter((f) => f.descriptor && f.descriptor.length > 0);
+      if (facesWithDesc.length > 0) {
+        const { people, updatedFaces } = clusterFaces(allFaces, [], 0.55, true);
+        for (const p of people) {
+          peopleMap.set(p.id, p);
+        }
+        this.state.faces = updatedFaces;
+        modified = true;
+      }
+    } else if (unassignedFaces.length > 0 && peopleMap.size > 0) {
+      // If we have some unassigned faces, cluster them matching to existing people or create new clusters
+      const { people, updatedFaces } = clusterFaces(allFaces, Array.from(peopleMap.values()), 0.55, true);
+      for (const p of people) {
+        peopleMap.set(p.id, p);
+      }
+      this.state.faces = updatedFaces;
+      modified = true;
+    }
+
+    // 6. Recalculate accurate faceCount and photoCount for all people
+    const personFacesSet = new Map<string, Set<string>>();
+    const personPhotosSet = new Map<string, Set<string>>();
+    for (const pId of peopleMap.keys()) {
+      personFacesSet.set(pId, new Set());
+      personPhotosSet.set(pId, new Set());
+    }
+
+    for (const f of this.state.faces) {
+      if (f.personId && peopleMap.has(f.personId)) {
+        personFacesSet.get(f.personId)?.add(f.id);
+        personPhotosSet.get(f.personId)?.add(f.photoId);
+      }
+    }
+
+    const finalPeople: Person[] = [];
+    for (const person of peopleMap.values()) {
+      const fSet = personFacesSet.get(person.id);
+      const pSet = personPhotosSet.get(person.id);
+      finalPeople.push({
+        ...person,
+        faceCount: fSet ? fSet.size : 0,
+        photoCount: pSet ? pSet.size : 0,
+      });
+    }
+    this.state.people = finalPeople;
+
+    // 7. Ensure photo.faces on every photo are synced with state.faces
+    const photoFacesMap = new Map<string, DetectedFace[]>();
+    for (const f of this.state.faces) {
+      if (!photoFacesMap.has(f.photoId)) photoFacesMap.set(f.photoId, []);
+      photoFacesMap.get(f.photoId)!.push(f);
+    }
+    for (const photo of this.state.photos) {
+      if (photoFacesMap.has(photo.id)) {
+        photo.faces = photoFacesMap.get(photo.id)!;
+      }
+    }
+
+    if (modified) {
+      this.scheduleDebouncedSave();
+    }
+
+    return modified;
+  }
+
+  /**
    * Instant startup loader:
    * 1. Reads pre-calculated catalog_meta.json (<25 KB, ~1ms)
    * 2. Immediately paints Screen 1 with Page 0 (first 100 photos, ~40 KB)
-   * 3. Zero O(N) loops or full 500K JSON parsing!
+   * 3. Seamlessly restores and reconciles people, faces, and albums from central storage
    */
   public async loadPersistedData() {
     try {
@@ -244,6 +392,20 @@ export class LibraryManager {
               console.log(`[STARTUP AUDIT] Page 0 (${p0.photos.length} photos) loaded in ${(tPageEnd - tPageStart).toFixed(1)}ms. Total renderer startup time to first screen: ${(tPageEnd - t0).toFixed(1)}ms`);
               this.state.photos = p0.photos;
               this.currentCatalogPage = 0;
+
+              // Restore persisted people, faces, and albums from central store
+              const data = await window.electronAPI.loadLibraryData(STORAGE_KEY);
+              if (data) {
+                this.state.people = data.people || [];
+                this.state.faces = data.faces || [];
+                this.state.albums = data.albums || [];
+                if (!this.state.selectedFolder) this.state.selectedFolder = data.selectedFolder || null;
+                if (!this.state.recentLibraries || this.state.recentLibraries.length === 0) {
+                  this.state.recentLibraries = data.recentLibraries || [];
+                }
+              }
+
+              this.reconcilePeopleAndFaces();
               this.notifyListeners();
               return;
             }
@@ -273,6 +435,19 @@ export class LibraryManager {
                 if (pageData && pageData.photos && pageData.photos.length > 0) {
                   this.state.photos = pageData.photos;
                   this.currentCatalogPage = 0;
+                  try {
+                    const libRes = await fetch('/api/library', { signal: AbortSignal.timeout(2000) });
+                    if (libRes.ok) {
+                      const full = await libRes.json();
+                      const libData = full[STORAGE_KEY] || full;
+                      if (libData) {
+                        this.state.people = libData.people || [];
+                        this.state.faces = libData.faces || [];
+                        this.state.albums = libData.albums || [];
+                      }
+                    }
+                  } catch {}
+                  this.reconcilePeopleAndFaces();
                   this.notifyListeners();
                   return;
                 }
@@ -324,6 +499,9 @@ export class LibraryManager {
         this.state.recentLibraries = recent;
         this.state.places = groupPhotosByPlace(this.state.photos);
         
+        // Auto-reconcile people and faces if missing or unassigned
+        this.reconcilePeopleAndFaces();
+
         // Immediate paint for UI responsiveness
         this.notifyListeners();
 
@@ -353,6 +531,9 @@ export class LibraryManager {
             this.verifyPhotosInBackground();
           }, 1200);
         }
+      } else if (this.state.photos.length > 0) {
+        this.reconcilePeopleAndFaces();
+        this.notifyListeners();
       }
     } catch (err) {
       console.warn('Failed to load library state:', err);
@@ -492,6 +673,11 @@ export class LibraryManager {
 
   private async savePersistedData() {
     try {
+      // Safety guard: if photos contain faces but people is empty, reconcile first
+      if (this.state.people.length === 0 && this.state.photos.some((p) => p.faces && p.faces.length > 0)) {
+        this.reconcilePeopleAndFaces();
+      }
+
       const dataToSave = {
         photos: this.state.photos,
         people: this.state.people,
@@ -556,6 +742,7 @@ export class LibraryManager {
       this.addRecentLibrary(folderPath);
     }
     this.state.places = groupPhotosByPlace(finalDeduped);
+    this.reconcilePeopleAndFaces();
     this.notify();
 
     if (typeof window !== 'undefined' && window.electronAPI?.startThumbnailPreCache) {
@@ -570,6 +757,7 @@ export class LibraryManager {
     );
     this.state.photos = deduped;
     this.state.places = groupPhotosByPlace(deduped);
+    this.reconcilePeopleAndFaces();
     this.notify();
 
     if (typeof window !== 'undefined' && window.electronAPI?.startThumbnailPreCache && newPhotos.length > 0) {
