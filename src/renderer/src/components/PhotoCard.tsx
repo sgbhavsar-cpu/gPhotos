@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Heart, MapPin, Users, Check, EyeOff, Image as ImageIcon, ImageOff, RotateCw } from 'lucide-react';
 import { Photo } from '../../types';
+import { getLocalPhotoUrl } from '../services/libraryStore';
 import { useBatchThumbnail, useSpriteCoordinate, getSpriteUrl, batchThumbnailStore, evictAndRefreshThumbnail } from '../services/asyncImageLoader';
 
 interface PhotoCardProps {
