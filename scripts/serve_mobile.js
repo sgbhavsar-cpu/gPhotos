@@ -4,7 +4,7 @@ const path = require('path');
 const os = require('os');
 const url = require('url');
 
-const PORT = parseInt(process.env.PORT || '5173', 10);
+const PORT = parseInt(process.env.PORT || '5174', 10);
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 
@@ -580,6 +580,9 @@ function startServer(port) {
   });
   srv.once('error', (err) => {
     if (err.code === 'EADDRINUSE') {
+      try {
+        srv.close();
+      } catch {}
       console.warn(`  ⚠️ Port ${port} is already in use, trying port ${port + 1}...`);
       startServer(port + 1);
     } else {
@@ -622,6 +625,24 @@ if (require.main === module) {
   process.on('unhandledRejection', (reason) => {
     console.error('[MobileServer] Unhandled Rejection:', reason);
   });
+  process.on('SIGINT', () => {
+    console.log('[MobileServer] Received SIGINT');
+  });
+  process.on('SIGTERM', () => {
+    console.log('[MobileServer] Received SIGTERM');
+  });
+  process.on('SIGBREAK', () => {
+    console.log('[MobileServer] Received SIGBREAK');
+  });
+  process.on('exit', (code) => {
+    console.log(`[MobileServer] Exiting with code: ${code}`);
+  });
+
+  // Keep event loop active and ignore stdin closure
+  if (process.stdin.isTTY === false) {
+    process.stdin.resume();
+  }
+
   startServer(PORT);
 }
 
