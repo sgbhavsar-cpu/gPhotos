@@ -13,7 +13,8 @@ import {
 import { scanVirtualMirrorDirectory, syncVirtualStorage, deleteFilesPermanently, trashFiles, rotatePhotoFile, rotatePhotoWithOfflineQueue, processPendingRotations } from './virtualMirrorService';
 import { scanPhotoDirectory } from './fileOrganizer';
 import { getOrGenerateCachedThumbnail, clearThumbnailCache, refreshThumbnailsFromSource } from './thumbnailCacheService';
-import { getCatalogMeta, getCatalogPage, switchCatalogLibrary } from './catalogService';
+import { getCatalogMeta, getCatalogPage, switchCatalogLibrary, ensureMigratedIfEmpty } from './catalogService';
+import { handleStorageSave, handleStorageLoad, STORAGE_KEY, GLOBAL_PEOPLE_KEY } from './storageHandlers';
 import { getSpriteCoordinate, getSpritePath } from './spriteService';
 import { thumbnailWorker } from './thumbnailWorkerService';
 import { getBackgroundServiceStatus } from './backgroundDaemon';
@@ -68,44 +69,7 @@ export function getNetworkIps(): Array<{ name: string; address: string }> {
   return ips;
 }
 
-// 2. Locate active library.json with highest priority given to active Electron store
-function getLibraryPath(): string {
-  try {
-    if (app && typeof app.getPath === 'function') {
-      const electronPath = path.join(app.getPath('userData'), 'library.json');
-      if (fs.existsSync(electronPath)) return electronPath;
-    }
-  } catch {}
-
-  const appData =
-    process.env.APPDATA ||
-    (process.platform === 'darwin'
-      ? path.join(os.homedir(), 'Library/Application Support')
-      : path.join(os.homedir(), '.config'));
-
-  const candidates = [
-    path.join(appData, 'gphotos-desktop', 'library.json'),
-    path.join(appData, 'gPhotos', 'library.json'),
-    path.join(__dirname, '..', '..', '..', 'library.json'),
-  ];
-
-  let bestCandidate: string | null = null;
-  let bestSize = -1;
-  for (const p of candidates) {
-    if (fs.existsSync(p)) {
-      try {
-        const sz = fs.statSync(p).size;
-        if (sz > bestSize) {
-          bestSize = sz;
-          bestCandidate = p;
-        }
-      } catch {}
-    }
-  }
-  return bestCandidate || candidates[0];
-}
-
-// 3. Settings path for web server config
+// 2. Settings path for web server config
 function getSettingsPath(): string {
   const appData =
     process.env.APPDATA ||
@@ -226,13 +190,16 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
 
   // Endpoint: /api/library
   if (pathname === '/api/library') {
-    const libPath = getLibraryPath();
     if (req.method === 'GET') {
-      res.setHeader('Content-Type', 'application/json');
-      if (fs.existsSync(libPath)) {
-        fs.createReadStream(libPath).pipe(res);
-      } else {
-        res.end(JSON.stringify({ photos: [], people: [], faces: [], albums: [] }));
+      try {
+        ensureMigratedIfEmpty();
+        const libraryData = handleStorageLoad(STORAGE_KEY) || { photos: [], people: [], faces: [], albums: [] };
+        const peopleRegistry = handleStorageLoad(GLOBAL_PEOPLE_KEY);
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ [STORAGE_KEY]: libraryData, [GLOBAL_PEOPLE_KEY]: peopleRegistry }));
+      } catch (err: any) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: err.message }));
       }
       return;
     } else if (req.method === 'POST') {
@@ -243,17 +210,12 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
       req.on('end', () => {
         try {
           const { key, data } = JSON.parse(body);
-          let current: Record<string, any> = {};
-          if (fs.existsSync(libPath)) {
-            try {
-              current = JSON.parse(fs.readFileSync(libPath, 'utf8'));
-            } catch {}
+          const result = handleStorageSave(key, data);
+          if (result.enqueuePhotos) {
+            thumbnailWorker.enqueuePhotos(result.enqueuePhotos, result.enqueueLibraryPath || undefined);
           }
-          current[key] = data;
-          fs.mkdirSync(path.dirname(libPath), { recursive: true });
-          fs.writeFileSync(libPath, JSON.stringify(current, null, 2), 'utf8');
           res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ success: true }));
+          res.end(JSON.stringify({ success: result.success }));
         } catch (err: any) {
           res.statusCode = 500;
           res.end(JSON.stringify({ error: err.message }));

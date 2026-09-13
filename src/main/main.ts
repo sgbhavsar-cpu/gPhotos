@@ -68,8 +68,9 @@ import {
   getCatalogMeta,
   getCatalogPage,
   switchCatalogLibrary,
-  buildAndSaveCatalog,
+  ensureMigratedIfEmpty,
 } from './services/catalogService';
+import { handleStorageSave, handleStorageLoad } from './services/storageHandlers';
 import {
   getSpriteCoordinate,
   getSpritePath,
@@ -706,68 +707,11 @@ let savePromiseQueue: Promise<boolean> = Promise.resolve(true);
 ipcMain.handle('storage:save', async (_event, key: string, data: any) => {
   const op = async (): Promise<boolean> => {
     try {
-      const storePath = getStoragePath();
-      let currentData: Record<string, any> = {};
-      if (fs.existsSync(storePath)) {
-        try {
-          currentData = JSON.parse(await fs.promises.readFile(storePath, 'utf-8'));
-        } catch (parseErr) {
-          console.warn('Failed to parse existing library.json, starting fresh:', parseErr);
-        }
+      const result = handleStorageSave(key, data);
+      if (result.enqueuePhotos) {
+        thumbnailWorker.enqueuePhotos(result.enqueuePhotos, result.enqueueLibraryPath || undefined);
       }
-      // Merge guard: protect library data against inadvertent wiping or truncation
-      if (key === 'gphotos_library_v1' && data) {
-        const existingLib = currentData['gphotos_library_v1'];
-        if (existingLib) {
-          // If incoming photos is a small slice from catalog pagination, merge updates into existingLib.photos
-          if (
-            Array.isArray(data.photos) &&
-            Array.isArray(existingLib.photos) &&
-            existingLib.photos.length > data.photos.length &&
-            data.photos.length <= 100
-          ) {
-            const incomingMap = new Map(data.photos.map((p: any) => [p.id, p]));
-            data.photos = existingLib.photos.map((ep: any) => incomingMap.get(ep.id) || ep);
-          }
-          // Guard: do not wipe existing people if incoming has empty people but existing had people
-          if (
-            (!data.people || data.people.length === 0) &&
-            existingLib.people &&
-            existingLib.people.length > 0
-          ) {
-            data.people = existingLib.people;
-          }
-          // Guard: do not wipe existing faces if incoming has empty faces but existing had faces
-          if (
-            (!data.faces || data.faces.length === 0) &&
-            existingLib.faces &&
-            existingLib.faces.length > 0
-          ) {
-            data.faces = existingLib.faces;
-          }
-        }
-      }
-
-      currentData[key] = data;
-      const tempPath = `${storePath}.tmp`;
-      await fs.promises.writeFile(tempPath, JSON.stringify(currentData, null, 2), 'utf-8');
-      await fs.promises.rename(tempPath, storePath);
-
-      // Asynchronously update 500K catalog index in background without blocking response
-      if (key === 'gphotos_library_v1' && data && Array.isArray(data.photos)) {
-        buildAndSaveCatalog(data.photos, {
-          recentLibraries: data.recentLibraries,
-          selectedFolder: data.selectedFolder,
-          currentDirectory: data.currentDirectory,
-          albums: data.albums,
-          people: data.people,
-        }).catch((err) => console.warn('[CatalogService] Auto-indexing on save failed:', err));
-
-        const libPath = data.selectedFolder || data.currentDirectory;
-        thumbnailWorker.enqueuePhotos(data.photos, libPath);
-      }
-
-      return true;
+      return result.success;
     } catch (err) {
       console.error('Failed to save library data:', err);
       return false;
@@ -780,12 +724,7 @@ ipcMain.handle('storage:save', async (_event, key: string, data: any) => {
 
 ipcMain.handle('storage:load', async (_event, key: string) => {
   try {
-    const storePath = getStoragePath();
-    if (fs.existsSync(storePath)) {
-      const currentData = JSON.parse(fs.readFileSync(storePath, 'utf-8'));
-      return currentData[key] ?? null;
-    }
-    return null;
+    return handleStorageLoad(key);
   } catch (err) {
     console.error('Failed to load library data:', err);
     return null;

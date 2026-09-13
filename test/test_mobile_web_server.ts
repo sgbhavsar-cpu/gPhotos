@@ -1,12 +1,26 @@
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
+import sharp from 'sharp';
+
+// Isolate the SQLite databases this test touches from the real, persisted
+// ones in userData — otherwise exercising /api/library here would trigger a
+// real one-time migration of this machine's actual library.json into SQLite
+// the first time this test runs. Must be set before any request is handled
+// (module-level DB access is all lazy, so this is safe to set here).
+const dbTestDir = path.join(os.tmpdir(), 'gphotos_mobile_server_global_db_' + Date.now());
+fs.mkdirSync(dbTestDir, { recursive: true });
+process.env.GPHOTOS_TEST_DB_DIR = dbTestDir;
+
 import {
   startEmbeddedWebServer,
   stopEmbeddedWebServer,
-  getEmbeddedWebServerStatus,
 } from '../src/main/services/embeddedWebServer';
 import { getOrCreatePin, revokeAllDevices } from '../src/main/services/webAuthService';
+import { setActiveLibrary } from '../src/main/services/db';
+import { upsertPhotos, upsertPeople } from '../src/main/services/libraryRepository';
+import { Photo } from '../src/types';
 
 function fetchUrl(
   url: string,
@@ -40,6 +54,33 @@ async function runMobileWebServerTests() {
 
   // Start from a clean auth slate so this test is not affected by prior pairings.
   revokeAllDevices();
+
+  // Seed a small, isolated, but real library: real JPEG bytes on disk so
+  // /api/photo, /api/file-exists, and /api/scan all have something genuine
+  // to serve, without touching the user's actual library.
+  const libraryDir = path.join(os.tmpdir(), 'gphotos_mobile_server_library_' + Date.now());
+  fs.mkdirSync(libraryDir, { recursive: true });
+  const photoPath = path.join(libraryDir, 'sample.jpg');
+  await sharp({ create: { width: 800, height: 600, channels: 3, background: { r: 100, g: 150, b: 200 } } })
+    .jpeg()
+    .toFile(photoPath);
+
+  setActiveLibrary(libraryDir);
+  const seedPhotos: Photo[] = [
+    {
+      id: 'mobile_test_photo_1',
+      filePath: photoPath,
+      fileName: 'sample.jpg',
+      fileSize: fs.statSync(photoPath).size,
+      fileDate: new Date().toISOString(),
+      dateTaken: new Date().toISOString(),
+      year: 2026,
+      month: 1,
+      day: 1,
+    },
+  ];
+  upsertPhotos(seedPhotos);
+  upsertPeople([{ id: 'p_mobile_test', name: 'Test Person', faceCount: 0, photoCount: 0, createdAt: new Date().toISOString() }]);
 
   const testPort = 5174;
   console.log(`[Step 1] Starting embedded web server on port ${testPort}...`);
@@ -123,7 +164,7 @@ async function runMobileWebServerTests() {
     if (photos.length === 0) {
       throw new Error('FAILED: /api/library returned ZERO photos! The bug still persists!');
     }
-    console.log(`[Test 2 PASS] Verified library is NOT empty (Total: ${photos.length} photos, People: ${(libJson.people || libJson.gphotos_library_v1?.people || []).length})`);
+    console.log(`[Test 2 PASS] Verified library is NOT empty (Total: ${photos.length} photos, People: ${(libJson.gphotos_people_v2 || []).length})`);
 
     const samplePhoto = photos[0];
     console.log(`[Test 2] Sample photo from library: "${samplePhoto.fileName}" (${samplePhoto.filePath})`);
@@ -133,25 +174,25 @@ async function runMobileWebServerTests() {
     const existsRes = await fetchUrl(`${baseUrl}/api/file-exists?path=${encodeURIComponent(samplePhoto.filePath)}`, { headers: authHeaders });
     const existsJson = existsRes.json();
     console.log(`[Test 3 PASS] /api/file-exists for "${samplePhoto.fileName}": exists=${existsJson.exists}`);
+    if (!existsJson.exists) {
+      throw new Error('FAILED: seeded fixture photo was not found on disk');
+    }
 
     // 4. Verify /api/photo image serving (via header token)
     console.log('[Test 4] Testing /api/photo serving for gallery grid (thumbnail)...');
     const photoRes = await fetchUrl(`${baseUrl}/api/photo?path=${encodeURIComponent(samplePhoto.filePath)}`, { headers: authHeaders });
     if (photoRes.status !== 200) {
-      console.warn(`Note: Photo file ${samplePhoto.filePath} might be on remote path, status: ${photoRes.status}`);
-    } else {
-      console.log(`[Test 4 PASS] /api/photo served photo bytes: ${photoRes.data.length} bytes, Content-Type: ${photoRes.headers['content-type']}`);
+      throw new Error(`FAILED: /api/photo returned status ${photoRes.status} for a real fixture file`);
     }
+    console.log(`[Test 4 PASS] /api/photo served photo bytes: ${photoRes.data.length} bytes, Content-Type: ${photoRes.headers['content-type']}`);
 
     // 4b. Verify /api/photo also accepts the token as a query param (for <img src> usage)
     console.log('[Test 4b] Testing /api/photo serving via query-param token (for <img> tags)...');
     const photoQueryTokenRes = await fetchUrl(`${baseUrl}/api/photo?path=${encodeURIComponent(samplePhoto.filePath)}&token=${encodeURIComponent(token)}`);
-    if (photoQueryTokenRes.status === 200) {
-      console.log(`[Test 4b PASS] /api/photo served via query-param token: ${photoQueryTokenRes.data.length} bytes`);
-    } else if (photoQueryTokenRes.status !== 401) {
-      // Only fail if it's neither success nor an expected remote-path miss; 401 here would mean the query-token path is broken.
+    if (photoQueryTokenRes.status !== 200) {
       throw new Error(`FAILED: /api/photo with query-param token returned unexpected status ${photoQueryTokenRes.status}`);
     }
+    console.log(`[Test 4b PASS] /api/photo served via query-param token: ${photoQueryTokenRes.data.length} bytes`);
 
     // 5. Test full-screen /preferOriginal=1 high quality photo serving
     console.log('[Test 5] Testing /api/photo with preferOriginal=1 (lightbox mode)...');
@@ -162,13 +203,10 @@ async function runMobileWebServerTests() {
 
     // 6. Test /api/scan endpoint
     console.log('[Test 6] Testing /api/scan endpoint...');
-    const testDir = path.dirname(samplePhoto.filePath);
-    if (fs.existsSync(testDir)) {
-      const scanRes = await fetchUrl(`${baseUrl}/api/scan?path=${encodeURIComponent(testDir)}`, { headers: authHeaders });
-      if (scanRes.status === 200) {
-        const scanPhotos = scanRes.json();
-        console.log(`[Test 6 PASS] /api/scan successfully scanned folder and returned ${scanPhotos.length} photo(s)`);
-      }
+    const scanRes = await fetchUrl(`${baseUrl}/api/scan?path=${encodeURIComponent(libraryDir)}`, { headers: authHeaders });
+    if (scanRes.status === 200) {
+      const scanPhotos = scanRes.json();
+      console.log(`[Test 6 PASS] /api/scan successfully scanned folder and returned ${scanPhotos.length} photo(s)`);
     }
 
     // 7. Verify Mobile HTML entrypoint & Mobile Meta tags (static assets stay public so the PIN screen can load)
@@ -185,7 +223,8 @@ async function runMobileWebServerTests() {
       console.log(`[Test 7 PASS] Apple iOS web-app capable: ${hasAppleMobile}`);
     }
 
-    // 8. Test /api/heic/prepare-hq and cleanup
+    // 8. Test /api/heic/prepare-hq and cleanup (fixture is a plain JPEG, not
+    // real HEIC, so this only needs to respond without crashing the server)
     console.log('[Test 8] Testing HEIC Face Detection HQ Prep & Cleanup APIs...');
     const prepRes = await fetchUrl(`${baseUrl}/api/heic/prepare-hq?path=${encodeURIComponent(samplePhoto.filePath)}&id=mobile_test_1`, { headers: authHeaders });
     if (prepRes.status === 200) {
@@ -193,6 +232,8 @@ async function runMobileWebServerTests() {
       console.log(`[Test 8 PASS] /api/heic/prepare-hq returned URL: ${prepJson.url}`);
       const cleanRes = await fetchUrl(`${baseUrl}/api/heic/cleanup-hq?id=mobile_test_1`, { headers: authHeaders });
       console.log(`[Test 8 PASS] /api/heic/cleanup-hq response: ${cleanRes.text}`);
+    } else {
+      console.log(`[Test 8 PASS] /api/heic/prepare-hq correctly declined a non-HEIC fixture (status ${prepRes.status})`);
     }
 
     // 9. Revoking the device invalidates its token immediately
@@ -208,6 +249,12 @@ async function runMobileWebServerTests() {
   } finally {
     stopEmbeddedWebServer();
     console.log('Test web server stopped cleanly.');
+    try {
+      fs.rmSync(libraryDir, { recursive: true, force: true });
+    } catch {}
+    try {
+      fs.rmSync(dbTestDir, { recursive: true, force: true });
+    } catch {}
   }
 }
 

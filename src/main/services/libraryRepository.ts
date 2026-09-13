@@ -160,6 +160,60 @@ export function getAllPhotos(): Photo[] {
   return photos;
 }
 
+/**
+ * Lightweight photo listing for computing catalog summaries (timeline/places)
+ * — selects only the columns those computations actually read and skips the
+ * face-hydration join entirely, so summarizing a large library doesn't pay
+ * the cost of loading every photo's full record and face list into memory.
+ */
+export function getAllPhotosForSummary(): Pick<Photo, 'id' | 'filePath' | 'dateTaken' | 'fileDate' | 'location'>[] {
+  const db = getDb();
+  const rows = db
+    .prepare('SELECT id, file_path, date_taken, file_date, location_json FROM photos ORDER BY date_taken DESC, id DESC')
+    .all() as any[];
+  return rows.map((row) => ({
+    id: row.id,
+    filePath: row.file_path,
+    dateTaken: row.date_taken,
+    fileDate: row.file_date || '',
+    location: parseJson<LocationMetadata | null>(row.location_json, null) ?? undefined,
+  }));
+}
+
+/**
+ * Replaces the active library's full photo set to match `photos` exactly —
+ * upserts everything present, and deletes any existing photo whose id is no
+ * longer in the incoming list (e.g. the user deleted a file or a dedup
+ * cleanup removed a photo). Mirrors the "send the whole current state, it
+ * fully replaces what's stored" contract the renderer already uses for
+ * library.json saves.
+ *
+ * Safety guard: if the incoming list is empty but the library isn't, this is
+ * far more likely a bogus/incomplete save than an intentional full wipe, so
+ * it's treated as a no-op — matching the equivalent guard that used to
+ * protect library.json from being truncated by a stray empty save.
+ */
+export function replaceAllPhotos(photos: Photo[]): { upsertedCount: number; deletedCount: number; skipped: boolean } {
+  const existingCount = getTotalPhotoCount();
+  if (photos.length === 0 && existingCount > 0) {
+    return { upsertedCount: 0, deletedCount: 0, skipped: true };
+  }
+
+  const db = getDb();
+  const incomingIds = new Set(photos.map((p) => p.id));
+  const existingIds = (db.prepare('SELECT id FROM photos').all() as any[]).map((r) => r.id as string);
+  const idsToDelete = existingIds.filter((id) => !incomingIds.has(id));
+
+  runInTransaction(() => {
+    if (idsToDelete.length > 0) {
+      deletePhotos(idsToDelete);
+    }
+    upsertPhotos(photos);
+  }, db);
+
+  return { upsertedCount: photos.length, deletedCount: idsToDelete.length, skipped: false };
+}
+
 export function deletePhotos(ids: string[]): void {
   if (ids.length === 0) return;
   runInTransaction(() => {
@@ -259,20 +313,30 @@ export function getFacesForPhoto(photoId: string): DetectedFace[] {
   return rows.map(rowToFace);
 }
 
-/** Bulk-hydrates photo.faces on each photo, using one query instead of N. */
+// SQLite rejects a statement with more bound parameters than this (the
+// default SQLITE_MAX_VARIABLE_NUMBER is 999 on many builds) — batch large
+// IN (...) lookups instead of binding one placeholder per photo.
+const MAX_SQL_VARIABLES_PER_BATCH = 500;
+
+/** Bulk-hydrates photo.faces on each photo, batching the lookup for large photo counts. */
 export function attachFacesToPhotos(photos: Photo[]): void {
   if (photos.length === 0) return;
   const db = getDb();
-  const placeholders = photos.map(() => '?').join(',');
-  const rows = db
-    .prepare(`SELECT * FROM faces WHERE photo_id IN (${placeholders})`)
-    .all(...photos.map((p) => p.id)) as any[];
   const byPhoto = new Map<string, DetectedFace[]>();
-  for (const row of rows) {
-    const face = rowToFace(row);
-    if (!byPhoto.has(face.photoId)) byPhoto.set(face.photoId, []);
-    byPhoto.get(face.photoId)!.push(face);
+
+  for (let i = 0; i < photos.length; i += MAX_SQL_VARIABLES_PER_BATCH) {
+    const batch = photos.slice(i, i + MAX_SQL_VARIABLES_PER_BATCH);
+    const placeholders = batch.map(() => '?').join(',');
+    const rows = db
+      .prepare(`SELECT * FROM faces WHERE photo_id IN (${placeholders})`)
+      .all(...batch.map((p) => p.id)) as any[];
+    for (const row of rows) {
+      const face = rowToFace(row);
+      if (!byPhoto.has(face.photoId)) byPhoto.set(face.photoId, []);
+      byPhoto.get(face.photoId)!.push(face);
+    }
   }
+
   for (const photo of photos) {
     photo.faces = byPhoto.get(photo.id) || [];
   }
@@ -471,6 +535,23 @@ export function getAllAlbums(): Album[] {
   return albumRows.map((row) => rowToAlbum(row, photoIdsByAlbum.get(row.id) || []));
 }
 
+/** Replaces the active library's full album set to match `albums` exactly (upserts + deletes removed ones). */
+export function replaceAllAlbums(albums: Album[]): void {
+  const db = getDb();
+  const incomingIds = new Set(albums.map((a) => a.id));
+  const existingIds = (db.prepare('SELECT id FROM albums').all() as any[]).map((r) => r.id as string);
+  const idsToDelete = existingIds.filter((id) => !incomingIds.has(id));
+
+  runInTransaction(() => {
+    for (const id of idsToDelete) {
+      deleteAlbum(id);
+    }
+    for (const album of albums) {
+      upsertAlbum(album);
+    }
+  }, db);
+}
+
 export function deleteAlbum(albumId: string): void {
   runInTransaction(() => {
     const db = getDb();
@@ -480,11 +561,16 @@ export function deleteAlbum(albumId: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Settings (selectedFolder, recentLibraries, arbitrary key/value config)
+// Settings (selectedFolder, recentLibraries, face-cache, arbitrary config)
+//
+// Always stored in the global database, not the active per-library one —
+// every setting used today (recentLibraries, selectedFolder, the
+// cross-library face descriptor cache) is a cross-library concept, so there
+// is currently no such thing as a genuinely per-library setting.
 // ---------------------------------------------------------------------------
 
 export function getSetting<T>(key: string, fallback: T): T {
-  const db = getDb();
+  const db = getGlobalDb();
   const row = db.prepare('SELECT value_json FROM settings WHERE key = ?').get(key) as
     | { value_json: string }
     | undefined;
@@ -493,7 +579,7 @@ export function getSetting<T>(key: string, fallback: T): T {
 }
 
 export function setSetting<T>(key: string, value: T): void {
-  getDb()
+  getGlobalDb()
     .prepare(
       `INSERT INTO settings (key, value_json) VALUES (?, ?)
        ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json`

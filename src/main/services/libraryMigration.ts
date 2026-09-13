@@ -130,6 +130,17 @@ export function migrateLibraryJsonToSqliteIfNeeded(libraryJsonPath: string): Mig
     }
     if (lib.selectedFolder) setSetting('selectedFolder', lib.selectedFolder);
     if (Array.isArray(lib.recentLibraries)) setSetting('recentLibraries', lib.recentLibraries);
+
+    // Carry over every other top-level key verbatim (virtual storage configs,
+    // unlinked-storage list, background-service settings, the face descriptor
+    // cache, and anything else ever saved) — these all go through the same
+    // generic settings mechanism on save, so nothing should be silently
+    // dropped just because this migration doesn't know its specific shape.
+    for (const key of Object.keys(raw)) {
+      if (key === STORAGE_KEY || key === GLOBAL_PEOPLE_KEY) continue;
+      setSetting(key, raw[key]);
+    }
+
     markMigrated(libraryJsonPath);
   });
 

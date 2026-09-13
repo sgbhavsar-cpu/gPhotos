@@ -11,7 +11,7 @@
     "test:smoke": "node test/smoke_test_app_ready.js",
     "test:workflow": "npx tsx test/test_5photo_library_workflow.ts",
     "test:dedup-heic": "npx tsx test/test_selected_dedup_and_heic_rotate.ts",
-    "test:mobile-auth": "npx tsx test/test_mobile_web_server.ts",
+    "test:mobile-auth": "cross-env ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron.exe node_modules/tsx/dist/cli.mjs test/test_mobile_web_server.ts",
     "test:vitest": "cross-env ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron.exe node_modules/vitest/vitest.mjs run",
     "test": "npm run test:imports && npm run test:render && npm run test:smoke && npm run test:workflow && npm run test:dedup-heic && npm run test:mobile-auth && npm run test:vitest",
     "build:ui": "vite build",

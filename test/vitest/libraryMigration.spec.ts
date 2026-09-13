@@ -92,6 +92,13 @@ describe('library.json -> SQLite migration', () => {
         { id: 'person_alice', name: 'Alice', faceCount: 1, photoCount: 1, createdAt: '2026-01-01T00:00:00Z' },
         { id: 'person_bob_orphaned', name: 'Bob', faceCount: 0, photoCount: 0, createdAt: '2025-12-01T00:00:00Z' },
       ],
+      // Arbitrary other keys the renderer/background daemon also persist —
+      // must be carried over verbatim even though this migration script has
+      // no specific knowledge of their shape.
+      gphotos_virtual_storages_v1: [
+        { id: 'storage_1', name: 'Family NAS', networkSourcePath: '\\\\NAS\\Family', localMirrorRoot: 'C:\\GPhotos_VirtualMirrors' },
+      ],
+      gphotos_service_settings_v1: { runAtStartup: true, maxCpuPercent: 40 },
     };
     fs.writeFileSync(libraryJsonPath, JSON.stringify(fixture, null, 2), 'utf-8');
   }
@@ -173,6 +180,18 @@ describe('library.json -> SQLite migration', () => {
     expect(result.reason).toMatch(/unreadable-source-file/);
     expect(fs.existsSync(libraryJsonPath)).toBe(true);
     expect(getAllPhotos()).toHaveLength(0);
+  });
+
+  it('carries over arbitrary other top-level keys verbatim (virtual storage configs, service settings)', () => {
+    writeFixtureLibrary();
+    migrateLibraryJsonToSqliteIfNeeded(libraryJsonPath);
+
+    const storages = getSetting<any[]>('gphotos_virtual_storages_v1', []);
+    expect(storages).toHaveLength(1);
+    expect(storages[0].name).toBe('Family NAS');
+
+    const serviceSettings = getSetting<any>('gphotos_service_settings_v1', null);
+    expect(serviceSettings?.maxCpuPercent).toBe(40);
   });
 
   it('handles a library with zero photos/people/albums without error', () => {

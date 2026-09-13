@@ -7,6 +7,7 @@ import { scanDirectoryRecursive } from './fileOrganizer';
 import { parsePhotoMetadata } from './exifParser';
 import { generateThumbnailBuffer, scanVirtualMirrorDirectory, processPendingRotations } from './virtualMirrorService';
 import { thumbnailWorker } from './thumbnailWorkerService';
+import { getSetting, setSetting } from './libraryRepository';
 
 let tray: Tray | null = null;
 let syncTimer: NodeJS.Timeout | null = null;
@@ -27,30 +28,20 @@ let serviceSettings: BackgroundServiceSettings = {
 
 let lastSyncTime: string | undefined = undefined;
 
-function getStoragePath(): string {
-  const userDir = app.getPath('userData');
-  if (!fs.existsSync(userDir)) {
-    fs.mkdirSync(userDir, { recursive: true });
-  }
-  return path.join(userDir, 'library.json');
-}
-
 function loadSavedSettings() {
   try {
-    const storePath = getStoragePath();
-    if (fs.existsSync(storePath)) {
-      const data = JSON.parse(fs.readFileSync(storePath, 'utf-8'));
-      if (data['gphotos_service_settings_v1']) {
-        serviceSettings = { ...serviceSettings, ...data['gphotos_service_settings_v1'] };
-        thumbnailWorker.setResourceLimits({
-          maxCpuPercent: serviceSettings.maxCpuPercent,
-          maxRamMb: serviceSettings.maxRamMb,
-          enabled: serviceSettings.enableThumbnailPreCache,
-        });
-      }
-      if (data['gphotos_service_last_sync']) {
-        lastSyncTime = data['gphotos_service_last_sync'];
-      }
+    const saved = getSetting<BackgroundServiceSettings | null>('gphotos_service_settings_v1', null);
+    if (saved) {
+      serviceSettings = { ...serviceSettings, ...saved };
+      thumbnailWorker.setResourceLimits({
+        maxCpuPercent: serviceSettings.maxCpuPercent,
+        maxRamMb: serviceSettings.maxRamMb,
+        enabled: serviceSettings.enableThumbnailPreCache,
+      });
+    }
+    const savedLastSync = getSetting<string | null>('gphotos_service_last_sync', null);
+    if (savedLastSync) {
+      lastSyncTime = savedLastSync;
     }
   } catch (err) {
     console.warn('Failed to load background service settings:', err);
@@ -59,18 +50,10 @@ function loadSavedSettings() {
 
 function saveSettings() {
   try {
-    const storePath = getStoragePath();
-    let currentData: Record<string, any> = {};
-    if (fs.existsSync(storePath)) {
-      try {
-        currentData = JSON.parse(fs.readFileSync(storePath, 'utf-8'));
-      } catch {}
-    }
-    currentData['gphotos_service_settings_v1'] = serviceSettings;
+    setSetting('gphotos_service_settings_v1', serviceSettings);
     if (lastSyncTime) {
-      currentData['gphotos_service_last_sync'] = lastSyncTime;
+      setSetting('gphotos_service_last_sync', lastSyncTime);
     }
-    fs.writeFileSync(storePath, JSON.stringify(currentData, null, 2), 'utf-8');
   } catch (err) {
     console.warn('Failed to persist background service settings:', err);
   }
@@ -288,12 +271,8 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
     // First drain any pending offline rotations if storage is available
     await processPendingRotations();
 
-    const storePath = getStoragePath();
-    if (!fs.existsSync(storePath)) return;
-
-    const data = JSON.parse(fs.readFileSync(storePath, 'utf-8'));
-    const storages: VirtualStorageConfig[] = data['gphotos_virtual_storages_v1'] || [];
-    const unlinked: string[] = data['gphotos_unlinked_storages_v1'] || [];
+    const storages = getSetting<VirtualStorageConfig[]>('gphotos_virtual_storages_v1', []);
+    const unlinked = getSetting<string[]>('gphotos_unlinked_storages_v1', []);
     const unlinkedSet = new Set(unlinked.map((n) => n.toLowerCase()));
 
     const activeStorages = storages.filter((s) => !unlinkedSet.has(s.name.toLowerCase()));

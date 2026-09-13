@@ -2,6 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
 import { app, dialog, BrowserWindow } from 'electron';
+import { getDbPath } from './db';
+import { getAllPhotos, getAllPeople, getAllAlbums, getSetting } from './libraryRepository';
 
 export interface ZipFileEntry {
   name: string;
@@ -109,21 +111,29 @@ export async function exportLibraryBackupZip(
 }> {
   try {
     const userDir = app.getPath('userData');
-    const libraryPath = path.join(userDir, 'library.json');
 
-    let libraryData: any = {};
-    if (fs.existsSync(libraryPath)) {
-      try {
-        libraryData = JSON.parse(fs.readFileSync(libraryPath, 'utf-8'));
-      } catch (e) {
-        console.warn('Failed to parse existing library.json:', e);
-      }
-    }
+    // Reconstruct the same library.json shape from SQLite (the active
+    // library's photos/albums plus the global people registry), so existing
+    // backups stay human-readable and portable even though the live data now
+    // lives in a database instead of a flat JSON file.
+    const photos = getAllPhotos();
+    const people = getAllPeople();
+    const albums = getAllAlbums();
+    const libState = {
+      photos,
+      people,
+      albums,
+      selectedFolder: getSetting<string | null>('selectedFolder', null),
+      recentLibraries: getSetting<string[]>('recentLibraries', []),
+    };
+    const libraryData = {
+      gphotos_library_v1: libState,
+      gphotos_people_v2: people,
+    };
 
-    const libState = libraryData.gphotos_library_v1 || {};
-    const totalPhotos = (libState.photos || []).length;
-    const totalPeople = (libState.people || []).length;
-    const totalAlbums = (libState.albums || []).length;
+    const totalPhotos = photos.length;
+    const totalPeople = people.length;
+    const totalAlbums = albums.length;
 
     let targetZipPath = customTargetZipPath;
 
@@ -149,18 +159,19 @@ export async function exportLibraryBackupZip(
       targetZipPath = dialogResult.filePath;
     }
 
+    const totalFaces = photos.reduce((sum, p) => sum + (p.faces?.length || 0), 0);
+
     // Prepare backup entries
     const manifest = {
       appName: 'gPhotos Desktop',
       version: app.getVersion() || '1.0.0',
       backupCreatedAt: new Date().toISOString(),
-      activeFolder: libState.selectedFolder || libState.currentDirectory || null,
+      activeFolder: libState.selectedFolder || null,
       summary: {
         totalPhotos,
         totalPeople,
         totalAlbums,
-        totalFaces: (libState.faces || []).length,
-        totalPlaces: (libState.places || []).length,
+        totalFaces,
       },
     };
 
@@ -172,12 +183,13 @@ Application: gPhotos Desktop Edition
 
 Archive Contents:
 - backup_manifest.json : Metadata summary of this backup
-- library.json         : Complete database (photos, faces, people, albums, places, tags, favorites)
+- gphotos.db           : The complete live database for this library (photos, faces, people, albums) — the authoritative copy
+- library.json         : A human-readable JSON export of the same data, for reference or portability
 - settings.json        : Background synchronization and service daemon settings
 
 To Restore:
-Place the library.json back into %APPDATA%\\gPhotos\\library.json
-or use the in-app restore mechanism.
+Place gphotos.db back into the library folder's .gphotos_catalog\\gphotos.db
+(or the app's userData folder for the default library), or use the in-app restore mechanism.
 =====================================================`;
 
     const entries: ZipFileEntry[] = [
@@ -194,6 +206,19 @@ or use the in-app restore mechanism.
         content: readmeText,
       },
     ];
+
+    // Include the live SQLite database itself — the authoritative, full-fidelity copy.
+    const activeDbPath = getDbPath(libState.selectedFolder || null);
+    if (fs.existsSync(activeDbPath)) {
+      try {
+        entries.push({
+          name: 'gphotos.db',
+          content: fs.readFileSync(activeDbPath),
+        });
+      } catch (err) {
+        console.warn('Failed to include gphotos.db in backup:', err);
+      }
+    }
 
     // Check for optional daemon settings file
     const settingsPath = path.join(userDir, 'settings.json');

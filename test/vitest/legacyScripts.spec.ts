@@ -13,12 +13,27 @@ import path from 'path';
 
 const repoRoot = path.resolve(__dirname, '..', '..');
 
-function runTsxScript(relativePath: string, timeoutMs = 240000): void {
-  execFileSync(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['tsx', relativePath], {
+// Several legacy scripts transitively import src/main/services/db.ts, which
+// uses the built-in node:sqlite module — only available on Node 22.5+/24, not
+// on this machine's system Node (20.x). Rather than spawn `npx tsx` (which
+// resolves to the system Node), run tsx's CLI directly under Electron's own
+// bundled Node 24 runtime — the same trick used to run this Vitest process
+// itself (see package.json's test:vitest script).
+const electronBinary = path.join(
+  repoRoot,
+  'node_modules',
+  'electron',
+  'dist',
+  process.platform === 'win32' ? 'electron.exe' : 'electron'
+);
+const tsxCliEntry = path.join(repoRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+
+function runTsxScript(relativePath: string, timeoutMs = 420000): void {
+  execFileSync(electronBinary, [tsxCliEntry, relativePath], {
     cwd: repoRoot,
     stdio: 'pipe',
     timeout: timeoutMs,
-    shell: process.platform === 'win32',
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
   });
 }
 

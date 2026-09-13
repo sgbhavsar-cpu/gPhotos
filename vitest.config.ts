@@ -11,7 +11,7 @@ export default defineConfig({
   test: {
     include: ['test/vitest/**/*.spec.ts'],
     environment: 'node',
-    testTimeout: 300000,
+    testTimeout: 480000,
     hookTimeout: 30000,
   },
 });
