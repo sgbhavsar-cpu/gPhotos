@@ -30,7 +30,7 @@ import {
   Zap,
   Activity
 } from 'lucide-react';
-import { BackgroundServiceStatus, BackgroundServiceSettings, WebServerStatus } from '../../types';
+import { BackgroundServiceStatus, BackgroundServiceSettings, WebServerStatus, PairedDeviceInfo } from '../../types';
 import { aiSearchService, AiSearchConfig, AiProvider } from '../services/aiSearchService';
 
 interface SettingsViewProps {
@@ -59,6 +59,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [copiedUrl, setCopiedUrl] = useState<boolean>(false);
   const [webServerFeedback, setWebServerFeedback] = useState<string | null>(null);
 
+  // Mobile Access PIN & paired devices
+  const [accessPin, setAccessPin] = useState<string | null>(null);
+  const [pairedDevices, setPairedDevices] = useState<PairedDeviceInfo[]>([]);
+  const [pinRevealed, setPinRevealed] = useState<boolean>(false);
+  const [authActionLoading, setAuthActionLoading] = useState<boolean>(false);
+  const [authFeedback, setAuthFeedback] = useState<string | null>(null);
+
   useEffect(() => {
     if (window.electronAPI?.getWebServerStatus) {
       window.electronAPI.getWebServerStatus().then((status) => {
@@ -69,7 +76,50 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         }
       });
     }
+    refreshAccessPinAndDevices();
   }, []);
+
+  const refreshAccessPinAndDevices = async () => {
+    if (window.electronAPI?.getWebServerPin) {
+      const res = await window.electronAPI.getWebServerPin();
+      setAccessPin(res?.pin || null);
+    }
+    if (window.electronAPI?.listPairedDevices) {
+      const list = await window.electronAPI.listPairedDevices();
+      setPairedDevices(list || []);
+    }
+  };
+
+  const handleRegeneratePin = async () => {
+    if (!window.electronAPI?.regenerateWebServerPin) return;
+    setAuthActionLoading(true);
+    const res = await window.electronAPI.regenerateWebServerPin();
+    setAuthActionLoading(false);
+    if (res?.pin) {
+      setAccessPin(res.pin);
+      setPinRevealed(true);
+      setAuthFeedback('New PIN generated. Existing paired devices remain connected.');
+      setTimeout(() => setAuthFeedback(null), 4000);
+    }
+  };
+
+  const handleRevokeDevice = async (deviceId: string) => {
+    if (!window.electronAPI?.revokePairedDevice) return;
+    setAuthActionLoading(true);
+    await window.electronAPI.revokePairedDevice(deviceId);
+    await refreshAccessPinAndDevices();
+    setAuthActionLoading(false);
+  };
+
+  const handleRevokeAllDevices = async () => {
+    if (!window.electronAPI?.revokeAllPairedDevices) return;
+    setAuthActionLoading(true);
+    await window.electronAPI.revokeAllPairedDevices();
+    await refreshAccessPinAndDevices();
+    setAuthActionLoading(false);
+    setAuthFeedback('All paired devices were signed out.');
+    setTimeout(() => setAuthFeedback(null), 4000);
+  };
 
   const handleSaveWebServerSettings = async () => {
     const portNum = parseInt(webServerPortInput, 10);
@@ -474,6 +524,113 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 💡 <strong>Android Chrome:</strong> Tap the <em>Three Dots (⋮)</em> → tap <em>"Install App"</em> or <em>"Add to Home Screen"</em>.<br />
                 📸 <strong>Apple iPhone HEIC Support:</strong> All `.heic` and `.heif` files from iPhone are automatically decoded into high-quality JPEG previews!
               </div>
+            </div>
+          )}
+
+          {/* Mobile Access PIN & Paired Devices (desktop-only: managed via Electron IPC) */}
+          {webServerStatus?.isRunning && !!window.electronAPI?.getWebServerPin && (
+            <div style={{
+              backgroundColor: 'var(--bg-surface-elevated)',
+              border: '1px solid var(--border-subtle)',
+              borderRadius: 'var(--radius-md)',
+              padding: '16px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '12px',
+            }}>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Key size={16} color="var(--accent-cyan)" />
+                🔒 Access PIN (required once per device)
+              </div>
+              <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
+                Anyone opening the mobile link above must enter this PIN once. Devices stay
+                paired afterward — regenerating the PIN does not sign out devices already paired.
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                <div style={{
+                  backgroundColor: '#0a0f1d',
+                  border: '1px solid rgba(255, 255, 255, 0.1)',
+                  padding: '8px 14px',
+                  borderRadius: 'var(--radius-md)',
+                  fontFamily: 'monospace',
+                  fontSize: '0.95rem',
+                  letterSpacing: '2px',
+                  color: 'var(--accent-cyan)',
+                  fontWeight: 700,
+                  userSelect: 'all',
+                  minWidth: '90px',
+                }}>
+                  {accessPin ? (pinRevealed ? accessPin : '• • • • • •') : 'Loading…'}
+                </div>
+                <button
+                  className="btn btn-ghost"
+                  onClick={() => setPinRevealed((v) => !v)}
+                  style={{ height: '36px', padding: '0 12px', fontSize: '0.8rem' }}
+                >
+                  {pinRevealed ? 'Hide' : 'Show'}
+                </button>
+                <button
+                  className="btn btn-secondary"
+                  onClick={handleRegeneratePin}
+                  disabled={authActionLoading}
+                  style={{ height: '36px', padding: '0 14px', fontSize: '0.8rem', gap: '6px' }}
+                >
+                  <RefreshCw size={14} />
+                  Regenerate PIN
+                </button>
+              </div>
+
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-primary)', marginTop: '4px' }}>
+                Paired Devices ({pairedDevices.length})
+              </div>
+              {pairedDevices.length === 0 ? (
+                <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>No devices paired yet.</div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  {pairedDevices.map((d) => (
+                    <div key={d.id} style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: '10px',
+                      backgroundColor: '#0a0f1d',
+                      border: '1px solid rgba(255, 255, 255, 0.08)',
+                      borderRadius: 'var(--radius-md)',
+                      padding: '8px 12px',
+                    }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: '0.82rem', color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {d.label || 'Unknown device'}
+                        </div>
+                        <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                          Last seen {new Date(d.lastSeenAt).toLocaleString()}
+                        </div>
+                      </div>
+                      <button
+                        className="btn btn-ghost"
+                        onClick={() => handleRevokeDevice(d.id)}
+                        disabled={authActionLoading}
+                        style={{ height: '30px', padding: '0 10px', fontSize: '0.75rem', color: '#f87171', flexShrink: 0 }}
+                      >
+                        Revoke
+                      </button>
+                    </div>
+                  ))}
+                  <button
+                    className="btn btn-ghost"
+                    onClick={handleRevokeAllDevices}
+                    disabled={authActionLoading}
+                    style={{ alignSelf: 'flex-start', height: '30px', padding: '0 10px', fontSize: '0.75rem', color: '#f87171' }}
+                  >
+                    Revoke All Devices
+                  </button>
+                </div>
+              )}
+
+              {authFeedback && (
+                <div style={{ fontSize: '0.78rem', color: '#10b981' }}>{authFeedback}</div>
+              )}
             </div>
           )}
 

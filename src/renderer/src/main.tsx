@@ -3,6 +3,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { App } from './App';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { MobileAuthGate } from './components/MobileAuthGate';
 import './index.css';
 
 // Global error handlers to prevent silent failures and ensure diagnostics
@@ -30,7 +31,9 @@ if (rootElement) {
   ReactDOM.createRoot(rootElement).render(
     <React.StrictMode>
       <ErrorBoundary fallbackTitle="Application Encountered an Error">
-        <App />
+        <MobileAuthGate>
+          <App />
+        </MobileAuthGate>
       </ErrorBoundary>
     </React.StrictMode>
   );

@@ -6,6 +6,8 @@
  * MUST BE IMPORTED FIRST before any React components or stores initialize!
  */
 
+import { authFetch } from './services/webAuthClient';
+
 if (typeof window !== 'undefined' && !(window as any).electronAPI) {
   (window as any).electronAPI = {
     isBrowserShim: true,
@@ -13,7 +15,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
 
     loadLibraryData: async (key: string) => {
       try {
-        const res = await fetch('/api/library');
+        const res = await authFetch('/api/library');
         if (!res.ok) return null;
         const data = await res.json();
         if (data && data[key] !== undefined) return data[key];
@@ -27,7 +29,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
 
     saveLibraryData: async (key: string, data: any) => {
       try {
-        const res = await fetch('/api/library', {
+        const res = await authFetch('/api/library', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ key, data }),
@@ -40,7 +42,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
 
     checkFileExists: async (p: string) => {
       try {
-        const res = await fetch(`/api/file-exists?path=${encodeURIComponent(p)}`);
+        const res = await authFetch(`/api/file-exists?path=${encodeURIComponent(p)}`);
         if (!res.ok) return false;
         const data = await res.json();
         return !!data.exists;
@@ -51,7 +53,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
 
     discoverMirrors: async () => {
       try {
-        const res = await fetch('/api/discover-mirrors');
+        const res = await authFetch('/api/discover-mirrors');
         if (!res.ok) return [];
         return await res.json();
       } catch {
@@ -64,7 +66,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     scanDirectory: async (dirPath?: string) => {
       try {
         if (!dirPath) return [];
-        const res = await fetch(`/api/scan?path=${encodeURIComponent(dirPath)}`);
+        const res = await authFetch(`/api/scan?path=${encodeURIComponent(dirPath)}`);
         if (!res.ok) return [];
         return await res.json();
       } catch {
@@ -74,7 +76,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
 
     prepareHeicHq: async (filePath: string, photoId: string) => {
       try {
-        const res = await fetch(
+        const res = await authFetch(
           `/api/heic/prepare-hq?path=${encodeURIComponent(filePath)}&id=${encodeURIComponent(photoId)}`
         );
         if (res.ok) {
@@ -87,13 +89,13 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
 
     cleanupHeicHq: async (photoId: string) => {
       try {
-        await fetch(`/api/heic/cleanup-hq?id=${encodeURIComponent(photoId)}`);
+        await authFetch(`/api/heic/cleanup-hq?id=${encodeURIComponent(photoId)}`);
       } catch {}
     },
 
     getBatchThumbnails: async (params: { items: Array<{ path: string; originalPath?: string }>; size?: number }) => {
       try {
-        const res = await fetch('/api/batch-thumbnails', {
+        const res = await authFetch('/api/batch-thumbnails', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(params),
@@ -112,7 +114,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     readFileAsBase64: async () => '',
     syncVirtualStorage: async (config: any) => {
       try {
-        const res = await fetch('/api/sync-virtual-storage', {
+        const res = await authFetch('/api/sync-virtual-storage', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(config),
@@ -126,7 +128,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     scanVirtualMirror: async (dirPath?: string) => {
       try {
         if (!dirPath) return [];
-        const res = await fetch(`/api/scan-mirror?path=${encodeURIComponent(dirPath)}`);
+        const res = await authFetch(`/api/scan-mirror?path=${encodeURIComponent(dirPath)}`);
         if (!res.ok) return [];
         return await res.json();
       } catch (err) {
@@ -143,7 +145,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
 
     trashFiles: async (filePaths: string[]) => {
       try {
-        const res = await fetch('/api/delete-files', {
+        const res = await authFetch('/api/delete-files', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ filePaths, permanent: false }),
@@ -155,7 +157,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
 
     deleteFilesPermanently: async (filePaths: string[]) => {
       try {
-        const res = await fetch('/api/delete-files', {
+        const res = await authFetch('/api/delete-files', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ filePaths, permanent: true }),
@@ -167,7 +169,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
 
     rotatePhoto: async (filePath: string, rotationDegrees: number, originalRemotePath?: string) => {
       try {
-        const res = await fetch('/api/rotate-photo', {
+        const res = await authFetch('/api/rotate-photo', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ filePath, rotationDegrees, originalRemotePath }),
@@ -179,7 +181,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
 
     processPendingRotations: async () => {
       try {
-        const res = await fetch('/api/process-pending-rotations', { method: 'POST' });
+        const res = await authFetch('/api/process-pending-rotations', { method: 'POST' });
         if (res.ok) return await res.json();
       } catch {}
       return { processed: 0, remaining: 0 };
@@ -187,7 +189,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
 
     getWebServerStatus: async () => {
       try {
-        const res = await fetch('/api/status');
+        const res = await authFetch('/api/status');
         if (res.ok) return await res.json();
       } catch {}
       const port = window.location.port ? parseInt(window.location.port, 10) : 80;
@@ -203,7 +205,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
 
     setWebServerSettings: async (settings: { enabled: boolean; port: number }) => {
       try {
-        const res = await fetch('/api/webserver-settings', {
+        const res = await authFetch('/api/webserver-settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(settings),
@@ -239,7 +241,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     sendAppReady: () => {},
     getCatalogMeta: async () => {
       try {
-        const res = await fetch('/api/catalog-meta');
+        const res = await authFetch('/api/catalog-meta');
         if (res.ok) return await res.json();
       } catch {}
       return {
@@ -262,14 +264,14 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     },
     getCatalogPage: async (params: { pageIndex: number; pageSize?: number }) => {
       try {
-        const res = await fetch(`/api/catalog-page?page=${params.pageIndex}&size=${params.pageSize || 100}`);
+        const res = await authFetch(`/api/catalog-page?page=${params.pageIndex}&size=${params.pageSize || 100}`);
         if (res.ok) return await res.json();
       } catch {}
       return { photos: [], totalPages: 0, totalPhotos: 0 };
     },
     switchLibrary: async (targetPath: string) => {
       try {
-        const res = await fetch('/api/switch-library', {
+        const res = await authFetch('/api/switch-library', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ targetPath }),
@@ -280,14 +282,14 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     },
     getSpriteCoordinate: async (photoPath: string) => {
       try {
-        const res = await fetch(`/api/sprite-coord?path=${encodeURIComponent(photoPath)}`);
+        const res = await authFetch(`/api/sprite-coord?path=${encodeURIComponent(photoPath)}`);
         if (res.ok) return await res.json();
       } catch {}
       return null;
     },
     getThumbnailPreCacheStatus: async () => {
       try {
-        const res = await fetch('/api/precache-status');
+        const res = await authFetch('/api/precache-status');
         if (res.ok) return await res.json();
       } catch {}
       return {
@@ -301,7 +303,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     },
     startThumbnailPreCache: async (photos?: any[]) => {
       try {
-        const res = await fetch('/api/start-precache', {
+        const res = await authFetch('/api/start-precache', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ photos }),
@@ -312,14 +314,14 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     },
     pauseThumbnailPreCache: async () => {
       try {
-        const res = await fetch('/api/pause-precache', { method: 'POST' });
+        const res = await authFetch('/api/pause-precache', { method: 'POST' });
         if (res.ok) return await res.json();
       } catch {}
       return { paused: true };
     },
     getBackgroundServiceStatus: async () => {
       try {
-        const res = await fetch('/api/background-service-status');
+        const res = await authFetch('/api/background-service-status');
         if (res.ok) return await res.json();
       } catch {}
       return {
@@ -333,7 +335,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     },
     refreshThumbnailsFromSource: async (items: Array<{ filePath: string; originalRemotePath?: string }>) => {
       try {
-        const res = await fetch('/api/thumbnails/refresh-from-source', {
+        const res = await authFetch('/api/thumbnails/refresh-from-source', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ items }),

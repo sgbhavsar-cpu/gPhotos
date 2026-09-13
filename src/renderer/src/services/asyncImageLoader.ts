@@ -11,6 +11,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { SpriteCoordinate } from '../../types';
 import { trackBackendCall } from './responseTracker';
+import { appendAuthToken, authFetch } from './webAuthClient';
 
 // ============================================================================
 // 0. SPRITE COORDINATE STORE & HOOK (HIGH-SPEED 50-PHOTO STATIC SHEETS)
@@ -30,7 +31,7 @@ export function getSpriteUrl(coord: SpriteCoordinate): string {
   if (isElectron) {
     return `gphoto://sprite?id=${encodeURIComponent(coord.spriteId)}`;
   }
-  return `/api/sprites/${encodeURIComponent(coord.spriteId)}.webp`;
+  return appendAuthToken(`/api/sprites/${encodeURIComponent(coord.spriteId)}.webp`);
 }
 
 /**
@@ -65,7 +66,7 @@ export function useSpriteCoordinate(photoPath: string | undefined | null): Sprit
             return await window.electronAPI.getSpriteCoordinate(photoPath);
           }
           if (window.location?.protocol?.startsWith('http')) {
-            const res = await fetch(`/api/sprite-coord?path=${encodeURIComponent(photoPath)}`);
+            const res = await authFetch(`/api/sprite-coord?path=${encodeURIComponent(photoPath)}`);
             if (res.ok) {
               return await res.json();
             }

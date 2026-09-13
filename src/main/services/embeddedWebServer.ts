@@ -18,6 +18,15 @@ import { getSpriteCoordinate, getSpritePath } from './spriteService';
 import { thumbnailWorker } from './thumbnailWorkerService';
 import { getBackgroundServiceStatus } from './backgroundDaemon';
 import { WebServerStatus } from '../../types';
+import {
+  getOrCreatePin,
+  verifyPin,
+  createSessionToken,
+  validateToken,
+  isLockedOut,
+  recordFailedAttempt,
+  clearFailedAttempts,
+} from './webAuthService';
 
 let serverInstance: http.Server | null = null;
 let activePort: number = 5173;
@@ -150,6 +159,68 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
   if (pathname === '/api/status') {
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify(getEmbeddedWebServerStatus()));
+    return;
+  }
+
+  // Endpoint: /api/auth/status — always public, lets the client know a PIN is required
+  if (pathname === '/api/auth/status') {
+    getOrCreatePin(); // ensure a PIN exists so Settings can display it even before first pairing
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ pinRequired: true }));
+    return;
+  }
+
+  // Endpoint: /api/auth/pair — public, exchanges a valid PIN for a session token
+  if (pathname === '/api/auth/pair' && req.method === 'POST') {
+    const clientIp = req.socket.remoteAddress || 'unknown';
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      res.setHeader('Content-Type', 'application/json');
+      if (isLockedOut(clientIp)) {
+        res.statusCode = 429;
+        res.end(JSON.stringify({ error: 'Too many attempts. Try again in a minute.' }));
+        return;
+      }
+      try {
+        const { pin, deviceLabel } = JSON.parse(body || '{}');
+        if (!verifyPin(pin)) {
+          recordFailedAttempt(clientIp);
+          res.statusCode = 401;
+          res.end(JSON.stringify({ error: 'Incorrect PIN' }));
+          return;
+        }
+        clearFailedAttempts(clientIp);
+        const { token } = createSessionToken(deviceLabel || 'Unknown device');
+        res.end(JSON.stringify({ token }));
+      } catch (err: any) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // All other /api/* routes require a valid paired-device session token.
+  if (pathname.startsWith('/api/')) {
+    const authHeader = req.headers['authorization'] || '';
+    const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    const queryToken = parsedUrl.searchParams.get('token') || '';
+    const token = bearerToken || queryToken;
+    if (!validateToken(token)) {
+      res.statusCode = 401;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ error: 'unauthorized', pinRequired: true }));
+      return;
+    }
+  }
+
+  // Endpoint: /api/auth/verify — reaching here means the gate above already validated the token
+  if (pathname === '/api/auth/verify') {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ valid: true }));
     return;
   }
 
