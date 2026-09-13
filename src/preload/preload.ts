@@ -70,6 +70,9 @@ const electronAPI: IElectronAPI = {
   getCatalogPage: (params) => ipcRenderer.invoke('catalog:get-page', params),
   switchLibrary: (targetPath: string) => ipcRenderer.invoke('catalog:switch-library', targetPath),
   getSpriteCoordinate: (photoPath: string) => ipcRenderer.invoke('sprite:get-coordinate', photoPath),
+  getThumbnailPreCacheStatus: () => ipcRenderer.invoke('service:get-precache-status'),
+  startThumbnailPreCache: (photos) => ipcRenderer.invoke('service:start-precache', photos),
+  pauseThumbnailPreCache: () => ipcRenderer.invoke('service:pause-precache'),
 };
 
 contextBridge.exposeInMainWorld('electronAPI', electronAPI);

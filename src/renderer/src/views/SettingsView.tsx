@@ -23,7 +23,12 @@ import {
   Copy,
   ExternalLink,
   Wifi,
-  Check
+  Check,
+  Sliders,
+  Pause,
+  Play,
+  Zap,
+  Activity
 } from 'lucide-react';
 import { BackgroundServiceStatus, BackgroundServiceSettings, WebServerStatus } from '../../types';
 import { aiSearchService, AiSearchConfig, AiProvider } from '../services/aiSearchService';
@@ -172,9 +177,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     fetchLogs();
     const interval = setInterval(() => {
       fetchStatus();
-    }, 5000);
+    }, serviceStatus?.isPreCachingActive ? 1500 : 4000);
     return () => clearInterval(interval);
-  }, []);
+  }, [serviceStatus?.isPreCachingActive]);
 
   const handleToggleSetting = async (key: keyof BackgroundServiceSettings, value: any) => {
     if (!window.electronAPI?.setBackgroundServiceSettings) return;
@@ -183,6 +188,24 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       await fetchStatus();
     } catch (err) {
       console.error(`Failed to update setting ${key}:`, err);
+    }
+  };
+
+  const handlePauseResumePreCache = async () => {
+    try {
+      if (serviceStatus?.isPreCachingActive) {
+        if (window.electronAPI?.pauseThumbnailPreCache) {
+          await window.electronAPI.pauseThumbnailPreCache();
+          await fetchStatus();
+        }
+      } else {
+        if (window.electronAPI?.startThumbnailPreCache) {
+          await window.electronAPI.startThumbnailPreCache();
+          await fetchStatus();
+        }
+      }
+    } catch (err) {
+      console.error('Failed to toggle pre-cache execution:', err);
     }
   };
 
@@ -650,6 +673,296 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <RefreshCw size={15} className={actionLoading === 'sync' || isScanning ? 'animate-spin' : ''} />
               {isScanning ? 'Sync in Progress...' : 'Run Sync Cycle Now'}
             </button>
+          </div>
+        </div>
+
+        {/* Section 1.5: Background Performance & Resource Throttling (Thumbnail Pre-Caching) */}
+        <div style={{
+          backgroundColor: 'var(--bg-surface)',
+          border: '1px solid var(--border-subtle)',
+          borderRadius: 'var(--radius-lg)',
+          padding: '24px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '20px',
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
+            <div>
+              <h2 style={{ fontSize: '1.15rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '10px', margin: 0 }}>
+                <Zap size={20} color="var(--accent-cyan)" />
+                Background Performance & Resource Throttling
+              </h2>
+              <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', margin: '4px 0 0 0' }}>
+                Pre-caches thumbnails for large libraries in a dedicated background worker thread with strict CPU duty-cycle pacing and RAM ceilings.
+              </p>
+            </div>
+
+            {/* Status Badge */}
+            <div style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '8px',
+              padding: '6px 14px',
+              borderRadius: '9999px',
+              fontSize: '0.82rem',
+              fontWeight: 600,
+              backgroundColor: serviceStatus?.isPreCachingActive
+                ? 'rgba(16, 185, 129, 0.15)'
+                : (serviceStatus?.enableThumbnailPreCache === false
+                  ? 'rgba(107, 114, 128, 0.15)'
+                  : 'rgba(56, 189, 248, 0.15)'),
+              color: serviceStatus?.isPreCachingActive
+                ? '#10b981'
+                : (serviceStatus?.enableThumbnailPreCache === false
+                  ? '#9ca3af'
+                  : 'var(--accent-cyan)'),
+              border: `1px solid ${
+                serviceStatus?.isPreCachingActive
+                  ? 'rgba(16, 185, 129, 0.3)'
+                  : (serviceStatus?.enableThumbnailPreCache === false
+                    ? 'rgba(107, 114, 128, 0.3)'
+                    : 'rgba(56, 189, 248, 0.3)')
+              }`,
+            }}>
+              <span style={{
+                width: '8px',
+                height: '8px',
+                borderRadius: '50%',
+                backgroundColor: serviceStatus?.isPreCachingActive
+                  ? '#10b981'
+                  : (serviceStatus?.enableThumbnailPreCache === false
+                    ? '#9ca3af'
+                    : 'var(--accent-cyan)'),
+              }} />
+              {serviceStatus?.isPreCachingActive
+                ? 'Pre-Caching In Progress...'
+                : (serviceStatus?.enableThumbnailPreCache === false
+                  ? 'Pre-Caching Disabled'
+                  : ((serviceStatus?.thumbnailsPreCachedTotal || 0) > 0 && (serviceStatus?.thumbnailsPreCachedCount || 0) >= (serviceStatus?.thumbnailsPreCachedTotal || 0))
+                    ? 'All Thumbnails Cached'
+                    : 'Worker Ready / Idle')}
+            </div>
+          </div>
+
+          {/* Master Toggle Banner */}
+          <div style={{
+            backgroundColor: 'var(--bg-card)',
+            border: '1px solid var(--border-subtle)',
+            borderRadius: 'var(--radius-md)',
+            padding: '18px',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: '16px',
+            flexWrap: 'wrap',
+          }}>
+            <div style={{ flex: 1, minWidth: '280px' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer', fontWeight: 600, fontSize: '0.95rem', color: 'var(--text-primary)' }}>
+                <input
+                  type="checkbox"
+                  checked={serviceStatus?.enableThumbnailPreCache ?? true}
+                  onChange={(e) => handleToggleSetting('enableThumbnailPreCache', e.target.checked)}
+                  style={{ width: '18px', height: '18px', accentColor: 'var(--accent-cyan)' }}
+                />
+                <span>Enable Background Thumbnail Pre-Caching</span>
+              </label>
+              <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', marginTop: '6px', lineHeight: 1.5, marginLeft: '28px' }}>
+                Generates high-performance WebP thumbnails in the background during folder scans and catalog imports. Once cached, browsing thousands of photos is buttery-smooth with zero wait times.
+              </p>
+            </div>
+
+            {/* Quick Pause / Resume button */}
+            {(serviceStatus?.enableThumbnailPreCache ?? true) && (
+              <div>
+                <button
+                  className="btn btn-secondary"
+                  onClick={handlePauseResumePreCache}
+                  style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.85rem', padding: '8px 16px' }}
+                >
+                  {serviceStatus?.isPreCachingActive ? <Pause size={15} color="#f59e0b" /> : <Play size={15} color="#10b981" />}
+                  {serviceStatus?.isPreCachingActive ? 'Pause Pre-Caching' : 'Resume Pre-Caching'}
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Sliders and Selectors Grid */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '16px' }}>
+            
+            {/* Setting 1: Max CPU Usage Cap */}
+            <div style={{
+              backgroundColor: 'var(--bg-card)',
+              border: '1px solid var(--border-subtle)',
+              borderRadius: 'var(--radius-md)',
+              padding: '16px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '12px',
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <label style={{ fontSize: '0.88rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <Cpu size={16} color="var(--accent-cyan)" />
+                  Max Background CPU Cap
+                </label>
+                <span style={{
+                  backgroundColor: 'rgba(56, 189, 248, 0.15)',
+                  color: 'var(--accent-cyan)',
+                  padding: '2px 8px',
+                  borderRadius: '12px',
+                  fontSize: '0.82rem',
+                  fontWeight: 700,
+                  fontFamily: 'monospace',
+                }}>
+                  {serviceStatus?.maxCpuPercent ?? 40}% Max
+                </span>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                <input
+                  type="range"
+                  min="10"
+                  max="90"
+                  step="5"
+                  value={serviceStatus?.maxCpuPercent ?? 40}
+                  onChange={(e) => handleToggleSetting('maxCpuPercent', parseInt(e.target.value, 10))}
+                  style={{ flex: 1, accentColor: 'var(--accent-cyan)', cursor: 'pointer' }}
+                />
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                <span>10% (Ultra Gentle)</span>
+                <span>40% (Default)</span>
+                <span>90% (Fast Scan)</span>
+              </div>
+
+              <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.4, margin: 0 }}>
+                Worker uses duty-cycle throttling to sleep proportional to work time. Guarantees {100 - (serviceStatus?.maxCpuPercent ?? 40)}%+ CPU remains available for smooth desktop responsiveness.
+              </p>
+            </div>
+
+            {/* Setting 2: Max Background RAM Ceiling */}
+            <div style={{
+              backgroundColor: 'var(--bg-card)',
+              border: '1px solid var(--border-subtle)',
+              borderRadius: 'var(--radius-md)',
+              padding: '16px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '12px',
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <label style={{ fontSize: '0.88rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <Server size={16} color="var(--accent-cyan)" />
+                  Max Background RAM Ceiling
+                </label>
+                <span style={{
+                  backgroundColor: 'rgba(56, 189, 248, 0.15)',
+                  color: 'var(--accent-cyan)',
+                  padding: '2px 8px',
+                  borderRadius: '12px',
+                  fontSize: '0.82rem',
+                  fontWeight: 700,
+                  fontFamily: 'monospace',
+                }}>
+                  {serviceStatus?.maxRamMb ?? 1024} MB
+                </span>
+              </div>
+
+              <select
+                className="input-field"
+                value={serviceStatus?.maxRamMb ?? 1024}
+                onChange={(e) => handleToggleSetting('maxRamMb', parseInt(e.target.value, 10))}
+                style={{ width: '100%', padding: '8px 12px', fontSize: '0.88rem' }}
+              >
+                <option value={512}>512 MB (Economy / Low-spec PCs)</option>
+                <option value={768}>768 MB</option>
+                <option value={1024}>1024 MB / 1 GB (Recommended Default)</option>
+                <option value={1536}>1536 MB / 1.5 GB</option>
+                <option value={2048}>2048 MB / 2 GB (High-End Workstation)</option>
+                <option value={4096}>4096 MB / 4 GB (Maximum Throughput)</option>
+              </select>
+
+              <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.4, margin: 0 }}>
+                Guards process RSS memory and Sharp image cache. If usage exceeds 85% of ceiling, memory buffers are aggressively flushed; if 100% is reached, the worker pauses automatically to prevent paging.
+              </p>
+            </div>
+          </div>
+
+          {/* Real-time Hardware Telemetry & Progress Dashboard */}
+          <div style={{
+            backgroundColor: 'var(--bg-surface-elevated)',
+            border: '1px solid var(--border-subtle)',
+            borderRadius: 'var(--radius-md)',
+            padding: '16px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '14px',
+          }}>
+            <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <Activity size={16} color="var(--accent-cyan)" />
+              Live Resource Telemetry & Pre-Cache Progress
+            </div>
+
+            {/* Progress Gauges Grid */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '16px' }}>
+              
+              {/* CPU Live Meter */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.78rem' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>Background CPU Usage:</span>
+                  <span style={{ fontWeight: 600, fontFamily: 'monospace', color: (serviceStatus?.currentCpuPercent || 0) > (serviceStatus?.maxCpuPercent || 40) ? '#ef4444' : 'var(--accent-cyan)' }}>
+                    {serviceStatus?.currentCpuPercent ?? 0}% (Cap: {serviceStatus?.maxCpuPercent ?? 40}%)
+                  </span>
+                </div>
+                <div style={{ height: '8px', backgroundColor: 'rgba(255,255,255,0.08)', borderRadius: '4px', overflow: 'hidden' }}>
+                  <div style={{
+                    height: '100%',
+                    width: `${Math.min(100, serviceStatus?.currentCpuPercent || 0)}%`,
+                    backgroundColor: (serviceStatus?.currentCpuPercent || 0) > (serviceStatus?.maxCpuPercent || 40) ? '#ef4444' : 'var(--accent-cyan)',
+                    transition: 'width 0.4s ease',
+                  }} />
+                </div>
+              </div>
+
+              {/* RAM Live Meter */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.78rem' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>Background RAM Usage:</span>
+                  <span style={{ fontWeight: 600, fontFamily: 'monospace', color: (serviceStatus?.currentRamMb || 0) > (serviceStatus?.maxRamMb || 1024) * 0.9 ? '#ef4444' : '#10b981' }}>
+                    {serviceStatus?.currentRamMb ?? 0} MB / {serviceStatus?.maxRamMb ?? 1024} MB
+                  </span>
+                </div>
+                <div style={{ height: '8px', backgroundColor: 'rgba(255,255,255,0.08)', borderRadius: '4px', overflow: 'hidden' }}>
+                  <div style={{
+                    height: '100%',
+                    width: `${Math.min(100, Math.round(((serviceStatus?.currentRamMb || 0) / Math.max(1, serviceStatus?.maxRamMb || 1024)) * 100))}%`,
+                    backgroundColor: (serviceStatus?.currentRamMb || 0) > (serviceStatus?.maxRamMb || 1024) * 0.9 ? '#ef4444' : '#10b981',
+                    transition: 'width 0.4s ease',
+                  }} />
+                </div>
+              </div>
+            </div>
+
+            {/* Thumbnail Cache Progress Bar */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', paddingTop: '4px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.78rem' }}>
+                <span style={{ color: 'var(--text-muted)' }}>
+                  Thumbnail Cache Progress:
+                </span>
+                <span style={{ fontWeight: 600, fontFamily: 'monospace', color: 'var(--text-primary)' }}>
+                  {serviceStatus?.thumbnailsPreCachedCount ?? 0} of {serviceStatus?.thumbnailsPreCachedTotal ?? 0} photos cached (
+                  {Math.round(((serviceStatus?.thumbnailsPreCachedCount || 0) / Math.max(1, serviceStatus?.thumbnailsPreCachedTotal || 1)) * 100)}%)
+                </span>
+              </div>
+              <div style={{ height: '10px', backgroundColor: 'rgba(255,255,255,0.08)', borderRadius: '5px', overflow: 'hidden' }}>
+                <div style={{
+                  height: '100%',
+                  width: `${Math.min(100, Math.round(((serviceStatus?.thumbnailsPreCachedCount || 0) / Math.max(1, serviceStatus?.thumbnailsPreCachedTotal || 1)) * 100))}%`,
+                  background: 'linear-gradient(90deg, var(--accent-cyan), #10b981)',
+                  transition: 'width 0.4s ease',
+                }} />
+              </div>
+            </div>
           </div>
         </div>
 

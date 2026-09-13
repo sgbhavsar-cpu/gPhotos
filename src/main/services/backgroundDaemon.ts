@@ -6,6 +6,7 @@ import { BackgroundServiceStatus, BackgroundServiceSettings, VirtualStorageConfi
 import { scanDirectoryRecursive } from './fileOrganizer';
 import { parsePhotoMetadata } from './exifParser';
 import { generateThumbnailBuffer } from './virtualMirrorService';
+import { thumbnailWorker } from './thumbnailWorkerService';
 
 let tray: Tray | null = null;
 let syncTimer: NodeJS.Timeout | null = null;
@@ -13,12 +14,15 @@ let isScanningNow = false;
 let activeScanStorage: string | undefined = undefined;
 let isQuitting = false;
 
-// Default background service settings
+// Default background service settings with 40% CPU cap and 1GB RAM cap
 let serviceSettings: BackgroundServiceSettings = {
   runAtStartup: false,
   minimizeToTray: true,
   isPaused: false,
   syncIntervalMinutes: 15,
+  maxCpuPercent: 40,
+  maxRamMb: 1024,
+  enableThumbnailPreCache: true,
 };
 
 let lastSyncTime: string | undefined = undefined;
@@ -38,6 +42,11 @@ function loadSavedSettings() {
       const data = JSON.parse(fs.readFileSync(storePath, 'utf-8'));
       if (data['gphotos_service_settings_v1']) {
         serviceSettings = { ...serviceSettings, ...data['gphotos_service_settings_v1'] };
+        thumbnailWorker.setResourceLimits({
+          maxCpuPercent: serviceSettings.maxCpuPercent,
+          maxRamMb: serviceSettings.maxRamMb,
+          enabled: serviceSettings.enableThumbnailPreCache,
+        });
       }
       if (data['gphotos_service_last_sync']) {
         lastSyncTime = data['gphotos_service_last_sync'];
@@ -512,6 +521,8 @@ export function getBackgroundServiceStatus(): BackgroundServiceStatus {
     ? (isRunning ? 'running' : 'stopped')
     : 'not_installed';
 
+  const workerStatus = thumbnailWorker.getStatus();
+
   return {
     isRunning: true,
     isPaused: serviceSettings.isPaused,
@@ -525,6 +536,14 @@ export function getBackgroundServiceStatus(): BackgroundServiceStatus {
     systemServiceStatus: status,
     systemServicePid: pid,
     executionMode: isInstalled && isRunning ? 'system_service' : 'app_thread',
+    maxCpuPercent: serviceSettings.maxCpuPercent ?? 40,
+    maxRamMb: serviceSettings.maxRamMb ?? 1024,
+    enableThumbnailPreCache: serviceSettings.enableThumbnailPreCache ?? true,
+    currentCpuPercent: workerStatus.cpuPercent,
+    currentRamMb: workerStatus.ramMb,
+    thumbnailsPreCachedCount: workerStatus.current,
+    thumbnailsPreCachedTotal: workerStatus.total,
+    isPreCachingActive: workerStatus.isRunning,
   };
 }
 
@@ -539,6 +558,14 @@ export function updateBackgroundServiceSettings(
       openAsHidden: true,
     });
   }
+
+  // Update resource throttling limits for the background thumbnail worker
+  thumbnailWorker.setResourceLimits({
+    maxCpuPercent: serviceSettings.maxCpuPercent,
+    maxRamMb: serviceSettings.maxRamMb,
+    enabled: serviceSettings.enableThumbnailPreCache,
+  });
+
   saveSettings();
   if (mainWindow && !mainWindow.isDestroyed()) {
     updateTrayMenu(mainWindow);

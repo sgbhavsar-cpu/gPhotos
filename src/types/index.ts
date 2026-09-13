@@ -316,6 +316,16 @@ export interface IElectronAPI {
   getCatalogPage: (params: { pageIndex: number; pageSize?: number; libraryDir?: string }) => Promise<{ photos: Photo[]; totalPages: number; totalPhotos: number }>;
   switchLibrary: (targetPath: string) => Promise<{ meta: CatalogMeta; firstPage: Photo[] }>;
   getSpriteCoordinate?: (photoPath: string) => Promise<SpriteCoordinate | null>;
+  getThumbnailPreCacheStatus?: () => Promise<{
+    isRunning: boolean;
+    current: number;
+    total: number;
+    cpuPercent: number;
+    ramMb: number;
+    paused: boolean;
+  }>;
+  startThumbnailPreCache?: (photos?: Photo[]) => Promise<{ started: boolean }>;
+  pauseThumbnailPreCache?: () => Promise<{ paused: boolean }>;
 }
 
 export interface TimelineMonthSummary {
@@ -394,6 +404,14 @@ export interface BackgroundServiceStatus {
   systemServiceStatus?: 'running' | 'stopped' | 'not_installed';
   systemServicePid?: number;
   executionMode?: 'system_service' | 'app_thread';
+  maxCpuPercent?: number;
+  maxRamMb?: number;
+  enableThumbnailPreCache?: boolean;
+  currentCpuPercent?: number;
+  currentRamMb?: number;
+  thumbnailsPreCachedCount?: number;
+  thumbnailsPreCachedTotal?: number;
+  isPreCachingActive?: boolean;
 }
 
 export interface BackgroundServiceSettings {
@@ -402,6 +420,9 @@ export interface BackgroundServiceSettings {
   isPaused: boolean;
   syncIntervalMinutes: number;
   systemServiceInstalled?: boolean;
+  maxCpuPercent?: number; // Cap background CPU usage (default: 40%)
+  maxRamMb?: number; // Cap background RAM usage in MB (default: 1024 MB / 1 GB)
+  enableThumbnailPreCache?: boolean; // Pre-cache thumbnails in background (default: true)
 }
 
 declare global {

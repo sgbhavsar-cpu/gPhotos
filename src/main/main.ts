@@ -57,6 +57,7 @@ import {
   getSpriteCoordinate,
   getSpritePath,
 } from './services/spriteService';
+import { thumbnailWorker } from './services/thumbnailWorkerService';
 
 app.name = 'gPhotos';
 app.setName('gPhotos');
@@ -582,6 +583,10 @@ ipcMain.handle('scanner:scan-directory', async (_event, dirPath: string): Promis
       }
     }
 
+    if (photos.length > 0) {
+      thumbnailWorker.enqueuePhotos(photos);
+    }
+
     return photos;
   } catch (err) {
     console.error(`Failed to scan directory ${dirPath}:`, err);
@@ -657,6 +662,8 @@ ipcMain.handle('storage:save', async (_event, key: string, data: any) => {
         albums: data.albums,
         people: data.people,
       }).catch((err) => console.warn('[CatalogService] Auto-indexing on save failed:', err));
+
+      thumbnailWorker.enqueuePhotos(data.photos);
     }
 
     return true;
@@ -704,7 +711,11 @@ ipcMain.handle(
 
 ipcMain.handle('catalog:switch-library', async (_event, targetPath: string) => {
   try {
-    return await switchCatalogLibrary(targetPath);
+    const res = await switchCatalogLibrary(targetPath);
+    if (res && res.firstPage && res.firstPage.length > 0) {
+      thumbnailWorker.enqueuePhotos(res.firstPage);
+    }
+    return res;
   } catch (err) {
     console.error('catalog:switch-library error:', err);
     return null;
@@ -1067,6 +1078,36 @@ ipcMain.handle('service:get-logs', async () => {
   } catch (err) {
     console.error('service:get-logs error:', err);
     return [];
+  }
+});
+
+// Resource-Throttled Background Thumbnail Pre-Caching Handlers
+ipcMain.handle('service:get-precache-status', async () => {
+  try {
+    return thumbnailWorker.getStatus();
+  } catch (err) {
+    return { isRunning: false, paused: false, current: 0, total: 0, cpuPercent: 0, ramMb: 0 };
+  }
+});
+
+ipcMain.handle('service:start-precache', async (_event, photos?: Photo[]) => {
+  try {
+    if (photos && photos.length > 0) {
+      thumbnailWorker.enqueuePhotos(photos);
+    }
+    thumbnailWorker.resume();
+    return { started: true };
+  } catch (err: any) {
+    return { started: false, error: err.message };
+  }
+});
+
+ipcMain.handle('service:pause-precache', async () => {
+  try {
+    thumbnailWorker.pause();
+    return { paused: true };
+  } catch (err: any) {
+    return { paused: false, error: err.message };
   }
 });
 

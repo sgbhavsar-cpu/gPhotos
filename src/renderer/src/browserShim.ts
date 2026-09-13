@@ -237,5 +237,15 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
       } catch {}
       return null;
     },
+    getThumbnailPreCacheStatus: async () => ({
+      isRunning: false,
+      paused: false,
+      current: 0,
+      total: 0,
+      cpuPercent: 0,
+      ramMb: 0,
+    }),
+    startThumbnailPreCache: async () => ({ started: true }),
+    pauseThumbnailPreCache: async () => ({ paused: true }),
   };
 }
