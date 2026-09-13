@@ -56,6 +56,13 @@ import {
   updateEmbeddedWebServerSettings,
   loadSavedWebServerSettings,
 } from './services/embeddedWebServer';
+import {
+  getOrCreatePin,
+  regeneratePin,
+  listDevices,
+  revokeDevice,
+  revokeAllDevices,
+} from './services/webAuthService';
 import { getOrGenerateCachedThumbnail, clearThumbnailCache, refreshThumbnailsFromSource } from './services/thumbnailCacheService';
 import {
   getCatalogMeta,
@@ -603,6 +610,16 @@ ipcMain.handle('scanner:scan-directory', async (_event, dirPath: string): Promis
         const meta = await parsePhotoMetadata(filePath);
         const date = new Date(meta.dateTaken);
 
+        let isHeicRotated = false;
+        let heicRotation = 0;
+        if (/\.(heic|heif)$/i.test(filePath)) {
+          try {
+            const { getHeicSavedRotation } = require('./services/heicRotationStore');
+            heicRotation = getHeicSavedRotation(filePath);
+            isHeicRotated = heicRotation !== 0;
+          } catch {}
+        }
+
         const photo: Photo = {
           id: Buffer.from(filePath).toString('base64'),
           filePath,
@@ -618,6 +635,9 @@ ipcMain.handle('scanner:scan-directory', async (_event, dirPath: string): Promis
           exif: meta.exif,
           location: meta.location,
           isFavorite: false,
+          isHeicRotated: isHeicRotated ? true : undefined,
+          heicRotation: isHeicRotated ? heicRotation : undefined,
+          rotation: isHeicRotated ? heicRotation : undefined,
         };
 
         photos.push(photo);
@@ -680,74 +700,82 @@ ipcMain.handle('file:read-base64', async (_event, filePath: string) => {
   }
 });
 
+// Serialized save queue to guarantee atomic sequential writes without race conditions
+let savePromiseQueue: Promise<boolean> = Promise.resolve(true);
+
 ipcMain.handle('storage:save', async (_event, key: string, data: any) => {
-  try {
-    const storePath = getStoragePath();
-    let currentData: Record<string, any> = {};
-    if (fs.existsSync(storePath)) {
-      try {
-        currentData = JSON.parse(await fs.promises.readFile(storePath, 'utf-8'));
-      } catch (parseErr) {
-        console.warn('Failed to parse existing library.json, starting fresh:', parseErr);
-      }
-    }
-    // Merge guard: protect library data against inadvertent wiping or truncation
-    if (key === 'gphotos_library_v1' && data) {
-      const existingLib = currentData['gphotos_library_v1'];
-      if (existingLib) {
-        // If incoming photos is a small slice from catalog pagination, merge updates into existingLib.photos
-        if (
-          Array.isArray(data.photos) &&
-          Array.isArray(existingLib.photos) &&
-          existingLib.photos.length > data.photos.length &&
-          data.photos.length <= 100
-        ) {
-          const incomingMap = new Map(data.photos.map((p: any) => [p.id, p]));
-          data.photos = existingLib.photos.map((ep: any) => incomingMap.get(ep.id) || ep);
-        }
-        // Guard: do not wipe existing people if incoming has empty people but existing had people
-        if (
-          (!data.people || data.people.length === 0) &&
-          existingLib.people &&
-          existingLib.people.length > 0
-        ) {
-          data.people = existingLib.people;
-        }
-        // Guard: do not wipe existing faces if incoming has empty faces but existing had faces
-        if (
-          (!data.faces || data.faces.length === 0) &&
-          existingLib.faces &&
-          existingLib.faces.length > 0
-        ) {
-          data.faces = existingLib.faces;
+  const op = async (): Promise<boolean> => {
+    try {
+      const storePath = getStoragePath();
+      let currentData: Record<string, any> = {};
+      if (fs.existsSync(storePath)) {
+        try {
+          currentData = JSON.parse(await fs.promises.readFile(storePath, 'utf-8'));
+        } catch (parseErr) {
+          console.warn('Failed to parse existing library.json, starting fresh:', parseErr);
         }
       }
+      // Merge guard: protect library data against inadvertent wiping or truncation
+      if (key === 'gphotos_library_v1' && data) {
+        const existingLib = currentData['gphotos_library_v1'];
+        if (existingLib) {
+          // If incoming photos is a small slice from catalog pagination, merge updates into existingLib.photos
+          if (
+            Array.isArray(data.photos) &&
+            Array.isArray(existingLib.photos) &&
+            existingLib.photos.length > data.photos.length &&
+            data.photos.length <= 100
+          ) {
+            const incomingMap = new Map(data.photos.map((p: any) => [p.id, p]));
+            data.photos = existingLib.photos.map((ep: any) => incomingMap.get(ep.id) || ep);
+          }
+          // Guard: do not wipe existing people if incoming has empty people but existing had people
+          if (
+            (!data.people || data.people.length === 0) &&
+            existingLib.people &&
+            existingLib.people.length > 0
+          ) {
+            data.people = existingLib.people;
+          }
+          // Guard: do not wipe existing faces if incoming has empty faces but existing had faces
+          if (
+            (!data.faces || data.faces.length === 0) &&
+            existingLib.faces &&
+            existingLib.faces.length > 0
+          ) {
+            data.faces = existingLib.faces;
+          }
+        }
+      }
+
+      currentData[key] = data;
+      const tempPath = `${storePath}.tmp`;
+      await fs.promises.writeFile(tempPath, JSON.stringify(currentData, null, 2), 'utf-8');
+      await fs.promises.rename(tempPath, storePath);
+
+      // Asynchronously update 500K catalog index in background without blocking response
+      if (key === 'gphotos_library_v1' && data && Array.isArray(data.photos)) {
+        buildAndSaveCatalog(data.photos, {
+          recentLibraries: data.recentLibraries,
+          selectedFolder: data.selectedFolder,
+          currentDirectory: data.currentDirectory,
+          albums: data.albums,
+          people: data.people,
+        }).catch((err) => console.warn('[CatalogService] Auto-indexing on save failed:', err));
+
+        const libPath = data.selectedFolder || data.currentDirectory;
+        thumbnailWorker.enqueuePhotos(data.photos, libPath);
+      }
+
+      return true;
+    } catch (err) {
+      console.error('Failed to save library data:', err);
+      return false;
     }
+  };
 
-    currentData[key] = data;
-    const tempPath = `${storePath}.tmp`;
-    await fs.promises.writeFile(tempPath, JSON.stringify(currentData, null, 2), 'utf-8');
-    await fs.promises.rename(tempPath, storePath);
-
-    // Asynchronously update 500K catalog index in background without blocking response
-    if (key === 'gphotos_library_v1' && data && Array.isArray(data.photos)) {
-      buildAndSaveCatalog(data.photos, {
-        recentLibraries: data.recentLibraries,
-        selectedFolder: data.selectedFolder,
-        currentDirectory: data.currentDirectory,
-        albums: data.albums,
-        people: data.people,
-      }).catch((err) => console.warn('[CatalogService] Auto-indexing on save failed:', err));
-
-      const libPath = data.selectedFolder || data.currentDirectory;
-      thumbnailWorker.enqueuePhotos(data.photos, libPath);
-    }
-
-    return true;
-  } catch (err) {
-    console.error('Failed to save library data:', err);
-    return false;
-  }
+  savePromiseQueue = savePromiseQueue.then(op, op);
+  return savePromiseQueue;
 });
 
 ipcMain.handle('storage:load', async (_event, key: string) => {
@@ -1468,6 +1496,47 @@ ipcMain.handle('webserver:set-settings', async (_event, settings: { enabled: boo
       allUrls: [],
       error: err.message,
     };
+  }
+});
+
+ipcMain.handle('webserver:get-pin', () => {
+  try {
+    return { pin: getOrCreatePin() };
+  } catch (err: any) {
+    return { pin: '', error: err.message };
+  }
+});
+
+ipcMain.handle('webserver:regenerate-pin', () => {
+  try {
+    return { pin: regeneratePin() };
+  } catch (err: any) {
+    return { pin: '', error: err.message };
+  }
+});
+
+ipcMain.handle('webserver:list-devices', () => {
+  try {
+    return listDevices();
+  } catch {
+    return [];
+  }
+});
+
+ipcMain.handle('webserver:revoke-device', (_event, deviceId: string) => {
+  try {
+    return { success: revokeDevice(deviceId) };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('webserver:revoke-all-devices', () => {
+  try {
+    revokeAllDevices();
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err.message };
   }
 });
 

@@ -47,6 +47,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
   onScanStorageFaces,
 }) => {
   const [storages, setStorages] = useState<VirtualStorageConfig[]>([]);
+  const [isLoadingStorages, setIsLoadingStorages] = useState(true);
   const storagesRef = useRef<VirtualStorageConfig[]>([]);
   storagesRef.current = storages;
 
@@ -88,68 +89,83 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
 
   // Load configured storages & auto-discover on-disk mirrors
   useEffect(() => {
+    let isMounted = true;
     const load = async () => {
-      let unlinked: string[] = [];
-      if (window.electronAPI) {
-        unlinked = (await window.electronAPI.loadLibraryData(UNLINKED_STORAGES_KEY)) || [];
-      } else if (typeof localStorage !== 'undefined') {
-        const raw = localStorage.getItem(UNLINKED_STORAGES_KEY);
-        if (raw) unlinked = JSON.parse(raw);
-      }
-      const unlinkedSet = new Set(unlinked.map((n) => n.toLowerCase()));
+      setIsLoadingStorages(true);
+      try {
+        let unlinked: string[] = [];
+        if (window.electronAPI) {
+          unlinked = (await window.electronAPI.loadLibraryData(UNLINKED_STORAGES_KEY)) || [];
+        } else if (typeof localStorage !== 'undefined') {
+          const raw = localStorage.getItem(UNLINKED_STORAGES_KEY);
+          if (raw) unlinked = JSON.parse(raw);
+        }
+        const unlinkedSet = new Set(unlinked.map((n) => n.toLowerCase()));
 
-      let saved: VirtualStorageConfig[] | null = null;
-      if (window.electronAPI) {
-        saved = await window.electronAPI.loadLibraryData(STORAGE_CONFIGS_KEY);
-      }
-      if (!saved && typeof localStorage !== 'undefined') {
-        const raw = localStorage.getItem(STORAGE_CONFIGS_KEY);
-        if (raw) saved = JSON.parse(raw);
-      }
-      let combined: VirtualStorageConfig[] = saved
-        ? [...saved].filter((s) => !unlinkedSet.has(s.name.toLowerCase()))
-        : [];
+        let saved: VirtualStorageConfig[] | null = null;
+        if (window.electronAPI) {
+          saved = await window.electronAPI.loadLibraryData(STORAGE_CONFIGS_KEY);
+        }
+        if (!saved && typeof localStorage !== 'undefined') {
+          const raw = localStorage.getItem(STORAGE_CONFIGS_KEY);
+          if (raw) saved = JSON.parse(raw);
+        }
+        let combined: VirtualStorageConfig[] = saved
+          ? [...saved].filter((s) => !unlinkedSet.has(s.name.toLowerCase()))
+          : [];
 
-      // Auto-discover mirrors on disk (e.g. C:\GPhotos_VirtualMirrors or existing localMirrorRoot)
-      if (window.electronAPI?.discoverMirrors) {
-        try {
-          const discovered = await window.electronAPI.discoverMirrors(localMirrorRoot);
-          if (discovered && discovered.length > 0) {
-            for (const disc of discovered) {
-              if (unlinkedSet.has(disc.name.toLowerCase())) continue; // Skip unlinked/deleted mirrors!
+        // Auto-discover mirrors on disk (e.g. C:\GPhotos_VirtualMirrors or existing localMirrorRoot)
+        if (window.electronAPI?.discoverMirrors) {
+          try {
+            const discovered = await window.electronAPI.discoverMirrors(localMirrorRoot);
+            if (discovered && discovered.length > 0) {
+              for (const disc of discovered) {
+                if (unlinkedSet.has(disc.name.toLowerCase())) continue; // Skip unlinked/deleted mirrors!
 
-              const existingIdx = combined.findIndex(
-                (s) => s.name.toLowerCase() === disc.name.toLowerCase() || s.id === disc.id
-              );
-              if (existingIdx === -1) {
-                combined.push(disc);
-              } else {
-                combined[existingIdx] = {
-                  ...combined[existingIdx],
-                  totalItems: disc.totalItems || combined[existingIdx].totalItems,
-                  totalSizeSaved: disc.totalSizeSaved || combined[existingIdx].totalSizeSaved,
-                  lastSynced: combined[existingIdx].lastSynced || disc.lastSynced,
-                };
+                const existingIdx = combined.findIndex(
+                  (s) => s.name.toLowerCase() === disc.name.toLowerCase() || s.id === disc.id
+                );
+                if (existingIdx === -1) {
+                  combined.push(disc);
+                } else {
+                  combined[existingIdx] = {
+                    ...combined[existingIdx],
+                    totalItems: disc.totalItems || combined[existingIdx].totalItems,
+                    totalSizeSaved: disc.totalSizeSaved || combined[existingIdx].totalSizeSaved,
+                    lastSynced: combined[existingIdx].lastSynced || disc.lastSynced,
+                  };
+                }
               }
             }
+          } catch (discErr) {
+            console.warn('Failed to auto-discover mirrors:', discErr);
           }
-        } catch (discErr) {
-          console.warn('Failed to auto-discover mirrors:', discErr);
         }
-      }
 
-      storagesRef.current = combined;
-      setStorages(combined);
-      if (onStoragesUpdated) onStoragesUpdated(combined);
-      if (window.electronAPI) {
-        await window.electronAPI.saveLibraryData(STORAGE_CONFIGS_KEY, combined);
-        if (window.electronAPI.getBackgroundServiceStatus) {
-          const status = await window.electronAPI.getBackgroundServiceStatus();
-          setServiceStatus(status);
+        if (isMounted) {
+          storagesRef.current = combined;
+          setStorages(combined);
+          if (onStoragesUpdated) onStoragesUpdated(combined);
+        }
+        if (window.electronAPI) {
+          await window.electronAPI.saveLibraryData(STORAGE_CONFIGS_KEY, combined);
+          if (window.electronAPI.getBackgroundServiceStatus) {
+            const status = await window.electronAPI.getBackgroundServiceStatus();
+            if (isMounted) setServiceStatus(status);
+          }
+        }
+      } catch (err) {
+        console.error('Failed to load virtual storages:', err);
+      } finally {
+        if (isMounted) {
+          setIsLoadingStorages(false);
         }
       }
     };
     load();
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
   // Listen to mirror sync progress
@@ -734,10 +750,31 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
       {/* Configured Storages List */}
       <div style={{ maxWidth: '860px' }}>
         <h3 style={{ fontSize: '1.1rem', fontWeight: 700, marginBottom: '16px' }}>
-          Configured Storages ({storages.length})
+          Configured Storages {isLoadingStorages ? '' : `(${storages.length})`}
         </h3>
 
-        {storages.length === 0 ? (
+        {isLoadingStorages ? (
+          <div style={{
+            padding: '48px 32px',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: '12px',
+            backgroundColor: 'var(--bg-surface)',
+            borderRadius: 'var(--radius-md)',
+            border: '1px solid var(--border-subtle)',
+            color: 'var(--text-secondary)',
+          }}>
+            <RefreshCw size={26} className="animate-spin" color="var(--accent-primary)" />
+            <div style={{ fontSize: '0.95rem', fontWeight: 600, color: 'var(--text-primary)' }}>
+              Loading storage configurations...
+            </div>
+            <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+              Checking connected network drives and virtual mirror directories
+            </div>
+          </div>
+        ) : storages.length === 0 ? (
           <div style={{
             padding: '32px',
             textAlign: 'center',
@@ -885,28 +922,31 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                     const details = storageDetailsMap[s.name] || storageDetailsMap[s.id];
                     const prog = storageProgressMap[s.name] || storageProgressMap[s.id];
 
-                    const totalPhotos = Math.max(
+                    const rawTotal = Math.max(
                       s.totalItems || 0,
-                      details?.totalPhotos || 0,
-                      prog?.thumbnailTotal || 0,
-                      prog?.faceTotal || 0
+                      details?.totalPhotos || 0
                     );
+                    const totalPhotos = rawTotal > 0
+                      ? rawTotal
+                      : Math.max(prog?.thumbnailTotal || 0, prog?.faceTotal || 0);
 
                     // Thumbnail stats
-                    const cachedThumbnails = prog?.thumbnailCurrent !== undefined && (prog.phase === 'thumbnails' || prog.phase === 'interrupted' || prog.phase === 'completed')
+                    const rawCached = prog?.thumbnailCurrent !== undefined && (prog.phase === 'thumbnails' || prog.phase === 'interrupted' || prog.phase === 'completed')
                       ? prog.thumbnailCurrent
                       : (details?.cachedThumbnails !== undefined ? details.cachedThumbnails : (s.totalItems || 0));
-                    const thumbTotal = prog?.thumbnailTotal || totalPhotos;
+                    const cachedThumbnails = totalPhotos > 0 ? Math.min(rawCached, totalPhotos) : rawCached;
+                    const thumbTotal = totalPhotos;
                     const thumbPercent = thumbTotal > 0
                       ? Math.min(100, Math.round((cachedThumbnails / thumbTotal) * 100))
                       : (cachedThumbnails > 0 ? 100 : 0);
                     const isThumbActive = prog?.phase === 'thumbnails' || (isSyncing && activeSyncStorageId === s.id);
 
                     // Face stats
-                    const facesScanned = prog?.faceCurrent !== undefined && (prog.phase === 'faces' || prog.phase === 'completed')
+                    const rawFaces = prog?.faceCurrent !== undefined && (prog.phase === 'faces' || prog.phase === 'completed')
                       ? prog.faceCurrent
                       : (details?.facesScannedCount !== undefined ? details.facesScannedCount : 0);
-                    const faceTotal = prog?.faceTotal || totalPhotos;
+                    const facesScanned = totalPhotos > 0 ? Math.min(rawFaces, totalPhotos) : rawFaces;
+                    const faceTotal = totalPhotos;
                     const facePercent = faceTotal > 0
                       ? Math.min(100, Math.round((facesScanned / faceTotal) * 100))
                       : (facesScanned > 0 && facesScanned >= faceTotal ? 100 : 0);

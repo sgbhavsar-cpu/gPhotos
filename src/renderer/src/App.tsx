@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Sidebar, ActiveTab } from './components/Sidebar';
 import { GalleryView } from './views/GalleryView';
 import { AlbumsView } from './views/AlbumsView';
@@ -19,7 +19,7 @@ import { MobileMenuDrawer } from './components/MobileMenuDrawer';
 import { libraryStore, LibraryState, getLocalPhotoUrl } from './services/libraryStore';
 import { detectFacesInImage, loadFaceModels } from './services/faceEngine';
 import { faceQueue } from './services/faceQueue';
-import { Photo, DetectedFace, VirtualStorageConfig, BackgroundScanProgress, NetworkStorageProgress } from '../types';
+import { Photo, DetectedFace, VirtualStorageConfig, BackgroundScanProgress, NetworkStorageProgress, DuplicateCluster } from '../types';
 import { AiPhotoFilter } from './services/aiSearchService';
 import { RefreshCw, CheckCircle2, X } from 'lucide-react';
 import { ResponseActivityIndicator } from './components/ResponseActivityIndicator';
@@ -35,6 +35,7 @@ export const App: React.FC = () => {
   const [toastMessage, setToastMessage] = useState<{ message: string; type?: 'info' | 'success' | 'warning' } | null>(null);
   const [selectedFolderForTree, setSelectedFolderForTree] = useState<string | null>(null);
   const [showDuplicateCleaner, setShowDuplicateCleaner] = useState(false);
+  const [duplicateCleanerCluster, setDuplicateCleanerCluster] = useState<DuplicateCluster | null>(null);
   const [showHelpModal, setShowHelpModal] = useState(false);
   const [showAiAssistant, setShowAiAssistant] = useState(false);
   const [showLibrarySwitcher, setShowLibrarySwitcher] = useState(false);
@@ -53,10 +54,56 @@ export const App: React.FC = () => {
     }
   }, [activeTab]);
 
+  // Stop background tasks immediately (called on Navigation click or Escape key press)
+  const stopBackgroundTasksImmediately = useCallback(() => {
+    try {
+      console.log('[IdleControl] User interacted/navigated/pressed Esc: Stopping background tasks immediately');
+      if (!faceQueue.getStatus().isPaused) {
+        faceQueue.pause();
+      }
+      if (window.electronAPI?.pauseThumbnailPreCache) {
+        window.electronAPI.pauseThumbnailPreCache().catch(() => {});
+      }
+    } catch (e) {
+      console.warn('[IdleControl] Error stopping background tasks:', e);
+    }
+  }, []);
+
+  // Start / resume background tasks (called when user is idle for 15s)
+  const startBackgroundTasks = useCallback(async () => {
+    try {
+      const currentPhotos = libraryStore.getState().photos || [];
+      if (currentPhotos.length === 0) return;
+
+      console.log('[IdleControl] User idle for 15s: Auto-starting background caching and face detection...');
+
+      // 1. Resume / start background thumbnail pre-caching
+      if (window.electronAPI?.startThumbnailPreCache) {
+        window.electronAPI.startThumbnailPreCache(currentPhotos).catch(() => {});
+      }
+
+      // 2. Resume / enqueue face detection queue
+      const unscannedPhotos = currentPhotos.filter(
+        (p) => !p.faceScanCompleted && (!p.faces || p.faces.length === 0)
+      );
+      if (unscannedPhotos.length > 0) {
+        faceQueue.enqueue(unscannedPhotos);
+      }
+      if (faceQueue.getStatus().isPaused) {
+        faceQueue.resume();
+      }
+    } catch (e) {
+      console.warn('[IdleControl] Error starting background tasks:', e);
+    }
+  }, []);
+
   // Global Escape key navigation handler
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
+
+      // Stop background tasks immediately when Esc key is pressed
+      stopBackgroundTasksImmediately();
 
       // 1. Close lightbox if active
       if (activeLightboxPhoto) {
@@ -67,6 +114,7 @@ export const App: React.FC = () => {
       // 2. Close global modals
       if (showDuplicateCleaner) {
         setShowDuplicateCleaner(false);
+        setDuplicateCleanerCluster(null);
         return;
       }
       if (showHelpModal) {
@@ -126,61 +174,39 @@ export const App: React.FC = () => {
     selectedFolderForTree,
     selectedPersonIdForView,
     activeTab,
+    stopBackgroundTasksImmediately,
   ]);
 
-  // 30-Second Auto-Resume for Thumbnail Pre-Caching & Face Detection Queue
+  // 15-Second Idle Inactivity Detector & Auto-Resume Handler
   useEffect(() => {
-    const timer = setTimeout(async () => {
-      console.log('[AutoResume] 30s elapsed after startup: Auto-resuming caching & face detection queues...');
+    let idleTimer: any = null;
 
-      // 1. Resume / start background thumbnail pre-caching
-      const currentPhotos = libraryStore.getState().photos;
-      if (window.electronAPI?.startThumbnailPreCache && currentPhotos.length > 0) {
-        window.electronAPI.startThumbnailPreCache(currentPhotos).catch(() => {});
-      }
+    const resetIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        startBackgroundTasks();
+      }, 15000);
+    };
 
-      // 2. Resume background face detection queue
-      if (faceQueue.getStatus().isPaused) {
-        faceQueue.resume();
-      }
-      const unscannedPhotos = currentPhotos.filter(
-        (p) => !p.faceScanCompleted && (!p.faces || p.faces.length === 0)
-      );
-      if (unscannedPhotos.length > 0) {
-        faceQueue.enqueue(unscannedPhotos);
-      } else {
-        faceQueue.resume();
-      }
+    const handleUserActivity = () => {
+      resetIdleTimer();
+    };
 
-      // 3. If library has no photos yet, check configured virtual storages/mirrors and auto-load
-      if (currentPhotos.length === 0 && window.electronAPI?.scanVirtualMirror) {
-        let configs: VirtualStorageConfig[] = virtualStorages;
-        if (configs.length === 0 && window.electronAPI.loadLibraryData) {
-          configs = (await window.electronAPI.loadLibraryData('gphotos_virtual_storages_v1')) || [];
-        }
-        if (configs.length > 0) {
-          const target = configs.find((s) => (s.totalItems || 0) > 0) || configs[0];
-          if (target) {
-            const mirrorPath = `${target.localMirrorRoot}\\${target.name}`;
-            try {
-              const mirrored = await window.electronAPI.scanVirtualMirror(mirrorPath);
-              if (mirrored && mirrored.length > 0) {
-                libraryStore.setPhotos(mirrored, mirrorPath);
-                if (window.electronAPI.startThumbnailPreCache) {
-                  window.electronAPI.startThumbnailPreCache(mirrored).catch(() => {});
-                }
-                faceQueue.enqueue(mirrored);
-              }
-            } catch (err) {
-              console.warn('[AutoResume] Failed to auto-load mirrored photos:', err);
-            }
-          }
-        }
-      }
-    }, 30000);
+    const activityEvents = ['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart', 'scroll'];
+    activityEvents.forEach((evt) => {
+      window.addEventListener(evt, handleUserActivity, { passive: true });
+    });
 
-    return () => clearTimeout(timer);
-  }, [virtualStorages]);
+    // Start 15s idle timer
+    resetIdleTimer();
+
+    return () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      activityEvents.forEach((evt) => {
+        window.removeEventListener(evt, handleUserActivity);
+      });
+    };
+  }, [startBackgroundTasks]);
 
   const showToast = (message: string, type: 'info' | 'success' | 'warning' = 'info') => {
     setToastMessage({ message, type });
@@ -408,19 +434,22 @@ export const App: React.FC = () => {
               const name = st.libraryName || 'Library';
               const isCompleted = st.thumbnailCompleted && st.faceCompleted;
               const phase = isCompleted ? 'completed' : 'interrupted';
+              const safeTotal = st.totalPhotos || 1;
+              const safeThumb = Math.min(st.thumbnailCachedCount, safeTotal);
+              const safeFaces = Math.min(st.faceScannedCount, safeTotal);
               if (!next[name] || next[name].phase === 'idle' || next[name].phase === 'interrupted') {
                 next[name] = {
                   storageName: name,
                   phase,
-                  thumbnailCurrent: st.thumbnailCachedCount,
-                  thumbnailTotal: st.thumbnailTotalCount || st.totalPhotos,
-                  faceCurrent: st.faceScannedCount,
-                  faceTotal: st.faceTotalCount || st.totalPhotos,
-                  percent: Math.min(100, Math.round(((st.thumbnailCachedCount + st.faceScannedCount) / Math.max(1, st.totalPhotos * 2)) * 100)),
+                  thumbnailCurrent: safeThumb,
+                  thumbnailTotal: safeTotal,
+                  faceCurrent: safeFaces,
+                  faceTotal: safeTotal,
+                  percent: Math.min(100, Math.round(((safeThumb + safeFaces) / Math.max(1, safeTotal * 2)) * 100)),
                   currentFile: st.thumbnailLastFile || st.faceLastFile,
                   message: isCompleted
                     ? '✓ 100% Caching & Face Scan Complete'
-                    : `Cached: ${st.thumbnailCachedCount}/${st.totalPhotos} • Faces: ${st.faceScannedCount}/${st.totalPhotos}. Ready to resume.`,
+                    : `Cached: ${safeThumb}/${safeTotal} • Faces: ${safeFaces}/${safeTotal}. Ready to resume.`,
                   canResume: !isCompleted,
                 };
               }
@@ -846,74 +875,20 @@ export const App: React.FC = () => {
     await runFaceDetectionForPhotos(enriched, true, storage.name);
   };
 
-  // 30-Second Auto-Resume on Startup: Resumes background caching and face detection without user intervention
-  useEffect(() => {
-    const autoResumeTimer = setTimeout(async () => {
-      console.log('[AUTO-RESUME] 30 seconds elapsed since startup. Checking for background tasks to auto-resume...');
-
-      const currentPhotos = libraryStore.getState().photos || [];
-      const isCurrentlyScanning = libraryStore.getState().isScanning;
-      const isCurrentlyDetecting = libraryStore.getState().isDetectingFaces;
-
-      // 1. Auto-resume thumbnail pre-caching if photos exist
-      if (currentPhotos.length > 0 && window.electronAPI?.startThumbnailPreCache) {
-        try {
-          console.log(`[AUTO-RESUME] Resuming thumbnail pre-caching for ${currentPhotos.length} photos...`);
-          window.electronAPI.startThumbnailPreCache(currentPhotos).catch(() => {});
-        } catch (err) {
-          console.warn('[AUTO-RESUME] Thumbnail pre-cache resume error:', err);
-        }
-      }
-
-      // 2. Auto-resume face detection if unscanned photos exist
-      if (!isCurrentlyScanning && !isCurrentlyDetecting && currentPhotos.length > 0) {
-        const unscanned = currentPhotos.filter(
-          (p) => !p.faceScanCompleted && (!p.faces || p.faces.length === 0)
-        );
-        if (unscanned.length > 0) {
-          console.log(`[AUTO-RESUME] Resuming background face detection for ${unscanned.length} unscanned photos...`);
-          runFaceDetectionForPhotos(currentPhotos, false).catch((err) => {
-            console.warn('[AUTO-RESUME] Face detection resume error:', err);
-          });
-        }
-      }
-
-      // 3. Auto-resume any interrupted network storages
-      if (window.electronAPI?.getAllLibraryStatuses) {
-        try {
-          const statuses = await window.electronAPI.getAllLibraryStatuses();
-          const storages = (await window.electronAPI.listVirtualStorages?.()) || [];
-          for (const st of statuses) {
-            if (!st.thumbnailCompleted || !st.faceCompleted) {
-              const matchedStorage = storages.find(
-                (s: any) => s.networkSourcePath === st.libraryPath || s.name === st.libraryName
-              );
-              if (matchedStorage && !isCurrentlyScanning) {
-                console.log(`[AUTO-RESUME] Auto-resuming interrupted storage: ${matchedStorage.name}`);
-                handleRefreshNetworkStorage(matchedStorage);
-                break;
-              }
-            }
-          }
-        } catch (err) {
-          console.warn('[AUTO-RESUME] Storage status resume check error:', err);
-        }
-      }
-    }, 30000); // 30 seconds
-
-    return () => {
-      clearTimeout(autoResumeTimer);
-    };
-  }, []);
-
   const [tabResetTrigger, setTabResetTrigger] = useState<number>(0);
 
   const handleSelectTab = (tab: ActiveTab) => {
+    stopBackgroundTasksImmediately();
     responseTracker.clearAll();
     setSelectedPersonIdForView(null);
     setSelectedFolderForTree(null);
     setTabResetTrigger(Date.now());
     setActiveTab(tab);
+  };
+
+  const handleOpenDuplicateCleaner = (cluster?: DuplicateCluster | null) => {
+    setDuplicateCleanerCluster(cluster || null);
+    setShowDuplicateCleaner(true);
   };
 
   return (
@@ -929,7 +904,7 @@ export const App: React.FC = () => {
           selectedFolder={libraryState.selectedFolder}
           onOpenLibrarySwitcher={() => setShowLibrarySwitcher(true)}
           onOpenAiAssistant={() => setShowAiAssistant(true)}
-          onOpenDuplicateCleaner={() => setShowDuplicateCleaner(true)}
+          onOpenDuplicateCleaner={() => handleOpenDuplicateCleaner()}
           onToggleDrawer={() => setShowMobileDrawer(true)}
         />
       ) : (
@@ -944,7 +919,7 @@ export const App: React.FC = () => {
           storageProgressMap={storageProgressMap}
           onSelectStorage={handleSelectVirtualStorage}
           onRefreshStorage={handleRefreshNetworkStorage}
-          onOpenDuplicateCleaner={() => setShowDuplicateCleaner(true)}
+          onOpenDuplicateCleaner={() => handleOpenDuplicateCleaner()}
           onOpenHelp={() => setShowHelpModal(true)}
           onOpenAiAssistant={() => setShowAiAssistant(true)}
           onOpenLibrarySwitcher={() => setShowLibrarySwitcher(true)}
@@ -971,7 +946,7 @@ export const App: React.FC = () => {
             onRefreshNetwork={() => handleRefreshNetworkStorage()}
             virtualStorages={virtualStorages}
             onSelectStorage={handleSelectVirtualStorage}
-            onOpenDuplicateCleaner={() => setShowDuplicateCleaner(true)}
+            onOpenDuplicateCleaner={handleOpenDuplicateCleaner}
             onOpenHelp={() => setShowHelpModal(true)}
             onOpenAiSearch={() => setShowAiAssistant(true)}
             activeAiFilter={activeAiFilter}
@@ -994,7 +969,7 @@ export const App: React.FC = () => {
             filterFavorite={true}
             virtualStorages={virtualStorages}
             onSelectStorage={handleSelectVirtualStorage}
-            onOpenDuplicateCleaner={() => setShowDuplicateCleaner(true)}
+            onOpenDuplicateCleaner={handleOpenDuplicateCleaner}
             onOpenHelp={() => setShowHelpModal(true)}
             resetTrigger={tabResetTrigger}
           />
@@ -1100,7 +1075,11 @@ export const App: React.FC = () => {
       {showDuplicateCleaner && (
         <DuplicateCleanerModal
           photos={libraryState.photos}
-          onClose={() => setShowDuplicateCleaner(false)}
+          initialCluster={duplicateCleanerCluster}
+          onClose={() => {
+            setShowDuplicateCleaner(false);
+            setDuplicateCleanerCluster(null);
+          }}
         />
       )}
 

@@ -264,14 +264,21 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
         </div>
 
         <div style={{ flex: 1, overflowY: 'auto', padding: '12px 16px' }}>
-          {rootNodes.map((root) => (
-            <TreeNodeItem
-              key={root.path}
-              node={root}
-              selectedPath={selectedFolderPath}
-              onSelectFolder={handleSelectFolder}
-            />
-          ))}
+          {rootNodes.length === 0 ? (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '16px 8px', color: 'var(--text-muted)', fontSize: '0.82rem' }}>
+              <RefreshCw className="animate-spin" size={14} />
+              <span>Loading folder structure...</span>
+            </div>
+          ) : (
+            rootNodes.map((root) => (
+              <TreeNodeItem
+                key={root.path}
+                node={root}
+                selectedPath={selectedFolderPath}
+                onSelectFolder={handleSelectFolder}
+              />
+            ))
+          )}
         </div>
       </aside>
 
@@ -326,6 +333,11 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
             <div style={{ textAlign: 'center', padding: '60px', color: 'var(--text-muted)' }}>
               <RefreshCw className="animate-spin" size={28} style={{ margin: '0 auto 12px' }} />
               <p>Reading direct image files on network storage...</p>
+            </div>
+          ) : (!selectedFolderPath && rootNodes.length === 0) ? (
+            <div style={{ textAlign: 'center', padding: '60px', color: 'var(--text-muted)' }}>
+              <RefreshCw className="animate-spin" size={28} style={{ margin: '0 auto 12px' }} />
+              <p>Loading folder structure...</p>
             </div>
           ) : folderPhotos.length === 0 ? (
             <div style={{ textAlign: 'center', padding: '60px', color: 'var(--text-muted)' }}>

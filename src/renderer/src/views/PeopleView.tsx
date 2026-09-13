@@ -834,42 +834,96 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
       {/* People Grid */}
       <div style={{ flex: 1, overflowY: 'auto', padding: '24px' }}>
         {people.length === 0 ? (
-          <div style={{
-            height: '70%',
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            justifyContent: 'center',
-            textAlign: 'center',
-          }}>
+          !libraryStore.getState().isInitialized ? (
             <div style={{
-              width: '64px',
-              height: '64px',
-              borderRadius: 'var(--radius-full)',
-              backgroundColor: 'rgba(236, 72, 153, 0.12)',
+              height: '70%',
               display: 'flex',
+              flexDirection: 'column',
               alignItems: 'center',
               justifyContent: 'center',
-              marginBottom: '16px',
-              color: '#ec4899',
+              textAlign: 'center',
+              gap: '14px',
             }}>
-              <Users size={32} />
+              <div
+                className="spinner"
+                style={{
+                  width: '36px',
+                  height: '36px',
+                  border: '3px solid rgba(236, 72, 153, 0.2)',
+                  borderTopColor: '#ec4899',
+                  borderRadius: '50%',
+                  animation: 'spin 1s linear infinite',
+                }}
+              />
+              <span style={{ color: 'var(--text-muted)', fontSize: '0.95rem' }}>Loading recognized people...</span>
             </div>
-            <h3 style={{ fontSize: '1.2rem', fontWeight: 700, marginBottom: '6px' }}>
-              No Faces Recognized Yet
-            </h3>
-            <p style={{ color: 'var(--text-muted)', maxWidth: '400px', fontSize: '0.85rem', marginBottom: '20px' }}>
-              Run local on-device face recognition on your library. Our AI will automatically detect faces, compute 128-D biometric embeddings, and group them into people virtual albums.
-            </p>
-            <button
-              className="btn btn-primary"
-              onClick={onTriggerFaceDetection}
-              disabled={isDetectingFaces || photos.length === 0}
-            >
-              <Sparkles size={16} />
-              <span>Run Face Detection</span>
-            </button>
-          </div>
+          ) : isDetectingFaces ? (
+            <div style={{
+              height: '70%',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              textAlign: 'center',
+            }}>
+              <div style={{
+                width: '64px',
+                height: '64px',
+                borderRadius: 'var(--radius-full)',
+                backgroundColor: 'rgba(236, 72, 153, 0.15)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                marginBottom: '16px',
+                color: '#ec4899',
+              }}>
+                <Sparkles size={32} className="animate-spin" />
+              </div>
+              <h3 style={{ fontSize: '1.2rem', fontWeight: 700, marginBottom: '6px' }}>
+                Detecting & Grouping Faces...
+              </h3>
+              <p style={{ color: 'var(--text-secondary)', maxWidth: '400px', fontSize: '0.85rem' }}>
+                Face recognition is scanning photos, extracting biometric vectors, and clustering recognized individuals. People albums will appear automatically as faces are identified.
+              </p>
+            </div>
+          ) : (
+            <div style={{
+              height: '70%',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              textAlign: 'center',
+            }}>
+              <div style={{
+                width: '64px',
+                height: '64px',
+                borderRadius: 'var(--radius-full)',
+                backgroundColor: 'rgba(236, 72, 153, 0.12)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                marginBottom: '16px',
+                color: '#ec4899',
+              }}>
+                <Users size={32} />
+              </div>
+              <h3 style={{ fontSize: '1.2rem', fontWeight: 700, marginBottom: '6px' }}>
+                No Faces Recognized Yet
+              </h3>
+              <p style={{ color: 'var(--text-muted)', maxWidth: '400px', fontSize: '0.85rem', marginBottom: '20px' }}>
+                Run local on-device face recognition on your library. Our AI will automatically detect faces, compute 128-D biometric embeddings, and group them into people virtual albums.
+              </p>
+              <button
+                className="btn btn-primary"
+                onClick={onTriggerFaceDetection}
+                disabled={isDetectingFaces || photos.length === 0}
+              >
+                <Sparkles size={16} />
+                <span>Run Face Detection</span>
+              </button>
+            </div>
+          )
         ) : (
           <div style={{
             display: 'grid',

@@ -478,6 +478,37 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
     }
   };
 
+  const isInitialized = libraryStore.getState().isInitialized;
+  if (!isInitialized && photos.length === 0) {
+    return (
+      <div
+        style={{
+          flex: 1,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          height: '100%',
+          gap: '14px',
+          color: 'var(--text-muted)',
+        }}
+      >
+        <div
+          className="spinner"
+          style={{
+            width: '36px',
+            height: '36px',
+            border: '3px solid rgba(56, 189, 248, 0.2)',
+            borderTopColor: '#38bdf8',
+            borderRadius: '50%',
+            animation: 'spin 1s linear infinite',
+          }}
+        />
+        <span style={{ fontSize: '0.95rem' }}>Loading map and geotagged places...</span>
+      </div>
+    );
+  }
+
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', position: 'relative', overflow: 'hidden' }}>
       {/* Sleek Top Navigation Header */}

@@ -209,3 +209,55 @@ export function identifyDuplicateClusters(
 
 export const findDuplicateAndBurstClusters = identifyDuplicateClusters;
 export const scorePhotoClarityAndExpression = calculatePhotoQualityScore;
+
+/**
+ * Creates a single duplicate/burst cluster from a user-selected group of photos,
+ * scoring each photo's sharpness, clarity, expression, and resolution to identify the best shot.
+ */
+export function createClusterFromSelectedPhotos(selectedPhotos: Photo[]): DuplicateCluster | null {
+  if (!selectedPhotos || selectedPhotos.length < 2) return null;
+
+  // Deduplicate physical files by canonical path
+  const uniqueMap = new Map<string, Photo>();
+  for (const p of selectedPhotos) {
+    if (p.isExcluded) continue;
+    const key = getPhotoCanonicalKey(p);
+    if (!uniqueMap.has(key)) {
+      uniqueMap.set(key, p);
+    }
+  }
+
+  const group = Array.from(uniqueMap.values());
+  if (group.length < 2) return null;
+
+  const scoresMap: DuplicateCluster['scores'] = {};
+  let bestPhotoId = group[0].id;
+  let highestScore = -1;
+  let bestReasons: string[] = [];
+
+  for (const item of group) {
+    const scoreData = calculatePhotoQualityScore(item);
+    scoresMap[item.id] = {
+      totalScore: scoreData.totalScore,
+      sharpnessScore: scoreData.sharpnessScore,
+      expressionScore: scoreData.expressionScore,
+      eyeOpenScore: scoreData.eyeOpenScore,
+      resolutionScore: scoreData.resolutionScore,
+    };
+
+    if (scoreData.totalScore > highestScore) {
+      highestScore = scoreData.totalScore;
+      bestPhotoId = item.id;
+      bestReasons = scoreData.reasons;
+    }
+  }
+
+  return {
+    id: `cluster_selected_${Date.now()}`,
+    clusterType: group.length >= 3 ? 'burst' : 'similar',
+    photos: group,
+    bestPhotoId,
+    bestReason: bestReasons.length > 0 ? bestReasons.join(' • ') : '⭐ Best overall quality & sharpness',
+    scores: scoresMap,
+  };
+}

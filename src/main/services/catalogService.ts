@@ -278,6 +278,22 @@ export async function getCatalogPage(
     try {
       const raw = await fs.promises.readFile(chunkFile, 'utf8');
       const photos: Photo[] = JSON.parse(raw);
+      for (const p of photos) {
+        if (!p.isHeicRotated) {
+          const target = p.originalRemotePath || p.filePath || '';
+          if (/\.(heic|heif)$/i.test(target)) {
+            try {
+              const { getHeicSavedRotation } = require('./heicRotationStore');
+              const rot = getHeicSavedRotation(target);
+              if (rot !== 0) {
+                p.isHeicRotated = true;
+                p.heicRotation = rot;
+                p.rotation = rot;
+              }
+            } catch {}
+          }
+        }
+      }
       const meta = await getCatalogMeta(customDir);
       return {
         photos,

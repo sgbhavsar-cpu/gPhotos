@@ -77,6 +77,8 @@ export interface Photo {
   faceScanCompleted?: boolean;
   sharpnessScore?: number;
   rotation?: number;
+  isHeicRotated?: boolean;
+  heicRotation?: number;
 }
 
 export interface FolderTreeNode {
@@ -172,6 +174,9 @@ export interface VirtualPhotoMetadata {
   location?: LocationMetadata;
   faces?: DetectedFace[];
   faceScanCompleted?: boolean;
+  rotation?: number;
+  isHeicRotated?: boolean;
+  heicRotation?: number;
 }
 
 export interface MirrorProgress {
@@ -333,7 +338,7 @@ export interface IElectronAPI {
   editPhoto: (options: EditPhotoOptions) => Promise<EditPhotoResult>;
   trashFiles: (filePaths: string[]) => Promise<{ success: boolean; trashedCount: number; errors: string[] }>;
   deleteFilesPermanently: (filePaths: string[]) => Promise<{ success: boolean; deletedCount: number; errors: string[] }>;
-  rotatePhoto: (filePath: string, rotationDegrees: number, originalRemotePath?: string) => Promise<{ success: boolean; isQueued?: boolean; newPath?: string; message?: string; error?: string }>;
+  rotatePhoto: (filePath: string, rotationDegrees: number, originalRemotePath?: string) => Promise<{ success: boolean; isQueued?: boolean; newPath?: string; message?: string; error?: string; isHeic?: boolean; isHeicRotated?: boolean; heicRotation?: number; rotation?: number }>;
   processPendingRotations?: () => Promise<{ processed: number; remaining: number; error?: string }>;
   deleteVirtualStorage: (params: { storageName: string; localMirrorRoot?: string; deleteDiskFiles: boolean }) => Promise<{ success: boolean; error?: string }>;
 
@@ -358,6 +363,11 @@ export interface IElectronAPI {
   openItemInFolder: (filePath: string) => Promise<boolean>;
   getWebServerStatus: () => Promise<WebServerStatus>;
   setWebServerSettings: (settings: { enabled: boolean; port: number }) => Promise<WebServerStatus>;
+  getWebServerPin?: () => Promise<{ pin: string; error?: string }>;
+  regenerateWebServerPin?: () => Promise<{ pin: string; error?: string }>;
+  listPairedDevices?: () => Promise<PairedDeviceInfo[]>;
+  revokePairedDevice?: (deviceId: string) => Promise<{ success: boolean; error?: string }>;
+  revokeAllPairedDevices?: () => Promise<{ success: boolean; error?: string }>;
   prepareHeicHq?: (filePath: string, photoId: string) => Promise<string | null>;
   cleanupHeicHq?: (photoId: string) => Promise<boolean>;
   getBatchThumbnails: (params: {
@@ -455,6 +465,13 @@ export interface SpriteCoordinate {
   height: number;
   sheetWidth: number;
   sheetHeight: number;
+}
+
+export interface PairedDeviceInfo {
+  id: string;
+  label: string;
+  createdAt: string;
+  lastSeenAt: string;
 }
 
 export interface WebServerStatus {

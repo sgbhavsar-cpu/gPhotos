@@ -40,6 +40,8 @@ import { FaceAvatar } from './FaceAvatar';
 import { ReassignFaceModal } from './ReassignFaceModal';
 import { PersonNameInput } from './PersonNameInput';
 import { detectFacesInImage, computeDescriptorForBox } from '../services/faceEngine';
+import { evictAndRefreshThumbnail } from '../services/asyncImageLoader';
+import { authFetch } from '../services/webAuthClient';
 
 function getExpressionEmoji(expr?: string): string {
   if (!expr) return '';
@@ -639,8 +641,54 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          {/* Edit photo button (available when local or online source, disabled for HEIC) */}
-          {(!photo.isVirtual || isOriginalAvailable) && !isHeic && (
+          {/* Quick Rotate button (rotates photo or local HEIC thumbnail) */}
+          <button
+            className="btn btn-secondary"
+            onClick={async () => {
+              const localPath = photo.filePath;
+              const remotePath = photo.originalRemotePath;
+              try {
+                let res: any = null;
+                if (window.electronAPI?.rotatePhoto) {
+                  res = await window.electronAPI.rotatePhoto(localPath, 90, remotePath);
+                } else {
+                  const fetchRes = await authFetch('/api/rotate-photo', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filePath: localPath, originalRemotePath: remotePath, rotationDegrees: 90 }),
+                  });
+                  if (fetchRes.ok) res = await fetchRes.json();
+                }
+
+                // If HEIC photo, flag and persist updated rotation to libraryStore
+                const isTargetHeic = /\.(heic|heif)$/i.test(localPath) || /\.(heic|heif)$/i.test(remotePath || '');
+                if (res?.isHeic || isTargetHeic || res?.isHeicRotated) {
+                  const newRot = res?.heicRotation ?? (((photo.heicRotation || photo.rotation || 0) + 90) % 360);
+                  libraryStore.updatePhoto({
+                    ...photo,
+                    isHeicRotated: newRot !== 0,
+                    heicRotation: newRot,
+                    rotation: newRot,
+                  });
+                }
+
+                setEditRotation((r) => (r + 90) % 360);
+                evictAndRefreshThumbnail(photo.thumbnailPath || photo.filePath, remotePath, 500);
+                setScanStatusMessage('✓ Rotated 90° clockwise');
+                setTimeout(() => setScanStatusMessage(null), 2500);
+              } catch (err: any) {
+                console.error('[PhotoLightbox] Rotate error:', err);
+              }
+            }}
+            style={{ fontSize: '0.8rem', gap: '6px' }}
+            title="Rotate photo 90° clockwise"
+          >
+            <RotateCw size={15} />
+            <span>Rotate</span>
+          </button>
+
+          {/* Edit photo button (available when local or online source, or virtual mirror) */}
+          {(!photo.isVirtual || isOriginalAvailable || isHeic) && (
             <button
               className={`btn ${isEditing ? 'btn-primary' : 'btn-secondary'}`}
               onClick={() => {
@@ -651,7 +699,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                 }
               }}
               style={{ fontSize: '0.8rem', gap: '6px' }}
-              title="Rotate, flip, or edit photo when source is available"
+              title="Rotate, flip, or edit photo"
             >
               <Edit2 size={15} />
               <span>{isEditing ? 'Exit Edit' : 'Edit'}</span>

@@ -3,7 +3,13 @@ import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
 import { app } from 'electron';
-import { getHeicHighQualityJpegBuffer, getOrGenerateHeicThumbnail500, purgeHeicCache } from './heicService';
+import {
+  getHeicHighQualityJpegBuffer,
+  getOrGenerateHeicThumbnail500,
+  purgeHeicCache,
+  rotateHeic500Thumbnail,
+} from './heicService';
+import { getHeicSavedRotation, saveHeicSavedRotation } from './heicRotationStore';
 
 let sharp: any = null;
 try {
@@ -141,10 +147,14 @@ export async function getOrGenerateCachedThumbnail(
 
       // A. For HEIC images
       if (isHeic) {
+        const extraRot = getHeicSavedRotation(sourcePath);
         if (sharp) {
           try {
-            thumbBuffer = await sharp(sourcePath)
-              .rotate()
+            let sharpPipeline = sharp(sourcePath).rotate();
+            if (extraRot !== 0) {
+              sharpPipeline = sharpPipeline.rotate(extraRot);
+            }
+            thumbBuffer = await sharpPipeline
               .resize(targetSize, targetSize, { fit: 'inside', withoutEnlargement: true })
               .jpeg({ quality: targetSize > 500 ? 86 : 82 })
               .toBuffer();
@@ -352,5 +362,86 @@ export async function refreshThumbnailsFromSource(
   }
 
   return { refreshedCount, errors };
+}
+
+/**
+ * Rotates all existing cached thumbnails on disk for a HEIC image,
+ * updates the persistent HEIC rotation store, and ensures fresh rotated thumbnails are saved.
+ * Returns the resulting total rotation degrees (0, 90, 180, 270).
+ */
+export async function rotateCachedHeicThumbnail(
+  sourcePath: string,
+  degrees: number,
+  secondaryPath?: string
+): Promise<number> {
+  if (!sourcePath) return 0;
+
+  // Determine all paths that represent this image (e.g. local mirror thumbnail + original remote path)
+  const pathsToRotate = new Set<string>();
+  pathsToRotate.add(sourcePath);
+  if (secondaryPath) pathsToRotate.add(secondaryPath);
+
+  // Check if sourcePath has sidecar metadata specifying originalFilePath
+  try {
+    const sidecarPath = sourcePath.replace(/\.[^/.]+$/, '.json');
+    if (fs.existsSync(sidecarPath)) {
+      const meta = JSON.parse(fs.readFileSync(sidecarPath, 'utf-8'));
+      if (meta.originalFilePath) {
+        pathsToRotate.add(meta.originalFilePath);
+      }
+    }
+  } catch {}
+
+  let totalRotation = 0;
+  const root = getGlobalCacheDir();
+  const knownSizes = [150, 200, 250, 300, 500, 1600];
+
+  for (const target of pathsToRotate) {
+    // 1. Record delta rotation in persistent store
+    totalRotation = saveHeicSavedRotation(target, degrees);
+
+    // 2. Rotate all existing cached thumbnail files in cache/thumbnails/{size}/{cacheKey}.jpg
+    let stat: fs.Stats | null = null;
+    try {
+      stat = await fs.promises.stat(target);
+    } catch {}
+
+    if (stat) {
+      for (const size of knownSizes) {
+        const cacheKey = getCacheKey(target, stat.mtimeMs, size);
+        const cachedFilePath = path.join(root, `${size}`, `${cacheKey}.jpg`);
+
+        if (fs.existsSync(cachedFilePath)) {
+          try {
+            if (sharp) {
+              const buf = await fs.promises.readFile(cachedFilePath);
+              const rotated = await sharp(buf)
+                .rotate(degrees)
+                .jpeg({ quality: size > 500 ? 86 : 82, mozjpeg: true })
+                .toBuffer();
+              await fs.promises.writeFile(cachedFilePath, rotated);
+            }
+          } catch (err) {
+            console.warn(`[ThumbnailCache] Failed to rotate existing cached thumbnail ${cachedFilePath}:`, err);
+          }
+        }
+      }
+    }
+
+    // 3. Rotate 500px thumbnail in heicService
+    try {
+      await rotateHeic500Thumbnail(target, degrees);
+    } catch (err) {
+      console.warn('[ThumbnailCache] Failed to rotate heicService thumbnail:', err);
+    }
+
+    // 4. Pre-generate and cache 250px and 500px thumbnails immediately so they exist rotated
+    try {
+      await getOrGenerateCachedThumbnail(target, 250);
+      await getOrGenerateCachedThumbnail(target, 500);
+    } catch {}
+  }
+
+  return totalRotation;
 }
 

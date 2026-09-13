@@ -671,6 +671,9 @@ export function scanVirtualMirrorDirectory(mirrorDirPath: string): Photo[] {
                 isFavorite: false,
                 faces,
                 faceScanCompleted,
+                rotation: meta.rotation,
+                isHeicRotated: meta.isHeicRotated,
+                heicRotation: meta.heicRotation,
               };
 
               photos.push(photo);
@@ -940,6 +943,23 @@ export async function editPhotoFile(options: EditPhotoOptions): Promise<EditPhot
 
   const ext = path.extname(targetPath).toLowerCase();
   if (ext === '.heic' || ext === '.heif') {
+    const thumbTarget = options.mirrorThumbnailPath || (options.filePath !== targetPath ? options.filePath : null);
+    if (thumbTarget && fs.existsSync(thumbTarget) && options.base64Data) {
+      try {
+        const cleaned = options.base64Data.replace(/^data:image\/\w+;base64,/, '');
+        const outputBuffer = Buffer.from(cleaned, 'base64');
+        fs.writeFileSync(thumbTarget, outputBuffer);
+        return {
+          success: true,
+          newPhoto: {
+            filePath: thumbTarget,
+            originalRemotePath: targetPath,
+          } as any,
+        };
+      } catch (e: any) {
+        return { success: false, error: e.message };
+      }
+    }
     return {
       success: false,
       error: 'Direct editing of HEIC/HEIF images is not supported. Please export or convert to JPEG/PNG to edit.',
@@ -1125,11 +1145,29 @@ export async function rotatePhotoFile(
     }
 
     const ext = path.extname(filePath).toLowerCase();
-    if (ext === '.heic' || ext === '.heif') {
-      return {
-        success: false,
-        error: 'Direct lossless rotation of HEIC/HEIF images is not supported. Please export or convert to JPEG/PNG to rotate.',
-      };
+    let isRawHeic = ext === '.heic' || ext === '.heif';
+
+    // Check if the file buffer is actually a JPEG/WebP thumbnail (often named after source photo)
+    const inputBuf = fs.readFileSync(filePath);
+    const isJpegBuffer = inputBuf.length > 2 && inputBuf[0] === 0xff && inputBuf[1] === 0xd8;
+    const isWebpBuffer = inputBuf.length > 12 && inputBuf.slice(0, 4).toString() === 'RIFF';
+
+    if (isRawHeic && !isJpegBuffer && !isWebpBuffer) {
+      // Raw HEIC files cannot be re-encoded on Windows with Sharp.
+      // Delegate to rotating multi-tier cached thumbnails and recording in heicRotationStore.
+      try {
+        const { rotateCachedHeicThumbnail } = require('./thumbnailCacheService');
+        await rotateCachedHeicThumbnail(filePath, degrees);
+        return {
+          success: true,
+          newPath: filePath,
+        };
+      } catch (rotErr: any) {
+        return {
+          success: false,
+          error: `Failed rotating cached thumbnail for HEIC: ${rotErr.message}`,
+        };
+      }
     }
 
     // Create .bak backup if it doesn't already exist
@@ -1150,8 +1188,6 @@ export async function rotatePhotoFile(
     try {
       prevMtime = fs.statSync(filePath).mtimeMs;
     } catch {}
-
-    const inputBuf = fs.readFileSync(filePath);
 
     if (sharpLib) {
       outputBuffer = await sharpLib(inputBuf)
@@ -1208,26 +1244,22 @@ export function getPendingRotationsPath(): string {
 }
 
 export function getPendingRotations(): PendingRotationItem[] {
+  const p = getPendingRotationsPath();
+  if (!fs.existsSync(p)) return [];
   try {
-    const p = getPendingRotationsPath();
-    if (fs.existsSync(p)) {
-      const raw = fs.readFileSync(p, 'utf-8');
-      return JSON.parse(raw);
-    }
-  } catch (err) {
-    console.warn('[OfflineRotation] Failed to read pending rotations:', err);
+    const raw = fs.readFileSync(p, 'utf-8');
+    return JSON.parse(raw) || [];
+  } catch {
+    return [];
   }
-  return [];
 }
 
 export function savePendingRotations(items: PendingRotationItem[]): void {
+  const p = getPendingRotationsPath();
   try {
-    const p = getPendingRotationsPath();
-    const dir = path.dirname(p);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(p, JSON.stringify(items, null, 2), 'utf-8');
   } catch (err) {
-    console.error('[OfflineRotation] Failed to save pending rotations:', err);
+    console.warn('[OfflineRotationSync] Failed to save pending rotations:', err);
   }
 }
 
@@ -1308,7 +1340,7 @@ export async function rotatePhotoWithOfflineQueue(params: {
   localFilePath: string;
   originalRemotePath?: string;
   rotationDegrees: number;
-}): Promise<{ success: boolean; isQueued: boolean; newPath?: string; message?: string; error?: string }> {
+}): Promise<{ success: boolean; isQueued: boolean; newPath?: string; message?: string; error?: string; isHeic?: boolean; isHeicRotated?: boolean; heicRotation?: number; rotation?: number }> {
   try {
     const { localFilePath, originalRemotePath, rotationDegrees } = params;
     const degrees = ((rotationDegrees % 360) + 360) % 360;
@@ -1318,11 +1350,75 @@ export async function rotatePhotoWithOfflineQueue(params: {
 
     const targetToCheck = originalRemotePath || localFilePath;
     const ext = path.extname(targetToCheck || '').toLowerCase();
-    if (ext === '.heic' || ext === '.heif') {
+    const isHeicByExtension = ext === '.heic' || ext === '.heif';
+
+    if (isHeicByExtension) {
+      // A Virtual Mirror local thumbnail is always JPEG bytes regardless of the
+      // remote master's real format (the mirror sync pipeline generates a JPEG
+      // preview for every source, HEIC included, and names it after the source
+      // file). So when `originalRemotePath` points at a distinct master file,
+      // `localFilePath` is that JPEG mirror thumbnail and can be rotated in
+      // place like any other image. When there is no separate remote master,
+      // `localFilePath` IS the original file itself, which for a genuine
+      // `.heic`/`.heif` photo is raw HEIC/HEIF container bytes that Sharp
+      // cannot re-encode on this platform — that case must go through the
+      // cache-only rotation path instead.
+      const isMirrorThumbnail = !!originalRemotePath && originalRemotePath !== localFilePath;
+      const isRawHeic = !isMirrorThumbnail;
+
+      const sidecarJson = localFilePath ? localFilePath.replace(/\.[^/.]+$/, '.json') : '';
+      const hasSidecar = !!sidecarJson && fs.existsSync(sidecarJson);
+
+      let totalRot = degrees;
+
+      if (isMirrorThumbnail && localFilePath && fs.existsSync(localFilePath)) {
+        // Physically rotate the real JPEG bytes on disk (also purges
+        // derived thumbnail-cache tiers so they regenerate with the new orientation).
+        await rotatePhotoFile(localFilePath, degrees);
+      } else {
+        // Genuinely raw HEIC/HEIF bytes cannot be re-encoded via Sharp on this
+        // platform. Rotate the multi-tier cached thumbnails instead and record
+        // the rotation persistently so it survives future re-reads.
+        const sourceHeicPath = (originalRemotePath && fs.existsSync(originalRemotePath))
+          ? originalRemotePath
+          : localFilePath;
+        try {
+          const { rotateCachedHeicThumbnail } = require('./thumbnailCacheService');
+          const secondary = (originalRemotePath && originalRemotePath !== localFilePath) ? originalRemotePath : undefined;
+          totalRot = await rotateCachedHeicThumbnail(localFilePath || sourceHeicPath, degrees, secondary);
+        } catch (err) {
+          console.warn('[rotatePhotoWithOfflineQueue] Failed rotating cached HEIC thumbnail:', err);
+        }
+      }
+
+      // Update sidecar metadata JSON if present, for either case above.
+      if (hasSidecar) {
+        try {
+          const meta = JSON.parse(fs.readFileSync(sidecarJson, 'utf-8'));
+          if (degrees === 90 || degrees === 270) {
+            const oldW = meta.width;
+            meta.width = meta.height;
+            meta.height = oldW;
+          }
+          meta.rotation = (((meta.rotation || 0) + degrees) % 360 + 360) % 360;
+          meta.isHeicRotated = meta.rotation !== 0;
+          meta.heicRotation = meta.rotation;
+          if (isMirrorThumbnail) totalRot = meta.rotation;
+          fs.writeFileSync(sidecarJson, JSON.stringify(meta, null, 2), 'utf-8');
+        } catch {}
+      }
+
       return {
-        success: false,
+        success: true,
         isQueued: false,
-        error: 'Direct lossless rotation of HEIC/HEIF images is not supported.',
+        isHeic: isRawHeic,
+        isHeicRotated: totalRot !== 0,
+        heicRotation: totalRot,
+        rotation: totalRot,
+        newPath: localFilePath,
+        message: isMirrorThumbnail
+          ? 'Rotated local mirror thumbnail on disk.'
+          : 'Rotated and cached local thumbnail for HEIC image.',
       };
     }
 

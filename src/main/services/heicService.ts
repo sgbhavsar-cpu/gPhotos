@@ -4,6 +4,7 @@ import os from 'os';
 import crypto from 'crypto';
 import exifr from 'exifr';
 import sharp from 'sharp';
+import { getHeicSavedRotation } from './heicRotationStore';
 
 // In Electron, app.getPath('userData') is used. In Node scripts/fallback, use APPDATA or HOME.
 function getUserDataDir(): string {
@@ -170,13 +171,16 @@ export async function getOrGenerateHeicThumbnail500(filePath: string): Promise<B
     // 3. Generate from HEIC source
     const fileBuffer = fs.readFileSync(filePath);
     const rotationDeg = await detectExifRotation(fileBuffer);
+    const savedRot = getHeicSavedRotation(filePath);
+    const totalRotationDeg = (((rotationDeg + savedRot) % 360) + 360) % 360;
+
     const extracted = await extractRawHeicJpeg(fileBuffer, filePath);
     if (!extracted || !extracted.buffer) return null;
 
-    // Use Sharp to rotate to upright orientation and resize to 500px
+    // Use Sharp to rotate to upright orientation (EXIF + user rotation) and resize to 500px
     let sharpPipeline = sharp(extracted.buffer);
-    if (rotationDeg !== 0) {
-      sharpPipeline = sharpPipeline.rotate(rotationDeg);
+    if (totalRotationDeg !== 0) {
+      sharpPipeline = sharpPipeline.rotate(totalRotationDeg);
     } else {
       sharpPipeline = sharpPipeline.rotate(); // Auto-orient via EXIF
     }
@@ -203,7 +207,7 @@ export async function getOrGenerateHeicThumbnail500(filePath: string): Promise<B
 
 /**
  * Retrieves a high-quality JPEG Buffer for fullscreen photo view (PhotoLightbox) or inspection.
- * Auto-oriented so it is never sideways.
+ * Auto-oriented and rotated according to saved user rotation.
  */
 export async function getHeicHighQualityJpegBuffer(filePath: string): Promise<Buffer | null> {
   if (!fs.existsSync(filePath)) return null;
@@ -217,12 +221,15 @@ export async function getHeicHighQualityJpegBuffer(filePath: string): Promise<Bu
 
     const fileBuffer = fs.readFileSync(filePath);
     const rotationDeg = await detectExifRotation(fileBuffer);
+    const savedRot = getHeicSavedRotation(filePath);
+    const totalRotationDeg = (((rotationDeg + savedRot) % 360) + 360) % 360;
+
     const extracted = await extractRawHeicJpeg(fileBuffer, filePath);
     if (!extracted || !extracted.buffer) return null;
 
     let sharpPipeline = sharp(extracted.buffer);
-    if (rotationDeg !== 0) {
-      sharpPipeline = sharpPipeline.rotate(rotationDeg);
+    if (totalRotationDeg !== 0) {
+      sharpPipeline = sharpPipeline.rotate(totalRotationDeg);
     } else {
       sharpPipeline = sharpPipeline.rotate();
     }
@@ -235,6 +242,53 @@ export async function getHeicHighQualityJpegBuffer(filePath: string): Promise<Bu
     return hqBuffer;
   } catch (err) {
     console.error(`Error getting high-quality JPEG for ${filePath}:`, err);
+    return null;
+  }
+}
+
+/**
+ * Rotates the persistent 500px thumbnail on disk in userData/thumbnails/{hash}_500.jpg,
+ * updates the memory cache, and invalidates any cached HQ buffers.
+ */
+export async function rotateHeic500Thumbnail(filePath: string, degrees: number): Promise<Buffer | null> {
+  if (!fs.existsSync(filePath)) return null;
+
+  try {
+    const hash = getFileCacheHash(filePath);
+    const thumbFileName = `${hash}_500.jpg`;
+    const thumbPath = path.join(getThumbnailsDir(), thumbFileName);
+    const memKey = `thumb500:${hash}`;
+    const hqKey = `hq:${hash}`;
+
+    // Invalidate HQ cache so next request for HQ JPEG decodes fresh with the new rotation
+    memoryCache.delete(hqKey);
+
+    let rotatedBuffer: Buffer | null = null;
+
+    if (fs.existsSync(thumbPath)) {
+      try {
+        const diskBuf = fs.readFileSync(thumbPath);
+        if (diskBuf && diskBuf.length > 0) {
+          rotatedBuffer = await sharp(diskBuf)
+            .rotate(degrees)
+            .jpeg({ quality: 82, mozjpeg: true })
+            .toBuffer();
+          fs.writeFileSync(thumbPath, rotatedBuffer);
+          setMemoryCache(memKey, rotatedBuffer);
+        }
+      } catch (err) {
+        console.warn(`[heicService] Error rotating existing 500px thumbnail ${thumbPath}:`, err);
+      }
+    }
+
+    if (!rotatedBuffer) {
+      // If it didn't exist yet, generate fresh with rotation applied
+      rotatedBuffer = await getOrGenerateHeicThumbnail500(filePath);
+    }
+
+    return rotatedBuffer;
+  } catch (err) {
+    console.error(`[heicService] Error in rotateHeic500Thumbnail for ${filePath}:`, err);
     return null;
   }
 }

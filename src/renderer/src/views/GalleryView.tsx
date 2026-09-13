@@ -28,6 +28,8 @@ import { libraryStore } from '../services/libraryStore';
 import { VirtualizedTimelineGallery, GalleryZoomLevel, ZOOM_LEVELS } from '../components/VirtualizedTimelineGallery';
 import { AiPhotoFilter } from '../services/aiSearchService';
 import { batchThumbnailStore, requestBatchThumbnails } from '../services/asyncImageLoader';
+import { createClusterFromSelectedPhotos } from '../services/deduplication';
+import { authFetch } from '../services/webAuthClient';
 
 interface GalleryViewProps {
   photos: Photo[];
@@ -38,7 +40,7 @@ interface GalleryViewProps {
   filterFavorite?: boolean;
   virtualStorages?: VirtualStorageConfig[];
   onSelectStorage?: (storage: VirtualStorageConfig) => void;
-  onOpenDuplicateCleaner?: () => void;
+  onOpenDuplicateCleaner?: (cluster?: any) => void;
   onOpenHelp?: () => void;
   onOpenAiSearch?: () => void;
   activeAiFilter?: AiPhotoFilter | null;
@@ -137,7 +139,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       if (window.electronAPI?.deleteFilesPermanently) {
         await window.electronAPI.deleteFilesPermanently(filePaths);
       } else {
-        await fetch('/api/delete-files', {
+        await authFetch('/api/delete-files', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ filePaths, permanent: true }),
@@ -232,7 +234,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       if (window.electronAPI?.refreshThumbnailsFromSource) {
         result = await window.electronAPI.refreshThumbnailsFromSource(itemsToRefresh);
       } else {
-        const res = await fetch('/api/thumbnails/refresh-from-source', {
+        const res = await authFetch('/api/thumbnails/refresh-from-source', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ items: itemsToRefresh }),
@@ -729,6 +731,31 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
               <RefreshCw size={16} className={isRefreshingThumbnails ? 'animate-spin' : ''} color="var(--accent-cyan)" />
               <span>{isRefreshingThumbnails ? 'Refreshing...' : `Refresh Cache (${selectedIds.size})`}</span>
             </button>
+
+            {/* Deduplicate & Find Best Shot from Selected Photos */}
+            {selectedIds.size >= 2 && onOpenDuplicateCleaner && (
+              <button
+                className="btn btn-primary"
+                onClick={() => {
+                  const selectedPhotos = photos.filter((p) => selectedIds.has(p.id));
+                  const cluster = createClusterFromSelectedPhotos(selectedPhotos);
+                  onOpenDuplicateCleaner(cluster);
+                }}
+                style={{
+                  fontSize: '0.85rem',
+                  gap: '8px',
+                  padding: '6px 14px',
+                  background: 'linear-gradient(135deg, #6366f1 0%, #a855f7 100%)',
+                  borderColor: '#a855f7',
+                  color: 'white',
+                  fontWeight: 600,
+                }}
+                title="Treat selected photos as one cluster and launch Best Shot finder to compare quality and keep the best"
+              >
+                <Sparkles size={16} />
+                <span>Find Best Shot ({selectedIds.size})</span>
+              </button>
+            )}
 
             {/* Add to Album Button */}
             <button

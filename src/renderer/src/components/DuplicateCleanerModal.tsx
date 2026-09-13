@@ -27,12 +27,14 @@ interface DuplicateCleanerModalProps {
   photos: Photo[];
   onClose: () => void;
   onPhotosDeleted?: (deletedCount: number) => void;
+  initialCluster?: DuplicateCluster | null;
 }
 
 export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
   photos,
   onClose,
   onPhotosDeleted,
+  initialCluster,
 }) => {
   const [clusters, setClusters] = useState<DuplicateCluster[]>([]);
   const [currentClusterIdx, setCurrentClusterIdx] = useState(0);
@@ -46,6 +48,14 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
   const [fullscreenPhoto, setFullscreenPhoto] = useState<Photo | null>(null);
 
   useEffect(() => {
+    if (initialCluster) {
+      setClusters([initialCluster]);
+      setKeptPhotoIds({
+        [initialCluster.id]: new Set([initialCluster.bestPhotoId]),
+      });
+      return;
+    }
+
     const found = identifyDuplicateClusters(photos);
     setClusters(found);
 
@@ -54,7 +64,7 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
       initialKeepers[c.id] = new Set([c.bestPhotoId]);
     }
     setKeptPhotoIds(initialKeepers);
-  }, [photos]);
+  }, [photos, initialCluster]);
 
   const activeCluster = clusters[currentClusterIdx];
 

@@ -1,8 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Heart, MapPin, Users, Check, EyeOff, Image as ImageIcon, ImageOff, RotateCw } from 'lucide-react';
 import { Photo } from '../../types';
-import { getLocalPhotoUrl } from '../services/libraryStore';
+import { getLocalPhotoUrl, libraryStore } from '../services/libraryStore';
 import { useBatchThumbnail, useSpriteCoordinate, getSpriteUrl, batchThumbnailStore, evictAndRefreshThumbnail } from '../services/asyncImageLoader';
+import { authFetch } from '../services/webAuthClient';
 
 interface PhotoCardProps {
   photo: Photo;
@@ -16,7 +17,7 @@ interface PhotoCardProps {
   onCardMouseEnter?: (photoId: string, e: React.MouseEvent) => void;
 }
 
-export const PhotoCard: React.FC<PhotoCardProps> = ({
+const PhotoCardComponent: React.FC<PhotoCardProps> = ({
   photo,
   onClick,
   onToggleFavorite,
@@ -30,8 +31,8 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
   const [isHovered, setIsHovered] = useState(false);
   const [imgElementLoaded, setImgElementLoaded] = useState(false);
 
-  // Instant local visual rotation on thumbnail (0ms latency feedback)
-  const [visualRotation, setVisualRotation] = useState<number>(photo.rotation || 0);
+  // Instant local visual rotation on thumbnail (0ms latency feedback during clicks)
+  const [visualRotation, setVisualRotation] = useState<number>(0);
   const [cacheBuster, setCacheBuster] = useState<number>(0);
   const debounceTimerRef = useRef<any>(null);
   const pendingRotationDeltaRef = useRef<number>(0);
@@ -86,9 +87,11 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
     targetPixelSize
   );
 
+  const isRotated = !!photo.isHeicRotated || (photo.heicRotation || photo.rotation || 0) !== 0;
   const isElectron = typeof window !== 'undefined' && !!(window.electronAPI && !(window.electronAPI as any).isBrowserShim);
-  const displaySrc = batchSrc || (isElectron ? directUrl : null);
-  const hasThumbnail = !!(spriteCoord || displaySrc);
+  const displaySrc = (isRotated ? directUrl : batchSrc) || (isElectron ? directUrl : null);
+  const canUseSprite = !!(spriteCoord && !hasError && !isRotated);
+  const hasThumbnail = !!(canUseSprite || displaySrc);
   const isLoading = !hasThumbnail && isBatchLoading;
   const hasError = !hasThumbnail && isBatchError;
 
@@ -121,7 +124,7 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
         if (window.electronAPI?.rotatePhoto) {
           res = await window.electronAPI.rotatePhoto(localPath, degreesToRotate, remotePath);
         } else {
-          const fetchRes = await fetch('/api/rotate-photo', {
+          const fetchRes = await authFetch('/api/rotate-photo', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -132,9 +135,22 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
           });
           if (fetchRes.ok) res = await fetchRes.json();
         }
+
+        // For HEIC photos: update photo in libraryStore so isHeicRotated and rotation flag persist in library.json
+        const isHeic = /\.(heic|heif)$/i.test(localPath) || /\.(heic|heif)$/i.test(remotePath || '');
+        if (res?.isHeic || isHeic || res?.isHeicRotated) {
+          const newRot = res?.heicRotation ?? (((photo.heicRotation || photo.rotation || 0) + degreesToRotate) % 360);
+          libraryStore.updatePhoto({
+            ...photo,
+            isHeicRotated: newRot !== 0,
+            heicRotation: newRot,
+            rotation: newRot,
+          });
+        }
+
         // Evict and immediately re-request fresh batch thumbnail from backend
         evictAndRefreshThumbnail(photoPath, remotePath, targetPixelSize);
-        // Reset CSS rotation because image file itself is physically rotated
+        // Reset CSS rotation because thumbnail image pixels on disk are now physically rotated
         setVisualRotation(0);
         setCacheBuster(Date.now());
       } catch (err) {
@@ -218,7 +234,7 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
       )}
 
       {/* 1. Ultra-High Performance Static WebP Sprite Tile (0 CPU overhead, 1 transfer for 50 cards) */}
-      {spriteCoord && !hasError && (
+      {canUseSprite && spriteCoord && (
         <div
           title={photo.fileName}
           style={{
@@ -237,11 +253,11 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
       )}
 
       {/* 2. Fallback Batch / Direct Photo Display */}
-      {!spriteCoord && displaySrc && !hasError && (
+      {!canUseSprite && displaySrc && !hasError && (
         <img
           src={
-            cacheBuster && !displaySrc.startsWith('data:')
-              ? `${displaySrc}${displaySrc.includes('?') ? '&' : '?'}cb=${cacheBuster}`
+            (cacheBuster || isRotated) && !displaySrc.startsWith('data:')
+              ? `${displaySrc}${displaySrc.includes('?') ? '&' : '?'}cb=${cacheBuster || photo.heicRotation || photo.rotation || 1}`
               : displaySrc
           }
           alt={photo.fileName}
@@ -291,8 +307,8 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
         </div>
       )}
 
-      {/* Quick Rotate Button on Hover (like checkbox for selection appears) - Hidden for HEIC */}
-      {!isHeic && (isHovered || visualRotation !== 0) && (
+      {/* Quick Rotate Button on Hover (like checkbox for selection appears) - Enabled for all photos including HEIC */}
+      {(isHovered || visualRotation !== 0) && (
         <div
           onClick={handleQuickRotate}
           style={{
@@ -395,6 +411,24 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
               </span>
             ) : null}
 
+            {photo.isHeicRotated && (
+              <span style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '3px',
+                fontSize: '11px',
+                padding: '2px 7px',
+                borderRadius: 'var(--radius-full)',
+                backgroundColor: 'rgba(15, 23, 42, 0.75)',
+                backdropFilter: 'blur(6px)',
+                color: 'var(--accent-primary)',
+                fontWeight: 600,
+              }} title={`HEIC thumbnail rotated ${photo.heicRotation || photo.rotation || 90}°`}>
+                <RotateCw size={10} />
+                HEIC {photo.heicRotation || photo.rotation || 90}°
+              </span>
+            )}
+
             {photo.isExcluded && (
               <span style={{
                 display: 'inline-flex',
@@ -457,3 +491,19 @@ export const PhotoCard: React.FC<PhotoCardProps> = ({
     </div>
   );
 };
+
+export const PhotoCard = React.memo(PhotoCardComponent, (prev, next) => {
+  return (
+    prev.photo.id === next.photo.id &&
+    prev.photo.rotation === next.photo.rotation &&
+    prev.photo.isHeicRotated === next.photo.isHeicRotated &&
+    prev.photo.heicRotation === next.photo.heicRotation &&
+    prev.photo.isFavorite === next.photo.isFavorite &&
+    prev.photo.isExcluded === next.photo.isExcluded &&
+    prev.photo.filePath === next.photo.filePath &&
+    prev.photo.thumbnailPath === next.photo.thumbnailPath &&
+    prev.isSelected === next.isSelected &&
+    prev.isSelectMode === next.isSelectMode &&
+    prev.size === next.size
+  );
+});

@@ -1,6 +1,7 @@
 import { Photo, Person, DetectedFace, PlaceAlbum, Album, CatalogMeta } from '../../types';
 import { groupPhotosByPlace } from './placesService';
 import { trackBackendCall } from './responseTracker';
+import { appendAuthToken, authFetch } from './webAuthClient';
 import {
   clusterFaces,
   euclideanDistance,
@@ -22,6 +23,7 @@ export interface LibraryState {
   faceDetectionProgress: { current: number; total: number } | null;
   catalogMeta?: CatalogMeta | null;
   totalCount?: number;
+  isInitialized?: boolean;
 }
 
 export function deduplicatePhotoList(photos: Photo[]): Photo[] {
@@ -102,7 +104,7 @@ export function getLocalPhotoUrl(
       } else if (size > 0) {
         url += `&size=${size}`;
       }
-      return url;
+      return appendAuthToken(url);
     }
 
     // If running in native Electron
@@ -130,7 +132,7 @@ export function getLocalPhotoUrl(
       } else if (size > 0) {
         url += `&size=${size}`;
       }
-      return url;
+      return appendAuthToken(url);
     }
   }
   return filePath;
@@ -150,6 +152,7 @@ export class LibraryManager {
     faceDetectionProgress: null,
     catalogMeta: null,
     totalCount: 0,
+    isInitialized: false,
   };
 
   private globalFaceCache: Map<string, CachedFaceRecord> = new Map();
@@ -526,6 +529,7 @@ export class LibraryManager {
               }
 
               this.reconcilePeopleAndFaces();
+              this.state.isInitialized = true;
               this.notifyListeners();
               return;
             }
@@ -538,7 +542,7 @@ export class LibraryManager {
       // 2. Web Browser Fast-Path over HTTP
       if (typeof window !== 'undefined' && window.location?.protocol?.startsWith('http')) {
         try {
-          const metaRes = await fetch('/api/catalog-meta', { signal: AbortSignal.timeout(1500) });
+          const metaRes = await authFetch('/api/catalog-meta', { signal: AbortSignal.timeout(1500) });
           if (metaRes.ok) {
             const meta: CatalogMeta = await metaRes.json();
             if (meta && meta.totalPhotos > 0) {
@@ -549,14 +553,14 @@ export class LibraryManager {
               this.state.currentDirectory = meta.currentDirectory;
               this.state.recentLibraries = meta.recentLibraries || [];
 
-              const pageRes = await fetch('/api/catalog-page?page=0&size=100', { signal: AbortSignal.timeout(2000) });
+              const pageRes = await authFetch('/api/catalog-page?page=0&size=100', { signal: AbortSignal.timeout(2000) });
               if (pageRes.ok) {
                 const pageData = await pageRes.json();
                 if (pageData && pageData.photos && pageData.photos.length > 0) {
                   this.state.photos = pageData.photos;
                   this.currentCatalogPage = 0;
                   try {
-                    const libRes = await fetch('/api/library', { signal: AbortSignal.timeout(2000) });
+                    const libRes = await authFetch('/api/library', { signal: AbortSignal.timeout(2000) });
                     if (libRes.ok) {
                       const full = await libRes.json();
                       const libData = full[STORAGE_KEY] || full;
@@ -568,6 +572,7 @@ export class LibraryManager {
                     }
                   } catch {}
                   this.reconcilePeopleAndFaces();
+                  this.state.isInitialized = true;
                   this.notifyListeners();
                   return;
                 }
@@ -587,7 +592,7 @@ export class LibraryManager {
       const isBrowser = typeof window !== 'undefined' && (!window.electronAPI || (window.electronAPI as any).isBrowserShim);
       if (isBrowser && !data && window.location?.protocol?.startsWith('http')) {
         try {
-          const res = await fetch('/api/library', { signal: AbortSignal.timeout(2000) });
+          const res = await authFetch('/api/library', { signal: AbortSignal.timeout(2000) });
           if (res.ok) {
             const full = await res.json();
             data = full[STORAGE_KEY] || (full.photos ? full : null);
@@ -657,6 +662,9 @@ export class LibraryManager {
       }
     } catch (err) {
       console.warn('Failed to load library state:', err);
+    } finally {
+      this.state.isInitialized = true;
+      this.notifyListeners();
     }
   }
 
@@ -674,7 +682,7 @@ export class LibraryManager {
         if (window.electronAPI?.switchLibrary) {
           result = await trackBackendCall(window.electronAPI.switchLibrary(targetPath), 'Switching library...');
         } else if (window.location?.protocol?.startsWith('http')) {
-          const res = await fetch('/api/switch-library', {
+          const res = await authFetch('/api/switch-library', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ targetPath }),
@@ -734,7 +742,7 @@ export class LibraryManager {
         const res = await trackBackendCall(window.electronAPI.getCatalogPage({ pageIndex: this.currentCatalogPage }), 'Loading photos...');
         if (res && res.photos) newPhotos = res.photos;
       } else if (window.location?.protocol?.startsWith('http')) {
-        const res = await fetch(`/api/catalog-page?page=${this.currentCatalogPage}&size=100`);
+        const res = await authFetch(`/api/catalog-page?page=${this.currentCatalogPage}&size=100`);
         if (res.ok) {
           const data = await res.json();
           if (data && data.photos) newPhotos = data.photos;

@@ -731,46 +731,75 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
       {/* Albums Grid */}
       <div style={{ flex: 1, overflowY: 'auto', padding: '28px' }}>
         {albums.length === 0 ? (
-          <div
-            style={{
-              textAlign: 'center',
-              padding: '80px 20px',
-              maxWidth: '520px',
-              margin: '40px auto',
-              backgroundColor: 'var(--bg-surface-elevated)',
-              borderRadius: 'var(--radius-lg)',
-              border: '1px dashed var(--border-subtle)',
-            }}
-          >
+          !libraryStore.getState().isInitialized ? (
             <div
               style={{
-                width: '64px',
-                height: '64px',
-                borderRadius: '50%',
-                backgroundColor: 'rgba(59, 130, 246, 0.12)',
+                textAlign: 'center',
+                padding: '80px 20px',
+                maxWidth: '520px',
+                margin: '40px auto',
                 display: 'flex',
+                flexDirection: 'column',
                 alignItems: 'center',
                 justifyContent: 'center',
-                margin: '0 auto 16px',
+                gap: '14px',
               }}
             >
-              <FolderHeart size={32} color="var(--accent-primary)" />
+              <div
+                className="spinner"
+                style={{
+                  width: '36px',
+                  height: '36px',
+                  border: '3px solid rgba(59, 130, 246, 0.2)',
+                  borderTopColor: 'var(--accent-primary)',
+                  borderRadius: '50%',
+                  animation: 'spin 1s linear infinite',
+                }}
+              />
+              <span style={{ color: 'var(--text-muted)', fontSize: '0.95rem' }}>Loading albums...</span>
             </div>
-            <h3 style={{ fontSize: '1.25rem', fontWeight: 700, color: 'var(--text-primary)', marginBottom: '8px' }}>
-              No Albums Created Yet
-            </h3>
-            <p style={{ fontSize: '0.88rem', color: 'var(--text-muted)', lineHeight: 1.5, marginBottom: '24px' }}>
-              Create an album for a wedding, family trip, or birthday party. You can easily add photos from anywhere in your library.
-            </p>
-            <button
-              className="btn btn-primary"
-              onClick={() => setShowCreateModal(true)}
-              style={{ gap: '8px', padding: '10px 22px', margin: '0 auto' }}
+          ) : (
+            <div
+              style={{
+                textAlign: 'center',
+                padding: '80px 20px',
+                maxWidth: '520px',
+                margin: '40px auto',
+                backgroundColor: 'var(--bg-surface-elevated)',
+                borderRadius: 'var(--radius-lg)',
+                border: '1px dashed var(--border-subtle)',
+              }}
             >
-              <Plus size={18} />
-              <span>Create Your First Album</span>
-            </button>
-          </div>
+              <div
+                style={{
+                  width: '64px',
+                  height: '64px',
+                  borderRadius: '50%',
+                  backgroundColor: 'rgba(59, 130, 246, 0.12)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  margin: '0 auto 16px',
+                }}
+              >
+                <FolderHeart size={32} color="var(--accent-primary)" />
+              </div>
+              <h3 style={{ fontSize: '1.25rem', fontWeight: 700, color: 'var(--text-primary)', marginBottom: '8px' }}>
+                No Albums Created Yet
+              </h3>
+              <p style={{ fontSize: '0.88rem', color: 'var(--text-muted)', lineHeight: 1.5, marginBottom: '24px' }}>
+                Create an album for a wedding, family trip, or birthday party. You can easily add photos from anywhere in your library.
+              </p>
+              <button
+                className="btn btn-primary"
+                onClick={() => setShowCreateModal(true)}
+                style={{ gap: '8px', padding: '10px 22px', margin: '0 auto' }}
+              >
+                <Plus size={18} />
+                <span>Create Your First Album</span>
+              </button>
+            </div>
+          )
         ) : (
           <div
             style={{
