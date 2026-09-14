@@ -352,6 +352,14 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
               : s
           )
         );
+
+        // Face recognition is part of the same "Rescan / Refresh" action now,
+        // not a separate manual step — runFaceDetectionForPhotos itself skips
+        // any photo that's already scanned, so this is a cheap no-op once a
+        // storage is fully caught up.
+        if (onScanStorageFaces) {
+          onScanStorageFaces(config);
+        }
       }
     } catch (err) {
       console.error('Failed to sync virtual storage:', err);
@@ -871,30 +879,13 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                             onClick={() => handleSyncStorage(s)}
                             disabled={isSyncing}
                             style={{ fontSize: '0.8rem', padding: '6px 12px' }}
-                            title="Rescan network location to check if new photos were added"
+                            title="Check for new photos, cache thumbnails, and run face recognition — all in one pass"
                           >
                             <RefreshCw size={14} className={isThisSyncing ? 'animate-spin' : ''} />
                             <span>{isThisSyncing ? 'Rescanning...' : 'Rescan / Refresh'}</span>
                           </button>
                         );
                       })()}
-
-                      {onScanStorageFaces && (
-                        <button
-                          className="btn btn-secondary"
-                          onClick={() => onScanStorageFaces(s)}
-                          disabled={isSyncing}
-                          style={{
-                            fontSize: '0.8rem',
-                            padding: '6px 12px',
-                            gap: '6px',
-                          }}
-                          title="Run face recognition on original photos in this storage"
-                        >
-                          <Sparkles size={14} color="#ec4899" />
-                          <span>Scan Faces</span>
-                        </button>
-                      )}
 
                       <button
                         className="btn btn-primary"
