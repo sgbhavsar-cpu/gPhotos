@@ -3,9 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import { spawn, execSync } from 'child_process';
 import { BackgroundServiceStatus, BackgroundServiceSettings, VirtualStorageConfig } from '../../types';
-import { scanDirectoryRecursive } from './fileOrganizer';
-import { parsePhotoMetadata } from './exifParser';
-import { generateThumbnailBuffer, scanVirtualMirrorDirectory, processPendingRotations } from './virtualMirrorService';
+import { scanVirtualMirrorDirectory, processPendingRotations, syncVirtualStorage } from './virtualMirrorService';
 import { thumbnailWorker } from './thumbnailWorkerService';
 import { getSetting, setSetting } from './libraryRepository';
 
@@ -290,63 +288,23 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
         fs.mkdirSync(mirrorDir, { recursive: true });
       }
 
-      // Scan source folder
-      const allFiles = scanDirectoryRecursive(storage.networkSourcePath);
-      let newlySynced = 0;
-
-      for (const filePath of allFiles) {
-        const rel = path.relative(storage.networkSourcePath, filePath);
-        const relNoExt = rel.replace(/\.[^/.]+$/, '');
-        const jsonSidecar = path.join(mirrorDir, `${relNoExt}.json`);
-        const thumbPath = path.join(mirrorDir, `${relNoExt}.jpg`);
-
-        // If thumbnail and sidecar already exist, it is up-to-date
-        if (fs.existsSync(jsonSidecar) && fs.existsSync(thumbPath)) {
-          continue;
-        }
-
-        try {
-          const thumbDir = path.dirname(thumbPath);
-          if (!fs.existsSync(thumbDir)) fs.mkdirSync(thumbDir, { recursive: true });
-
-          const thumbBuffer = generateThumbnailBuffer(filePath, 500);
-          if (thumbBuffer) {
-            fs.writeFileSync(thumbPath, thumbBuffer);
-            const stats = fs.statSync(filePath);
-            const meta = await parsePhotoMetadata(filePath);
-
-            const sidecar = {
-              originalFilePath: filePath,
-              thumbnailPath: thumbPath,
-              fileName: path.basename(filePath),
-              originalFileSize: stats.size,
-              dateTaken: meta.dateTaken || stats.mtime.toISOString(),
-              width: meta.width,
-              height: meta.height,
-              storageName: storage.name,
-              storageRoot: storage.networkSourcePath,
-              lastSynced: new Date().toISOString(),
-            };
-
-            fs.writeFileSync(jsonSidecar, JSON.stringify(sidecar, null, 2), 'utf-8');
-            newlySynced++;
-          }
-        } catch {
-          // Continue to next photo on error
-        }
-
-        // Brief yield to avoid starving I/O
-        await new Promise((r) => setTimeout(r, 8));
+      // Delegate to the same sync implementation the manual "Sync Now" button
+      // uses, instead of a separate reimplementation — the two used to
+      // disagree on thumbnail file naming (this one forced .jpg, the other
+      // preserved the source extension), which made each pass misclassify
+      // the other's already-mirrored files as new and permanently inflate
+      // the reported total. Using one implementation also means
+      // delayBetweenPhotosSec / bandwidthLimitMbps apply here automatically.
+      const result = await syncVirtualStorage(storage);
+      if (result.errors.length > 0) {
+        console.warn(`[BackgroundSync] ${storage.name}: ${result.errors.length} error(s) during sync.`);
       }
+      // Reflect the live, just-synced count — never accumulate on top of the
+      // previous value, or a bad cycle would permanently inflate the total.
+      storage.totalItems = result.totalSynced;
+      storage.totalSizeSaved = result.totalSizeSaved;
 
-      // Always reflect the live source-folder count, never accumulate on top
-      // of the previous value — otherwise a single cycle that (for any
-      // reason, e.g. the two mirror-sync code paths disagreeing on a
-      // thumbnail's file extension) misclassifies already-mirrored files as
-      // "new" permanently inflates this storage's reported total.
-      storage.totalItems = allFiles.length;
-
-      if (newlySynced > 0) {
+      if (result.newlyAdded > 0) {
         storage.lastSynced = new Date().toISOString();
         try {
           const mirroredPhotos = scanVirtualMirrorDirectory(mirrorDir);

@@ -460,9 +460,13 @@ export async function syncVirtualStorage(
       });
     }
 
+    const fileStartTime = Date.now();
+    let bytesReadForBandwidth = 0;
+
     try {
       const stats = fs.statSync(remoteFile);
       totalOriginalSize += stats.size;
+      bytesReadForBandwidth = stats.size;
 
       // Incremental sync check: if both thumbnail and metadata exist and remote was not modified after
       if (fs.existsSync(localThumbPath) && fs.existsSync(localMetaPath)) {
@@ -471,6 +475,7 @@ export async function syncVirtualStorage(
           const thumbStats = fs.statSync(localThumbPath);
           totalThumbnailSize += thumbStats.size;
           totalSynced++;
+          bytesReadForBandwidth = 0; // No actual network read happened — nothing to throttle for.
           continue;
         }
       }
@@ -537,6 +542,21 @@ export async function syncVirtualStorage(
         timestamp: Date.now(),
         updatedAt: new Date().toISOString(),
       });
+    }
+
+    // Bandwidth cap: enforce a minimum wall-clock time for this file based on
+    // its size, so a fast local/cached read doesn't burst past the configured
+    // rate. A read that was already slower than the target (a genuinely slow
+    // network) needs no extra sleep — this only pumps the brakes when we're
+    // running faster than the user's configured cap.
+    if (config.bandwidthLimitMbps && config.bandwidthLimitMbps > 0 && bytesReadForBandwidth > 0) {
+      const bytesPerSecondLimit = (config.bandwidthLimitMbps * 1_000_000) / 8;
+      const targetMs = (bytesReadForBandwidth / bytesPerSecondLimit) * 1000;
+      const elapsedMs = Date.now() - fileStartTime;
+      const bandwidthSleepMs = targetMs - elapsedMs;
+      if (bandwidthSleepMs > 0) {
+        await new Promise((r) => setTimeout(r, bandwidthSleepMs));
+      }
     }
 
     // Configurable delay between photos to prevent bandwidth saturation and keep desktop 100% responsive
