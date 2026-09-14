@@ -83,6 +83,9 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
   const [isSearchingPlaces, setIsSearchingPlaces] = useState(false);
   const [chosenLocation, setChosenLocation] = useState<{ name: string; lat: number; lon: number } | null>(null);
   const [selectedUnlocatedIds, setSelectedUnlocatedIds] = useState<Set<string>>(new Set());
+  // When set, the Assign Location modal targets these specific (already-geotagged) photos
+  // instead of the unlocated ones — used by the cluster panel's "Fix Location" override.
+  const [assignModalOverridePhotos, setAssignModalOverridePhotos] = useState<Photo[] | null>(null);
 
   // Reset selected cluster on resetTrigger
   useEffect(() => {
@@ -90,6 +93,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
       setSelectedCluster(null);
       setIsEditingClusterLocation(false);
       setShowAssignModal(false);
+      setAssignModalOverridePhotos(null);
     }
   }, [resetTrigger]);
 
@@ -101,6 +105,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
       if (showAssignModal) {
         e.stopPropagation();
         setShowAssignModal(false);
+        setAssignModalOverridePhotos(null);
       } else if (isEditingClusterLocation) {
         e.stopPropagation();
         setIsEditingClusterLocation(false);
@@ -127,12 +132,18 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
     );
   }, [photos]);
 
-  // Initialize all unlocated photos as selected when opening assign modal
+  // Photos targeted by the Assign Location modal: either the unlocated set (default),
+  // or a specific cluster's photos when opened via the "Fix Location" override.
+  const photosForAssignModal = assignModalOverridePhotos ?? unlocatedPhotos;
+  const isLocationOverrideMode = assignModalOverridePhotos !== null;
+
+  // Initialize all target photos as selected when opening assign modal
   useEffect(() => {
     if (showAssignModal) {
-      setSelectedUnlocatedIds(new Set(unlocatedPhotos.map((p) => p.id)));
+      setSelectedUnlocatedIds(new Set(photosForAssignModal.map((p) => p.id)));
     }
-  }, [showAssignModal, unlocatedPhotos]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showAssignModal, assignModalOverridePhotos, unlocatedPhotos]);
 
   // All valid geotagged photos
   const geoPhotos = useMemo(() => {
@@ -423,6 +434,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
     }));
     libraryStore.updatePhotos(updated);
     setShowAssignModal(false);
+    setAssignModalOverridePhotos(null);
     setChosenLocation(null);
     setAssignSearchResults([]);
     setAssignSearchQuery('');
@@ -619,7 +631,10 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
           {/* Assign Location to unlocated photos Button */}
           {unlocatedPhotos.length > 0 && (
             <button
-              onClick={() => setShowAssignModal(true)}
+              onClick={() => {
+                setAssignModalOverridePhotos(null);
+                setShowAssignModal(true);
+              }}
               className="btn btn-secondary"
               title="Assign geographical location to photos without geotags"
               style={{
@@ -747,6 +762,17 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                         title="Rename location for all photos in this cluster"
                       >
                         <Edit2 size={13} color="var(--accent-primary)" />
+                      </button>
+                      <button
+                        className="btn btn-ghost btn-icon"
+                        style={{ width: '24px', height: '24px', padding: 0 }}
+                        onClick={() => {
+                          setAssignModalOverridePhotos(selectedCluster.photos);
+                          setShowAssignModal(true);
+                        }}
+                        title="Correct the coordinates for these photos (search a different place)"
+                      >
+                        <MapPin size={13} color="#f43f5e" />
                       </button>
                     </div>
                     <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
@@ -881,7 +907,10 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
               justifyContent: 'center',
               padding: '20px',
             }}
-            onClick={() => setShowAssignModal(false)}
+            onClick={() => {
+              setShowAssignModal(false);
+              setAssignModalOverridePhotos(null);
+            }}
           >
             <div
               style={{
@@ -912,16 +941,39 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                   <MapPin size={20} color="#f43f5e" />
                   <h3 style={{ fontSize: '1.05rem', fontWeight: 700, margin: 0, color: 'var(--text-primary)' }}>
-                    Assign Location ({unlocatedPhotos.length} unlocated)
+                    {isLocationOverrideMode
+                      ? `Correct Location (${photosForAssignModal.length} photos)`
+                      : `Assign Location (${photosForAssignModal.length} unlocated)`}
                   </h3>
                 </div>
-                <button className="btn btn-ghost btn-icon" onClick={() => setShowAssignModal(false)}>
+                <button
+                  className="btn btn-ghost btn-icon"
+                  onClick={() => {
+                    setShowAssignModal(false);
+                    setAssignModalOverridePhotos(null);
+                  }}
+                >
                   <X size={18} />
                 </button>
               </div>
 
               {/* Modal Body */}
               <div style={{ padding: '20px', display: 'flex', flexDirection: 'column', gap: '16px', overflowY: 'auto' }}>
+                {isLocationOverrideMode && (
+                  <div
+                    style={{
+                      padding: '10px 14px',
+                      borderRadius: '8px',
+                      backgroundColor: 'rgba(244, 63, 94, 0.12)',
+                      border: '1px solid rgba(244, 63, 94, 0.35)',
+                      fontSize: '0.8rem',
+                      color: 'var(--text-secondary)',
+                    }}
+                  >
+                    These photos already have a location. Applying a new one below will
+                    <strong> overwrite their existing GPS coordinates and place name.</strong> This cannot be undone automatically.
+                  </div>
+                )}
                 {/* Search / Pick Location */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '6px' }}>
@@ -1022,21 +1074,21 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
                     <label style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-secondary)' }}>
-                      2. Select Photos to Tag ({selectedUnlocatedIds.size} of {unlocatedPhotos.length} selected):
+                      2. Select Photos to Tag ({selectedUnlocatedIds.size} of {photosForAssignModal.length} selected):
                     </label>
                     <button
                       type="button"
                       className="btn btn-ghost"
                       style={{ fontSize: '0.75rem', padding: '2px 8px' }}
                       onClick={() => {
-                        if (selectedUnlocatedIds.size === unlocatedPhotos.length) {
+                        if (selectedUnlocatedIds.size === photosForAssignModal.length) {
                           setSelectedUnlocatedIds(new Set());
                         } else {
-                          setSelectedUnlocatedIds(new Set(unlocatedPhotos.map((p) => p.id)));
+                          setSelectedUnlocatedIds(new Set(photosForAssignModal.map((p) => p.id)));
                         }
                       }}
                     >
-                      {selectedUnlocatedIds.size === unlocatedPhotos.length ? 'Deselect All' : 'Select All'}
+                      {selectedUnlocatedIds.size === photosForAssignModal.length ? 'Deselect All' : 'Select All'}
                     </button>
                   </div>
 
@@ -1050,7 +1102,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                       padding: '4px',
                     }}
                   >
-                    {unlocatedPhotos.map((p) => {
+                    {photosForAssignModal.map((p) => {
                       const isSel = selectedUnlocatedIds.has(p.id);
                       return (
                         <div
@@ -1107,7 +1159,15 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                   backgroundColor: 'var(--bg-surface-elevated)',
                 }}
               >
-                <button type="button" className="btn btn-secondary" onClick={() => setShowAssignModal(false)} style={{ fontSize: '0.85rem' }}>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={() => {
+                    setShowAssignModal(false);
+                    setAssignModalOverridePhotos(null);
+                  }}
+                  style={{ fontSize: '0.85rem' }}
+                >
                   Cancel
                 </button>
                 <button
@@ -1118,7 +1178,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                   style={{ fontSize: '0.85rem', gap: '6px', padding: '6px 18px' }}
                 >
                   <Check size={15} />
-                  <span>Assign to {selectedUnlocatedIds.size} Photos</span>
+                  <span>{isLocationOverrideMode ? 'Overwrite' : 'Assign to'} {selectedUnlocatedIds.size} Photos</span>
                 </button>
               </div>
             </div>
