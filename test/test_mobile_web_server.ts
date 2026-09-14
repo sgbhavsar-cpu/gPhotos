@@ -19,7 +19,7 @@ import {
 } from '../src/main/services/embeddedWebServer';
 import { getOrCreatePin, revokeAllDevices } from '../src/main/services/webAuthService';
 import { setActiveLibrary } from '../src/main/services/db';
-import { upsertPhotos, upsertPeople } from '../src/main/services/libraryRepository';
+import { upsertPhotos, upsertPeople, setSetting } from '../src/main/services/libraryRepository';
 import { Photo } from '../src/types';
 
 function fetchUrl(
@@ -66,6 +66,10 @@ async function runMobileWebServerTests() {
     .toFile(photoPath);
 
   setActiveLibrary(libraryDir);
+  // Register this as the known/active library folder — pathSecurity's
+  // allowlist (used by the embedded web server) is built from this setting,
+  // just like it would be for a real library the app has actually opened.
+  setSetting('selectedFolder', libraryDir);
   const seedPhotos: Photo[] = [
     {
       id: 'mobile_test_photo_1',
@@ -235,6 +239,29 @@ async function runMobileWebServerTests() {
     } else {
       console.log(`[Test 8 PASS] /api/heic/prepare-hq correctly declined a non-HEIC fixture (status ${prepRes.status})`);
     }
+
+    // 8b. Even an authenticated, correctly-paired device cannot read/scan/
+    // delete an arbitrary path outside the known library — a paired phone is
+    // a lower-trust client than the desktop app itself.
+    console.log('[Test 8b] Testing path confinement rejects paths outside the known library...');
+    const outsidePath = 'C:\\Windows\\System32\\drivers\\etc\\hosts';
+    const photoOutsideRes = await fetchUrl(`${baseUrl}/api/photo?path=${encodeURIComponent(outsidePath)}`, { headers: authHeaders });
+    if (photoOutsideRes.status !== 403) {
+      throw new Error(`FAILED: /api/photo for an out-of-library path returned ${photoOutsideRes.status}, expected 403`);
+    }
+    const scanOutsideRes = await fetchUrl(`${baseUrl}/api/scan?path=${encodeURIComponent('C:\\Windows\\System32')}`, { headers: authHeaders });
+    if (scanOutsideRes.status !== 403) {
+      throw new Error(`FAILED: /api/scan for an out-of-library path returned ${scanOutsideRes.status}, expected 403`);
+    }
+    const deleteOutsideRes = await fetchUrl(
+      `${baseUrl}/api/delete-files`,
+      { method: 'POST', headers: { ...authHeaders, 'Content-Type': 'application/json' } },
+      JSON.stringify({ filePaths: [outsidePath], permanent: false })
+    );
+    if (deleteOutsideRes.status !== 403) {
+      throw new Error(`FAILED: /api/delete-files for an out-of-library path returned ${deleteOutsideRes.status}, expected 403`);
+    }
+    console.log('[Test 8b PASS] Paths outside the known library are rejected with 403 even when authenticated.');
 
     // 9. Revoking the device invalidates its token immediately
     console.log('[Test 9] Testing device revocation invalidates the token...');

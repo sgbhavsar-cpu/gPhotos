@@ -15,6 +15,7 @@ import { scanPhotoDirectory } from './fileOrganizer';
 import { getOrGenerateCachedThumbnail, clearThumbnailCache, refreshThumbnailsFromSource } from './thumbnailCacheService';
 import { getCatalogMeta, getCatalogPage, switchCatalogLibrary, ensureMigratedIfEmpty } from './catalogService';
 import { handleStorageSave, handleStorageLoad, STORAGE_KEY, GLOBAL_PEOPLE_KEY } from './storageHandlers';
+import { isPathAllowed } from './pathSecurity';
 import { getSpriteCoordinate, getSpritePath } from './spriteService';
 import { thumbnailWorker } from './thumbnailWorkerService';
 import { getBackgroundServiceStatus } from './backgroundDaemon';
@@ -101,6 +102,26 @@ export function saveWebServerSettings(settings: { enabled: boolean; port: number
   } catch (err) {
     console.warn('Failed to save webserver settings:', err);
   }
+}
+
+/**
+ * Rejects a request whose path parameter(s) fall outside the app's known
+ * library/mirror roots. Applied to every route on this LAN-facing server
+ * that accepts a filesystem path — a paired phone/device is a lower-trust
+ * client than the desktop app's own renderer, so this server confines it to
+ * the user's actual photo folders rather than the whole host filesystem.
+ * Returns true (and has already written the 403 response) if rejected.
+ */
+function rejectIfPathNotAllowed(res: http.ServerResponse, candidatePaths: Array<string | null | undefined>, context: string): boolean {
+  for (const p of candidatePaths) {
+    if (p && !isPathAllowed(p)) {
+      res.statusCode = 403;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ error: `Access denied: path is outside the app's known library/mirror folders (${context}).` }));
+      return true;
+    }
+  }
+  return false;
 }
 
 // Request handler for all HTTP requests
@@ -228,6 +249,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
   // Endpoint: /api/scan?path=...
   if (pathname === '/api/scan') {
     const targetDir = parsedUrl.searchParams.get('path');
+    if (rejectIfPathNotAllowed(res, [targetDir], '/api/scan')) return;
     if (targetDir && fs.existsSync(targetDir)) {
       try {
         const photos = await scanPhotoDirectory(targetDir);
@@ -249,6 +271,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
   // Endpoint: /api/scan-mirror?path=...
   if (pathname === '/api/scan-mirror') {
     const mirrorPath = parsedUrl.searchParams.get('path');
+    if (rejectIfPathNotAllowed(res, [mirrorPath], '/api/scan-mirror')) return;
     if (mirrorPath && fs.existsSync(mirrorPath)) {
       try {
         const photos = scanVirtualMirrorDirectory(mirrorPath);
@@ -356,7 +379,10 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     req.on('end', async () => {
       try {
         const { items } = JSON.parse(body || '{}');
-        const result = await refreshThumbnailsFromSource(Array.isArray(items) ? items : []);
+        const safeItems = (Array.isArray(items) ? items : []).filter(
+          (item: any) => item && (isPathAllowed(item.filePath) || isPathAllowed(item.originalRemotePath))
+        );
+        const result = await refreshThumbnailsFromSource(safeItems);
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.end(JSON.stringify(result));
@@ -381,7 +407,9 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
         const { items, size } = JSON.parse(body || '{}');
         const targetSize = typeof size === 'number' && size > 0 ? size : 250;
         const requestedItems: Array<{ path: string; originalPath?: string }> = Array.isArray(items)
-          ? items.slice(0, 100) // Cap at 100 items per batch
+          ? items
+              .slice(0, 100) // Cap at 100 items per batch
+              .filter((item: any) => item && (isPathAllowed(item.path) || isPathAllowed(item.originalPath)))
           : [];
 
         const thumbnails: Record<string, string> = {};
@@ -430,6 +458,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
       try {
         const { filePaths, permanent } = JSON.parse(body || '{}');
         const paths = Array.isArray(filePaths) ? filePaths : [];
+        if (rejectIfPathNotAllowed(res, paths, '/api/delete-files')) return;
         const result = permanent
           ? await deleteFilesPermanently(paths)
           : await trashFiles(paths);
@@ -450,6 +479,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     req.on('end', async () => {
       try {
         const { filePath, rotationDegrees, originalRemotePath } = JSON.parse(body || '{}');
+        if (rejectIfPathNotAllowed(res, [filePath, originalRemotePath], '/api/rotate-photo')) return;
         const result = await rotatePhotoWithOfflineQueue({
           localFilePath: filePath,
           originalRemotePath,
@@ -524,6 +554,10 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
           res.end(JSON.stringify({ error: 'targetPath required' }));
           return;
         }
+        // Only allow switching to an already-known (recently used) library —
+        // a remote/paired device shouldn't be able to repoint the whole app
+        // at an arbitrary new disk path it has never been told about.
+        if (rejectIfPathNotAllowed(res, [targetPath], '/api/switch-library')) return;
         const result = await switchCatalogLibrary(targetPath);
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify(result));
@@ -575,6 +609,8 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     const quality = parsedUrl.searchParams.get('quality');
     const sizeParam = parsedUrl.searchParams.get('size');
     const requestedSize = sizeParam ? parseInt(sizeParam, 10) : 0;
+
+    if (rejectIfPathNotAllowed(res, [filePath, originalPath], '/api/photo')) return;
 
     let targetPath: string | null = null;
     if (preferOriginal && originalPath && fs.existsSync(originalPath)) {
@@ -699,6 +735,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
   if (pathname === '/api/heic/prepare-hq') {
     const targetPath = parsedUrl.searchParams.get('path');
     const photoId = parsedUrl.searchParams.get('id') || 'temp';
+    if (rejectIfPathNotAllowed(res, [targetPath], '/api/heic/prepare-hq')) return;
     if (targetPath && fs.existsSync(targetPath)) {
       const tempPath = await prepareHeicHqTemp(targetPath, photoId);
       res.setHeader('Content-Type', 'application/json');
@@ -728,6 +765,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
   // Endpoint: /api/file-exists?path=...
   if (pathname === '/api/file-exists') {
     const p = parsedUrl.searchParams.get('path');
+    if (rejectIfPathNotAllowed(res, [p], '/api/file-exists')) return;
     const exists = p ? fs.existsSync(p) : false;
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify({ exists }));

@@ -71,6 +71,7 @@ import {
   ensureMigratedIfEmpty,
 } from './services/catalogService';
 import { handleStorageSave, handleStorageLoad } from './services/storageHandlers';
+import { assertPathsAllowed } from './services/pathSecurity';
 import {
   getSpriteCoordinate,
   getSpritePath,
@@ -1180,6 +1181,7 @@ ipcMain.handle('photo:edit', async (_event, options: EditPhotoOptions) => {
 
 ipcMain.handle('file:trash-files', async (_event, filePaths: string[]) => {
   try {
+    assertPathsAllowed(filePaths, 'file:trash-files');
     return await trashFiles(filePaths);
   } catch (err: any) {
     console.error('file:trash-files error:', err);
@@ -1189,6 +1191,7 @@ ipcMain.handle('file:trash-files', async (_event, filePaths: string[]) => {
 
 ipcMain.handle('file:delete-permanently', async (_event, filePaths: string[]) => {
   try {
+    assertPathsAllowed(filePaths, 'file:delete-permanently');
     return await deleteFilesPermanently(filePaths);
   } catch (err: any) {
     console.error('file:delete-permanently error:', err);
@@ -1240,8 +1243,17 @@ ipcMain.handle(
 ipcMain.handle('mirror:delete-storage', async (_event, params: { storageName: string; localMirrorRoot?: string; deleteDiskFiles: boolean }) => {
   try {
     const { storageName, localMirrorRoot, deleteDiskFiles } = params;
+    // A storageName containing path separators or ".." could otherwise walk
+    // the joined path outside the mirror root entirely before the recursive
+    // delete below runs.
+    if (!storageName || /[\\/]|\.\./.test(storageName)) {
+      throw new Error(`Invalid storage name: "${storageName}"`);
+    }
     const finalRoot = localMirrorRoot || 'C:\\GPhotos_VirtualMirrors';
     const mirrorDir = path.join(finalRoot, storageName);
+    if (deleteDiskFiles) {
+      assertPathsAllowed([mirrorDir], 'mirror:delete-storage');
+    }
 
     if (deleteDiskFiles && fs.existsSync(mirrorDir)) {
       try {
