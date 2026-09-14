@@ -30,6 +30,7 @@ import {
   Save,
   Copy,
   Sliders,
+  Frame,
   FolderPlus,
   Check,
   AlertCircle
@@ -211,6 +212,20 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   const [editRotation, setEditRotation] = useState<number>(0);
   const [editFlipH, setEditFlipH] = useState(false);
   const [isSavingEdit, setIsSavingEdit] = useState(false);
+  // Crop tool: cropRect is normalized (0-1) relative to the currently displayed
+  // (rotated/flipped) image box. Only usable at 0°/180° rotation, since a 90°/270°
+  // CSS rotation on the <img> doesn't reflow its layout box, which would make the
+  // overlay's coordinates disagree with the rotated canvas built in handleApplyEdit.
+  const [isCropping, setIsCropping] = useState(false);
+  const [cropRect, setCropRect] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
+  const [cropDrawBox, setCropDrawBox] = useState<{ startX: number; startY: number; currentX: number; currentY: number } | null>(null);
+
+  // A pending 90°/270° rotation invalidates any crop selection's coordinate frame.
+  useEffect(() => {
+    setCropRect(null);
+    setIsCropping(false);
+    setCropDrawBox(null);
+  }, [editRotation]);
 
   const handleApplyEdit = async (saveAsCopy: boolean) => {
     if (!imgRef.current) return;
@@ -238,7 +253,23 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
       ctx.drawImage(img, -naturalW / 2, -naturalH / 2);
       ctx.restore();
 
-      const base64Data = canvas.toDataURL('image/jpeg', 0.94);
+      let finalCanvas: HTMLCanvasElement = canvas;
+      if (cropRect && cropRect.width > 0.001 && cropRect.height > 0.001) {
+        const cx = Math.max(0, Math.round(cropRect.x * canvas.width));
+        const cy = Math.max(0, Math.round(cropRect.y * canvas.height));
+        const cw = Math.max(1, Math.min(canvas.width - cx, Math.round(cropRect.width * canvas.width)));
+        const ch = Math.max(1, Math.min(canvas.height - cy, Math.round(cropRect.height * canvas.height)));
+        const cropCanvas = document.createElement('canvas');
+        cropCanvas.width = cw;
+        cropCanvas.height = ch;
+        const cctx = cropCanvas.getContext('2d');
+        if (cctx) {
+          cctx.drawImage(canvas, cx, cy, cw, ch, 0, 0, cw, ch);
+          finalCanvas = cropCanvas;
+        }
+      }
+
+      const base64Data = finalCanvas.toDataURL('image/jpeg', 0.94);
 
       if (window.electronAPI?.editPhoto) {
         const res = await window.electronAPI.editPhoto({
@@ -259,6 +290,8 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
           setIsEditing(false);
           setEditRotation(0);
           setEditFlipH(false);
+          setCropRect(null);
+          setIsCropping(false);
         } else {
           alert(`Error saving photo: ${res.error || 'Unknown error'}`);
         }
@@ -696,6 +729,8 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                 if (isEditing) {
                   setEditRotation(0);
                   setEditFlipH(false);
+                  setCropRect(null);
+                  setIsCropping(false);
                 }
               }}
               style={{ fontSize: '0.8rem', gap: '6px' }}
@@ -1173,6 +1208,112 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
               </div>
             )}
 
+            {/* Crop Selection Interactive Overlay */}
+            {isCropping && (
+              <div
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  width: '100%',
+                  height: '100%',
+                  cursor: 'crosshair',
+                  zIndex: 65,
+                  userSelect: 'none',
+                  touchAction: 'none',
+                }}
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  try {
+                    (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
+                  } catch {}
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const x = (e.clientX - rect.left) / zoom;
+                  const y = (e.clientY - rect.top) / zoom;
+                  setCropDrawBox({ startX: x, startY: y, currentX: x, currentY: y });
+                }}
+                onPointerMove={(e) => {
+                  if (!cropDrawBox) return;
+                  e.stopPropagation();
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const x = (e.clientX - rect.left) / zoom;
+                  const y = (e.clientY - rect.top) / zoom;
+                  setCropDrawBox({ ...cropDrawBox, currentX: x, currentY: y });
+                }}
+                onPointerUp={(e) => {
+                  try {
+                    (e.currentTarget as HTMLDivElement).releasePointerCapture(e.pointerId);
+                  } catch {}
+                  e.stopPropagation();
+                  if (!cropDrawBox || !imgRef.current) {
+                    setCropDrawBox(null);
+                    return;
+                  }
+                  const minX = Math.min(cropDrawBox.startX, cropDrawBox.currentX);
+                  const minY = Math.min(cropDrawBox.startY, cropDrawBox.currentY);
+                  const w = Math.abs(cropDrawBox.currentX - cropDrawBox.startX);
+                  const h = Math.abs(cropDrawBox.currentY - cropDrawBox.startY);
+                  setCropDrawBox(null);
+
+                  const boxW = imgRef.current.clientWidth || 1;
+                  const boxH = imgRef.current.clientHeight || 1;
+
+                  if (w > 12 && h > 12) {
+                    setCropRect({
+                      x: Math.max(0, Math.min(1, minX / boxW)),
+                      y: Math.max(0, Math.min(1, minY / boxH)),
+                      width: Math.max(0, Math.min(1, w / boxW)),
+                      height: Math.max(0, Math.min(1, h / boxH)),
+                    });
+                  } else {
+                    setScanStatusMessage('Click and drag on the photo to select a crop area');
+                    setTimeout(() => setScanStatusMessage(null), 3000);
+                  }
+                }}
+              >
+                {(cropDrawBox || cropRect) && (() => {
+                  const boxW = imgRef.current?.clientWidth || 0;
+                  const boxH = imgRef.current?.clientHeight || 0;
+                  const sel = cropDrawBox
+                    ? {
+                        left: Math.min(cropDrawBox.startX, cropDrawBox.currentX),
+                        top: Math.min(cropDrawBox.startY, cropDrawBox.currentY),
+                        width: Math.abs(cropDrawBox.currentX - cropDrawBox.startX),
+                        height: Math.abs(cropDrawBox.currentY - cropDrawBox.startY),
+                      }
+                    : cropRect
+                    ? {
+                        left: cropRect.x * boxW,
+                        top: cropRect.y * boxH,
+                        width: cropRect.width * boxW,
+                        height: cropRect.height * boxH,
+                      }
+                    : null;
+                  if (!sel) return null;
+                  return (
+                    <>
+                      <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: `${sel.top}px`, backgroundColor: 'rgba(0,0,0,0.55)', pointerEvents: 'none' }} />
+                      <div style={{ position: 'absolute', top: `${sel.top + sel.height}px`, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.55)', pointerEvents: 'none' }} />
+                      <div style={{ position: 'absolute', top: `${sel.top}px`, left: 0, width: `${sel.left}px`, height: `${sel.height}px`, backgroundColor: 'rgba(0,0,0,0.55)', pointerEvents: 'none' }} />
+                      <div style={{ position: 'absolute', top: `${sel.top}px`, left: `${sel.left + sel.width}px`, right: 0, height: `${sel.height}px`, backgroundColor: 'rgba(0,0,0,0.55)', pointerEvents: 'none' }} />
+                      <div
+                        style={{
+                          position: 'absolute',
+                          left: `${sel.left}px`,
+                          top: `${sel.top}px`,
+                          width: `${sel.width}px`,
+                          height: `${sel.height}px`,
+                          border: '2px dashed #f59e0b',
+                          boxShadow: '0 0 0 1px rgba(0,0,0,0.4)',
+                          pointerEvents: 'none',
+                        }}
+                      />
+                    </>
+                  );
+                })()}
+              </div>
+            )}
+
             {/* Face Bounding Box Overlays (Locked to transformed stage) */}
             {showFaces && imgRef.current && photo.faces && (
               photo.faces.map((face) => {
@@ -1325,6 +1466,38 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                 <Scissors size={15} />
                 <span>Flip</span>
               </button>
+              <button
+                className={`btn ${isCropping ? 'btn-primary' : 'btn-secondary'}`}
+                onClick={() => {
+                  if (editRotation % 180 !== 0) return;
+                  setIsCropping((v) => !v);
+                  setIsTaggingMode(false);
+                  setDrawBox(null);
+                }}
+                disabled={editRotation % 180 !== 0}
+                style={{ fontSize: '0.8rem', gap: '6px', padding: '6px 12px', opacity: editRotation % 180 !== 0 ? 0.5 : 1 }}
+                title={
+                  editRotation % 180 !== 0
+                    ? 'Save or undo the 90°/270° rotation before cropping'
+                    : 'Drag on the photo to select a crop area'
+                }
+              >
+                <Frame size={15} />
+                <span>{cropRect ? 'Crop Set' : 'Crop'}</span>
+              </button>
+              {cropRect && (
+                <button
+                  className="btn btn-ghost"
+                  onClick={() => {
+                    setCropRect(null);
+                    setIsCropping(false);
+                  }}
+                  style={{ fontSize: '0.8rem', padding: '6px 10px' }}
+                  title="Clear crop selection"
+                >
+                  Clear Crop
+                </button>
+              )}
               <div style={{ width: '1px', height: '20px', backgroundColor: 'var(--border-subtle)', margin: '0 4px' }} />
               <button
                 className="btn btn-primary"
@@ -1352,6 +1525,8 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                   setIsEditing(false);
                   setEditRotation(0);
                   setEditFlipH(false);
+                  setCropRect(null);
+                  setIsCropping(false);
                 }}
                 style={{ fontSize: '0.8rem', padding: '6px 10px' }}
               >
