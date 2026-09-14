@@ -922,10 +922,12 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                     const details = storageDetailsMap[s.name] || storageDetailsMap[s.id];
                     const prog = storageProgressMap[s.name] || storageProgressMap[s.id];
 
-                    const rawTotal = Math.max(
-                      s.totalItems || 0,
-                      details?.totalPhotos || 0
-                    );
+                    // Prefer the live per-storage scan (details.totalPhotos) —
+                    // it's recomputed from what's actually on disk right now.
+                    // Only fall back to the persisted config's totalItems
+                    // before details have loaded at all, so a stale/inflated
+                    // number can't permanently outrank an accurate live count.
+                    const rawTotal = details?.totalPhotos || s.totalItems || 0;
                     const totalPhotos = rawTotal > 0
                       ? rawTotal
                       : Math.max(prog?.thumbnailTotal || 0, prog?.faceTotal || 0);

@@ -339,9 +339,15 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
         await new Promise((r) => setTimeout(r, 8));
       }
 
+      // Always reflect the live source-folder count, never accumulate on top
+      // of the previous value — otherwise a single cycle that (for any
+      // reason, e.g. the two mirror-sync code paths disagreeing on a
+      // thumbnail's file extension) misclassifies already-mirrored files as
+      // "new" permanently inflates this storage's reported total.
+      storage.totalItems = allFiles.length;
+
       if (newlySynced > 0) {
         storage.lastSynced = new Date().toISOString();
-        storage.totalItems = (storage.totalItems || 0) + newlySynced;
         try {
           const mirroredPhotos = scanVirtualMirrorDirectory(mirrorDir);
           if (mirroredPhotos && mirroredPhotos.length > 0) {
@@ -352,6 +358,7 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
     }
 
     lastSyncTime = new Date().toISOString();
+    setSetting('gphotos_virtual_storages_v1', storages);
     saveSettings();
   } catch (err) {
     console.error('Error during background daemon sync cycle:', err);

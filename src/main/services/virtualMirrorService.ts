@@ -314,20 +314,26 @@ export function getStorageDetails(storageName: string, mirrorRoot?: string): Sto
     scan(mirrorFolder);
   }
 
-  // Cross-reference checkpoint
+  // The live scan above is ground truth (it's counting sidecar files that
+  // physically exist right now). Only fall back to the persisted
+  // checkpoint/library-status estimates when the live scan found nothing at
+  // all — e.g. a sync is actively in progress and hasn't written any sidecars
+  // yet. Previously this took whichever number was *larger*, which meant a
+  // stale or inflated persisted total (e.g. left over from an earlier,
+  // larger version of the source folder, or a past double-counting bug)
+  // would permanently win over the real, current, accurate count.
   const cp = loadStorageCheckpoint(storageName, root);
-  if (cp) {
-    if (cp.totalDiscovered > totalPhotos) totalPhotos = cp.totalDiscovered;
-    if (cp.processedCount > thumbnailCachedCount) thumbnailCachedCount = cp.processedCount;
+  if (totalPhotos === 0 && cp) {
+    totalPhotos = cp.totalDiscovered;
+    thumbnailCachedCount = cp.processedCount;
   }
 
-  // Cross-reference library status
   const libStatus = libraryStatusService.getLibraryStatus(mirrorFolder);
-  if (libStatus) {
-    if (libStatus.totalPhotos > totalPhotos) totalPhotos = libStatus.totalPhotos;
-    if (libStatus.thumbnailCachedCount > thumbnailCachedCount) thumbnailCachedCount = libStatus.thumbnailCachedCount;
-    if (libStatus.faceScannedCount > faceScannedCount) faceScannedCount = libStatus.faceScannedCount;
-    if (libStatus.faceDetectedCount > facesDetectedCount) facesDetectedCount = libStatus.faceDetectedCount;
+  if (totalPhotos === 0 && libStatus) {
+    totalPhotos = libStatus.totalPhotos;
+    thumbnailCachedCount = libStatus.thumbnailCachedCount;
+    faceScannedCount = libStatus.faceScannedCount;
+    facesDetectedCount = libStatus.faceDetectedCount;
   }
 
   let phase: 'completed' | 'thumbnails' | 'faces' | 'interrupted' | 'idle' = 'idle';
