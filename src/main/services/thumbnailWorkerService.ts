@@ -35,6 +35,15 @@ interface WorkerStatus {
 class ThumbnailWorkerService {
   private queue: Photo[] = [];
   private queuedPaths = new Set<string>();
+  // Photos confirmed cached (fast-forwarded or freshly generated) THIS
+  // session — unlike queuedPaths (which only tracks current queue
+  // membership and is cleared as each item finishes), this persists for the
+  // life of the process, so re-enqueuing the same library later (e.g. on
+  // every idle-timer tick, or re-navigating to it) doesn't re-add and
+  // re-count photos whose thumbnails are already known-good, which used to
+  // make "Total" grow indefinitely across repeated enqueue calls even
+  // though nothing new was actually happening.
+  private confirmedCachedPaths = new Set<string>();
   private isProcessing = false;
   private isPaused = false;
   private totalQueuedCount = 0;
@@ -91,6 +100,7 @@ class ThumbnailWorkerService {
     this.testCheckpointDir = dir;
     this.queue = [];
     this.queuedPaths.clear();
+    this.confirmedCachedPaths.clear();
     this.isProcessing = false;
     this.isPaused = false;
     this.totalQueuedCount = 0;
@@ -282,6 +292,9 @@ class ThumbnailWorkerService {
         if (existingStatus.thumbnailCompleted && existingStatus.totalPhotos === photos.length) {
           this.processedCount = photos.length;
           this.totalQueuedCount = photos.length;
+          for (const photo of photos) {
+            if (photo?.filePath) this.confirmedCachedPaths.add(photo.filePath.toLowerCase());
+          }
           console.log(`[ThumbnailWorker] Library ${this.currentLibraryPath} is already 100% pre-cached (${photos.length} photos). Skipping redundant queueing.`);
           this.notifyStatus();
           return;
@@ -296,6 +309,7 @@ class ThumbnailWorkerService {
     for (const photo of photos) {
       if (!photo || !photo.filePath) continue;
       const key = photo.filePath.toLowerCase();
+      if (this.confirmedCachedPaths.has(key)) continue;
       if (!this.queuedPaths.has(key)) {
         this.queuedPaths.add(key);
         this.queue.push(photo);
@@ -360,6 +374,7 @@ class ThumbnailWorkerService {
 
         if (isCached) {
           fastForwardCount++;
+          this.confirmedCachedPaths.add(photo.filePath.toLowerCase());
           this.processedCount = Math.min(this.totalQueuedCount, this.processedCount + 1);
 
           // Periodically save and notify every 50 fast-forwarded photos to avoid UI overhead
@@ -373,6 +388,7 @@ class ThumbnailWorkerService {
 
         // New photo generation required:
         this.currentFileName = photo.fileName || path.basename(photo.filePath);
+        this.confirmedCachedPaths.add(photo.filePath.toLowerCase());
         this.processedCount = Math.min(this.totalQueuedCount, this.processedCount + 1);
         const tWork = Math.max(1, Date.now() - t0);
 

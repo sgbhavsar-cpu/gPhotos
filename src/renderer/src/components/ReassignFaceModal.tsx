@@ -22,8 +22,12 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
   onSuccess,
 }) => {
   const personList = people || libraryStore.getState().people || [];
-  // Available existing people (excluding current person if assigned)
-  const availablePeople = personList.filter((p) => p.id !== face.personId);
+  // Available existing people: excludes the person already assigned, and excludes
+  // generic auto-generated placeholders ("Person 3") — those aren't a real person
+  // the user recognizes, so reassigning a face TO one would just swap one unknown
+  // label for another instead of actually correcting the identification.
+  const isGenericPersonName = (name: string): boolean => /^Person(\s+\d+)?$/i.test(name);
+  const availablePeople = personList.filter((p) => p.id !== face.personId && !isGenericPersonName(p.name));
 
   const [mode, setMode] = useState<'existing' | 'new'>(
     availablePeople.length > 0 ? 'existing' : 'new'
@@ -93,9 +97,10 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
     >
       <div
         style={{
-          width: '100%',
-          maxWidth: '540px',
-          maxHeight: '90vh',
+          width: '96vw',
+          maxWidth: '1400px',
+          height: '92vh',
+          maxHeight: '92vh',
           backgroundColor: 'var(--bg-surface)',
           border: '1px solid var(--border-subtle)',
           borderRadius: 'var(--radius-lg)',
@@ -142,7 +147,18 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
         </div>
 
         {/* Content */}
-        <form onSubmit={handleReassign} style={{ padding: '20px', display: 'flex', flexDirection: 'column', gap: '16px', overflowY: 'auto' }}>
+        <form
+          onSubmit={handleReassign}
+          style={{
+            padding: '20px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '16px',
+            flex: 1,
+            minHeight: 0,
+            overflowY: 'auto',
+          }}
+        >
           {/* Face Preview Card */}
           <div
             style={{
@@ -201,10 +217,10 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
 
           {/* Form Fields */}
           {mode === 'existing' ? (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', flex: 1, minHeight: 0 }}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <label style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-secondary)' }}>
-                  Select Person from Profile Cards:
+                  Select Person from Profile Cards ({filteredAvailablePeople.length}):
                 </label>
                 {availablePeople.length > 4 && (
                   <input
@@ -219,15 +235,18 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
                 )}
               </div>
 
-              {/* Big Profile Photo Cards Grid */}
+              {/* Big Profile Photo Cards Grid — fills the full-screen dialog so as many
+                  names as possible are visible at once without needing to search */}
               <div
                 style={{
                   display: 'grid',
                   gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
                   gap: '10px',
-                  maxHeight: '260px',
+                  flex: 1,
+                  minHeight: 0,
                   overflowY: 'auto',
                   padding: '4px',
+                  alignContent: 'start',
                 }}
               >
                 {filteredAvailablePeople.length === 0 ? (
@@ -263,7 +282,7 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
                       >
                         <div style={{ position: 'relative', width: '64px', height: '64px', flexShrink: 0, borderRadius: '50%', overflow: 'hidden' }}>
                           {personPhoto ? (
-                            <FaceAvatar photo={personPhoto} face={personFace} box={personFace?.box} size={64} alt={p.name} />
+                            <FaceAvatar photo={personPhoto} face={personFace} box={personFace?.box} size={64} alt={p.name} personId={p.id} />
                           ) : (
                             <div
                               style={{

@@ -56,6 +56,7 @@ const PORTABLE_TSX_SCRIPTS = [
   'test/test_batch_thumbnails.ts',
   'test/test_checkpoint_and_resume.ts',
   'test/test_heic_and_refresh_cache.ts',
+  'test/test_heic_mirror_rotation_persistence.ts',
   'test/test_heic_pipeline.ts',
   'test/test_network_storage_thumbnail_progress.ts',
   'test/test_new_features.ts',

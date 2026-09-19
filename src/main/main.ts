@@ -28,7 +28,9 @@ import {
   loadStorageCheckpoint,
   getAllStorageCheckpoints,
   getStorageDetails,
-  getAllStorageDetails
+  getAllStorageDetails,
+  syncOnePhoto,
+  scanStorageInventory
 } from './services/virtualMirrorService';
 import { Photo, OrganizeOptions, VirtualStorageConfig, EditPhotoOptions, BackgroundServiceSettings } from '../types';
 import {
@@ -48,6 +50,7 @@ import {
   getHeicHighQualityJpegBuffer,
   prepareHeicHqTemp,
   cleanupHeicHqTemp,
+  getHeicFullResolutionBufferForDetection,
 } from './services/heicService';
 import {
   startEmbeddedWebServer,
@@ -71,13 +74,33 @@ import {
   ensureMigratedIfEmpty,
 } from './services/catalogService';
 import { handleStorageSave, handleStorageLoad } from './services/storageHandlers';
+import { getPhotosByStorageName, getFacesForPhoto, getAllPeople } from './services/libraryRepository';
+import { getDbForLibraryPath } from './services/db';
+import { detectFacesForPhoto, forceRedetectFacesForPhoto, resolveDbForPhoto } from './services/pipelineOrchestrator';
+import { detectFaceInRegion } from './services/faceDetectionEngine';
 import { assertPathsAllowed } from './services/pathSecurity';
 import {
   getSpriteCoordinate,
+  getSpriteCoordinatesBatch,
   getSpritePath,
 } from './services/spriteService';
 import { thumbnailWorker } from './services/thumbnailWorkerService';
 import { libraryStatusService } from './services/libraryStatusService';
+import { isPathReachable, clearOfflineCache } from './services/networkReachabilityCache';
+import { installHangWatchdog, attachRendererHangDetection } from './services/hangWatchdog';
+import { initLogger, applyStoredLogLevelOverride, getLogLevelOverride, setLogLevelOverride, logger } from './services/logger';
+import { getPersonAvatarPath, savePersonAvatar, deletePersonAvatar } from './services/personAvatarService';
+import {
+  getOneDriveStatus,
+  setReclaimEnabled,
+  markFilesForSpaceReclaim,
+  runReclaimHealthCheck,
+  getReclaimHealth,
+  resetReclaimHealth,
+} from './services/oneDriveService';
+
+initLogger();
+installHangWatchdog();
 
 app.name = 'gPhotos';
 app.setName('gPhotos');
@@ -307,9 +330,7 @@ function createWindow() {
     }
   });
 
-  mainWindow.webContents.on('unresponsive', () => {
-    console.warn('[WARN] Renderer process temporarily unresponsive');
-  });
+  attachRendererHangDetection(mainWindow, 'main');
 
   // Standard Edit & View menu to guarantee native text editing accelerators (Cut, Copy, Paste, Select All)
   const menuTemplate: Electron.MenuItemConstructorOptions[] = [
@@ -351,33 +372,6 @@ function createWindow() {
   protocol.handle('gphoto', async (request) => {
     try {
       const url = new URL(request.url);
-
-      // 1. Serving AI models: gphoto://models/<model-filename>
-      if (url.hostname === 'models' || url.pathname.startsWith('/models/')) {
-        const filename = path.basename(url.pathname);
-        const searchPaths = [
-          path.join(__dirname, '../../dist/models', filename),
-          path.join(__dirname, '../../public/models', filename),
-          path.join(app.getAppPath(), 'dist/models', filename),
-          path.join(app.getAppPath(), 'public/models', filename),
-        ];
-
-        for (const p of searchPaths) {
-          if (fs.existsSync(p)) {
-            const buffer = fs.readFileSync(p);
-            const contentType = filename.endsWith('.json')
-              ? 'application/json'
-              : 'application/octet-stream';
-            return new Response(buffer, {
-              headers: {
-                'Content-Type': contentType,
-                'Access-Control-Allow-Origin': '*',
-              },
-            });
-          }
-        }
-        return new Response(`Model file ${filename} not found`, { status: 404 });
-      }
 
       // Serving Help documentation: gphoto://help or gphoto://help.html
       if (url.hostname === 'help' || url.pathname.includes('help.html') || url.pathname === '/help') {
@@ -430,15 +424,20 @@ function createWindow() {
 
       let targetPath: string | null = null;
       // When network storage source is available, serve original high-res photo!
-      if (preferOriginal && originalPath && fs.existsSync(originalPath)) {
+      // isPathReachable (not fs.existsSync) is what keeps an offline network
+      // share from hanging the whole app: it bounds each check to ~1.5s and,
+      // once a storage is found offline, skips checking it again for a
+      // while instead of blocking on the OS's full network timeout on
+      // every single photo request.
+      if (preferOriginal && originalPath && (await isPathReachable(originalPath))) {
         targetPath = originalPath;
-      } else if (filePath && fs.existsSync(filePath)) {
+      } else if (filePath && (await isPathReachable(filePath))) {
         targetPath = filePath;
-      } else if (originalPath && fs.existsSync(originalPath)) {
+      } else if (originalPath && (await isPathReachable(originalPath))) {
         targetPath = originalPath;
       }
 
-      if (targetPath && fs.existsSync(targetPath)) {
+      if (targetPath) {
         const ext = path.extname(targetPath).toLowerCase();
 
         // 1. Raw original full resolution requested
@@ -544,6 +543,8 @@ app.on('before-quit', () => {
 });
 
 app.whenReady().then(() => {
+  applyStoredLogLevelOverride();
+
   // Start embedded mobile web server automatically on launch
   const wsSettings = loadSavedWebServerSettings();
   if (wsSettings.enabled) {
@@ -584,7 +585,41 @@ ipcMain.on('app:ready', () => {
   revealMainWindow();
 });
 
+// Renderer -> main log bridge (see docs/PIPELINE_REDESIGN_DEV_DOC.md §3.8):
+// fire-and-forget so a debug log call from the renderer never adds IPC
+// round-trip latency to whatever action triggered it.
+ipcMain.on('logger:write', (_event, level: 'debug' | 'info' | 'warn' | 'error', scope: string, message: string, meta?: Record<string, unknown>) => {
+  if (typeof logger[level] === 'function') {
+    logger[level](scope, message, meta);
+  }
+});
+
+ipcMain.handle('logger:get-level-override', async () => {
+  try {
+    return getLogLevelOverride();
+  } catch (err) {
+    logger.error('Logger', 'Failed to read log level override setting', { err: String(err) });
+    return false;
+  }
+});
+
+ipcMain.handle('logger:set-level-override', async (_event, overrideDebug: boolean) => {
+  try {
+    setLogLevelOverride(overrideDebug);
+    logger.info('Logger', `Debug logging override set to ${overrideDebug}`);
+    return true;
+  } catch (err) {
+    logger.error('Logger', 'Failed to set log level override setting', { err: String(err) });
+    return false;
+  }
+});
+
+// Worked example of the standard error-handling/logging pattern documented
+// in logger.ts: debug-level entry/exit for the user action, error-level +
+// {success:false} shape on failure, so it's always visible in the log file
+// (not just console) without any commented-out debug code.
 ipcMain.handle('dialog:select-directory', async () => {
+  logger.debug('Dialog', 'User requested folder picker (select-directory)');
   try {
     if (!mainWindow) return null;
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -592,18 +627,20 @@ ipcMain.handle('dialog:select-directory', async () => {
       title: 'Select Folder',
     });
     if (result.canceled || result.filePaths.length === 0) {
+      logger.debug('Dialog', 'Folder picker canceled by user');
       return null;
     }
+    logger.debug('Dialog', 'Folder picker selection made', { selectedPath: result.filePaths[0] });
     return result.filePaths[0];
   } catch (err) {
-    console.error('dialog:select-directory error:', err);
+    logger.error('Dialog', 'select-directory failed', { err: String(err) });
     return null;
   }
 });
 
 ipcMain.handle('scanner:scan-directory', async (_event, dirPath: string): Promise<Photo[]> => {
   try {
-    const filePaths = scanDirectoryRecursive(dirPath);
+    const filePaths = await scanDirectoryRecursive(dirPath);
     const photos: Photo[] = [];
 
     for (const filePath of filePaths) {
@@ -723,9 +760,9 @@ ipcMain.handle('storage:save', async (_event, key: string, data: any) => {
   return savePromiseQueue;
 });
 
-ipcMain.handle('storage:load', async (_event, key: string) => {
+ipcMain.handle('storage:load', async (_event, key: string, libraryDir?: string) => {
   try {
-    return handleStorageLoad(key);
+    return handleStorageLoad(key, libraryDir);
   } catch (err) {
     console.error('Failed to load library data:', err);
     return null;
@@ -775,9 +812,26 @@ ipcMain.handle('sprite:get-coordinate', async (_event, photoPath: string) => {
   }
 });
 
+ipcMain.handle('sprite:get-coordinates-batch', async (_event, photoPaths: string[]) => {
+  try {
+    return getSpriteCoordinatesBatch(Array.isArray(photoPaths) ? photoPaths : []);
+  } catch {
+    return {};
+  }
+});
+
 // Virtual Mirror & Network Storage Handlers
 ipcMain.handle('mirror:sync-storage', async (event, config: VirtualStorageConfig) => {
   try {
+    // A manual sync/rescan IS the user explicitly asking to check this
+    // storage again — clear any cached "known offline" flag so the
+    // reachability checks below actually probe it fresh, instead of
+    // skipping straight to "offline" from a stale earlier result. The
+    // periodic background sync cycle deliberately does NOT do this, so an
+    // offline storage stays skipped there until the user does this.
+    if (config.networkSourcePath) {
+      clearOfflineCache(config.networkSourcePath);
+    }
     const result = await syncVirtualStorage(config, (progress) => {
       try {
         event.sender.send('mirror:progress', progress);
@@ -853,6 +907,114 @@ ipcMain.handle('mirror:get-all-storage-details', async (_event, mirrorRoot?: str
   }
 });
 
+// Unified pipeline (see docs/PIPELINE_REDESIGN_DEV_DOC.md §3.3): the renderer
+// calls this after syncVirtualStorage to pick up faces the pipeline already
+// wrote straight to SQLite, without re-reading the whole library.
+ipcMain.handle('mirror:get-photos-by-storage', async (_event, storageName: string, mirrorRoot?: string) => {
+  try {
+    // Each virtual storage has its own database at
+    // <mirrorRoot>/<name>/.gphotos_catalog/gphotos.db (see
+    // pipelineOrchestrator.ts's runFaceDetectionStep, which writes there) —
+    // must resolve the SAME path here, not the ambient active library, or
+    // this returns stale/empty results right after a sync.
+    const mirrorFolder = path.join(mirrorRoot || 'C:\\GPhotos_VirtualMirrors', storageName);
+    return getPhotosByStorageName(storageName, getDbForLibraryPath(mirrorFolder));
+  } catch (err) {
+    logger.error('Pipeline', 'mirror:get-photos-by-storage failed', { storageName, err: String(err) });
+    return [];
+  }
+});
+
+// Bulk face detection for local (or already-thumbnailed virtual) photos —
+// the engine now runs in the main process (see faceDetectionEngine.ts), so
+// this replaces the renderer's old face-api.js-driven loop everywhere
+// EXCEPT the virtual-storage sync pipeline, which calls
+// pipelineOrchestrator.ts's detectFacesForPhoto directly per photo instead
+// of round-tripping one at a time over IPC (see syncVirtualStorage).
+ipcMain.handle('faces:detect-batch', async (_event, photos: Photo[]) => {
+  const results: Array<{ photoId: string; ran: boolean; faceCount: number; locked: boolean; skippedReason?: string; faces: any[] }> = [];
+  for (const photo of photos) {
+    try {
+      const sourceFilePath = photo.isVirtual ? (photo.originalRemotePath || photo.filePath) : photo.filePath;
+      // resolveDbForPhoto, not the ambient active-library pointer — see its
+      // doc comment in pipelineOrchestrator.ts. This loop awaits real file
+      // I/O and ONNX inference per photo, during which the active library
+      // can legitimately change out from under a naive getDb() call.
+      const db = resolveDbForPhoto(photo);
+      const result = await detectFacesForPhoto(photo, sourceFilePath, db);
+      results.push({ photoId: photo.id, ...result, faces: getFacesForPhoto(photo.id, db) });
+    } catch (err) {
+      logger.error('Pipeline', 'faces:detect-batch item failed', { photoId: photo.id, err: String(err) });
+      results.push({ photoId: photo.id, ran: false, faceCount: 0, locked: false, skippedReason: 'decode-failed', faces: [] });
+    }
+  }
+  return { results, people: getAllPeople() };
+});
+
+// Per-photo forced re-scan (requirement: a locked photo only unlocks when
+// the user explicitly asks to rescan it, via a "Detect Faces" button).
+ipcMain.handle('faces:detect-one-forced', async (_event, photo: Photo) => {
+  try {
+    const result = await forceRedetectFacesForPhoto(photo);
+    // Same database forceRedetectFacesForPhoto itself resolved and wrote
+    // to (resolveDbForPhoto) — NOT getDb()'s ambient pointer, which can
+    // have moved on by the time this read-back runs (see resolveDbForPhoto's
+    // doc comment for the exact failure this caused: "1 face detected" with
+    // no marker or people-panel entry to show for it).
+    const db = resolveDbForPhoto(photo);
+    const readBackFaces = getFacesForPhoto(photo.id, db);
+    logger.info('Pipeline', 'faces:detect-one-forced: returning to renderer', {
+      photoId: photo.id,
+      storageName: photo.storageName,
+      resultFaceCount: result.faceCount,
+      readBackFacesLength: readBackFaces.length,
+      readBackFaceIds: readBackFaces.map((f) => f.id),
+      locked: result.locked,
+      ran: result.ran,
+      skippedReason: result.skippedReason,
+    });
+    return { ...result, faces: readBackFaces, people: getAllPeople() };
+  } catch (err) {
+    logger.error('Pipeline', 'faces:detect-one-forced failed', { photoId: photo.id, err: String(err) });
+    return { ran: false, faceCount: 0, locked: false, skippedReason: 'decode-failed', faces: [], people: [] };
+  }
+});
+
+// Manual face tagging: computes a descriptor for a user-drawn box (backs
+// PhotoLightbox's "draw a box around a missed face" flow) by re-running
+// detection constrained to just that region of the full-resolution source.
+ipcMain.handle('faces:compute-descriptor-for-region', async (
+  _event,
+  sourceFilePath: string,
+  box: { x: number; y: number; width: number; height: number }
+) => {
+  try {
+    const buffer = /\.(heic|heif)$/i.test(sourceFilePath)
+      ? await getHeicFullResolutionBufferForDetection(sourceFilePath)
+      : await fs.promises.readFile(sourceFilePath);
+    if (!buffer) return null;
+    const face = await detectFaceInRegion(buffer, box);
+    return face ? { descriptor: face.descriptor, confidence: face.confidence } : null;
+  } catch (err) {
+    logger.error('Pipeline', 'faces:compute-descriptor-for-region failed', { sourceFilePath, err: String(err) });
+    return null;
+  }
+});
+
+// Inventory gate (see docs/PIPELINE_REDESIGN_DEV_DOC.md §3.2): counts every
+// eligible file under a storage's source path before any processing starts.
+ipcMain.handle('mirror:scan-inventory', async (_event, networkSourcePath: string) => {
+  logger.debug('Inventory', 'Starting inventory scan', { networkSourcePath });
+  try {
+    const result = await scanStorageInventory(networkSourcePath);
+    logger.info('Inventory', 'Inventory scan finished', { networkSourcePath, ...result });
+    return result;
+  } catch (err) {
+    logger.error('Inventory', 'Inventory scan failed', { networkSourcePath, err: String(err) });
+    return { status: 'failed', totalFiles: 0, error: String(err) };
+  }
+});
+
 ipcMain.handle('library:get-status', async (_event, libraryPath: string) => {
   try {
     return libraryStatusService.getLibraryStatus(libraryPath);
@@ -880,6 +1042,110 @@ ipcMain.handle('library:get-all-statuses', async () => {
   }
 });
 
+ipcMain.handle('onedrive:get-status', async () => {
+  try {
+    return getOneDriveStatus();
+  } catch (err) {
+    console.error('onedrive:get-status error:', err);
+    return { detectedRoots: [], reclaimEnabled: true, supported: false };
+  }
+});
+
+ipcMain.handle('onedrive:set-reclaim-enabled', async (_event, enabled: boolean) => {
+  try {
+    setReclaimEnabled(enabled);
+    return true;
+  } catch (err) {
+    console.error('onedrive:set-reclaim-enabled error:', err);
+    return false;
+  }
+});
+
+ipcMain.handle('onedrive:mark-reclaimable', async (_event, filePaths: string[]) => {
+  try {
+    return await markFilesForSpaceReclaim(Array.isArray(filePaths) ? filePaths : []);
+  } catch (err) {
+    console.error('onedrive:mark-reclaimable error:', err);
+    return { markedCount: 0 };
+  }
+});
+
+ipcMain.handle('onedrive:run-health-check', async () => {
+  try {
+    return await runReclaimHealthCheck();
+  } catch (err) {
+    console.error('onedrive:run-health-check error:', err);
+    return { checked: 0, stillHydrated: 0 };
+  }
+});
+
+ipcMain.handle('onedrive:get-reclaim-health', async () => {
+  try {
+    return getReclaimHealth();
+  } catch (err) {
+    console.error('onedrive:get-reclaim-health error:', err);
+    return { broken: false, pendingCount: 0, recentFailureRate: 0, checkedCount: 0 };
+  }
+});
+
+ipcMain.handle('onedrive:reset-reclaim-health', async () => {
+  try {
+    resetReclaimHealth();
+    return true;
+  } catch (err) {
+    console.error('onedrive:reset-reclaim-health error:', err);
+    return false;
+  }
+});
+
+ipcMain.handle('mirror:sync-one-photo', async (_event, config: VirtualStorageConfig, remoteFile: string) => {
+  try {
+    assertPathsAllowed([remoteFile, config.localMirrorRoot], 'mirror:sync-one-photo');
+    return await syncOnePhoto(remoteFile, config);
+  } catch (err: any) {
+    console.error('mirror:sync-one-photo error:', err);
+    return { success: false, skipped: false, bytesRead: 0, originalSize: 0, thumbnailSize: 0, error: err.message };
+  }
+});
+
+ipcMain.handle('mirror:list-source-files', async (_event, sourcePath: string) => {
+  try {
+    assertPathsAllowed([sourcePath], 'mirror:list-source-files');
+    return await scanDirectoryRecursive(sourcePath);
+  } catch (err) {
+    console.error('mirror:list-source-files error:', err);
+    return [];
+  }
+});
+
+ipcMain.handle('person:get-avatar-path', async (_event, personId: string, cacheKey: string) => {
+  try {
+    return getPersonAvatarPath(personId, cacheKey);
+  } catch (err) {
+    console.error('person:get-avatar-path error:', err);
+    return null;
+  }
+});
+
+ipcMain.handle('person:save-avatar', async (_event, personId: string, cacheKey: string, dataUrl: string) => {
+  try {
+    return savePersonAvatar(personId, cacheKey, dataUrl);
+  } catch (err: any) {
+    console.error('person:save-avatar error:', err);
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('person:delete-avatar', async (_event, personId: string) => {
+  try {
+    deletePersonAvatar(personId);
+    return true;
+  } catch (err) {
+    console.error('person:delete-avatar error:', err);
+    return false;
+  }
+});
+
 ipcMain.handle('mirror:open-original', async (_event, filePath: string) => {
   try {
     if (filePath && typeof filePath === 'string' && fs.existsSync(filePath)) {
@@ -895,11 +1161,7 @@ ipcMain.handle('mirror:open-original', async (_event, filePath: string) => {
 
 ipcMain.handle('file:check-exists', async (_event, filePath: string) => {
   if (!filePath || typeof filePath !== 'string') return false;
-  try {
-    return fs.existsSync(filePath);
-  } catch {
-    return false;
-  }
+  return isPathReachable(filePath);
 });
 
 // ---------------- New Storage & Photo Intelligence Handlers ----------------
@@ -922,7 +1184,7 @@ ipcMain.handle('mirror:start-bg-scan', async (event, sourcePath: string, mirrorR
   // Non-blocking asynchronous background scan
   setTimeout(async () => {
     try {
-      const allFiles = scanDirectoryRecursive(sourcePath);
+      const allFiles = await scanDirectoryRecursive(sourcePath);
       const total = allFiles.length;
       let batch: Photo[] = [];
 
@@ -1008,7 +1270,7 @@ ipcMain.handle('mirror:start-bg-scan', async (event, sourcePath: string, mirrorR
             }
           }
           if (!thumbBuf) {
-            thumbBuf = generateThumbnailBuffer(remoteFile, 500);
+            thumbBuf = await generateThumbnailBuffer(remoteFile, 500);
           }
           if (thumbBuf) {
             fs.writeFileSync(localThumbPath, thumbBuf);
@@ -1084,6 +1346,7 @@ ipcMain.handle('mirror:start-bg-scan', async (event, sourcePath: string, mirrorR
             jobId,
             sourcePath,
             storageName: name,
+            mirrorRoot: finalMirrorRoot,
             phase: 'thumbnails',
             currentFile: fileName,
             processedCount: i + 1,
@@ -1117,6 +1380,7 @@ ipcMain.handle('mirror:start-bg-scan', async (event, sourcePath: string, mirrorR
         jobId,
         sourcePath,
         storageName: name,
+        mirrorRoot: finalMirrorRoot,
         phase: 'completed',
         currentFile: 'Complete',
         processedCount: total,
@@ -1185,7 +1449,7 @@ ipcMain.handle('file:trash-files', async (_event, filePaths: string[]) => {
     return await trashFiles(filePaths);
   } catch (err: any) {
     console.error('file:trash-files error:', err);
-    return { success: false, trashedCount: 0, errors: [err.message] };
+    return { success: false, trashedCount: 0, trashedPaths: [], errors: [err.message] };
   }
 });
 
@@ -1195,7 +1459,7 @@ ipcMain.handle('file:delete-permanently', async (_event, filePaths: string[]) =>
     return await deleteFilesPermanently(filePaths);
   } catch (err: any) {
     console.error('file:delete-permanently error:', err);
-    return { success: false, deletedCount: 0, errors: [err.message] };
+    return { success: false, deletedCount: 0, deletedPaths: [], errors: [err.message] };
   }
 });
 

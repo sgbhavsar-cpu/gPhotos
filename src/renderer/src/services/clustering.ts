@@ -93,6 +93,16 @@ export function computeQualityWeightedCentroid(faces: DetectedFace[]): number[] 
 }
 
 /**
+ * Default Euclidean-distance match threshold for the 512-d, L2-normalized
+ * ArcFace/MobileFaceNet embeddings produced by the main-process detection
+ * engine (see src/main/services/faceDetectionEngine.ts) — must stay in sync
+ * with faceClustering.ts's DEFAULT_MATCH_THRESHOLD, since this copy clusters
+ * the exact same descriptors during interactive edits (confirm/reassign/
+ * unassign/delete) on the renderer's in-memory state.
+ */
+export const DEFAULT_MATCH_THRESHOLD = 1.1;
+
+/**
  * Clusters detected face vectors into People identities with quality-weighted centroids
  * and strict enforcement of the single-photo uniqueness invariant:
  * "In one photo, two faces should NEVER be detected as the same person."
@@ -100,7 +110,7 @@ export function computeQualityWeightedCentroid(faces: DetectedFace[]): number[] 
 export function clusterFaces(
   allFaces: DetectedFace[],
   existingPeople: Person[] = [],
-  threshold = 0.55,
+  threshold = DEFAULT_MATCH_THRESHOLD,
   allowNewClusters = true
 ): { people: Person[]; updatedFaces: DetectedFace[] } {
   const peopleMap = new Map<string, Person>();
@@ -141,8 +151,15 @@ export function clusterFaces(
 
   for (let i = 0; i < updatedFaces.length; i++) {
     const face = updatedFaces[i];
-    if (face.personId && peopleMap.has(face.personId)) {
-      continue; // already validly assigned
+    // A face that already carries SOME personId is left alone here, even if
+    // that person doesn't happen to be in this call's existingPeople list —
+    // it must NOT fall through to the "no match found" branch below. See
+    // src/main/services/faceClustering.ts for the full explanation: this
+    // used to re-run the full O(people x exemplars) search AND mint a brand
+    // new throwaway "Person N" for every such face, on every single call,
+    // which is expensive CPU work running on the UI thread here.
+    if (face.personId) {
+      continue;
     }
 
     if (!photoAssignedPeople.has(face.photoId)) {
@@ -189,8 +206,14 @@ export function clusterFaces(
       personFaces.get(bestMatchPersonId)!.push(face);
       assignedInThisPhoto.add(bestMatchPersonId);
     } else if (allowNewClusters) {
-      // Create new person cluster
-      const newPersonId = `person_${Date.now()}_${nextPersonIndex}`;
+      // Create new person cluster. Seeded off this face's own (stable,
+      // DB-persisted) id rather than Date.now() — this reconciliation runs
+      // independently in every session that loads the library (desktop
+      // window, each mobile browser tab), so two sessions inventing "the
+      // same" new person for the same unassigned face must derive the same
+      // id, or the merge-only people upsert (never deletes — see
+      // storageHandlers.ts) permanently keeps both as separate duplicates.
+      const newPersonId = `person_${face.id}`;
       const newPerson: Person = {
         id: newPersonId,
         name: `Person ${nextPersonIndex}`,

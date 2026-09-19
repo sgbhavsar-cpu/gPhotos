@@ -25,6 +25,13 @@ export const ZOOM_LEVELS: GalleryZoomLevel[] = [
   'large',
 ];
 
+// How far above/below the visible viewport rows are still fully rendered
+// (instead of a lightweight spacer div), and thumbnails are fetched ahead of
+// time — in both scroll directions — so items are already on-screen and
+// their images already loading by the time the user scrolls to them.
+const RENDER_BUFFER_PX = 1600;
+const THUMBNAIL_PREFETCH_BUFFER_PX = 1600;
+
 interface VirtualizedTimelineGalleryProps {
   photos: Photo[];
   zoomLevel: GalleryZoomLevel;
@@ -37,6 +44,13 @@ interface VirtualizedTimelineGalleryProps {
   onDragSelect?: (photoId: string) => void;
   onSelectionChange?: (selectedIds: Set<string>) => void;
   emptyMessage?: string;
+  /**
+   * Called when the user has scrolled near the bottom of the currently-loaded
+   * photos, so the caller can append the next catalog page. Safe to call
+   * repeatedly — the caller is expected to no-op while already loading or
+   * once every page has been fetched.
+   */
+  onLoadMore?: () => void;
 }
 
 export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProps> = ({
@@ -51,12 +65,14 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
   onDragSelect,
   onSelectionChange,
   emptyMessage = 'No photos found in this view.',
+  onLoadMore,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [containerHeight, setContainerHeight] = useState(800);
   const [containerWidth, setContainerWidth] = useState(1200);
   const lastWheelZoomTime = useRef<number>(0);
+  const scrollRafRef = useRef<number | null>(null);
 
   // 2D Matrix Mouse drag-selection tracking
   const isMouseDownRef = useRef<boolean>(false);
@@ -106,12 +122,53 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
     }
   }, []);
 
-  // Handle scroll to track viewport
+  // Distance from the bottom of loaded content, in pixels, at which the next
+  // batch of catalog pages is requested (onLoadMore loads several pages at
+  // once) — large enough that a multi-page buffer is ready well before the
+  // user actually scrolls into blank space.
+  const LOAD_MORE_THRESHOLD_PX = 4800;
+
+  // Handle scroll to track viewport. Batched to at most once per animation
+  // frame — native scroll events can fire far more often than the display
+  // can paint, and updating React state on every single one causes the
+  // visible-item recalculation below to run redundantly, which is what was
+  // making fast scrolling feel like it stutters/pauses.
   const handleScroll = useCallback(() => {
-    if (containerRef.current) {
-      setScrollTop(containerRef.current.scrollTop);
-    }
+    if (scrollRafRef.current !== null) return;
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      const el = containerRef.current;
+      if (!el) return;
+      setScrollTop(el.scrollTop);
+
+      if (onLoadMore) {
+        const distanceFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight);
+        if (distanceFromBottom < LOAD_MORE_THRESHOLD_PX) {
+          onLoadMore();
+        }
+      }
+    });
+  }, [onLoadMore]);
+
+  useEffect(() => {
+    return () => {
+      if (scrollRafRef.current !== null) {
+        cancelAnimationFrame(scrollRafRef.current);
+      }
+    };
   }, []);
+
+  // Bootstraps loading: if the currently-loaded photos don't even fill the
+  // viewport (e.g. right after a library switch loads just the first page),
+  // no scroll event will ever fire to trigger onLoadMore — so also check
+  // directly whenever the content or container size changes.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || !onLoadMore) return;
+    if (el.scrollHeight - el.clientHeight < LOAD_MORE_THRESHOLD_PX) {
+      onLoadMore();
+    }
+  }, [photos.length, containerHeight, onLoadMore]);
 
   // Handle Ctrl + Wheel Zoom (and trackpad pinch zoom which triggers ctrlKey + wheel)
   const handleWheel = useCallback(
@@ -253,7 +310,7 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
     if (zoomLevel === 'years' || zoomLevel === 'months') return;
     if (virtualMonthData.length === 0) return;
 
-    const bufferPx = 800;
+    const bufferPx = THUMBNAIL_PREFETCH_BUFFER_PX;
     const viewportTop = Math.max(0, scrollTop - bufferPx);
     const viewportBottom = scrollTop + containerHeight + bufferPx;
     const { cols, itemHeight, gap, size } = gridConfig;
@@ -551,8 +608,8 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
   }
 
   // 3. FULL PHOTO GRID (very_small, small, medium, large) WITH HIGH-EFFICIENCY VIRTUALIZATION
-  // Viewport buffer: render items within 800px before and after current scroll view
-  const bufferPx = 800;
+  // Viewport buffer: render items within RENDER_BUFFER_PX before and after current scroll view
+  const bufferPx = RENDER_BUFFER_PX;
   const viewportTop = Math.max(0, scrollTop - bufferPx);
   const viewportBottom = scrollTop + containerHeight + bufferPx;
 

@@ -11,14 +11,83 @@
 import { useState, useEffect, useRef } from 'react';
 import { SpriteCoordinate } from '../../types';
 import { trackBackendCall } from './responseTracker';
-import { appendAuthToken, authFetch } from './webAuthClient';
+import { appendAuthToken } from './webAuthClient';
 
 // ============================================================================
 // 0. SPRITE COORDINATE STORE & HOOK (HIGH-SPEED 50-PHOTO STATIC SHEETS)
 // ============================================================================
 
 const spriteCoordCache = new Map<string, SpriteCoordinate | null>();
-const pendingCoordRequests = new Map<string, Promise<SpriteCoordinate | null>>();
+const pendingSpriteCoordKeys = new Set<string>();
+const spriteCoordListeners = new Set<(updatedKeys: Set<string>) => void>();
+
+// Queue for batched sprite-coordinate lookups. Coordinate lookups are a
+// cheap in-memory dictionary read on the server, so the real cost is purely
+// request/response overhead — before batching, every rendered PhotoCard
+// fired its own /api/sprite-coord request, which measured as ~25-30
+// individual HTTP round-trips per screenful while scrolling and was the
+// main cause of scroll stutter on large libraries. This mirrors the
+// requestBatchThumbnails queue below.
+let spriteCoordBatchTimeoutId: any = null;
+let queuedSpriteCoordPaths: string[] = [];
+
+async function flushSpriteCoordQueue(): Promise<void> {
+  if (queuedSpriteCoordPaths.length === 0) return;
+
+  const currentPaths = queuedSpriteCoordPaths;
+  queuedSpriteCoordPaths = [];
+  spriteCoordBatchTimeoutId = null;
+
+  const CHUNK_SIZE = 300;
+  for (let i = 0; i < currentPaths.length; i += CHUNK_SIZE) {
+    const chunk = currentPaths.slice(i, i + CHUNK_SIZE);
+    let result: Record<string, SpriteCoordinate | null> | null = null;
+    try {
+      if (window.electronAPI?.getSpriteCoordinatesBatch) {
+        result = await window.electronAPI.getSpriteCoordinatesBatch(chunk);
+      }
+    } catch (err) {
+      console.warn('[SpriteCoordManager] Batch fetch error:', err);
+    }
+
+    const updated = new Set<string>();
+    for (const p of chunk) {
+      const key = p.toLowerCase();
+      spriteCoordCache.set(key, result ? (result[p] ?? result[key] ?? null) : null);
+      pendingSpriteCoordKeys.delete(key);
+      updated.add(key);
+    }
+    for (const l of spriteCoordListeners) {
+      try { l(updated); } catch {}
+    }
+  }
+}
+
+/**
+ * Queues photo paths for a batched sprite-coordinate lookup, debounced and
+ * chunked just like requestBatchThumbnails.
+ */
+function requestBatchSpriteCoordinates(paths: Array<string | undefined | null>): void {
+  const needed: string[] = [];
+  for (const p of paths) {
+    if (!p) continue;
+    const key = p.toLowerCase();
+    if (!spriteCoordCache.has(key) && !pendingSpriteCoordKeys.has(key)) {
+      needed.push(p);
+      pendingSpriteCoordKeys.add(key);
+    }
+  }
+
+  if (needed.length === 0) return;
+
+  queuedSpriteCoordPaths.push(...needed);
+
+  if (!spriteCoordBatchTimeoutId) {
+    spriteCoordBatchTimeoutId = setTimeout(() => {
+      flushSpriteCoordQueue();
+    }, 20);
+  }
+}
 
 /**
  * Returns the optimized URL to access the sprite sheet.
@@ -36,12 +105,13 @@ export function getSpriteUrl(coord: SpriteCoordinate): string {
 
 /**
  * Hook to retrieve pre-baked sprite coordinates for a photo thumbnail.
- * Renders instantly from memory cache if available, or queries main/web service asynchronously.
+ * Renders instantly from memory cache if available, otherwise the path is
+ * enqueued into a batched lookup shared across every mounted PhotoCard.
  */
 export function useSpriteCoordinate(photoPath: string | undefined | null): SpriteCoordinate | null {
   const [coord, setCoord] = useState<SpriteCoordinate | null>(() => {
     if (!photoPath) return null;
-    return spriteCoordCache.get(photoPath.toLowerCase()) || null;
+    return spriteCoordCache.get(photoPath.toLowerCase()) ?? null;
   });
 
   useEffect(() => {
@@ -52,42 +122,23 @@ export function useSpriteCoordinate(photoPath: string | undefined | null): Sprit
 
     const key = photoPath.toLowerCase();
     if (spriteCoordCache.has(key)) {
-      setCoord(spriteCoordCache.get(key) || null);
+      setCoord(spriteCoordCache.get(key) ?? null);
       return;
     }
 
-    let isMounted = true;
-    let fetchPromise = pendingCoordRequests.get(key);
+    requestBatchSpriteCoordinates([photoPath]);
 
-    if (!fetchPromise) {
-      fetchPromise = (async () => {
-        try {
-          if (window.electronAPI?.getSpriteCoordinate) {
-            return await window.electronAPI.getSpriteCoordinate(photoPath);
-          }
-          if (window.location?.protocol?.startsWith('http')) {
-            const res = await authFetch(`/api/sprite-coord?path=${encodeURIComponent(photoPath)}`);
-            if (res.ok) {
-              return await res.json();
-            }
-          }
-        } catch {}
-        return null;
-      })();
-      pendingCoordRequests.set(key, fetchPromise);
-    }
+    const unsubscribe = (() => {
+      const listener = (updatedKeys: Set<string>) => {
+        if (updatedKeys.has(key)) {
+          setCoord(spriteCoordCache.get(key) ?? null);
+        }
+      };
+      spriteCoordListeners.add(listener);
+      return () => spriteCoordListeners.delete(listener);
+    })();
 
-    fetchPromise.then((result) => {
-      spriteCoordCache.set(key, result);
-      pendingCoordRequests.delete(key);
-      if (isMounted) {
-        setCoord(result);
-      }
-    });
-
-    return () => {
-      isMounted = false;
-    };
+    return unsubscribe;
   }, [photoPath]);
 
   return coord;
@@ -101,6 +152,50 @@ export function useSpriteCoordinate(photoPath: string | undefined | null): Sprit
 export const batchThumbnailStore = new Map<string, string>();
 const pendingBatchPaths = new Set<string>();
 const batchListeners = new Set<(updatedPaths: Set<string>) => void>();
+
+// ----------------------------------------------------------------------------
+// Prefetch activity status — lets the UI show a small "Pre-fetching N
+// thumbnails..." indicator, so it's visible whether thumbnail prefetch (the
+// buffer of thumbnails requested ahead of/behind the current scroll
+// position) is actually happening rather than a silent no-op.
+// ----------------------------------------------------------------------------
+export interface PrefetchStatus {
+  isActive: boolean;
+  pendingCount: number;
+  lastFetchedCount: number;
+}
+
+let prefetchStatus: PrefetchStatus = { isActive: false, pendingCount: 0, lastFetchedCount: 0 };
+const prefetchStatusListeners = new Set<(status: PrefetchStatus) => void>();
+
+function setPrefetchStatus(next: Partial<PrefetchStatus>): void {
+  prefetchStatus = { ...prefetchStatus, ...next };
+  for (const l of prefetchStatusListeners) {
+    try { l(prefetchStatus); } catch {}
+  }
+}
+
+export function getPrefetchStatus(): PrefetchStatus {
+  return prefetchStatus;
+}
+
+export function subscribeToPrefetchStatus(callback: (status: PrefetchStatus) => void): () => void {
+  prefetchStatusListeners.add(callback);
+  return () => {
+    prefetchStatusListeners.delete(callback);
+  };
+}
+
+/**
+ * React hook exposing live thumbnail-prefetch activity, for a small UI
+ * indicator that shows whether prefetching-ahead-of-scroll is actually
+ * happening (and how many thumbnails are currently queued).
+ */
+export function usePrefetchStatus(): PrefetchStatus {
+  const [status, setStatus] = useState<PrefetchStatus>(getPrefetchStatus());
+  useEffect(() => subscribeToPrefetchStatus(setStatus), []);
+  return status;
+}
 
 // Queue for batch requests to debounce rapid view updates
 let batchTimeoutId: any = null;
@@ -128,8 +223,11 @@ async function flushBatchQueue(): Promise<void> {
   queuedBatchItems = [];
   batchTimeoutId = null;
 
+  setPrefetchStatus({ isActive: true, pendingCount: pendingBatchPaths.size });
+
   // Chunk into batches of up to 100
   const CHUNK_SIZE = 100;
+  let fetchedThisFlush = 0;
   for (let i = 0; i < currentItems.length; i += CHUNK_SIZE) {
     const chunk = currentItems.slice(i, i + CHUNK_SIZE);
     try {
@@ -148,6 +246,7 @@ async function flushBatchQueue(): Promise<void> {
             if (dataUrl) {
               batchThumbnailStore.set(filePath, dataUrl);
               updated.add(filePath);
+              fetchedThisFlush++;
             }
           }
           for (const l of batchListeners) {
@@ -161,8 +260,15 @@ async function flushBatchQueue(): Promise<void> {
       for (const item of chunk) {
         pendingBatchPaths.delete(item.path);
       }
+      setPrefetchStatus({ pendingCount: pendingBatchPaths.size });
     }
   }
+
+  setPrefetchStatus({
+    isActive: pendingBatchPaths.size > 0,
+    pendingCount: pendingBatchPaths.size,
+    lastFetchedCount: fetchedThisFlush,
+  });
 }
 
 /**
@@ -187,6 +293,7 @@ export function requestBatchThumbnails(
 
   queuedBatchItems.push(...needed);
   queuedBatchSize = size;
+  setPrefetchStatus({ isActive: true, pendingCount: pendingBatchPaths.size });
 
   if (!batchTimeoutId) {
     batchTimeoutId = setTimeout(() => {

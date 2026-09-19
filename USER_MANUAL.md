@@ -1,4 +1,4 @@
-# Google Photos Desktop — Complete User Manual & Reference Guide
+# gPhotos Desktop — Complete User Manual & Reference Guide
 
 **Version**: 1.2.0  
 **Target OS**: Windows 10 / Windows 11 (64-bit)  
@@ -40,11 +40,11 @@
 
 ## 1. Overview & Core Architecture
 
-**Google Photos Desktop** is a private, standalone desktop alternative to cloud photo services. Unlike commercial cloud platforms, your photos and biometrics **never leave your personal computer**.
+**gPhotos Desktop** is a private, standalone desktop alternative to cloud photo services. Unlike commercial cloud platforms, your photos and biometrics **never leave your personal computer**.
 
 ### Key Architectural Highlights:
 - **Zero Cloud Dependence**: All neural networks, facial recognition models, image decoders, and metadata extractors execute entirely on your device.
-- **Hardware Acceleration**: Built with WebGPU and WebGL backends via `@vladmandic/face-api` for fast real-time face detection.
+- **Main-Process Face Detection**: Runs via ONNX Runtime (SCRFD + ArcFace/MobileFaceNet) in the background service itself, not the browser window — face detection keeps working even while the app window is closed.
 - **Virtual Network Mirroring**: Browse multi-terabyte network shares (NAS/SMB) using lightweight local 500px JPEG thumbnails (~50 KB) without transferring massive original files to your local drive.
 - **Non-Destructive Operations**: By default, file organization and duplicate removal operate in non-destructive modes (Copy instead of Move; Recycle Bin trashing instead of permanent deletion).
 
@@ -73,8 +73,8 @@ npm start
 npm run dist:win
 ```
 The command builds standard 64-bit Windows executables into the `release/` directory:
-- **`Google Photos Desktop-Setup-1.0.0.exe`**: Full Windows NSIS setup wizard with Desktop and Start Menu shortcuts, custom install directory selection, and uninstaller.
-- **`Google Photos Desktop-Portable-1.0.0.exe`**: Self-contained single-file portable executable. Runs immediately without installation or admin privileges (ideal for USB drives).
+- **`gPhotos Desktop-Setup-1.0.0.exe`**: Full Windows NSIS setup wizard with Desktop and Start Menu shortcuts, custom install directory selection, and uninstaller.
+- **`gPhotos Desktop-Portable-1.0.0.exe`**: Self-contained single-file portable executable. Runs immediately without installation or admin privileges (ideal for USB drives).
 
 ### Mobile Access via Local Web Server:
 You can access your complete desktop photo library directly from your mobile phone (iPhone or Android) on your local Wi-Fi:
@@ -106,7 +106,7 @@ The application allows you to manage multiple photo collections independently:
 
 ## 4. Timeline Gallery & Dynamic Zoom
 
-The **Photos** gallery presents your collection in a chronological Google Photos-style layout:
+The **Photos** gallery presents your collection in a chronological, zoomable timeline layout:
 
 ### Timeline & Grouping:
 - Photos are partitioned by **Year** and **Month** with sticky date headers.

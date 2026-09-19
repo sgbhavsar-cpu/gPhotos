@@ -23,17 +23,19 @@ import {
   Radio,
   Users,
   Image,
+  X,
 } from 'lucide-react';
 import { VirtualStorageConfig, MirrorProgress, BackgroundServiceStatus, NetworkStorageProgress, StorageDetails } from '../../types';
 import { DeleteStorageModal } from '../components/DeleteStorageModal';
 import { libraryStore } from '../services/libraryStore';
+import { splitStoragesByExistence } from '../services/storageValidation';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 interface VirtualStorageViewProps {
   onLoadMirroredPhotos: (mirrorRootPath: string) => void;
   onStoragesUpdated?: (storages: VirtualStorageConfig[]) => void;
   onBrowseFolderTree?: (folderPath: string) => void;
   storageProgressMap?: Record<string, NetworkStorageProgress>;
-  onScanStorageFaces?: (storage: VirtualStorageConfig) => void;
 }
 
 const STORAGE_CONFIGS_KEY = 'gphotos_virtual_storages_v1';
@@ -44,14 +46,19 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
   onStoragesUpdated,
   onBrowseFolderTree,
   storageProgressMap = {},
-  onScanStorageFaces,
 }) => {
+  const isMobile = useIsMobile();
   const [storages, setStorages] = useState<VirtualStorageConfig[]>([]);
   const [isLoadingStorages, setIsLoadingStorages] = useState(true);
   const storagesRef = useRef<VirtualStorageConfig[]>([]);
   storagesRef.current = storages;
 
   const [storageDetailsMap, setStorageDetailsMap] = useState<Record<string, StorageDetails>>({});
+  // Cards would otherwise briefly render with 0/empty stats before the first
+  // getAllStorageDetails() round-trip (a live disk + SQLite read per storage)
+  // resolves, which reads as the screen being stuck rather than loading.
+  const [isLoadingStorageDetails, setIsLoadingStorageDetails] = useState(true);
+  const [prunedStoragesNotice, setPrunedStoragesNotice] = useState<string | null>(null);
 
   const [name, setName] = useState('');
   const [networkSourcePath, setNetworkSourcePath] = useState('');
@@ -85,6 +92,66 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
       localStorage.setItem(STORAGE_CONFIGS_KEY, JSON.stringify(updated));
     }
     return updated;
+  };
+
+  /**
+   * Inventory gate (see docs/PIPELINE_REDESIGN_DEV_DOC.md §3.2): counts every
+   * eligible file under the storage's source folder (incl. subfolders) and
+   * persists the fixed total before any thumbnail/face processing is allowed
+   * to start. Returns the updated config so callers can check the result
+   * (and its inventoryTotalFiles) without racing a separate re-read.
+   */
+  const ensureInventoryCompleted = async (config: VirtualStorageConfig): Promise<VirtualStorageConfig> => {
+    if (config.inventoryStatus === 'completed' || !window.electronAPI?.scanStorageInventory) {
+      return config;
+    }
+
+    await saveStorages((prev) =>
+      prev.map((s) => (s.id === config.id ? { ...s, inventoryStatus: 'scanning' } : s))
+    );
+
+    const result = await window.electronAPI.scanStorageInventory(config.networkSourcePath);
+
+    const updatedConfig: VirtualStorageConfig = {
+      ...config,
+      inventoryStatus: result.status,
+      inventoryTotalFiles: result.totalFiles,
+      inventoryCompletedAt: result.completedAt,
+      inventoryError: result.error,
+    };
+    await saveStorages((prev) => prev.map((s) => (s.id === config.id ? updatedConfig : s)));
+    return updatedConfig;
+  };
+
+  // The mirror folder is the source of truth for whether a storage still
+  // "exists" — the settings entry is just a config record that has to live
+  // somewhere before the first sync ever creates that folder. Whenever a
+  // configured storage's folder is gone, drop it from the list (and
+  // blacklist it so auto-discovery can't resurrect it) rather than letting
+  // a stale settings entry outlive the folder it describes.
+  const pruneMissingStorageFolders = async (list: VirtualStorageConfig[]): Promise<VirtualStorageConfig[]> => {
+    if (!window.electronAPI?.checkFileExists || list.length === 0) return list;
+    const { valid: stillValid, removed: missing } = await splitStoragesByExistence(list, window.electronAPI.checkFileExists);
+    if (missing.length === 0) return list;
+
+    if (window.electronAPI) {
+      const unlinked: string[] = (await window.electronAPI.loadLibraryData(UNLINKED_STORAGES_KEY)) || [];
+      const missingNames = missing.map((s) => s.name.toLowerCase());
+      const nextUnlinked = Array.from(new Set([...unlinked, ...missingNames]));
+      await window.electronAPI.saveLibraryData(UNLINKED_STORAGES_KEY, nextUnlinked);
+    }
+    // Also clears "Active Library" in the sidebar and any of this storage's
+    // photos still held in memory, if either currently points at it — those
+    // are a separate persisted record (selectedFolder / gphotos_library_v1)
+    // from the storages list above, and were left stale otherwise.
+    for (const s of missing) {
+      libraryStore.removePhotosByStorage(s.name);
+    }
+    const names = missing.map((s) => s.name).join(', ');
+    setPrunedStoragesNotice(
+      `Removed ${missing.length === 1 ? 'storage' : `${missing.length} storages`} whose local mirror folder no longer exists: ${names}. Its network source and photos are unaffected — re-add it to sync again.`
+    );
+    return stillValid;
   };
 
   // Load configured storages & auto-discover on-disk mirrors
@@ -142,6 +209,11 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
           }
         }
 
+        // Prune entries whose local mirror folder no longer exists on disk —
+        // e.g. deleted manually outside the app rather than via "Delete
+        // Storage" here.
+        combined = await pruneMissingStorageFolders(combined);
+
         if (isMounted) {
           storagesRef.current = combined;
           setStorages(combined);
@@ -197,6 +269,60 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
           const details = await window.electronAPI.getAllStorageDetails();
           setStorageDetailsMap(details || {});
         }
+      } catch {
+      } finally {
+        setIsLoadingStorageDetails(false);
+      }
+    };
+
+    // Catches a mirror folder deleted (or a drive unplugged) while this
+    // screen is open, live — not just on next app launch — since the folder
+    // is the source of truth for whether the storage still exists at all.
+    const checkForRemovedStorages = async () => {
+      if (storagesRef.current.length === 0 || isSyncing) return;
+      const pruned = await pruneMissingStorageFolders(storagesRef.current);
+      if (pruned.length !== storagesRef.current.length) {
+        storagesRef.current = pruned;
+        setStorages(pruned);
+        if (onStoragesUpdated) onStoragesUpdated(pruned);
+        if (window.electronAPI) {
+          await window.electronAPI.saveLibraryData(STORAGE_CONFIGS_KEY, pruned);
+        }
+      }
+    };
+
+    // The background sync daemon updates totalItems/lastSynced/
+    // totalSizeSaved in the persisted setting continuously while it runs,
+    // independent of this screen — without re-reading it, "Mirrored: X
+    // photos" stays frozen at whatever it was when this screen last loaded
+    // the list, even while a sync is visibly progressing (the % bars above
+    // it are fine since those come from the always-live getAllStorageDetails
+    // call, just not this specific line).
+    const refreshStorageTotals = async () => {
+      if (!window.electronAPI?.loadLibraryData || storagesRef.current.length === 0 || isSyncing) return;
+      try {
+        const saved: VirtualStorageConfig[] | null = await window.electronAPI.loadLibraryData(STORAGE_CONFIGS_KEY);
+        if (!saved || saved.length === 0) return;
+        const byName = new Map(saved.map((s) => [s.name.toLowerCase(), s]));
+        let changed = false;
+        const merged = storagesRef.current.map((s) => {
+          const fresh = byName.get(s.name.toLowerCase());
+          if (
+            fresh &&
+            (fresh.totalItems !== s.totalItems ||
+              fresh.lastSynced !== s.lastSynced ||
+              fresh.totalSizeSaved !== s.totalSizeSaved)
+          ) {
+            changed = true;
+            return { ...s, totalItems: fresh.totalItems, lastSynced: fresh.lastSynced, totalSizeSaved: fresh.totalSizeSaved };
+          }
+          return s;
+        });
+        if (changed) {
+          storagesRef.current = merged;
+          setStorages(merged);
+          if (onStoragesUpdated) onStoragesUpdated(merged);
+        }
       } catch {}
     };
 
@@ -205,6 +331,8 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
     const intervalId = setInterval(() => {
       fetchStatus();
       fetchStorageDetails();
+      checkForRemovedStorages();
+      refreshStorageTotals();
     }, 2000);
     return () => clearInterval(intervalId);
   }, [storages]);
@@ -269,7 +397,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
     e.preventDefault();
     if (!name.trim() || !networkSourcePath.trim() || !localMirrorRoot.trim()) return;
 
-    const newConfig: VirtualStorageConfig = {
+    let newConfig: VirtualStorageConfig = {
       id: `storage_${Date.now()}`,
       name: name.trim(),
       networkSourcePath: networkSourcePath.trim(),
@@ -279,6 +407,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
       totalSizeSaved: 0,
       delayBetweenPhotosSec: delaySec,
       bandwidthLimitMbps: bandwidthLimit,
+      inventoryStatus: 'not_started',
     };
 
     await saveStorages((prev) => {
@@ -296,23 +425,24 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
     setName('');
     setNetworkSourcePath('');
 
-    // Trigger non-blocking background scan (Requirement 1)
-    if (window.electronAPI?.startBackgroundScan) {
-      const fullLocalPath = `${newConfig.localMirrorRoot}\\${newConfig.name}`;
-      await window.electronAPI.startBackgroundScan(newConfig.networkSourcePath, fullLocalPath);
-      setSyncSummary({
-        storageName: newConfig.name,
-        totalSynced: 0,
-        newlyAdded: 0,
-        totalSizeSaved: 0,
-        localPath: fullLocalPath,
-      });
-    } else {
-      handleSyncStorage(newConfig);
+    // Inventory gate: count everything under the source folder and fix that
+    // number before any thumbnail/face processing is allowed to start.
+    newConfig = await ensureInventoryCompleted(newConfig);
+    if (newConfig.inventoryStatus !== 'completed') {
+      setSyncSummary(null);
+      return;
     }
+
+    // One unified per-photo pipeline (thumbnail -> face detection -> OneDrive
+    // reclaim if applicable) for every storage, added or rescanned alike —
+    // see docs/PIPELINE_REDESIGN_DEV_DOC.md §3.3. This used to branch into a
+    // separate "non-blocking background scan" IPC call for a freshly-added
+    // plain storage, which was thumbnail-only, used a different photo-id
+    // scheme than everything else, and never ran face detection at all.
+    handleSyncStorage(newConfig);
   };
 
-  const handleSyncStorage = async (config: VirtualStorageConfig) => {
+  const handleSyncStorage = async (config: VirtualStorageConfig, forceRecount = false) => {
     if (!window.electronAPI || isSyncing) return;
 
     setIsSyncing(true);
@@ -325,7 +455,29 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
     });
     setSyncSummary(null);
 
+    // Inventory gate: only an explicit "Rescan / Refresh" (forceRecount)
+    // re-counts the source folder to pick up newly added files. Resuming an
+    // interrupted sync, retrying after a OneDrive health check, or the
+    // auto-sync that fires right after adding a storage all already have a
+    // valid, just-computed inventory count — forcing a second full recursive
+    // recount here (as this used to do unconditionally) meant every one of
+    // those wasted a full extra directory walk before any real work started,
+    // which on a large NAS share could look like nothing was happening.
+    if (forceRecount) {
+      config = { ...config, inventoryStatus: 'not_started' };
+    }
+    config = await ensureInventoryCompleted(config);
+    if (config.inventoryStatus !== 'completed') {
+      setIsSyncing(false);
+      setActiveSyncStorageId(null);
+      return;
+    }
+
     try {
+      // syncVirtualStorage now runs the full unified pipeline itself —
+      // thumbnail, then face detection, then OneDrive reclaim if applicable
+      // — for plain and OneDrive-backed sources alike (see
+      // docs/PIPELINE_REDESIGN_DEV_DOC.md §3.3).
       const result = await window.electronAPI.syncVirtualStorage(config);
       if (result.success) {
         const fullLocalPath = `${config.localMirrorRoot}\\${config.name}`;
@@ -353,13 +505,23 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
           )
         );
 
-        // Face recognition is part of the same "Rescan / Refresh" action now,
-        // not a separate manual step — runFaceDetectionForPhotos itself skips
-        // any photo that's already scanned, so this is a cheap no-op once a
-        // storage is fully caught up.
-        if (onScanStorageFaces) {
-          onScanStorageFaces(config);
-        }
+        // syncVirtualStorage above already ran the full unified pipeline
+        // (thumbnail -> face detection -> OneDrive reclaim) for every photo
+        // — there's nothing left for a second pass to do. This used to also
+        // call onScanStorageFaces(config), which round-tripped into App.tsx
+        // and triggered a SECOND, redundant syncVirtualStorage run there —
+        // driven by App.tsx's own separate copy of the virtualStorages
+        // array (it and this component each hold their own React state,
+        // kept in sync only via the onStoragesUpdated callback above, which
+        // isn't necessarily caught up with what saveStorages just persisted
+        // a moment ago). That second run's save-back would then overwrite
+        // the inventoryStatus/inventoryTotalFiles just set above with stale
+        // values from App.tsx's lagging copy — exactly the "storage view
+        // shows a different, wrong number" bug this rewrite was meant to
+        // eliminate, just reintroduced through a different door. If the
+        // user is actively browsing this storage's photos, re-selecting it
+        // (or the next "Browse in Library" click) picks up the fresh data —
+        // no need to force that refresh from here.
       }
     } catch (err) {
       console.error('Failed to sync virtual storage:', err);
@@ -434,7 +596,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
   const handleSyncAllStorages = async () => {
     if (!window.electronAPI || isSyncing || storagesRef.current.length === 0) return;
     for (const storage of storagesRef.current) {
-      await handleSyncStorage(storage);
+      await handleSyncStorage(storage, true);
     }
   };
 
@@ -447,13 +609,21 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
   };
 
   return (
-    <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflowY: 'auto', padding: '32px 40px' }}>
+    <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflowY: 'auto', padding: isMobile ? '16px' : '32px 40px' }}>
       {/* Header */}
-      <div style={{ marginBottom: '28px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+      <div style={{
+        marginBottom: isMobile ? '18px' : '28px',
+        display: 'flex',
+        flexWrap: isMobile ? 'wrap' : 'nowrap',
+        justifyContent: 'space-between',
+        alignItems: isMobile ? 'stretch' : 'flex-start',
+        gap: isMobile ? '12px' : undefined,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', minWidth: 0 }}>
           <div style={{
-            width: '42px',
-            height: '42px',
+            width: isMobile ? '34px' : '42px',
+            height: isMobile ? '34px' : '42px',
+            flexShrink: 0,
             borderRadius: 'var(--radius-md)',
             backgroundColor: 'rgba(6, 182, 212, 0.15)',
             display: 'flex',
@@ -461,15 +631,17 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
             justifyContent: 'center',
             color: 'var(--accent-cyan)',
           }}>
-            <HardDrive size={24} />
+            <HardDrive size={isMobile ? 18 : 24} />
           </div>
-          <div>
-            <h2 style={{ fontSize: '1.4rem', fontWeight: 800, color: 'var(--text-primary)' }}>
+          <div style={{ minWidth: 0 }}>
+            <h2 style={{ fontSize: isMobile ? '1.05rem' : '1.4rem', fontWeight: 800, color: 'var(--text-primary)' }}>
               Virtual Network Storage Mirrors
             </h2>
-            <p style={{ fontSize: '0.875rem', color: 'var(--text-muted)' }}>
-              Replicate network folders locally with lightweight 500px thumbnails and EXIF metadata without copying original photos.
-            </p>
+            {!isMobile && (
+              <p style={{ fontSize: '0.875rem', color: 'var(--text-muted)' }}>
+                Replicate network folders locally with lightweight 500px thumbnails and EXIF metadata without copying original photos.
+              </p>
+            )}
           </div>
         </div>
 
@@ -478,7 +650,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
             className="btn btn-secondary"
             onClick={handleSyncAllStorages}
             disabled={isSyncing}
-            style={{ fontSize: '0.85rem', gap: '8px' }}
+            style={{ fontSize: '0.85rem', gap: '8px', width: isMobile ? '100%' : undefined, justifyContent: isMobile ? 'center' : undefined }}
             title="Rescan all network folders to check if photos were added"
           >
             <RefreshCw size={15} className={isSyncing ? 'animate-spin' : ''} />
@@ -492,17 +664,24 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
         backgroundColor: 'var(--bg-surface)',
         border: '1px solid var(--border-subtle)',
         borderRadius: 'var(--radius-lg)',
-        padding: '24px',
+        padding: isMobile ? '16px' : '24px',
         boxShadow: 'var(--shadow-sm)',
         maxWidth: '860px',
-        marginBottom: '32px',
+        marginBottom: isMobile ? '20px' : '32px',
       }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+        <div style={{
+          display: 'flex',
+          flexDirection: isMobile ? 'column' : 'row',
+          justifyContent: 'space-between',
+          alignItems: isMobile ? 'stretch' : 'center',
+          gap: isMobile ? '10px' : undefined,
+          marginBottom: '16px',
+        }}>
           <h3 style={{ fontSize: '1.05rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px' }}>
             <Zap size={18} color="var(--accent-cyan)" />
             Connect Remote / Cloud Storage Mirror
           </h3>
-          <div style={{ display: 'flex', gap: '6px' }}>
+          <div className={isMobile ? 'filter-pills-row' : undefined} style={{ display: 'flex', gap: '6px' }}>
             <button
               type="button"
               className="btn btn-secondary"
@@ -557,7 +736,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
         </div>
 
         <form onSubmit={handleAddStorage} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: '16px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 2fr', gap: '16px' }}>
             <div>
               <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, marginBottom: '6px', color: 'var(--text-secondary)' }}>
                 Storage Location Name
@@ -614,7 +793,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
             </div>
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: '16px' }}>
             <div>
               <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '6px', color: 'var(--text-secondary)' }}>
                 Scan Delay Per Photo (seconds)
@@ -678,11 +857,18 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
           maxWidth: '860px',
           marginBottom: '24px',
         }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85rem', marginBottom: '8px' }}>
-            <span style={{ color: 'var(--accent-cyan)', fontWeight: 600 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85rem', marginBottom: '8px', gap: '8px' }}>
+            <span style={{
+              color: 'var(--accent-cyan)',
+              fontWeight: 600,
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}>
               Generating 500px Thumbnails: {progress.currentFile}
             </span>
-            <span>{progress.current} / {progress.total}</span>
+            <span style={{ flexShrink: 0 }}>{progress.current} / {progress.total}</span>
           </div>
           <div style={{
             height: '8px',
@@ -700,15 +886,42 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
         </div>
       )}
 
+      {/* Notice: storages auto-removed because their local mirror folder is gone */}
+      {prunedStoragesNotice && (
+        <div style={{
+          backgroundColor: 'rgba(245, 158, 11, 0.12)',
+          border: '1px solid rgba(245, 158, 11, 0.35)',
+          borderRadius: 'var(--radius-lg)',
+          padding: '14px 18px',
+          maxWidth: '860px',
+          display: 'flex',
+          flexWrap: isMobile ? 'wrap' : 'nowrap',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '12px',
+        }}>
+          <span style={{ fontSize: '0.85rem', color: '#f59e0b' }}>{prunedStoragesNotice}</span>
+          <button
+            className="btn btn-ghost btn-icon"
+            onClick={() => setPrunedStoragesNotice(null)}
+            title="Dismiss"
+            style={{ flexShrink: 0 }}
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
       {/* Sync Success Summary */}
       {syncSummary && (
         <div style={{
           backgroundColor: syncSummary.newlyAdded > 0 ? 'rgba(59, 130, 246, 0.12)' : 'rgba(16, 185, 129, 0.12)',
           border: syncSummary.newlyAdded > 0 ? '1px solid rgba(59, 130, 246, 0.35)' : '1px solid rgba(16, 185, 129, 0.35)',
           borderRadius: 'var(--radius-lg)',
-          padding: '20px',
+          padding: isMobile ? '16px' : '20px',
           maxWidth: '860px',
           display: 'flex',
+          flexWrap: isMobile ? 'wrap' : 'nowrap',
           alignItems: 'center',
           justifyContent: 'space-between',
           gap: '16px',
@@ -716,9 +929,9 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
             {syncSummary.newlyAdded > 0 ? (
-              <Sparkles size={32} color="var(--accent-primary)" />
+              <Sparkles size={isMobile ? 24 : 32} color="var(--accent-primary)" />
             ) : (
-              <CheckCircle2 size={32} color="var(--accent-emerald)" />
+              <CheckCircle2 size={isMobile ? 24 : 32} color="var(--accent-emerald)" />
             )}
             <div>
               <h4 style={{
@@ -747,7 +960,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
           <button
             className="btn btn-primary"
             onClick={() => onLoadMirroredPhotos(syncSummary.localPath)}
-            style={{ fontSize: '0.85rem', padding: '8px 16px', whiteSpace: 'nowrap' }}
+            style={{ fontSize: '0.85rem', padding: '8px 16px', whiteSpace: 'nowrap', width: isMobile ? '100%' : undefined, justifyContent: isMobile ? 'center' : undefined }}
           >
             <Layers size={15} />
             <span>Browse in Library Now</span>
@@ -761,7 +974,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
           Configured Storages {isLoadingStorages ? '' : `(${storages.length})`}
         </h3>
 
-        {isLoadingStorages ? (
+        {isLoadingStorages || (storages.length > 0 && isLoadingStorageDetails) ? (
           <div style={{
             padding: '48px 32px',
             display: 'flex',
@@ -807,17 +1020,18 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                     backgroundColor: 'var(--bg-surface)',
                     border: '1px solid var(--border-subtle)',
                     borderRadius: 'var(--radius-lg)',
-                    padding: '20px 24px',
+                    padding: isMobile ? '14px 16px' : '20px 24px',
                     display: 'flex',
                     flexDirection: 'column',
                     gap: '12px',
                   }}
                 >
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                  <div style={{ display: 'flex', flexWrap: isMobile ? 'wrap' : 'nowrap', justifyContent: 'space-between', alignItems: 'flex-start', gap: '10px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px', minWidth: 0 }}>
                       <div style={{
                         width: '36px',
                         height: '36px',
+                        flexShrink: 0,
                         borderRadius: 'var(--radius-md)',
                         backgroundColor: 'var(--bg-surface-elevated)',
                         display: 'flex',
@@ -827,26 +1041,43 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                       }}>
                         <HardDrive size={18} />
                       </div>
-                      <div>
+                      <div style={{ minWidth: 0 }}>
                         <h4 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-primary)' }}>
                           {s.name}
                         </h4>
-                        <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+                        <div style={{
+                          fontSize: '0.75rem',
+                          color: 'var(--text-muted)',
+                          fontFamily: 'var(--font-mono)',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: isMobile ? 'nowrap' : 'normal',
+                        }}>
                           Remote: {s.networkSourcePath}
                         </div>
+                        {s.inventoryStatus === 'scanning' && (
+                          <div style={{ fontSize: '0.75rem', color: 'var(--accent-cyan)', marginTop: '4px', fontWeight: 600 }}>
+                            Inventorying… counting files before processing starts
+                          </div>
+                        )}
+                        {s.inventoryStatus === 'failed' && (
+                          <div style={{ fontSize: '0.75rem', color: '#fb7185', marginTop: '4px', fontWeight: 600 }}>
+                            Inventory failed{s.inventoryError ? `: ${s.inventoryError}` : ''} — processing paused until this succeeds
+                          </div>
+                        )}
                       </div>
                     </div>
 
-                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                    <div style={{ display: 'flex', gap: isMobile ? '6px' : '8px', flexWrap: 'wrap' }}>
                       {onBrowseFolderTree && (
                         <button
                           className="btn btn-secondary"
                           onClick={() => onBrowseFolderTree(s.networkSourcePath)}
-                          style={{ fontSize: '0.8rem', padding: '6px 12px', gap: '6px' }}
+                          style={{ fontSize: '0.8rem', padding: isMobile ? '6px 8px' : '6px 12px', gap: '6px' }}
                           title="Browse remote directory tree immediately (even before scanning completes)"
                         >
                           <FolderTree size={14} color="var(--accent-cyan)" />
-                          <span>Folder Tree</span>
+                          {!isMobile && <span>Folder Tree</span>}
                         </button>
                       )}
 
@@ -861,7 +1092,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                             disabled={isSyncing}
                             style={{
                               fontSize: '0.8rem',
-                              padding: '6px 14px',
+                              padding: isMobile ? '6px 8px' : '6px 14px',
                               gap: '6px',
                               backgroundColor: '#f59e0b',
                               borderColor: '#d97706',
@@ -871,18 +1102,18 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                             title={`Resume sync from photo ${(prog?.thumbnailCurrent || 0) + 1} of ${prog?.thumbnailTotal || '?'}`}
                           >
                             <Play size={14} />
-                            <span>Resume Sync ({prog?.percent || 0}%)</span>
+                            {!isMobile && <span>Resume Sync ({prog?.percent || 0}%)</span>}
                           </button>
                         ) : (
                           <button
                             className="btn btn-secondary"
-                            onClick={() => handleSyncStorage(s)}
+                            onClick={() => handleSyncStorage(s, true)}
                             disabled={isSyncing}
-                            style={{ fontSize: '0.8rem', padding: '6px 12px' }}
+                            style={{ fontSize: '0.8rem', padding: isMobile ? '6px 8px' : '6px 12px', gap: '6px' }}
                             title="Check for new photos, cache thumbnails, and run face recognition — all in one pass"
                           >
                             <RefreshCw size={14} className={isThisSyncing ? 'animate-spin' : ''} />
-                            <span>{isThisSyncing ? 'Rescanning...' : 'Rescan / Refresh'}</span>
+                            {!isMobile && <span>{isThisSyncing ? 'Rescanning...' : 'Rescan / Refresh'}</span>}
                           </button>
                         );
                       })()}
@@ -890,10 +1121,11 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                       <button
                         className="btn btn-primary"
                         onClick={() => onLoadMirroredPhotos(fullLocalPath)}
-                        style={{ fontSize: '0.8rem', padding: '6px 14px' }}
+                        style={{ fontSize: '0.8rem', padding: isMobile ? '6px 8px' : '6px 14px', gap: '6px' }}
+                        title="Browse in Library"
                       >
                         <Layers size={14} />
-                        <span>Browse in Library</span>
+                        {!isMobile && <span>Browse in Library</span>}
                       </button>
 
                       <button
@@ -913,12 +1145,16 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                     const details = storageDetailsMap[s.name] || storageDetailsMap[s.id];
                     const prog = storageProgressMap[s.name] || storageProgressMap[s.id];
 
-                    // Prefer the live per-storage scan (details.totalPhotos) —
-                    // it's recomputed from what's actually on disk right now.
-                    // Only fall back to the persisted config's totalItems
-                    // before details have loaded at all, so a stale/inflated
-                    // number can't permanently outrank an accurate live count.
-                    const rawTotal = details?.totalPhotos || s.totalItems || 0;
+                    // Once inventory has completed, its fixed count is the
+                    // single source of truth (see docs/PIPELINE_REDESIGN_DEV_DOC.md
+                    // §3.2) — no more live disk-scan vs persisted-config
+                    // numbers that can disagree with each other or with the
+                    // sidebar. Before inventory completes, fall back to the
+                    // live per-storage scan / persisted totalItems so the
+                    // card still shows a reasonable number mid-scan.
+                    const rawTotal = s.inventoryStatus === 'completed'
+                      ? (s.inventoryTotalFiles || 0)
+                      : (details?.totalPhotos || s.totalItems || 0);
                     const totalPhotos = rawTotal > 0
                       ? rawTotal
                       : Math.max(prog?.thumbnailTotal || 0, prog?.faceTotal || 0);
@@ -928,21 +1164,9 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                       ? prog.thumbnailCurrent
                       : (details?.cachedThumbnails !== undefined ? details.cachedThumbnails : (s.totalItems || 0));
                     const cachedThumbnails = totalPhotos > 0 ? Math.min(rawCached, totalPhotos) : rawCached;
-                    const thumbTotal = totalPhotos;
-                    const thumbPercent = thumbTotal > 0
-                      ? Math.min(100, Math.round((cachedThumbnails / thumbTotal) * 100))
-                      : (cachedThumbnails > 0 ? 100 : 0);
                     const isThumbActive = prog?.phase === 'thumbnails' || (isSyncing && activeSyncStorageId === s.id);
 
                     // Face stats
-                    const rawFaces = prog?.faceCurrent !== undefined && (prog.phase === 'faces' || prog.phase === 'completed')
-                      ? prog.faceCurrent
-                      : (details?.facesScannedCount !== undefined ? details.facesScannedCount : 0);
-                    const facesScanned = totalPhotos > 0 ? Math.min(rawFaces, totalPhotos) : rawFaces;
-                    const faceTotal = totalPhotos;
-                    const facePercent = faceTotal > 0
-                      ? Math.min(100, Math.round((facesScanned / faceTotal) * 100))
-                      : (facesScanned > 0 && facesScanned >= faceTotal ? 100 : 0);
                     const facesDetected = details?.facesDetectedCount ?? 0;
                     const isFaceActive = prog?.phase === 'faces';
 
@@ -960,19 +1184,25 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                         {prog && prog.phase && prog.phase !== 'idle' && (
                           <div style={{
                             display: 'flex',
+                            flexWrap: isMobile ? 'wrap' : 'nowrap',
                             alignItems: 'center',
                             justifyContent: 'space-between',
+                            gap: '8px',
                             padding: '6px 12px',
                             borderRadius: 'var(--radius-sm)',
                             fontSize: '0.78rem',
-                            backgroundColor: prog.phase === 'faces'
+                            backgroundColor: prog.phase === 'paused' || prog.phase === 'error'
+                              ? 'rgba(244, 63, 94, 0.14)'
+                              : prog.phase === 'faces'
                               ? 'rgba(236, 72, 153, 0.12)'
                               : prog.phase === 'completed'
                               ? 'rgba(16, 185, 129, 0.12)'
                               : prog.phase === 'interrupted'
                               ? 'rgba(245, 158, 11, 0.12)'
                               : 'rgba(56, 189, 248, 0.12)',
-                            color: prog.phase === 'faces'
+                            color: prog.phase === 'paused' || prog.phase === 'error'
+                              ? '#fb7185'
+                              : prog.phase === 'faces'
                               ? '#f472b6'
                               : prog.phase === 'completed'
                               ? '#10b981'
@@ -981,127 +1211,85 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                               : 'var(--accent-cyan)',
                             border: '1px solid currentColor',
                           }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                              {(isThumbActive || isFaceActive) && <RefreshCw size={12} className="animate-spin" />}
-                              <span style={{ fontWeight: 700 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+                              {(isThumbActive || isFaceActive) && <RefreshCw size={12} className="animate-spin" style={{ flexShrink: 0 }} />}
+                              <span style={{
+                                fontWeight: 700,
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                                whiteSpace: isMobile ? 'nowrap' : 'normal',
+                              }}>
+                                {prog.phase === 'paused' && (prog.message || '⚠ Paused — OneDrive is not freeing up disk space as expected.')}
                                 {prog.phase === 'scanning' && 'Scanning remote directory...'}
                                 {prog.phase === 'thumbnails' && `Caching Thumbnails (${prog.thumbnailCurrent}/${prog.thumbnailTotal || '?'})`}
                                 {prog.phase === 'faces' && `Recognizing Faces (${prog.faceCurrent}/${prog.faceTotal || '?'})`}
                                 {prog.phase === 'interrupted' && `Sync Interrupted / Checkpoint Saved at photo ${prog.thumbnailCurrent}`}
                                 {prog.phase === 'completed' && '✓ Sync and Processing Completed'}
-                                {prog.currentFile && ` • ${prog.currentFile}`}
+                                {prog.phase !== 'paused' && prog.currentFile && ` • ${prog.currentFile}`}
                               </span>
                             </div>
-                            <span style={{ fontWeight: 700, fontFamily: 'var(--font-mono)' }}>{prog.percent}%</span>
+                            {prog.phase === 'paused' ? (
+                              <button
+                                className="btn btn-secondary"
+                                style={{ fontSize: '0.72rem', padding: '4px 10px', flexShrink: 0 }}
+                                onClick={async (e) => {
+                                  e.stopPropagation();
+                                  await window.electronAPI?.resetOneDriveReclaimHealth?.();
+                                  handleSyncStorage(s);
+                                }}
+                              >
+                                Retry
+                              </button>
+                            ) : (
+                              <span style={{ fontWeight: 700, fontFamily: 'var(--font-mono)' }}>{prog.percent}%</span>
+                            )}
                           </div>
                         )}
 
-                        {/* 2-Column Grid: Thumbnail Cache & Face Recognition */}
+                        {/* Single simple status row: total images, cached, faces detected */}
                         <div style={{
-                          display: 'grid',
-                          gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
-                          gap: '12px',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-around',
+                          backgroundColor: 'var(--bg-surface-elevated)',
+                          borderRadius: 'var(--radius-sm)',
+                          padding: '12px 8px',
+                          border: '1px solid rgba(255, 255, 255, 0.04)',
                         }}>
-                          {/* Column 1: Thumbnail Caching */}
-                          <div style={{
-                            display: 'flex',
-                            flexDirection: 'column',
-                            gap: '6px',
-                            backgroundColor: 'var(--bg-surface-elevated)',
-                            borderRadius: 'var(--radius-sm)',
-                            padding: '10px 12px',
-                            border: '1px solid rgba(255, 255, 255, 0.04)',
-                          }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.8rem' }}>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--accent-cyan)', fontWeight: 700 }}>
-                                <Image size={14} />
-                                <span>Thumbnails Cached</span>
-                              </div>
-                              <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem', color: 'var(--text-primary)', fontWeight: 600 }}>
-                                {cachedThumbnails.toLocaleString()} / {thumbTotal.toLocaleString()} ({thumbPercent}%)
-                              </span>
+                          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--text-secondary)' }}>
+                              <Layers size={14} />
+                              <span style={{ fontSize: '0.72rem', fontWeight: 600, textTransform: 'uppercase' }}>Total Images</span>
                             </div>
-
-                            <div style={{ height: '7px', borderRadius: '4px', backgroundColor: 'rgba(255, 255, 255, 0.08)', overflow: 'hidden' }}>
-                              <div style={{
-                                height: '100%',
-                                width: `${thumbPercent}%`,
-                                background: 'linear-gradient(90deg, var(--accent-cyan), #10b981)',
-                                transition: 'width 0.3s ease',
-                              }} />
-                            </div>
-
-                            <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', display: 'flex', justifyContent: 'space-between' }}>
-                              <span>
-                                {isThumbActive
-                                  ? '⚡ Caching in progress...'
-                                  : thumbPercent >= 100 && totalPhotos > 0
-                                  ? '✓ 100% cached for 0ms browsing'
-                                  : cachedThumbnails < thumbTotal
-                                  ? `${(thumbTotal - cachedThumbnails).toLocaleString()} pending cache`
-                                  : 'Ready'}
-                              </span>
-                              <span style={{ color: 'var(--text-secondary)' }}>
-                                500px + 250px grid
-                              </span>
-                            </div>
+                            <span style={{ fontFamily: 'var(--font-mono)', fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-primary)' }}>
+                              {totalPhotos.toLocaleString()}
+                            </span>
                           </div>
 
-                          {/* Column 2: Face Detection & Recognition */}
-                          <div style={{
-                            display: 'flex',
-                            flexDirection: 'column',
-                            gap: '6px',
-                            backgroundColor: 'var(--bg-surface-elevated)',
-                            borderRadius: 'var(--radius-sm)',
-                            padding: '10px 12px',
-                            border: '1px solid rgba(255, 255, 255, 0.04)',
-                          }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.8rem' }}>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#ec4899', fontWeight: 700 }}>
-                                <Users size={14} />
-                                <span>Face Recognition</span>
-                              </div>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                <span style={{
-                                  fontSize: '0.72rem',
-                                  fontWeight: 700,
-                                  padding: '1px 6px',
-                                  borderRadius: '4px',
-                                  backgroundColor: 'rgba(236, 72, 153, 0.15)',
-                                  color: '#f472b6',
-                                }}>
-                                  {facesDetected.toLocaleString()} faces detected
-                                </span>
-                                <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem', color: 'var(--text-primary)', fontWeight: 600 }}>
-                                  {facesScanned.toLocaleString()} / {faceTotal.toLocaleString()} ({facePercent}%)
-                                </span>
-                              </div>
-                            </div>
+                          <div style={{ width: '1px', alignSelf: 'stretch', backgroundColor: 'rgba(255, 255, 255, 0.08)' }} />
 
-                            <div style={{ height: '7px', borderRadius: '4px', backgroundColor: 'rgba(255, 255, 255, 0.08)', overflow: 'hidden' }}>
-                              <div style={{
-                                height: '100%',
-                                width: `${facePercent}%`,
-                                background: 'linear-gradient(90deg, #ec4899, #a855f7)',
-                                transition: 'width 0.3s ease',
-                              }} />
+                          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--accent-cyan)' }}>
+                              <Image size={14} />
+                              <span style={{ fontSize: '0.72rem', fontWeight: 600, textTransform: 'uppercase' }}>Cached</span>
                             </div>
+                            <span style={{ fontFamily: 'var(--font-mono)', fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-primary)' }}>
+                              {cachedThumbnails.toLocaleString()}
+                              {isThumbActive && <RefreshCw size={12} className="animate-spin" style={{ marginLeft: '6px', verticalAlign: 'middle' }} />}
+                            </span>
+                          </div>
 
-                            <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', display: 'flex', justifyContent: 'space-between' }}>
-                              <span>
-                                {isFaceActive
-                                  ? '⚡ Analyzing original photos...'
-                                  : facePercent >= 100 && totalPhotos > 0
-                                  ? '✓ Face scanning complete'
-                                  : facesScanned > 0
-                                  ? `${(faceTotal - facesScanned).toLocaleString()} photos remaining`
-                                  : 'Not yet scanned'}
-                              </span>
-                              <span style={{ color: 'var(--text-secondary)' }}>
-                                Full-res scan
-                              </span>
+                          <div style={{ width: '1px', alignSelf: 'stretch', backgroundColor: 'rgba(255, 255, 255, 0.08)' }} />
+
+                          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#ec4899' }}>
+                              <Users size={14} />
+                              <span style={{ fontSize: '0.72rem', fontWeight: 600, textTransform: 'uppercase' }}>Faces Detected</span>
                             </div>
+                            <span style={{ fontFamily: 'var(--font-mono)', fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-primary)' }}>
+                              {facesDetected.toLocaleString()}
+                              {isFaceActive && <RefreshCw size={12} className="animate-spin" style={{ marginLeft: '6px', verticalAlign: 'middle' }} />}
+                            </span>
                           </div>
                         </div>
                       </div>
@@ -1111,18 +1299,20 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                   {/* Mirror Location & Space Saved Pill */}
                   <div style={{
                     display: 'flex',
-                    alignItems: 'center',
+                    flexDirection: isMobile ? 'column' : 'row',
+                    alignItems: isMobile ? 'flex-start' : 'center',
                     justifyContent: 'space-between',
                     padding: '10px 14px',
                     backgroundColor: 'var(--bg-surface-elevated)',
                     borderRadius: 'var(--radius-md)',
                     fontSize: '0.78rem',
+                    gap: isMobile ? '8px' : undefined,
                   }}>
-                    <div style={{ color: 'var(--text-secondary)' }}>
+                    <div style={{ color: 'var(--text-secondary)', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '100%' }}>
                       Local Mirror: <code style={{ color: 'var(--text-primary)' }}>{fullLocalPath}</code>
                     </div>
 
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <div style={{ display: 'flex', flexWrap: isMobile ? 'wrap' : 'nowrap', alignItems: 'center', gap: '12px' }}>
                       {s.newlyAdded !== undefined && (
                         <span style={{
                           fontSize: '0.72rem',
@@ -1160,22 +1350,23 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
       <div
         style={{
           maxWidth: '860px',
-          marginTop: '32px',
+          marginTop: isMobile ? '20px' : '32px',
           backgroundColor: 'var(--bg-surface)',
           border: '1px solid var(--border-subtle)',
           borderRadius: 'var(--radius-lg)',
-          padding: '24px',
+          padding: isMobile ? '16px' : '24px',
           display: 'flex',
           flexDirection: 'column',
           gap: '16px',
         }}
       >
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+        <div style={{ display: 'flex', flexDirection: isMobile ? 'column' : 'row', flexWrap: isMobile ? 'wrap' : 'nowrap', justifyContent: 'space-between', alignItems: isMobile ? 'stretch' : 'center', gap: isMobile ? '12px' : undefined }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', minWidth: 0 }}>
             <div
               style={{
                 width: '38px',
                 height: '38px',
+                flexShrink: 0,
                 borderRadius: 'var(--radius-md)',
                 backgroundColor: 'rgba(59, 130, 246, 0.15)',
                 display: 'flex',
@@ -1186,7 +1377,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
             >
               <Cpu size={20} />
             </div>
-            <div>
+            <div style={{ minWidth: 0 }}>
               <h3 style={{ fontSize: '1.05rem', fontWeight: 700, margin: 0, color: 'var(--text-primary)' }}>
                 Background Service & System Tray Daemon
               </h3>
@@ -1196,7 +1387,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
             </div>
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <div style={{ display: 'flex', flexWrap: isMobile ? 'wrap' : 'nowrap', alignItems: 'center', gap: '10px' }}>
             <span
               style={{
                 fontSize: '0.75rem',

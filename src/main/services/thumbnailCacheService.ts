@@ -10,6 +10,7 @@ import {
   rotateHeic500Thumbnail,
 } from './heicService';
 import { getHeicSavedRotation, saveHeicSavedRotation } from './heicRotationStore';
+import { isPathReachable } from './networkReachabilityCache';
 
 let sharp: any = null;
 try {
@@ -319,11 +320,11 @@ export async function refreshThumbnailsFromSource(
 
   for (const item of items) {
     try {
-      const source = (item.originalRemotePath && fs.existsSync(item.originalRemotePath))
+      const source = (item.originalRemotePath && (await isPathReachable(item.originalRemotePath)))
         ? item.originalRemotePath
         : item.filePath;
 
-      if (!source || !fs.existsSync(source)) {
+      if (!source || !(await isPathReachable(source))) {
         errors.push(`Source file not found for ${item.filePath}`);
         continue;
       }
@@ -343,7 +344,7 @@ export async function refreshThumbnailsFromSource(
         } else {
           try {
             const { generateThumbnailBuffer } = require('./virtualMirrorService');
-            freshMirrorBuf = generateThumbnailBuffer(source, 500);
+            freshMirrorBuf = await generateThumbnailBuffer(source, 500);
           } catch {}
         }
         if (freshMirrorBuf) {

@@ -1,4 +1,5 @@
-import { getDb, getGlobalDb, runInTransaction } from './db';
+import type { DatabaseSync } from 'node:sqlite';
+import { getDb, getGlobalDb, getDbForLibraryPath, runInTransaction, resolveDbForPhoto } from './db';
 import { Photo, Person, DetectedFace, Album, ExifMetadata, LocationMetadata } from '../../types';
 
 function toBool(v: any): boolean {
@@ -41,10 +42,12 @@ function rowToPhoto(row: any): Photo {
     storageName: row.storage_name ?? undefined,
     isExcluded: toBool(row.is_excluded),
     faceScanCompleted: toBool(row.face_scan_completed),
+    facesLocked: toBool(row.faces_locked),
     sharpnessScore: row.sharpness_score ?? undefined,
     rotation: row.rotation ?? undefined,
     isHeicRotated: toBool(row.is_heic_rotated),
     heicRotation: row.heic_rotation ?? undefined,
+    originalMtimeMs: row.original_mtime_ms ?? undefined,
   };
   const exif = parseJson<ExifMetadata | null>(row.exif_json, null);
   if (exif) photo.exif = exif;
@@ -57,13 +60,13 @@ const UPSERT_PHOTO_SQL = `
   INSERT INTO photos (
     id, file_path, file_name, file_size, file_date, date_taken, year, month, day,
     width, height, is_favorite, is_virtual, original_remote_path, storage_name,
-    is_excluded, face_scan_completed, sharpness_score, rotation, is_heic_rotated,
-    heic_rotation, exif_json, location_json
+    is_excluded, face_scan_completed, faces_locked, sharpness_score, rotation, is_heic_rotated,
+    heic_rotation, exif_json, location_json, original_mtime_ms
   ) VALUES (
     @id, @filePath, @fileName, @fileSize, @fileDate, @dateTaken, @year, @month, @day,
     @width, @height, @isFavorite, @isVirtual, @originalRemotePath, @storageName,
-    @isExcluded, @faceScanCompleted, @sharpnessScore, @rotation, @isHeicRotated,
-    @heicRotation, @exifJson, @locationJson
+    @isExcluded, @faceScanCompleted, @facesLocked, @sharpnessScore, @rotation, @isHeicRotated,
+    @heicRotation, @exifJson, @locationJson, @originalMtimeMs
   )
   ON CONFLICT(id) DO UPDATE SET
     file_path=excluded.file_path, file_name=excluded.file_name, file_size=excluded.file_size,
@@ -72,9 +75,11 @@ const UPSERT_PHOTO_SQL = `
     is_favorite=excluded.is_favorite, is_virtual=excluded.is_virtual,
     original_remote_path=excluded.original_remote_path, storage_name=excluded.storage_name,
     is_excluded=excluded.is_excluded, face_scan_completed=excluded.face_scan_completed,
+    faces_locked=excluded.faces_locked,
     sharpness_score=excluded.sharpness_score, rotation=excluded.rotation,
     is_heic_rotated=excluded.is_heic_rotated, heic_rotation=excluded.heic_rotation,
-    exif_json=excluded.exif_json, location_json=excluded.location_json
+    exif_json=excluded.exif_json, location_json=excluded.location_json,
+    original_mtime_ms=excluded.original_mtime_ms
 `;
 
 function photoToParams(photo: Photo): Record<string, any> {
@@ -96,50 +101,100 @@ function photoToParams(photo: Photo): Record<string, any> {
     storageName: photo.storageName ?? null,
     isExcluded: fromBool(photo.isExcluded),
     faceScanCompleted: fromBool(photo.faceScanCompleted),
+    facesLocked: fromBool(photo.facesLocked),
     sharpnessScore: photo.sharpnessScore ?? null,
     rotation: photo.rotation ?? null,
     isHeicRotated: fromBool(photo.isHeicRotated),
     heicRotation: photo.heicRotation ?? null,
     exifJson: photo.exif ? JSON.stringify(photo.exif) : null,
     locationJson: photo.location ? JSON.stringify(photo.location) : null,
+    originalMtimeMs: photo.originalMtimeMs ?? null,
   };
 }
 
-export function upsertPhoto(photo: Photo): void {
-  const db = getDb();
+export function upsertPhoto(photo: Photo, db: DatabaseSync = getDb()): void {
   db.prepare(UPSERT_PHOTO_SQL).run(photoToParams(photo) as any);
   if (photo.faces) {
-    replaceFacesForPhoto(photo.id, photo.faces);
+    replaceFacesForPhoto(photo.id, photo.faces, false, db);
   }
 }
 
 export function upsertPhotos(photos: Photo[]): void {
   if (photos.length === 0) return;
-  runInTransaction(() => {
-    const db = getDb();
-    const stmt = db.prepare(UPSERT_PHOTO_SQL);
-    for (const photo of photos) {
-      stmt.run(photoToParams(photo) as any);
-      if (photo.faces) {
-        replaceFacesForPhoto(photo.id, photo.faces, /* skipTransaction */ true);
+  // Resolved PER PHOTO via resolveDbForPhoto, not once via the ambient
+  // "active library" pointer (getDb()'s default) — this bulk path backs the
+  // renderer's periodic debounced autosave of its whole in-memory photo
+  // list (libraryStore.ts's scheduleDebouncedSave), which fires regardless
+  // of which library happens to be "active" in the main process at that
+  // moment. Using a single ambient db for the whole batch meant a virtual
+  // storage photo edited (or just re-saved as-is) while some OTHER library
+  // was active would upsert into the wrong database — for faces specifically,
+  // that silently overwrote a correctly-detected-and-persisted set with
+  // whatever (possibly stale) `faces` the renderer's snapshot happened to
+  // carry, making a face just detected via the correctly-scoped
+  // faces:detect-one-forced path vanish again moments later. Grouped by
+  // resolved database so each group still gets one transaction, not one per
+  // photo — in the common case (a batch from one library) that's still a
+  // single transaction, same as before.
+  const groups = new Map<DatabaseSync, Photo[]>();
+  for (const photo of photos) {
+    const db = resolveDbForPhoto(photo);
+    const group = groups.get(db);
+    if (group) group.push(photo);
+    else groups.set(db, [photo]);
+  }
+  for (const [db, group] of groups) {
+    runInTransaction(() => {
+      const stmt = db.prepare(UPSERT_PHOTO_SQL);
+      for (const photo of group) {
+        stmt.run(photoToParams(photo) as any);
+        if (photo.faces) {
+          replaceFacesForPhoto(photo.id, photo.faces, /* skipTransaction */ true, db);
+        }
       }
-    }
-  });
+    }, db);
+  }
 }
 
-export function getPhotoById(id: string): Photo | null {
-  const db = getDb();
+export function getPhotoById(id: string, db: DatabaseSync = getDb()): Photo | null {
   const row = db.prepare('SELECT * FROM photos WHERE id = ?').get(id);
   if (!row) return null;
   const photo = rowToPhoto(row);
-  photo.faces = getFacesForPhoto(id);
+  photo.faces = getFacesForPhoto(id, db);
   return photo;
 }
 
-export function getTotalPhotoCount(): number {
-  const db = getDb();
+export function getTotalPhotoCount(db: DatabaseSync = getDb()): number {
   const row = db.prepare('SELECT COUNT(*) as c FROM photos').get() as any;
   return row?.c ?? 0;
+}
+
+/**
+ * Face-detection stats for a specific library folder's own catalog database
+ * — not necessarily the currently active one. Face-detection results (via
+ * upsertPhotos/replaceFacesForPhoto) only ever get written to this SQLite
+ * catalog, never back into the mirror folder's loose sidecar JSON files, so
+ * this is the only accurate source for "how many of this storage's photos
+ * have been face-scanned" — a caller that instead parses the sidecar JSONs
+ * will always see 0, since nothing writes face data there.
+ */
+export function getFaceStatsForLibrary(libraryDir: string): {
+  totalPhotos: number;
+  faceScannedCount: number;
+  facesDetectedCount: number;
+} {
+  try {
+    const db = getDbForLibraryPath(libraryDir);
+    const photoRow = db.prepare('SELECT COUNT(*) as total, SUM(face_scan_completed) as scanned FROM photos').get() as any;
+    const faceRow = db.prepare('SELECT COUNT(*) as c FROM faces').get() as any;
+    return {
+      totalPhotos: photoRow?.total ?? 0,
+      faceScannedCount: photoRow?.scanned ?? 0,
+      facesDetectedCount: faceRow?.c ?? 0,
+    };
+  } catch {
+    return { totalPhotos: 0, faceScannedCount: 0, facesDetectedCount: 0 };
+  }
 }
 
 export function getPhotosPage(pageIndex: number, pageSize: number): Photo[] {
@@ -152,32 +207,65 @@ export function getPhotosPage(pageIndex: number, pageSize: number): Photo[] {
   return photos;
 }
 
-export function getAllPhotos(): Photo[] {
-  const db = getDb();
+export function getAllPhotos(db: DatabaseSync = getDb()): Photo[] {
   const rows = db.prepare('SELECT * FROM photos ORDER BY date_taken DESC, id DESC').all() as any[];
   const photos = rows.map(rowToPhoto);
-  attachFacesToPhotos(photos);
+  attachFacesToPhotos(photos, db);
   return photos;
 }
+
+/**
+ * Photos (with faces attached) for one virtual storage by name — used after
+ * the unified sync pipeline (see pipelineOrchestrator.ts) writes face
+ * results straight to SQLite, so the renderer can pick up freshly-detected
+ * faces without re-reading the whole library.
+ */
+export function getPhotosByStorageName(storageName: string, db: DatabaseSync = getDb()): Photo[] {
+  const rows = db.prepare('SELECT * FROM photos WHERE storage_name = ? ORDER BY date_taken DESC, id DESC').all(storageName) as any[];
+  const photos = rows.map(rowToPhoto);
+  attachFacesToPhotos(photos, db);
+  return photos;
+}
+
+const SUMMARY_QUERY_CHUNK_SIZE = 5000;
 
 /**
  * Lightweight photo listing for computing catalog summaries (timeline/places)
  * — selects only the columns those computations actually read and skips the
  * face-hydration join entirely, so summarizing a large library doesn't pay
  * the cost of loading every photo's full record and face list into memory.
+ *
+ * Reads in chunks and yields to the event loop between them (node:sqlite's
+ * DatabaseSync is fully synchronous, so a single all-rows query on a
+ * library with hundreds of thousands of photos can block the main process
+ * long enough for Windows to mark the app "Not Responding" during a library
+ * switch). Callers on a hot path that must stay synchronous can still fall
+ * back to the exported sync variant below.
  */
-export function getAllPhotosForSummary(): Pick<Photo, 'id' | 'filePath' | 'dateTaken' | 'fileDate' | 'location'>[] {
+export async function getAllPhotosForSummary(): Promise<Pick<Photo, 'id' | 'filePath' | 'dateTaken' | 'fileDate' | 'location'>[]> {
   const db = getDb();
-  const rows = db
-    .prepare('SELECT id, file_path, date_taken, file_date, location_json FROM photos ORDER BY date_taken DESC, id DESC')
-    .all() as any[];
-  return rows.map((row) => ({
-    id: row.id,
-    filePath: row.file_path,
-    dateTaken: row.date_taken,
-    fileDate: row.file_date || '',
-    location: parseJson<LocationMetadata | null>(row.location_json, null) ?? undefined,
-  }));
+  const total = getTotalPhotoCount();
+  const stmt = db.prepare(
+    'SELECT id, file_path, date_taken, file_date, location_json FROM photos ORDER BY date_taken DESC, id DESC LIMIT ? OFFSET ?'
+  );
+  const results: Pick<Photo, 'id' | 'filePath' | 'dateTaken' | 'fileDate' | 'location'>[] = [];
+
+  for (let offset = 0; offset < total; offset += SUMMARY_QUERY_CHUNK_SIZE) {
+    const rows = stmt.all(SUMMARY_QUERY_CHUNK_SIZE, offset) as any[];
+    for (const row of rows) {
+      results.push({
+        id: row.id,
+        filePath: row.file_path,
+        dateTaken: row.date_taken,
+        fileDate: row.file_date || '',
+        location: parseJson<LocationMetadata | null>(row.location_json, null) ?? undefined,
+      });
+    }
+    if (rows.length < SUMMARY_QUERY_CHUNK_SIZE) break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  return results;
 }
 
 /**
@@ -194,19 +282,30 @@ export function getAllPhotosForSummary(): Pick<Photo, 'id' | 'filePath' | 'dateT
  * protect library.json from being truncated by a stray empty save.
  */
 export function replaceAllPhotos(photos: Photo[]): { upsertedCount: number; deletedCount: number; skipped: boolean } {
-  const existingCount = getTotalPhotoCount();
+  // This is a "this batch IS the complete library" operation — it deletes
+  // whatever's in the target database but missing from `photos`, so it must
+  // resolve that database from the batch's OWN content (its first virtual
+  // photo's storage), not the ambient "active library" pointer, which can
+  // legitimately point at a different library than the one this batch
+  // actually belongs to (see resolveDbForPhoto's doc comment). Getting this
+  // wrong here is worse than the face-overwrite bug it's fixed alongside:
+  // it would delete photos from whatever library getDb() happened to
+  // resolve to, based on an incoming set that was never meant to replace it.
+  const virtualPhoto = photos.find((p) => p.isVirtual);
+  const db = virtualPhoto ? resolveDbForPhoto(virtualPhoto) : getDb();
+
+  const existingCount = getTotalPhotoCount(db);
   if (photos.length === 0 && existingCount > 0) {
     return { upsertedCount: 0, deletedCount: 0, skipped: true };
   }
 
-  const db = getDb();
   const incomingIds = new Set(photos.map((p) => p.id));
   const existingIds = (db.prepare('SELECT id FROM photos').all() as any[]).map((r) => r.id as string);
   const idsToDelete = existingIds.filter((id) => !incomingIds.has(id));
 
   runInTransaction(() => {
     if (idsToDelete.length > 0) {
-      deletePhotos(idsToDelete);
+      deletePhotos(idsToDelete, db);
     }
     upsertPhotos(photos);
   }, db);
@@ -214,10 +313,9 @@ export function replaceAllPhotos(photos: Photo[]): { upsertedCount: number; dele
   return { upsertedCount: photos.length, deletedCount: idsToDelete.length, skipped: false };
 }
 
-export function deletePhotos(ids: string[]): void {
+export function deletePhotos(ids: string[], db: DatabaseSync = getDb()): void {
   if (ids.length === 0) return;
   runInTransaction(() => {
-    const db = getDb();
     const deletePhotoStmt = db.prepare('DELETE FROM photos WHERE id = ?');
     const deleteFacesStmt = db.prepare('DELETE FROM faces WHERE photo_id = ?');
     const deleteAlbumLinksStmt = db.prepare('DELETE FROM album_photos WHERE photo_id = ?');
@@ -226,11 +324,16 @@ export function deletePhotos(ids: string[]): void {
       deleteFacesStmt.run(id);
       deleteAlbumLinksStmt.run(id);
     }
-  });
+  }, db);
 }
 
 export function setPhotoFavorite(id: string, isFavorite: boolean): void {
   getDb().prepare('UPDATE photos SET is_favorite = ? WHERE id = ?').run(fromBool(isFavorite), id);
+}
+
+/** Records that a OneDrive original was marked for space reclaim after processing (observability only). */
+export function markOneDriveReleased(id: string, db: DatabaseSync = getDb()): void {
+  db.prepare('UPDATE photos SET onedrive_released_at = ? WHERE id = ?').run(new Date().toISOString(), id);
 }
 
 // ---------------------------------------------------------------------------
@@ -307,8 +410,7 @@ function faceToParams(face: DetectedFace): Record<string, any> {
   };
 }
 
-export function getFacesForPhoto(photoId: string): DetectedFace[] {
-  const db = getDb();
+export function getFacesForPhoto(photoId: string, db: DatabaseSync = getDb()): DetectedFace[] {
   const rows = db.prepare('SELECT * FROM faces WHERE photo_id = ?').all(photoId) as any[];
   return rows.map(rowToFace);
 }
@@ -319,9 +421,8 @@ export function getFacesForPhoto(photoId: string): DetectedFace[] {
 const MAX_SQL_VARIABLES_PER_BATCH = 500;
 
 /** Bulk-hydrates photo.faces on each photo, batching the lookup for large photo counts. */
-export function attachFacesToPhotos(photos: Photo[]): void {
+export function attachFacesToPhotos(photos: Photo[], db: DatabaseSync = getDb()): void {
   if (photos.length === 0) return;
-  const db = getDb();
   const byPhoto = new Map<string, DetectedFace[]>();
 
   for (let i = 0; i < photos.length; i += MAX_SQL_VARIABLES_PER_BATCH) {
@@ -342,8 +443,7 @@ export function attachFacesToPhotos(photos: Photo[]): void {
   }
 }
 
-export function replaceFacesForPhoto(photoId: string, faces: DetectedFace[], skipTransaction = false): void {
-  const db = getDb();
+export function replaceFacesForPhoto(photoId: string, faces: DetectedFace[], skipTransaction = false, db: DatabaseSync = getDb()): void {
   const doWork = () => {
     db.prepare('DELETE FROM faces WHERE photo_id = ?').run(photoId);
     const stmt = db.prepare(UPSERT_FACE_SQL);
@@ -354,12 +454,11 @@ export function replaceFacesForPhoto(photoId: string, faces: DetectedFace[], ski
   if (skipTransaction) {
     doWork();
   } else {
-    runInTransaction(doWork);
+    runInTransaction(doWork, db);
   }
 }
 
-export function getAllFaces(): DetectedFace[] {
-  const db = getDb();
+export function getAllFaces(db: DatabaseSync = getDb()): DetectedFace[] {
   const rows = db.prepare('SELECT * FROM faces').all() as any[];
   return rows.map(rowToFace);
 }
@@ -496,9 +595,8 @@ function rowToAlbum(row: any, photoIds: string[]): Album {
   };
 }
 
-export function upsertAlbum(album: Album): void {
+export function upsertAlbum(album: Album, db: DatabaseSync = getDb()): void {
   runInTransaction(() => {
-    const db = getDb();
     db.prepare(
       `INSERT INTO albums (id, title, description, cover_photo_id, created_at, updated_at, event_date)
        VALUES (@id, @title, @description, @coverPhotoId, @createdAt, @updatedAt, @eventDate)
@@ -520,11 +618,10 @@ export function upsertAlbum(album: Album): void {
     album.photoIds.forEach((photoId, index) => {
       linkStmt.run(album.id, photoId, index);
     });
-  });
+  }, db);
 }
 
-export function getAllAlbums(): Album[] {
-  const db = getDb();
+export function getAllAlbums(db: DatabaseSync = getDb()): Album[] {
   const albumRows = db.prepare('SELECT * FROM albums ORDER BY created_at DESC').all() as any[];
   const linkRows = db.prepare('SELECT album_id, photo_id FROM album_photos ORDER BY album_id, position').all() as any[];
   const photoIdsByAlbum = new Map<string, string[]>();
@@ -536,28 +633,26 @@ export function getAllAlbums(): Album[] {
 }
 
 /** Replaces the active library's full album set to match `albums` exactly (upserts + deletes removed ones). */
-export function replaceAllAlbums(albums: Album[]): void {
-  const db = getDb();
+export function replaceAllAlbums(albums: Album[], db: DatabaseSync = getDb()): void {
   const incomingIds = new Set(albums.map((a) => a.id));
   const existingIds = (db.prepare('SELECT id FROM albums').all() as any[]).map((r) => r.id as string);
   const idsToDelete = existingIds.filter((id) => !incomingIds.has(id));
 
   runInTransaction(() => {
     for (const id of idsToDelete) {
-      deleteAlbum(id);
+      deleteAlbum(id, db);
     }
     for (const album of albums) {
-      upsertAlbum(album);
+      upsertAlbum(album, db);
     }
   }, db);
 }
 
-export function deleteAlbum(albumId: string): void {
+export function deleteAlbum(albumId: string, db: DatabaseSync = getDb()): void {
   runInTransaction(() => {
-    const db = getDb();
     db.prepare('DELETE FROM albums WHERE id = ?').run(albumId);
     db.prepare('DELETE FROM album_photos WHERE album_id = ?').run(albumId);
-  });
+  }, db);
 }
 
 // ---------------------------------------------------------------------------

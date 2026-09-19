@@ -2,7 +2,7 @@
   "name": "gphotos-desktop",
   "productName": "gPhotos",
   "version": "1.0.0",
-  "description": "Google Photos Desktop Clone - Standalone Windows Photo Manager with Face Recognition and Places Map",
+  "description": "gPhotos Desktop - Standalone Windows Photo Manager with Face Recognition and Places Map",
   "main": "dist-electron/main/main.js",
   "scripts": {
     "dev": "vite",
@@ -23,7 +23,7 @@
     "start": "electron ."
   },
   "keywords": [
-    "google-photos",
+    "photo-gallery",
     "photo-manager",
     "face-recognition",
     "exif",
@@ -33,11 +33,12 @@
   "author": "Sachin Bhavsar",
   "license": "MIT",
   "dependencies": {
-    "@vladmandic/face-api": "^1.7.15",
+    "electron-log": "^5.4.4",
     "exifr": "^7.1.3",
     "heic-convert": "^2.1.0",
     "leaflet": "^1.9.4",
     "lucide-react": "^1.45.0",
+    "onnxruntime-node": "^1.30.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "script-runner": "^0.1.8",

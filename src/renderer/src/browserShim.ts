@@ -13,9 +13,10 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     isBrowserShim: true,
     isElectron: false,
 
-    loadLibraryData: async (key: string) => {
+    loadLibraryData: async (key: string, libraryDir?: string) => {
       try {
-        const res = await authFetch('/api/library');
+        const dirParam = libraryDir ? `?libraryDir=${encodeURIComponent(libraryDir)}` : '';
+        const res = await authFetch(`/api/library${dirParam}`);
         if (!res.ok) return null;
         const data = await res.json();
         if (data && data[key] !== undefined) return data[key];
@@ -152,7 +153,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
         });
         if (res.ok) return await res.json();
       } catch {}
-      return { success: true, trashedCount: filePaths.length, errors: [] };
+      return { success: true, trashedCount: filePaths.length, trashedPaths: filePaths, errors: [] };
     },
 
     deleteFilesPermanently: async (filePaths: string[]) => {
@@ -164,7 +165,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
         });
         if (res.ok) return await res.json();
       } catch {}
-      return { success: true, deletedCount: filePaths.length, errors: [] };
+      return { success: true, deletedCount: filePaths.length, deletedPaths: filePaths, errors: [] };
     },
 
     rotatePhoto: async (filePath: string, rotationDegrees: number, originalRemotePath?: string) => {
@@ -262,9 +263,10 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
         lastUpdated: new Date().toISOString(),
       };
     },
-    getCatalogPage: async (params: { pageIndex: number; pageSize?: number }) => {
+    getCatalogPage: async (params: { pageIndex: number; pageSize?: number; libraryDir?: string }) => {
       try {
-        const res = await authFetch(`/api/catalog-page?page=${params.pageIndex}&size=${params.pageSize || 100}`);
+        const libraryDirParam = params.libraryDir ? `&libraryDir=${encodeURIComponent(params.libraryDir)}` : '';
+        const res = await authFetch(`/api/catalog-page?page=${params.pageIndex}&size=${params.pageSize || 100}${libraryDirParam}`);
         if (res.ok) return await res.json();
       } catch {}
       return { photos: [], totalPages: 0, totalPhotos: 0 };
@@ -286,6 +288,17 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
         if (res.ok) return await res.json();
       } catch {}
       return null;
+    },
+    getSpriteCoordinatesBatch: async (photoPaths: string[]) => {
+      try {
+        const res = await authFetch('/api/sprite-coords-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ paths: photoPaths }),
+        });
+        if (res.ok) return await res.json();
+      } catch {}
+      return {};
     },
     getThumbnailPreCacheStatus: async () => {
       try {

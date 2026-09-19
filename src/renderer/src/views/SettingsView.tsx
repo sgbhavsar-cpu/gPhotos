@@ -28,10 +28,12 @@ import {
   Pause,
   Play,
   Zap,
-  Activity
+  Activity,
+  Cloud
 } from 'lucide-react';
 import { BackgroundServiceStatus, BackgroundServiceSettings, WebServerStatus, PairedDeviceInfo } from '../../types';
 import { aiSearchService, AiSearchConfig, AiProvider } from '../services/aiSearchService';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 interface SettingsViewProps {
   onOpenHelp?: () => void;
@@ -42,6 +44,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onOpenHelp,
   onOpenDuplicateCleaner,
 }) => {
+  const isMobile = useIsMobile();
   const [serviceStatus, setServiceStatus] = useState<BackgroundServiceStatus | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
@@ -66,6 +69,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [authActionLoading, setAuthActionLoading] = useState<boolean>(false);
   const [authFeedback, setAuthFeedback] = useState<string | null>(null);
 
+  // OneDrive Files On-Demand space reclaim
+  const [oneDriveStatus, setOneDriveStatus] = useState<{ detectedRoots: string[]; reclaimEnabled: boolean; supported: boolean } | null>(null);
+  const [oneDriveHealth, setOneDriveHealth] = useState<{ broken: boolean; pendingCount: number; recentFailureRate: number; checkedCount: number } | null>(null);
+  const [isResettingOneDriveHealth, setIsResettingOneDriveHealth] = useState(false);
+
+  // Debug logging override (see docs/PIPELINE_REDESIGN_DEV_DOC.md §3.8) —
+  // lets a packaged/release build be flipped to verbose (debug-level)
+  // logging in the field for troubleshooting, without a rebuild.
+  const [debugLoggingEnabled, setDebugLoggingEnabled] = useState<boolean>(false);
+
+  const handleToggleDebugLogging = async (enabled: boolean) => {
+    setDebugLoggingEnabled(enabled);
+    await window.electronAPI?.setLogLevelOverride?.(enabled);
+  };
+
+  const refreshOneDriveHealth = async () => {
+    if (window.electronAPI?.getOneDriveReclaimHealth) {
+      const health = await window.electronAPI.getOneDriveReclaimHealth();
+      if (health) setOneDriveHealth(health);
+    }
+  };
+
   useEffect(() => {
     if (window.electronAPI?.getWebServerStatus) {
       window.electronAPI.getWebServerStatus().then((status) => {
@@ -77,7 +102,30 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       });
     }
     refreshAccessPinAndDevices();
+    if (window.electronAPI?.getLogLevelOverride) {
+      window.electronAPI.getLogLevelOverride().then((enabled) => setDebugLoggingEnabled(!!enabled));
+    }
+    if (window.electronAPI?.getOneDriveStatus) {
+      window.electronAPI.getOneDriveStatus().then((status) => {
+        if (status) setOneDriveStatus(status);
+      });
+    }
+    refreshOneDriveHealth();
+    const healthInterval = setInterval(refreshOneDriveHealth, 10000);
+    return () => clearInterval(healthInterval);
   }, []);
+
+  const handleToggleOneDriveReclaim = async (enabled: boolean) => {
+    setOneDriveStatus((prev) => (prev ? { ...prev, reclaimEnabled: enabled } : prev));
+    await window.electronAPI?.setOneDriveReclaimEnabled?.(enabled);
+  };
+
+  const handleResetOneDriveHealth = async () => {
+    setIsResettingOneDriveHealth(true);
+    await window.electronAPI?.resetOneDriveReclaimHealth?.();
+    await refreshOneDriveHealth();
+    setIsResettingOneDriveHealth(false);
+  };
 
   const refreshAccessPinAndDevices = async () => {
     if (window.electronAPI?.getWebServerPin) {
@@ -333,7 +381,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       <div style={{ maxWidth: '1000px', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: '28px' }}>
         
         {/* Header */}
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', borderBottom: '1px solid var(--border-subtle)', paddingBottom: '20px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: isMobile ? 'wrap' : 'nowrap', gap: isMobile ? '12px' : undefined, borderBottom: '1px solid var(--border-subtle)', paddingBottom: '20px' }}>
           <div>
             <h1 style={{ fontSize: '1.75rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '12px', margin: 0 }}>
               <Settings size={28} color="var(--accent-cyan)" />
@@ -421,7 +469,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           {/* Configuration Controls */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '16px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(auto-fit, minmax(260px, 1fr))', gap: '16px' }}>
             <div>
               <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, marginBottom: '8px' }}>
                 Self-Hosted Web Server
@@ -703,7 +751,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             gap: '16px',
             flexWrap: 'wrap',
           }}>
-            <div style={{ flex: 1, minWidth: '280px' }}>
+            <div style={{ flex: 1, minWidth: isMobile ? 0 : '280px' }}>
               <div style={{ fontWeight: 600, fontSize: '0.95rem', color: 'var(--text-primary)' }}>
                 {isServiceInstalled ? 'Autonomous Windows Background Service' : 'Run as System Service'}
               </div>
@@ -747,7 +795,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           {/* Sync Controls Grid */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '16px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(auto-fit, minmax(280px, 1fr))', gap: '16px' }}>
             
             {/* Sync Interval */}
             <div style={{
@@ -803,6 +851,97 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 />
                 <span>Launch at Windows user logon</span>
               </label>
+            </div>
+
+            {/* OneDrive Files On-Demand Space Reclaim */}
+            {oneDriveStatus?.supported && oneDriveStatus.detectedRoots.length > 0 && (
+              <div style={{
+                backgroundColor: 'var(--bg-card)',
+                border: '1px solid var(--border-subtle)',
+                borderRadius: 'var(--radius-md)',
+                padding: '16px',
+              }}>
+                <div style={{ fontSize: '0.85rem', fontWeight: 600, marginBottom: '10px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <Cloud size={16} color="var(--accent-cyan)" />
+                  OneDrive Storage
+                </div>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '0.85rem', cursor: 'pointer', marginBottom: '8px' }}>
+                  <input
+                    type="checkbox"
+                    checked={oneDriveStatus.reclaimEnabled}
+                    onChange={(e) => handleToggleOneDriveReclaim(e.target.checked)}
+                  />
+                  <span>Free up OneDrive space after scanning &amp; face detection</span>
+                </label>
+                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'block' }}>
+                  Photos under a detected OneDrive folder download on demand when scanned, then get marked
+                  "unpinned" once thumbnailing and face detection are done with them — OneDrive reclaims the
+                  local disk space on its own schedule. Nothing is deleted; files stay safe in the cloud and
+                  re-download automatically if opened again.
+                </span>
+                <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', display: 'block', marginTop: '8px', wordBreak: 'break-all' }}>
+                  Detected: {oneDriveStatus.detectedRoots.join(', ')}
+                </span>
+
+                {oneDriveHealth?.broken && (
+                  <div style={{
+                    marginTop: '10px',
+                    padding: '10px 12px',
+                    borderRadius: 'var(--radius-sm)',
+                    backgroundColor: 'rgba(244, 63, 94, 0.14)',
+                    border: '1px solid rgba(244, 63, 94, 0.4)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '10px',
+                  }}>
+                    <span style={{ fontSize: '0.76rem', color: '#fb7185', fontWeight: 600 }}>
+                      ⚠ OneDrive doesn't appear to be freeing up space — {Math.round(oneDriveHealth.recentFailureRate * 100)}% of
+                      recently-unpinned files are still hydrated after 3+ minutes. Sync is paused for OneDrive storages until this is resolved.
+                    </span>
+                    <button
+                      className="btn btn-secondary"
+                      style={{ fontSize: '0.72rem', padding: '5px 12px', flexShrink: 0 }}
+                      onClick={handleResetOneDriveHealth}
+                      disabled={isResettingOneDriveHealth}
+                    >
+                      {isResettingOneDriveHealth ? 'Retrying...' : 'Retry'}
+                    </button>
+                  </div>
+                )}
+                {!oneDriveHealth?.broken && oneDriveHealth && oneDriveHealth.checkedCount > 0 && (
+                  <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'block', marginTop: '6px' }}>
+                    Reclaim health: {oneDriveHealth.checkedCount - Math.round(oneDriveHealth.recentFailureRate * oneDriveHealth.checkedCount)}/{oneDriveHealth.checkedCount} recently-unpinned files confirmed freed
+                    {oneDriveHealth.pendingCount > 0 && ` · ${oneDriveHealth.pendingCount} awaiting check`}
+                  </span>
+                )}
+              </div>
+            )}
+
+            {/* Debug logging override */}
+            <div style={{
+              backgroundColor: 'var(--bg-card)',
+              border: '1px solid var(--border-subtle)',
+              borderRadius: 'var(--radius-md)',
+              padding: '16px',
+            }}>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600, marginBottom: '10px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Terminal size={16} color="var(--accent-cyan)" />
+                Debug Logging
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '0.85rem', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={debugLoggingEnabled}
+                  onChange={(e) => handleToggleDebugLogging(e.target.checked)}
+                />
+                <span>Enable verbose debug logging</span>
+              </label>
+              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'block', marginTop: '8px' }}>
+                Records a detailed log entry for every action you take (scanning, face detection,
+                storage sync, etc.), useful for troubleshooting. Off by default in release builds
+                to keep log files small. Log files are kept for the last 5 app sessions.
+              </span>
             </div>
           </div>
 
@@ -913,7 +1052,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             gap: '16px',
             flexWrap: 'wrap',
           }}>
-            <div style={{ flex: 1, minWidth: '280px' }}>
+            <div style={{ flex: 1, minWidth: isMobile ? 0 : '280px' }}>
               <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer', fontWeight: 600, fontSize: '0.95rem', color: 'var(--text-primary)' }}>
                 <input
                   type="checkbox"
@@ -944,7 +1083,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           {/* Sliders and Selectors Grid */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '16px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(auto-fit, minmax(280px, 1fr))', gap: '16px' }}>
             
             {/* Setting 1: Max CPU Usage Cap */}
             <div style={{
@@ -1162,7 +1301,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             )}
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '14px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(auto-fit, minmax(280px, 1fr))', gap: '14px' }}>
             <div style={{
               backgroundColor: 'var(--bg-card)',
               border: '1px solid var(--border-subtle)',

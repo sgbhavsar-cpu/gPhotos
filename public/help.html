@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Google Photos Desktop — User Guide & Architecture Manual</title>
+  <title>gPhotos Desktop — User Guide & Architecture Manual</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -412,7 +412,7 @@
     <div class="brand">
       <div class="brand-icon">✨</div>
       <div class="brand-text">
-        <h1>Google Photos</h1>
+        <h1>gPhotos</h1>
         <span>User Guide & Manual</span>
       </div>
     </div>
@@ -449,7 +449,7 @@
     <!-- Hero Header -->
     <div class="hero-banner">
       <div class="badge">Comprehensive Reference v1.2</div>
-      <h1 class="hero-title">How Google Photos Desktop Works</h1>
+      <h1 class="hero-title">How gPhotos Desktop Works</h1>
       <p class="hero-subtitle">
         A private, high-performance, on-device photo manager with zero cloud lock-in. Powered by local AI face recognition, intelligent duplicate clustering, and non-blocking background synchronization.
       </p>
@@ -529,7 +529,7 @@
       </div>
 
       <p style="color: var(--text-secondary); margin-bottom: 16px;">
-        Google Photos Desktop gives you two flexible execution models for continuously discovering new photos and generating 500px virtual mirror thumbnails:
+        gPhotos Desktop gives you two flexible execution models for continuously discovering new photos and generating 500px virtual mirror thumbnails:
       </p>
 
       <div class="table-container">
@@ -587,14 +587,14 @@
       </div>
 
       <p style="color: var(--text-secondary); margin-bottom: 16px;">
-        Our face recognition engine operates 100% locally on your computer using neural network models with WebGPU acceleration:
+        Our face recognition engine operates 100% locally on your computer, running in the background service itself (via ONNX Runtime) — it keeps working even while the app window is closed:
       </p>
 
       <div class="grid-3">
         <div class="card">
-          <div class="card-title">CosFace 128-D Hypersphere</div>
+          <div class="card-title">ArcFace 512-D Hypersphere</div>
           <p class="card-desc">
-            Each detected face is normalized onto a unit hypersphere ($L_2$ norm). Matches are calculated using cosine distance ($1 - \mathbf{a} \cdot \mathbf{b}$), delivering superior discrimination over Euclidean metrics.
+            Each detected face is normalized onto a unit hypersphere ($L_2$ norm). Matches are calculated using Euclidean distance between these normalized embeddings, delivering strong discrimination between different people.
           </p>
         </div>
 
@@ -802,7 +802,7 @@
     </section>
 
     <footer>
-      <div>Google Photos Desktop Edition • 100% Local & Private</div>
+      <div>gPhotos Desktop Edition • 100% Local & Private</div>
       <div>Press <kbd style="background: #1e293b; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--border);">Esc</kbd> to close help</div>
     </footer>
 

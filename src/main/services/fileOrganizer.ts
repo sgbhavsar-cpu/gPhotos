@@ -62,22 +62,41 @@ const RAW_OR_MASTER_EXTS = new Set([
   '.heic', '.heif', '.dng', '.raw', '.cr2', '.nef', '.tif', '.tiff'
 ]);
 
-export function scanDirectoryRecursive(dirPath: string): string[] {
+// How many directory entries to process before yielding back to the event
+// loop. A synchronous walk over a large or network-mounted tree otherwise
+// blocks the main process's message pump for its entire duration — the
+// actual mechanism behind Electron windows going "Not Responding" — since
+// nothing else (IPC replies, window painting, the hang-detector ping) can
+// run until a JS callback returns control.
+const SCAN_YIELD_EVERY_ENTRIES = 200;
+
+export async function scanDirectoryRecursive(dirPath: string): Promise<string[]> {
   const results: string[] = [];
   if (!fs.existsSync(dirPath)) return results;
 
-  function scan(current: string) {
+  let processedSinceYield = 0;
+  const yieldToEventLoop = () => {
+    processedSinceYield = 0;
+    return new Promise<void>((resolve) => setImmediate(resolve));
+  };
+
+  async function scan(current: string) {
     try {
       const entries = fs.readdirSync(current, { withFileTypes: true });
       const dirImages: string[] = [];
 
       for (const entry of entries) {
+        processedSinceYield++;
+        if (processedSinceYield >= SCAN_YIELD_EVERY_ENTRIES) {
+          await yieldToEventLoop();
+        }
+
         const fullPath = path.join(current, entry.name);
         if (entry.isDirectory()) {
           const lowerName = entry.name.toLowerCase();
           // Skip hidden, system, NAS thumbnail, and cache folders
           if (!entry.name.startsWith('.') && !IGNORED_DIRECTORY_NAMES.has(lowerName)) {
-            scan(fullPath);
+            await scan(fullPath);
           }
         } else if (entry.isFile()) {
           // Skip hidden files, system stream files (Synology NAS), and thumbnail artifacts
@@ -126,12 +145,12 @@ export function scanDirectoryRecursive(dirPath: string): string[] {
     }
   }
 
-  scan(dirPath);
+  await scan(dirPath);
   return results;
 }
 
 export async function scanPhotoDirectory(dirPath: string): Promise<Photo[]> {
-  const filePaths = scanDirectoryRecursive(dirPath);
+  const filePaths = await scanDirectoryRecursive(dirPath);
   const photos: Photo[] = [];
 
   for (const filePath of filePaths) {
@@ -220,7 +239,7 @@ export async function generateDryRun(
   options: OrganizeOptions,
   onProgress?: (current: number, total: number) => void
 ): Promise<DryRunSummary> {
-  const files = scanDirectoryRecursive(options.sourceDir);
+  const files = await scanDirectoryRecursive(options.sourceDir);
   const items: DryRunItem[] = [];
   const targetFolderSet = new Set<string>();
   let totalSize = 0;

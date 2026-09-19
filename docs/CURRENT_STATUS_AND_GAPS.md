@@ -7,7 +7,7 @@
 
 ## 1. Product goals (as stated)
 
-1. A Google-Photos-style app, usable from **Windows desktop (Electron)** and as a **mobile web app** (browser, same LAN), with face detection, fast preview of large libraries via cached thumbnails, and people identification.
+1. A modern cloud-photo-app-style experience, usable from **Windows desktop (Electron)** and as a **mobile web app** (browser, same LAN), with face detection, fast preview of large libraries via cached thumbnails, and people identification.
 2. An **AI chatbot** that can search photos by person and location.
 3. **Fastest possible browsing experience.**
 4. **Basic photo editing.**

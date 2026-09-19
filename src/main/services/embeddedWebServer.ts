@@ -10,15 +10,16 @@ import {
   prepareHeicHqTemp,
   cleanupHeicHqTemp,
 } from './heicService';
-import { scanVirtualMirrorDirectory, syncVirtualStorage, deleteFilesPermanently, trashFiles, rotatePhotoFile, rotatePhotoWithOfflineQueue, processPendingRotations } from './virtualMirrorService';
+import { scanVirtualMirrorDirectory, syncVirtualStorage, deleteFilesPermanently, trashFiles, rotatePhotoFile, rotatePhotoWithOfflineQueue, processPendingRotations, discoverStoredMirrors } from './virtualMirrorService';
 import { scanPhotoDirectory } from './fileOrganizer';
 import { getOrGenerateCachedThumbnail, clearThumbnailCache, refreshThumbnailsFromSource } from './thumbnailCacheService';
 import { getCatalogMeta, getCatalogPage, switchCatalogLibrary, ensureMigratedIfEmpty } from './catalogService';
 import { handleStorageSave, handleStorageLoad, STORAGE_KEY, GLOBAL_PEOPLE_KEY } from './storageHandlers';
 import { isPathAllowed } from './pathSecurity';
-import { getSpriteCoordinate, getSpritePath } from './spriteService';
+import { getSpriteCoordinate, getSpriteCoordinatesBatch, getSpritePath } from './spriteService';
 import { thumbnailWorker } from './thumbnailWorkerService';
 import { getBackgroundServiceStatus } from './backgroundDaemon';
+import { isPathReachable, clearOfflineCache } from './networkReachabilityCache';
 import { WebServerStatus } from '../../types';
 import {
   getOrCreatePin,
@@ -209,12 +210,14 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     return;
   }
 
-  // Endpoint: /api/library
+  // Endpoint: /api/library?libraryDir=...
   if (pathname === '/api/library') {
     if (req.method === 'GET') {
+      const libraryDir = parsedUrl.searchParams.get('libraryDir') || undefined;
+      if (libraryDir && rejectIfPathNotAllowed(res, [libraryDir], '/api/library')) return;
       try {
         ensureMigratedIfEmpty();
-        const libraryData = handleStorageLoad(STORAGE_KEY) || { photos: [], people: [], faces: [], albums: [] };
+        const libraryData = handleStorageLoad(STORAGE_KEY, libraryDir) || { photos: [], people: [], faces: [], albums: [] };
         const peopleRegistry = handleStorageLoad(GLOBAL_PEOPLE_KEY);
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify({ [STORAGE_KEY]: libraryData, [GLOBAL_PEOPLE_KEY]: peopleRegistry }));
@@ -302,6 +305,13 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     req.on('end', async () => {
       try {
         const config = JSON.parse(body);
+        // A manual sync IS the user explicitly asking to check this storage
+        // again — see the matching comment on the Electron IPC equivalent
+        // (mirror:sync-storage in main.ts) for why this only happens here,
+        // not from the periodic background sync cycle.
+        if (config?.networkSourcePath) {
+          clearOfflineCache(config.networkSourcePath);
+        }
         const result = await syncVirtualStorage(config);
         try {
           const mirrorPath = path.join(config.localMirrorRoot, config.name);
@@ -523,12 +533,14 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     }
   }
 
-  // Endpoint: /api/catalog-page?page=0&size=100
+  // Endpoint: /api/catalog-page?page=0&size=100&libraryDir=...
   if (pathname === '/api/catalog-page') {
     const pageIndex = parseInt(parsedUrl.searchParams.get('page') || '0', 10);
     const pageSize = parseInt(parsedUrl.searchParams.get('size') || '100', 10);
+    const libraryDir = parsedUrl.searchParams.get('libraryDir') || undefined;
+    if (libraryDir && rejectIfPathNotAllowed(res, [libraryDir], '/api/catalog-page')) return;
     try {
-      const pageData = await getCatalogPage(pageIndex, pageSize);
+      const pageData = await getCatalogPage(pageIndex, pageSize, libraryDir);
       res.setHeader('Content-Type', 'application/json');
       res.setHeader('Cache-Control', 'public, max-age=300');
       res.end(JSON.stringify(pageData));
@@ -599,6 +611,30 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     }
   }
 
+  // Endpoint: /api/sprite-coords-batch (POST) - looks up sprite coordinates
+  // for many photos in one request instead of one HTTP round-trip per photo
+  // card, which was the main cause of scroll stutter on large libraries.
+  if (pathname === '/api/sprite-coords-batch' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      try {
+        const { paths } = JSON.parse(body || '{}');
+        const requestedPaths: string[] = Array.isArray(paths) ? paths.slice(0, 500) : [];
+        const coords = getSpriteCoordinatesBatch(requestedPaths);
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify(coords));
+      } catch (err: any) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
   // Endpoint: /api/photo?path=...
   if (pathname === '/api/photo') {
     const filePath = parsedUrl.searchParams.get('path');
@@ -613,15 +649,19 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     if (rejectIfPathNotAllowed(res, [filePath, originalPath], '/api/photo')) return;
 
     let targetPath: string | null = null;
-    if (preferOriginal && originalPath && fs.existsSync(originalPath)) {
+    // isPathReachable (not fs.existsSync) is what keeps an offline network
+    // share from hanging the whole app: it bounds each check to ~1.5s and,
+    // once a storage is found offline, skips checking it again for a while
+    // instead of blocking on the OS's full network timeout on every request.
+    if (preferOriginal && originalPath && (await isPathReachable(originalPath))) {
       targetPath = originalPath;
-    } else if (filePath && fs.existsSync(filePath)) {
+    } else if (filePath && (await isPathReachable(filePath))) {
       targetPath = filePath;
-    } else if (originalPath && fs.existsSync(originalPath)) {
+    } else if (originalPath && (await isPathReachable(originalPath))) {
       targetPath = originalPath;
     }
 
-    if (targetPath && fs.existsSync(targetPath)) {
+    if (targetPath) {
       const ext = path.extname(targetPath).toLowerCase();
 
       // 1. Raw original full-resolution requested (e.g. download or 100% zoom)
@@ -766,38 +806,35 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
   if (pathname === '/api/file-exists') {
     const p = parsedUrl.searchParams.get('path');
     if (rejectIfPathNotAllowed(res, [p], '/api/file-exists')) return;
-    const exists = p ? fs.existsSync(p) : false;
+    const exists = p ? await isPathReachable(p) : false;
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify({ exists }));
     return;
   }
 
   // Endpoint: /api/discover-mirrors
+  //
+  // This used to be its own, separate reimplementation of mirror discovery
+  // — built before VirtualStorageConfig grew networkSourcePath/inventory*
+  // fields, and never updated to match. It always sent sourcePath: '' (an
+  // entirely different, non-existent field — the real one is
+  // networkSourcePath), a syncIntervalMinutes/isVirtualServerRunning shape
+  // nothing else in the app uses, and a naive file-extension count instead
+  // of the real inventory total. Accessing the app from a phone browser
+  // (this HTTP path) triggered it, and the renderer's discovery-merge logic
+  // wrote its broken object straight into the same persisted storage list
+  // the desktop Electron app reads — permanently overwriting a correctly
+  // configured storage's real network source path with an empty string,
+  // which is exactly what made "Rescan" fail with "No source path
+  // configured" and every displayed count go wrong afterward. Delegating to
+  // the same discoverStoredMirrors() the Electron IPC path uses guarantees
+  // this HTTP path can never again diverge from — or corrupt — what the
+  // desktop app considers a storage's real configuration.
   if (pathname === '/api/discover-mirrors') {
-    const defaultRoot = 'C:\\GPhotos_VirtualMirrors';
-    const mirrors: any[] = [];
-    if (fs.existsSync(defaultRoot)) {
-      try {
-        const entries = fs.readdirSync(defaultRoot, { withFileTypes: true });
-        for (const entry of entries) {
-          if (entry.isDirectory()) {
-            const mirrorPath = path.join(defaultRoot, entry.name);
-            const files = fs.readdirSync(mirrorPath);
-            mirrors.push({
-              id: `mirror_${entry.name}`,
-              name: entry.name,
-              sourcePath: '',
-              localMirrorRoot: defaultRoot,
-              syncIntervalMinutes: 60,
-              lastSynced: Date.now(),
-              totalItems: files.filter((f) => /\.(jpe?g|png|webp|gif|bmp|heic|heif)$/i.test(f)).length,
-              totalSizeSaved: files.length * 2500000,
-              isVirtualServerRunning: true,
-            });
-          }
-        }
-      } catch {}
-    }
+    let mirrors: any[] = [];
+    try {
+      mirrors = discoverStoredMirrors();
+    } catch {}
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify(mirrors));
     return;

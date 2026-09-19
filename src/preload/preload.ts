@@ -23,7 +23,7 @@ const electronAPI: IElectronAPI = {
   },
   readFileAsBase64: (filePath: string) => ipcRenderer.invoke('file:read-base64', filePath),
   saveLibraryData: (key: string, data: any) => ipcRenderer.invoke('storage:save', key, data),
-  loadLibraryData: (key: string) => ipcRenderer.invoke('storage:load', key),
+  loadLibraryData: (key: string, libraryDir?: string) => ipcRenderer.invoke('storage:load', key, libraryDir),
   syncVirtualStorage: (config) => ipcRenderer.invoke('mirror:sync-storage', config),
   scanVirtualMirror: (mirrorDirPath) => ipcRenderer.invoke('mirror:scan-virtual-mirror', mirrorDirPath),
   discoverMirrors: (rootPath) => ipcRenderer.invoke('mirror:list-stored-mirrors', rootPath),
@@ -79,6 +79,7 @@ const electronAPI: IElectronAPI = {
   getCatalogPage: (params) => ipcRenderer.invoke('catalog:get-page', params),
   switchLibrary: (targetPath: string) => ipcRenderer.invoke('catalog:switch-library', targetPath),
   getSpriteCoordinate: (photoPath: string) => ipcRenderer.invoke('sprite:get-coordinate', photoPath),
+  getSpriteCoordinatesBatch: (photoPaths: string[]) => ipcRenderer.invoke('sprite:get-coordinates-batch', photoPaths),
   getThumbnailPreCacheStatus: () => ipcRenderer.invoke('service:get-precache-status'),
   startThumbnailPreCache: (photos) => ipcRenderer.invoke('service:start-precache', photos),
   pauseThumbnailPreCache: () => ipcRenderer.invoke('service:pause-precache'),
@@ -92,6 +93,30 @@ const electronAPI: IElectronAPI = {
     ipcRenderer.invoke('mirror:get-storage-details', storageName, mirrorRoot),
   getAllStorageDetails: (mirrorRoot?: string) =>
     ipcRenderer.invoke('mirror:get-all-storage-details', mirrorRoot),
+  getPersonAvatarPath: (personId: string, cacheKey: string) =>
+    ipcRenderer.invoke('person:get-avatar-path', personId, cacheKey),
+  savePersonAvatar: (personId: string, cacheKey: string, dataUrl: string) =>
+    ipcRenderer.invoke('person:save-avatar', personId, cacheKey, dataUrl),
+  deletePersonAvatar: (personId: string) => ipcRenderer.invoke('person:delete-avatar', personId),
+  getOneDriveStatus: () => ipcRenderer.invoke('onedrive:get-status'),
+  setOneDriveReclaimEnabled: (enabled: boolean) => ipcRenderer.invoke('onedrive:set-reclaim-enabled', enabled),
+  markOneDriveReclaimable: (filePaths: string[]) => ipcRenderer.invoke('onedrive:mark-reclaimable', filePaths),
+  runOneDriveHealthCheck: () => ipcRenderer.invoke('onedrive:run-health-check'),
+  getOneDriveReclaimHealth: () => ipcRenderer.invoke('onedrive:get-reclaim-health'),
+  resetOneDriveReclaimHealth: () => ipcRenderer.invoke('onedrive:reset-reclaim-health'),
+  syncOnePhoto: (config, remoteFile: string) => ipcRenderer.invoke('mirror:sync-one-photo', config, remoteFile),
+  scanStorageInventory: (networkSourcePath: string) => ipcRenderer.invoke('mirror:scan-inventory', networkSourcePath),
+  getPhotosByStorageName: (storageName: string, mirrorRoot?: string) =>
+    ipcRenderer.invoke('mirror:get-photos-by-storage', storageName, mirrorRoot),
+  detectFacesBatch: (photos) => ipcRenderer.invoke('faces:detect-batch', photos),
+  detectFacesForced: (photo) => ipcRenderer.invoke('faces:detect-one-forced', photo),
+  computeDescriptorForRegion: (sourceFilePath: string, box) =>
+    ipcRenderer.invoke('faces:compute-descriptor-for-region', sourceFilePath, box),
+  listSourceFiles: (sourcePath: string) => ipcRenderer.invoke('mirror:list-source-files', sourcePath),
+  logFromRenderer: (level, scope: string, message: string, meta?: Record<string, unknown>) =>
+    ipcRenderer.send('logger:write', level, scope, message, meta),
+  getLogLevelOverride: () => ipcRenderer.invoke('logger:get-level-override'),
+  setLogLevelOverride: (overrideDebug: boolean) => ipcRenderer.invoke('logger:set-level-override', overrideDebug),
 };
 
 contextBridge.exposeInMainWorld('electronAPI', electronAPI);

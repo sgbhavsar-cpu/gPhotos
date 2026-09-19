@@ -110,7 +110,7 @@ async function extractRawHeicJpeg(fileBuffer: Buffer, filePath: string): Promise
   const bakPath = `${filePath}.bak`;
   if (fs.existsSync(bakPath)) {
     try {
-      const bakBuf = fs.readFileSync(bakPath);
+      const bakBuf = await fs.promises.readFile(bakPath);
       // Fast check if backup is valid
       const thumbBuffer = await exifr.thumbnail(bakBuf).catch(() => null);
       if (thumbBuffer && thumbBuffer.length > 0) {
@@ -122,6 +122,64 @@ async function extractRawHeicJpeg(fileBuffer: Buffer, filePath: string): Promise
   }
 
   return null;
+}
+
+/**
+ * Full bitstream decode ONLY — deliberately skips the embedded-EXIF-thumbnail
+ * fast path that extractRawHeicJpeg() prefers, because that embedded preview
+ * is not guaranteed to be full resolution (see
+ * docs/PIPELINE_REDESIGN_DEV_DOC.md §3.5). Used exclusively for face
+ * detection, where a downscaled preview could miss small/distant faces.
+ * Slower than extractRawHeicJpeg() but only runs once per photo.
+ */
+async function extractFullResolutionHeicJpeg(fileBuffer: Buffer, filePath: string): Promise<Buffer | null> {
+  try {
+    const sharpJpeg = await sharp(fileBuffer).jpeg({ quality: 92 }).toBuffer();
+    if (sharpJpeg && sharpJpeg.length > 0) {
+      return sharpJpeg;
+    }
+  } catch {}
+
+  if (heicConvert) {
+    try {
+      const converted = await heicConvert({ buffer: fileBuffer, format: 'JPEG', quality: 0.92 });
+      return Buffer.from(converted);
+    } catch (convErr) {
+      console.error(`heic-convert full-resolution decode failed for ${filePath}:`, convErr);
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Retrieves a full-resolution (never embedded-preview) JPEG buffer of a HEIC
+ * photo for face detection, auto-oriented and rotated according to saved
+ * user rotation. Returns null if no full decode path succeeds — callers
+ * should skip face detection for that photo rather than fall back to a
+ * lower-resolution buffer, which would silently violate the full-resolution
+ * detection requirement.
+ */
+export async function getHeicFullResolutionBufferForDetection(filePath: string): Promise<Buffer | null> {
+  if (!fs.existsSync(filePath)) return null;
+
+  try {
+    const fileBuffer = await fs.promises.readFile(filePath);
+    const rotationDeg = await detectExifRotation(fileBuffer);
+    const savedRot = getHeicSavedRotation(filePath);
+    const totalRotationDeg = (((rotationDeg + savedRot) % 360) + 360) % 360;
+
+    const decoded = await extractFullResolutionHeicJpeg(fileBuffer, filePath);
+    if (!decoded) return null;
+
+    let sharpPipeline = sharp(decoded);
+    sharpPipeline = totalRotationDeg !== 0 ? sharpPipeline.rotate(totalRotationDeg) : sharpPipeline.rotate();
+
+    return await sharpPipeline.jpeg({ quality: 92, mozjpeg: true }).toBuffer();
+  } catch (err) {
+    console.error(`Error getting full-resolution JPEG for detection for ${filePath}:`, err);
+    return null;
+  }
 }
 
 /**
@@ -158,7 +216,7 @@ export async function getOrGenerateHeicThumbnail500(filePath: string): Promise<B
     // 2. Local disk cache hit
     if (fs.existsSync(thumbPath)) {
       try {
-        const diskBuf = fs.readFileSync(thumbPath);
+        const diskBuf = await fs.promises.readFile(thumbPath);
         if (diskBuf && diskBuf.length > 0) {
           setMemoryCache(memKey, diskBuf);
           return diskBuf;
@@ -169,7 +227,7 @@ export async function getOrGenerateHeicThumbnail500(filePath: string): Promise<B
     }
 
     // 3. Generate from HEIC source
-    const fileBuffer = fs.readFileSync(filePath);
+    const fileBuffer = await fs.promises.readFile(filePath);
     const rotationDeg = await detectExifRotation(fileBuffer);
     const savedRot = getHeicSavedRotation(filePath);
     const totalRotationDeg = (((rotationDeg + savedRot) % 360) + 360) % 360;
@@ -219,7 +277,7 @@ export async function getHeicHighQualityJpegBuffer(filePath: string): Promise<Bu
       return memoryCache.get(memKey)!;
     }
 
-    const fileBuffer = fs.readFileSync(filePath);
+    const fileBuffer = await fs.promises.readFile(filePath);
     const rotationDeg = await detectExifRotation(fileBuffer);
     const savedRot = getHeicSavedRotation(filePath);
     const totalRotationDeg = (((rotationDeg + savedRot) % 360) + 360) % 360;
@@ -267,7 +325,7 @@ export async function rotateHeic500Thumbnail(filePath: string, degrees: number):
 
     if (fs.existsSync(thumbPath)) {
       try {
-        const diskBuf = fs.readFileSync(thumbPath);
+        const diskBuf = await fs.promises.readFile(thumbPath);
         if (diskBuf && diskBuf.length > 0) {
           rotatedBuffer = await sharp(diskBuf)
             .rotate(degrees)

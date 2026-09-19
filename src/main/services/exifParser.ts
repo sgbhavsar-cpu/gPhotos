@@ -95,7 +95,7 @@ export async function parsePhotoMetadata(filePath: string): Promise<{
   let height: number | undefined;
 
   try {
-    const fileBuffer = fs.readFileSync(filePath);
+    const fileBuffer = await fs.promises.readFile(filePath);
     const raw = await exifr.parse(fileBuffer, {
       tiff: true,
       exif: true,
@@ -114,6 +114,29 @@ export async function parsePhotoMetadata(filePath: string): Promise<{
 
       width = raw.ExifImageWidth || raw.ImageWidth;
       height = raw.ExifImageHeight || raw.ImageHeight;
+
+      // ExifImageWidth/Height are the raw sensor/capture dimensions, not
+      // auto-rotated — for an orientation tag requiring a 90/270 rotation
+      // (extremely common: most cameras/phones never physically rotate the
+      // pixel data, they just tag the intended orientation), the image that
+      // actually gets displayed and that face detection decodes (both
+      // auto-orient via sharp's .rotate()) has these swapped. Left
+      // unswapped, this photo's stored width/height silently disagrees with
+      // its real display-oriented frame — exactly the kind of mismatch that
+      // throws off face-box coordinate scaling (see PhotoLightbox.tsx's
+      // getFaceNormalizedCoords, which uses photo.width/height as its
+      // primary reference). exifr returns Orientation as either the raw
+      // EXIF number (5-8 = a 90/270 rotation) or, with this parse config, a
+      // translated string like "Rotate 90 CW" — handle both.
+      const orientationRaw: unknown = raw.Orientation;
+      const orientationNeedsSwap =
+        (typeof orientationRaw === 'number' && [5, 6, 7, 8].includes(orientationRaw)) ||
+        (typeof orientationRaw === 'string' && /90|270/.test(orientationRaw));
+      if (orientationNeedsSwap && width != null && height != null) {
+        const swapped = width;
+        width = height;
+        height = swapped;
+      }
 
       exifData = {
         cameraMake: raw.Make,

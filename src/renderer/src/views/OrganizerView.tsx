@@ -21,7 +21,8 @@ import {
   List,
   Eye,
   X,
-  Sparkles
+  Sparkles,
+  MoreVertical
 } from 'lucide-react';
 import {
   FolderStructure,
@@ -31,6 +32,7 @@ import {
   OrganizeProgress
 } from '../../types';
 import { getLocalPhotoUrl } from '../services/libraryStore';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 interface OrganizerViewProps {
   onOrganizeComplete?: (targetDir: string) => void;
@@ -45,6 +47,8 @@ interface FolderNode {
 }
 
 export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete }) => {
+  const isMobile = useIsMobile();
+  const [showMobileMetrics, setShowMobileMetrics] = useState(false);
   const [sourceDir, setSourceDir] = useState<string>('');
   const [targetDir, setTargetDir] = useState<string>('');
   const [structure, setStructure] = useState<FolderStructure>('YYYY/YYYY-MM');
@@ -517,70 +521,144 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
           marginBottom: '24px',
         }}>
           {/* Top Summary Bar */}
-          <div style={{
-            padding: '16px 20px',
-            borderBottom: '1px solid var(--border-subtle)',
-            backgroundColor: 'var(--bg-surface-elevated)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            flexWrap: 'wrap',
-            gap: '12px',
-          }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-              <FileCheck size={20} color="var(--accent-emerald)" />
-              <div>
-                <h3 style={{ fontSize: '1.05rem', fontWeight: 700, margin: 0 }}>
-                  Dry-Run Review & Tree Organization
-                </h3>
-                <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                  Inspect how photos will be categorized into folders before executing
-                </span>
+          {isMobile ? (
+            // Mobile: title + a single "more options" toggle for the metrics,
+            // so the persistent bar never grows past one compact row. The
+            // Execute button stays outside the collapsed panel since it's
+            // the primary action for this section.
+            <div style={{ borderBottom: '1px solid var(--border-subtle)', backgroundColor: 'var(--bg-surface-elevated)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', padding: '12px 14px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0, overflow: 'hidden' }}>
+                  <FileCheck size={18} color="var(--accent-emerald)" style={{ flexShrink: 0 }} />
+                  <h3 style={{ fontSize: '0.92rem', fontWeight: 700, margin: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    Dry-Run Review
+                  </h3>
+                </div>
+                <button
+                  className={`btn ${showMobileMetrics ? 'btn-primary' : 'btn-ghost'} btn-icon`}
+                  onClick={() => setShowMobileMetrics((v) => !v)}
+                  style={{ width: '32px', height: '32px', flexShrink: 0 }}
+                  title="Show metrics"
+                  aria-expanded={showMobileMetrics}
+                >
+                  <MoreVertical size={16} />
+                </button>
               </div>
-            </div>
 
-            {/* Metrics & Execute Button */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
-              <div style={{ display: 'flex', gap: '12px', fontSize: '0.82rem' }}>
-                <span>Total: <strong>{dryRunResult.totalFiles}</strong> photos</span>
-                <span>Size: <strong>{formatBytes(dryRunResult.totalSize)}</strong></span>
-                <span>Target Folders: <strong>{dryRunResult.targetFolders.length}</strong></span>
-                {dryRunResult.duplicateCount > 0 && (
-                  <span style={{ color: 'var(--accent-amber)' }}>
-                    Duplicates: <strong>{dryRunResult.duplicateCount}</strong>
+              {showMobileMetrics && (
+                <div style={{ padding: '0 14px 12px', display: 'flex', flexDirection: 'column', gap: '4px', fontSize: '0.8rem' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>
+                    Inspect how photos will be categorized into folders before executing
                   </span>
-                )}
+                  <span>Total: <strong>{dryRunResult.totalFiles}</strong> photos</span>
+                  <span>Size: <strong>{formatBytes(dryRunResult.totalSize)}</strong></span>
+                  <span>Target Folders: <strong>{dryRunResult.targetFolders.length}</strong></span>
+                  {dryRunResult.duplicateCount > 0 && (
+                    <span style={{ color: 'var(--accent-amber)' }}>
+                      Duplicates: <strong>{dryRunResult.duplicateCount}</strong>
+                    </span>
+                  )}
+                </div>
+              )}
+
+              <div style={{ padding: '0 14px 14px' }}>
+                <button
+                  className="btn btn-primary"
+                  onClick={handleStartOrganizing}
+                  disabled={isOrganizing || dryRunResult.totalFiles === 0}
+                  style={{
+                    backgroundColor: 'var(--accent-emerald)',
+                    padding: '10px 22px',
+                    fontSize: '0.88rem',
+                    fontWeight: 700,
+                    gap: '8px',
+                    width: '100%',
+                    justifyContent: 'center',
+                  }}
+                >
+                  <Play size={16} />
+                  <span>{isOrganizing ? 'Organizing...' : `Execute ${mode === 'copy' ? 'Copy' : 'Move'}`}</span>
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div style={{
+              padding: '16px 20px',
+              borderBottom: '1px solid var(--border-subtle)',
+              backgroundColor: 'var(--bg-surface-elevated)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              flexWrap: 'wrap',
+              gap: '12px',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <FileCheck size={20} color="var(--accent-emerald)" />
+                <div>
+                  <h3 style={{ fontSize: '1.05rem', fontWeight: 700, margin: 0 }}>
+                    Dry-Run Review & Tree Organization
+                  </h3>
+                  <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                    Inspect how photos will be categorized into folders before executing
+                  </span>
+                </div>
               </div>
 
-              <button
-                className="btn btn-primary"
-                onClick={handleStartOrganizing}
-                disabled={isOrganizing || dryRunResult.totalFiles === 0}
-                style={{
-                  backgroundColor: 'var(--accent-emerald)',
-                  padding: '9px 22px',
-                  fontSize: '0.88rem',
-                  fontWeight: 700,
-                  gap: '8px',
-                }}
-              >
-                <Play size={16} />
-                <span>{isOrganizing ? 'Organizing...' : `Execute ${mode === 'copy' ? 'Copy' : 'Move'}`}</span>
-              </button>
-            </div>
-          </div>
+              {/* Metrics & Execute Button */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+                <div style={{ display: 'flex', gap: '12px', fontSize: '0.82rem' }}>
+                  <span>Total: <strong>{dryRunResult.totalFiles}</strong> photos</span>
+                  <span>Size: <strong>{formatBytes(dryRunResult.totalSize)}</strong></span>
+                  <span>Target Folders: <strong>{dryRunResult.targetFolders.length}</strong></span>
+                  {dryRunResult.duplicateCount > 0 && (
+                    <span style={{ color: 'var(--accent-amber)' }}>
+                      Duplicates: <strong>{dryRunResult.duplicateCount}</strong>
+                    </span>
+                  )}
+                </div>
 
-          {/* Split Pane Body */}
-          <div style={{ display: 'flex', height: '520px', overflow: 'hidden' }}>
+                <button
+                  className="btn btn-primary"
+                  onClick={handleStartOrganizing}
+                  disabled={isOrganizing || dryRunResult.totalFiles === 0}
+                  style={{
+                    backgroundColor: 'var(--accent-emerald)',
+                    padding: '9px 22px',
+                    fontSize: '0.88rem',
+                    fontWeight: 700,
+                    gap: '8px',
+                  }}
+                >
+                  <Play size={16} />
+                  <span>{isOrganizing ? 'Organizing...' : `Execute ${mode === 'copy' ? 'Copy' : 'Move'}`}</span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Split Pane Body — desktop keeps the fixed 520px side-by-side
+              layout; mobile stacks the tree pane above the content pane
+              (each full width) and swaps the fixed height for a flexible,
+              scrollable one so it fits 375-600px viewports instead of
+              overflowing horizontally or wasting/constraining vertical space. */}
+          <div style={{
+            display: 'flex',
+            flexDirection: isMobile ? 'column' : 'row',
+            height: isMobile ? 'auto' : '520px',
+            maxHeight: isMobile ? '75vh' : undefined,
+            overflow: isMobile ? 'auto' : 'hidden',
+          }}>
             {/* Left Pane: Hierarchical Tree View */}
             <div style={{
-              width: '290px',
-              minWidth: '290px',
-              borderRight: '1px solid var(--border-subtle)',
+              width: isMobile ? '100%' : '290px',
+              minWidth: isMobile ? '0' : '290px',
+              borderRight: isMobile ? 'none' : '1px solid var(--border-subtle)',
+              borderBottom: isMobile ? '1px solid var(--border-subtle)' : 'none',
               backgroundColor: 'var(--bg-app)',
               display: 'flex',
               flexDirection: 'column',
               padding: '14px',
+              flexShrink: 0,
             }}>
               <div style={{
                 fontSize: '0.75rem',
@@ -599,7 +677,14 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
                 </span>
               </div>
 
-              <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+              <div style={{
+                flex: isMobile ? undefined : 1,
+                maxHeight: isMobile ? '220px' : undefined,
+                overflowY: 'auto',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '4px',
+              }}>
                 {/* Root All Folders Node */}
                 {renderTreeNode(folderTree)}
               </div>
@@ -611,19 +696,23 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
               display: 'flex',
               flexDirection: 'column',
               backgroundColor: 'var(--bg-surface)',
-              overflow: 'hidden',
+              overflow: isMobile ? 'visible' : 'hidden',
+              minWidth: isMobile ? 0 : undefined,
             }}>
-              {/* Review Filter Bar */}
+              {/* Review Filter Bar — wraps to a second row on mobile instead
+                  of squeezing the folder label, search box and view toggle
+                  into one row that doesn't fit a phone width. */}
               <div style={{
                 padding: '10px 18px',
                 borderBottom: '1px solid var(--border-subtle)',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'space-between',
+                flexWrap: isMobile ? 'wrap' : 'nowrap',
                 gap: '12px',
                 backgroundColor: 'var(--bg-surface)',
               }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0, width: isMobile ? '100%' : undefined }}>
                   <Folder size={16} color="var(--accent-cyan)" />
                   <span style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {selectedFolderPath === '__ALL__' ? 'All Folders' : selectedFolderPath}
@@ -633,9 +722,9 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
                   </span>
                 </div>
 
-                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', width: isMobile ? '100%' : undefined }}>
                   {/* Search Input */}
-                  <div style={{ position: 'relative', width: '200px' }}>
+                  <div style={{ position: 'relative', width: isMobile ? '100%' : '200px', flex: isMobile ? 1 : undefined }}>
                     <Search size={14} style={{ position: 'absolute', left: '10px', top: '10px', color: 'var(--text-muted)' }} />
                     <input
                       type="text"
@@ -687,8 +776,11 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
                 </div>
               </div>
 
-              {/* Photos Content Area */}
-              <div style={{ flex: 1, overflowY: 'auto', padding: '16px' }}>
+              {/* Photos Content Area — on mobile this relies on the outer
+                  split-pane body's single scroll region instead of its own
+                  nested scrollbar, since that outer region is now the
+                  flexible/scrollable container replacing the fixed 520px pane. */}
+              <div style={{ flex: isMobile ? undefined : 1, overflowY: isMobile ? 'visible' : 'auto', padding: '16px' }}>
                 {displayedPhotos.length === 0 ? (
                   <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--text-muted)' }}>
                     <ImageIcon size={42} style={{ margin: '0 auto 12px', opacity: 0.5 }} />
@@ -782,7 +874,10 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
                     })}
                   </div>
                 ) : (
-                  /* Table View */
+                  /* Table View — wrapped so its multiple columns scroll
+                     horizontally on mobile instead of overflowing the
+                     viewport or squeezing illegibly narrow. */
+                  <div style={{ overflowX: isMobile ? 'auto' : 'visible' }}>
                   <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.78rem', fontFamily: 'var(--font-mono)' }}>
                     <thead>
                       <tr style={{ borderBottom: '1px solid var(--border-subtle)', backgroundColor: 'var(--bg-surface-elevated)', color: 'var(--text-muted)' }}>
@@ -840,6 +935,7 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
                       })}
                     </tbody>
                   </table>
+                  </div>
                 )}
               </div>
             </div>

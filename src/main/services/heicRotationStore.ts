@@ -6,6 +6,11 @@ import os from 'os';
  * Resolves the path to the persistent heic_rotations.json file in userData.
  */
 export function getHeicRotationsFilePath(): string {
+  // Test-only override so unit tests never touch a real user's rotation flags.
+  if (process.env.GPHOTOS_TEST_CONFIG_DIR) {
+    return path.join(process.env.GPHOTOS_TEST_CONFIG_DIR, 'heic_rotations.json');
+  }
+
   try {
     const { app } = require('electron');
     if (app && typeof app.getPath === 'function') {
@@ -28,6 +33,11 @@ export function getHeicRotationsFilePath(): string {
 // In-memory cache of saved rotations: normalizedPath -> rotation degrees (0, 90, 180, 270)
 let heicRotationsCache: Map<string, number> | null = null;
 
+/** Test-only: clears the in-memory cache so the next call re-reads from disk. */
+export function resetHeicRotationCacheForTests(): void {
+  heicRotationsCache = null;
+}
+
 function normalizePath(filePath: string): string {
   return (filePath || '').trim().toLowerCase().replace(/\\/g, '/');
 }
@@ -41,7 +51,8 @@ function loadHeicRotations(): Map<string, number> {
     const pathsToLoad = [p];
 
     // Also check alternative userData directories to merge any past rotations
-    const base = process.env.APPDATA || '';
+    // (skipped entirely under test isolation, so tests never read real user data).
+    const base = process.env.GPHOTOS_TEST_CONFIG_DIR ? '' : (process.env.APPDATA || '');
     if (base) {
       const alt1 = path.join(base, 'gPhotos', 'heic_rotations.json');
       const alt2 = path.join(base, 'gphotos-desktop', 'heic_rotations.json');
@@ -91,7 +102,8 @@ function persistHeicRotations(map: Map<string, number>): void {
     fs.writeFileSync(p, jsonStr, 'utf-8');
 
     // Also sync to alternative APPDATA directory if present so both environments stay in sync
-    const base = process.env.APPDATA || '';
+    // (skipped entirely under test isolation, so tests never write real user data).
+    const base = process.env.GPHOTOS_TEST_CONFIG_DIR ? '' : (process.env.APPDATA || '');
     if (base) {
       const altDirs = [path.join(base, 'gPhotos'), path.join(base, 'gphotos-desktop')];
       for (const d of altDirs) {

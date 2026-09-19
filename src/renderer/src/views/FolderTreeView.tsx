@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { Photo, FolderTreeNode, VirtualStorageConfig } from '../../types';
 import { getLocalPhotoUrl, libraryStore } from '../services/libraryStore';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 interface FolderTreeViewProps {
   onSelectPhoto: (photo: Photo) => void;
@@ -130,6 +131,7 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
 }) => {
   const [rootNodes, setRootNodes] = useState<FolderTreeNode[]>([]);
   const [selectedFolderPath, setSelectedFolderPath] = useState<string | null>(initialFolderPath);
+  const isMobile = useIsMobile();
   const [folderPhotos, setFolderPhotos] = useState<Photo[]>([]);
   const [isLoadingPhotos, setIsLoadingPhotos] = useState(false);
   const [customPathInput, setCustomPathInput] = useState('');
@@ -230,16 +232,21 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
   };
 
   return (
-    <div style={{ height: '100%', display: 'flex', overflow: 'hidden' }}>
-      {/* Left Sidebar: Folder Tree */}
+    <div style={{ height: '100%', display: 'flex', flexDirection: isMobile ? 'column' : 'row', overflow: 'hidden' }}>
+      {/* Left Sidebar: Folder Tree — a fixed 320px side-by-side pane doesn't
+          fit a 375-600px phone screen at all, so on mobile this becomes a
+          collapsed-height panel stacked above the photo list instead. */}
       <aside
         style={{
-          width: '320px',
-          borderRight: '1px solid var(--border-subtle)',
+          width: isMobile ? '100%' : '320px',
+          maxHeight: isMobile ? '38vh' : undefined,
+          borderRight: isMobile ? 'none' : '1px solid var(--border-subtle)',
+          borderBottom: isMobile ? '1px solid var(--border-subtle)' : 'none',
           backgroundColor: 'var(--bg-surface)',
           display: 'flex',
           flexDirection: 'column',
           overflow: 'hidden',
+          flexShrink: 0,
         }}
       >
         <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border-subtle)' }}>
@@ -287,16 +294,26 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
         {/* Header */}
         <div
           style={{
-            padding: '16px 24px',
+            padding: isMobile ? '10px 12px' : '16px 24px',
             borderBottom: '1px solid var(--border-subtle)',
             backgroundColor: 'var(--bg-surface)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
+            flexWrap: 'wrap',
+            gap: '8px',
           }}
         >
-          <div>
-            <h3 style={{ fontSize: '1.1rem', fontWeight: 700, margin: 0, color: 'var(--text-primary)' }}>
+          <div style={{ minWidth: 0, flex: '1 1 auto' }}>
+            <h3 style={{
+              fontSize: isMobile ? '0.9rem' : '1.1rem',
+              fontWeight: 700,
+              margin: 0,
+              color: 'var(--text-primary)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}>
               {selectedFolderPath ? selectedFolderPath : 'Select a Folder'}
             </h3>
             <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
@@ -308,17 +325,9 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
             <button
               className="btn btn-primary"
               onClick={() => {
-                if (onStartBackgroundScan) {
-                  onStartBackgroundScan(selectedFolderPath);
-                } else if (window.electronAPI?.startBackgroundScan) {
-                  window.electronAPI.startBackgroundScan({
-                    sourcePath: selectedFolderPath,
-                    storageName: selectedFolderPath.split(/[/\\]/).filter(Boolean).pop() || 'Folder',
-                    mirrorDir: 'C:\\GPhotos_VirtualMirrors'
-                  });
-                }
+                onStartBackgroundScan?.(selectedFolderPath);
               }}
-              style={{ fontSize: '0.82rem', gap: '6px' }}
+              style={{ fontSize: '0.82rem', gap: '6px', flexShrink: 0 }}
               title="Start non-blocking background index & thumbnail mirroring for this entire directory"
             >
               <Play size={14} />

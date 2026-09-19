@@ -1,5 +1,5 @@
 appId: com.gphotos.desktop
-productName: Google Photos Desktop
+productName: gPhotos Desktop
 directories:
   output: release
   buildResources: build
@@ -8,6 +8,9 @@ files:
   - dist-electron/**/*
   - public/**/*
   - package.json
+extraResources:
+  - from: resources/models-onnx
+    to: models-onnx
 win:
   icon: public/icon.png
   target:

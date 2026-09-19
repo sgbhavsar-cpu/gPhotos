@@ -32,7 +32,7 @@ export interface DetectedFace {
   };
   imageWidth?: number;
   imageHeight?: number;
-  descriptor: number[]; // 128-dimensional CosFace embedding vector
+  descriptor: number[]; // 512-dimensional ArcFace embedding vector (see faceDetectionEngine.ts)
   personId?: string;
   confidence: number;
   isConfirmed?: boolean;
@@ -75,10 +75,22 @@ export interface Photo {
   storageName?: string;
   isExcluded?: boolean;
   faceScanCompleted?: boolean;
+  // True once every face currently on this photo is confirmed (including
+  // the trivial zero-faces case) — set automatically as faces get confirmed,
+  // or explicitly via a bulk curation action (e.g. "Remove Unknown Faces").
+  // Blocks automatic/bulk face (re-)detection from touching this photo until
+  // the user explicitly re-runs "Scan Faces" on it (which clears the lock).
+  facesLocked?: boolean;
   sharpnessScore?: number;
   rotation?: number;
   isHeicRotated?: boolean;
   heicRotation?: number;
+  // Source file's filesystem modified-time (ms since epoch) as of the last
+  // time this photo's bytes were actually read for thumbnail/face
+  // processing. Compared against the source file's current mtime (and
+  // fileSize) on each rescan so an unchanged file can skip re-reading
+  // entirely instead of being re-hydrated/re-detected every pass.
+  originalMtimeMs?: number;
 }
 
 export interface FolderTreeNode {
@@ -138,6 +150,8 @@ export interface DuplicateCluster {
   }>;
 }
 
+export type InventoryStatus = 'not_started' | 'scanning' | 'completed' | 'failed';
+
 export interface VirtualStorageConfig {
   id: string;
   name: string;
@@ -149,6 +163,16 @@ export interface VirtualStorageConfig {
   newlyAdded?: number;
   delayBetweenPhotosSec?: number;
   bandwidthLimitMbps?: number;
+
+  // Inventory gate (see docs/PIPELINE_REDESIGN_DEV_DOC.md §3.2): until
+  // inventoryStatus is 'completed', no thumbnail/face processing runs for
+  // this storage. Once completed, inventoryTotalFiles is the single fixed
+  // count every UI surface (sidebar, Virtual Storage view) displays — no
+  // more independently-computed, possibly-disagreeing counts.
+  inventoryStatus?: InventoryStatus;
+  inventoryTotalFiles?: number;
+  inventoryCompletedAt?: string;
+  inventoryError?: string;
 }
 
 export interface SyncVirtualStorageResult {
@@ -163,6 +187,11 @@ export interface VirtualPhotoMetadata {
   fileName: string;
   originalFilePath: string;
   originalFileSize: number;
+  // Source file's filesystem mtime (ms since epoch) captured at the same
+  // time originalFileSize was read, so a later sync can detect "unchanged"
+  // without any extra stat/read beyond the one already done for the
+  // thumbnail incremental-skip check.
+  sourceMtimeMs?: number;
   dateTaken: string;
   width?: number;
   height?: number;
@@ -321,7 +350,7 @@ export interface IElectronAPI {
   onOrganizeProgress: (callback: (progress: OrganizeProgress) => void) => () => void;
   readFileAsBase64: (filePath: string) => Promise<string>;
   saveLibraryData: (key: string, data: any) => Promise<boolean>;
-  loadLibraryData: (key: string) => Promise<any>;
+  loadLibraryData: (key: string, libraryDir?: string) => Promise<any>;
   syncVirtualStorage: (config: VirtualStorageConfig) => Promise<SyncVirtualStorageResult>;
   scanVirtualMirror: (mirrorDirPath: string) => Promise<Photo[]>;
   discoverMirrors: (rootPath?: string) => Promise<VirtualStorageConfig[]>;
@@ -336,8 +365,8 @@ export interface IElectronAPI {
   readFolderPhotos: (folderPath: string) => Promise<Photo[]>;
   generateThumbnailOnTheFly: (sourceFilePath: string, mirrorDirPath?: string) => Promise<string | null>;
   editPhoto: (options: EditPhotoOptions) => Promise<EditPhotoResult>;
-  trashFiles: (filePaths: string[]) => Promise<{ success: boolean; trashedCount: number; errors: string[] }>;
-  deleteFilesPermanently: (filePaths: string[]) => Promise<{ success: boolean; deletedCount: number; errors: string[] }>;
+  trashFiles: (filePaths: string[]) => Promise<{ success: boolean; trashedCount: number; trashedPaths: string[]; errors: string[] }>;
+  deleteFilesPermanently: (filePaths: string[]) => Promise<{ success: boolean; deletedCount: number; deletedPaths: string[]; errors: string[] }>;
   rotatePhoto: (filePath: string, rotationDegrees: number, originalRemotePath?: string) => Promise<{ success: boolean; isQueued?: boolean; newPath?: string; message?: string; error?: string; isHeic?: boolean; isHeicRotated?: boolean; heicRotation?: number; rotation?: number }>;
   processPendingRotations?: () => Promise<{ processed: number; remaining: number; error?: string }>;
   deleteVirtualStorage: (params: { storageName: string; localMirrorRoot?: string; deleteDiskFiles: boolean }) => Promise<{ success: boolean; error?: string }>;
@@ -379,6 +408,7 @@ export interface IElectronAPI {
   getCatalogPage: (params: { pageIndex: number; pageSize?: number; libraryDir?: string }) => Promise<{ photos: Photo[]; totalPages: number; totalPhotos: number }>;
   switchLibrary: (targetPath: string) => Promise<{ meta: CatalogMeta; firstPage: Photo[] }>;
   getSpriteCoordinate?: (photoPath: string) => Promise<SpriteCoordinate | null>;
+  getSpriteCoordinatesBatch?: (photoPaths: string[]) => Promise<Record<string, SpriteCoordinate | null>>;
   getThumbnailPreCacheStatus?: () => Promise<{
     isRunning: boolean;
     current: number;
@@ -399,6 +429,65 @@ export interface IElectronAPI {
   ) => Promise<{ refreshedCount: number; errors: string[] }>;
   getStorageDetails?: (storageName: string, mirrorRoot?: string) => Promise<StorageDetails | null>;
   getAllStorageDetails?: (mirrorRoot?: string) => Promise<Record<string, StorageDetails>>;
+
+  // Person profile-photo local cache (independent of network storage reachability)
+  getPersonAvatarPath?: (personId: string, cacheKey: string) => Promise<string | null>;
+  savePersonAvatar?: (personId: string, cacheKey: string, dataUrl: string) => Promise<{ success: boolean; filePath?: string; error?: string }>;
+  deletePersonAvatar?: (personId: string) => Promise<boolean>;
+
+  // OneDrive Files On-Demand space reclaim
+  getOneDriveStatus?: () => Promise<{ detectedRoots: string[]; reclaimEnabled: boolean; supported: boolean }>;
+  setOneDriveReclaimEnabled?: (enabled: boolean) => Promise<boolean>;
+  markOneDriveReclaimable?: (filePaths: string[]) => Promise<{ markedCount: number }>;
+  runOneDriveHealthCheck?: () => Promise<{ checked: number; stillHydrated: number }>;
+  getOneDriveReclaimHealth?: () => Promise<{ broken: boolean; pendingCount: number; recentFailureRate: number; checkedCount: number }>;
+  resetOneDriveReclaimHealth?: () => Promise<boolean>;
+
+  // Unified per-photo sync (thumbnail+sidecar) — interleaved with face
+  // detection in the renderer so each photo fully completes (including an
+  // OneDrive unpin request) before the next one's original is hydrated.
+  syncOnePhoto?: (config: VirtualStorageConfig, remoteFile: string) => Promise<{
+    success: boolean;
+    skipped: boolean;
+    bytesRead: number;
+    originalSize: number;
+    thumbnailSize: number;
+    localThumbPath?: string;
+    localMetaPath?: string;
+    sidecar?: any;
+    error?: string;
+  }>;
+  listSourceFiles?: (sourcePath: string) => Promise<string[]>;
+
+  // Logging (see docs/PIPELINE_REDESIGN_DEV_DOC.md §3.8) — routes renderer
+  // log calls into the same rotated log file the main process writes to.
+  logFromRenderer?: (level: 'debug' | 'info' | 'warn' | 'error', scope: string, message: string, meta?: Record<string, unknown>) => void;
+  getLogLevelOverride?: () => Promise<boolean>;
+  setLogLevelOverride?: (overrideDebug: boolean) => Promise<boolean>;
+
+  // Inventory gate (see docs/PIPELINE_REDESIGN_DEV_DOC.md §3.2)
+  scanStorageInventory?: (networkSourcePath: string) => Promise<{
+    status: 'completed' | 'failed';
+    totalFiles: number;
+    completedAt?: string;
+    error?: string;
+  }>;
+  getPhotosByStorageName?: (storageName: string, mirrorRoot?: string) => Promise<Photo[]>;
+
+  // Main-process face detection (see src/main/services/faceDetectionEngine.ts
+  // + pipelineOrchestrator.ts) — replaces the old renderer-side face-api.js
+  // engine for every photo, local or network.
+  detectFacesBatch?: (photos: Photo[]) => Promise<{
+    results: Array<{ photoId: string; ran: boolean; faceCount: number; locked: boolean; skippedReason?: string; faces: DetectedFace[] }>;
+    people: Person[];
+  }>;
+  detectFacesForced?: (photo: Photo) => Promise<{
+    ran: boolean; faceCount: number; locked: boolean; skippedReason?: string; faces: DetectedFace[]; people: Person[];
+  }>;
+  computeDescriptorForRegion?: (
+    sourceFilePath: string,
+    box: { x: number; y: number; width: number; height: number }
+  ) => Promise<{ descriptor: number[]; confidence: number } | null>;
 }
 
 export interface StorageDetails {

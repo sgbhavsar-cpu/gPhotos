@@ -211,16 +211,41 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
 
     setIsDeleting(true);
     const deletePaths = toDelete.map((p) => p.originalRemotePath || p.filePath);
-    const deleteIds = toDelete.map((p) => p.id);
 
     try {
-      if (window.electronAPI?.trashFiles) {
-        await window.electronAPI.trashFiles(deletePaths);
-      }
-      libraryStore.removePhotos(deleteIds);
+      // Only remove photos that were actually trashed — a photo whose network
+      // storage is offline is skipped by trashFiles rather than attempted, so
+      // it must stay in the library instead of silently disappearing from view.
+      let trashedIds = toDelete.map((p) => p.id);
+      let failureMessage: string | null = null;
 
-      setStatusMessage(`✓ Kept ${keptSet.size} photo(s) and safely removed ${count} duplicate(s)!`);
-      if (onPhotosDeleted) onPhotosDeleted(count);
+      if (window.electronAPI?.trashFiles) {
+        const result = await window.electronAPI.trashFiles(deletePaths);
+        const trashedPathSet = new Set(result.trashedPaths);
+        trashedIds = toDelete
+          .filter((p) => trashedPathSet.has(p.originalRemotePath || p.filePath))
+          .map((p) => p.id);
+
+        if (result.errors.length > 0) {
+          const offlineCount = result.errors.filter((e) => e.includes('network storage is not available')).length;
+          failureMessage = offlineCount > 0
+            ? `${offlineCount} of ${count} photo(s) skipped — network storage is not available.`
+            : `${result.errors.length} of ${count} photo(s) could not be removed.`;
+        }
+      }
+
+      if (trashedIds.length > 0) {
+        libraryStore.removePhotos(trashedIds);
+      }
+
+      setStatusMessage(
+        failureMessage
+          ? (trashedIds.length > 0
+              ? `⚠ Kept ${keptSet.size} photo(s), removed ${trashedIds.length}. ${failureMessage}`
+              : `⚠ ${failureMessage}`)
+          : `✓ Kept ${keptSet.size} photo(s) and safely removed ${count} duplicate(s)!`
+      );
+      if (onPhotosDeleted) onPhotosDeleted(trashedIds.length);
 
       // Remove this cluster from view
       const remainingClusters = clusters.filter((_, idx) => idx !== currentClusterIdx);

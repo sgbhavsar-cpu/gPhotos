@@ -1,4 +1,4 @@
-# Google Photos Desktop — Standalone Windows Application
+# gPhotos Desktop — Standalone Windows Application
 
 [![CI](https://github.com/sgbhavsar-cpu/gPhotos/actions/workflows/ci.yml/badge.svg)](https://github.com/sgbhavsar-cpu/gPhotos/actions/workflows/ci.yml)
 
@@ -27,8 +27,8 @@ A modern, privacy-first desktop photo library and organization suite built with 
   - **Move Mode**: Relocates files to save disk space.
 
 ### 2. 👤 Local AI Face Recognition & "People" Virtual Albums
-- **100% Local Biometric Detection**: Uses `@vladmandic/face-api` (SSD MobileNet / TinyFaceDetector + FaceRecognitionNet) accelerated with WebGPU / WebGL.
-- **128-Dimensional Biometric Embeddings**: Clustered on unit hyperspheres using cosine distance with 2.5× active-learning ground-truth weighting.
+- **100% Local Biometric Detection**: Runs entirely in the main process via ONNX Runtime (SCRFD detection + ArcFace/MobileFaceNet recognition) — no browser/DOM dependency, so it works even with the app window closed (see the background sync service).
+- **512-Dimensional Biometric Embeddings**: Clustered using Euclidean distance with 2.5× active-learning ground-truth weighting.
 - **People Management**:
   - **Instant Inline Renaming**: Click any name or pencil icon to type immediately. Native keyboard focus is active out of the box without requiring DevTools or F12.
   - **Reset & Rescan**: Purges all background face records, resets photo scan flags, and rescans all photos from 1 to Total with a live progress counter.
@@ -114,14 +114,17 @@ The resulting executable will be saved in the `release/` directory.
 ```
 gphotos/
 ├── public/
-│   ├── help.html             # Embedded interactive documentation viewer
-│   └── models/               # Bundled face-api neural network weights
+│   └── help.html             # Embedded interactive documentation viewer
+├── resources/
+│   └── models-onnx/          # Bundled SCRFD + ArcFace ONNX model weights
 ├── src/
 │   ├── main/                 # Electron main process
 │   │   ├── services/
 │   │   │   ├── exifParser.ts # EXIF & GPS metadata extraction
 │   │   │   ├── fileOrganizer.ts # Physical date organization & dry-run engine
 │   │   │   ├── virtualMirrorService.ts # NAS/SMB mirror cache & thumbnailer
+│   │   │   ├── faceDetectionEngine.ts # ONNX face detection + recognition
+│   │   │   ├── pipelineOrchestrator.ts # Unified thumbnail -> face -> reclaim pipeline
 │   │   │   ├── zipBackupService.ts # Pure Node.js PKZIP backup generator
 │   │   │   └── backgroundDaemon.ts # 24/7 background sync daemon
 │   │   └── main.ts           # Window management, IPC handlers, error recovery
@@ -131,7 +134,7 @@ gphotos/
 │   │   ├── src/
 │   │   │   ├── components/   # ErrorBoundary, PhotoCard, Lightbox, Modals
 │   │   │   ├── views/        # GalleryView, PeopleView, PlacesMapView, OrganizerView
-│   │   │   ├── services/     # faceEngine, clustering, deduplication, libraryStore
+│   │   │   ├── services/     # clustering (interactive edits), deduplication, libraryStore
 │   │   │   ├── App.tsx       # Root UI router & state coordinator
 │   │   │   └── index.css     # Dark slate theme & glassmorphic tokens
 │   │   └── index.html

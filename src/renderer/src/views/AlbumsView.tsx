@@ -18,11 +18,16 @@ import {
 } from 'lucide-react';
 import { Album, Photo } from '../../types';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 interface AlbumsViewProps {
   photos: Photo[];
   albums: Album[];
-  onSelectPhoto: (photo: Photo) => void;
+  // contextPhotos, when provided, is the ordered list the caller should use
+  // for lightbox next/prev navigation instead of the whole library — here,
+  // the currently open album's own photos, so browsing an album's lightbox
+  // stays inside that album.
+  onSelectPhoto: (photo: Photo, contextPhotos?: Photo[]) => void;
   resetTrigger?: number;
 }
 
@@ -33,6 +38,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
   resetTrigger,
 }) => {
   const [selectedAlbumId, setSelectedAlbumId] = useState<string | null>(null);
+  const isMobile = useIsMobile();
 
   useEffect(() => {
     if (resetTrigger) {
@@ -175,28 +181,39 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
         {/* Detail Header */}
         <div
           style={{
-            padding: '16px 28px',
+            padding: isMobile ? '12px 14px' : '16px 28px',
             backgroundColor: 'var(--bg-surface)',
             borderBottom: '1px solid var(--border-subtle)',
             display: 'flex',
-            alignItems: 'center',
+            flexDirection: isMobile ? 'column' : 'row',
+            alignItems: isMobile ? 'stretch' : 'center',
             justifyContent: 'space-between',
-            flexWrap: 'wrap',
-            gap: '16px',
+            flexWrap: isMobile ? 'nowrap' : 'wrap',
+            gap: isMobile ? '10px' : '16px',
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: isMobile ? '10px' : '16px', minWidth: 0 }}>
             <button
               className="btn btn-secondary btn-icon"
               onClick={() => setSelectedAlbumId(null)}
               title="Back to all albums"
-              style={{ width: '40px', height: '40px', borderRadius: 'var(--radius-md)' }}
+              style={{ width: '40px', height: '40px', borderRadius: 'var(--radius-md)', flexShrink: 0 }}
             >
               <ArrowLeft size={20} />
             </button>
-            <div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                <h2 style={{ fontSize: '1.4rem', fontWeight: 700, margin: 0, color: 'var(--text-primary)' }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 }}>
+                <h2
+                  style={{
+                    fontSize: isMobile ? '1.1rem' : '1.4rem',
+                    fontWeight: 700,
+                    margin: 0,
+                    color: 'var(--text-primary)',
+                    ...(isMobile
+                      ? { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }
+                      : {}),
+                  }}
+                >
                   {activeAlbum.title}
                 </h2>
                 <span
@@ -207,28 +224,31 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                     borderRadius: 'var(--radius-full)',
                     backgroundColor: 'rgba(59, 130, 246, 0.15)',
                     color: 'var(--accent-primary)',
+                    flexShrink: 0,
                   }}
                 >
                   {activeAlbum.photoIds.length} photo{activeAlbum.photoIds.length === 1 ? '' : 's'}
                 </span>
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginTop: '4px', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
-                {activeAlbum.eventDate && (
-                  <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                    <Calendar size={13} color="var(--accent-cyan)" />
-                    {new Date(activeAlbum.eventDate).toLocaleDateString(undefined, {
-                      year: 'numeric',
-                      month: 'long',
-                      day: 'numeric',
-                    })}
-                  </span>
-                )}
-                {activeAlbum.description && <span>• {activeAlbum.description}</span>}
-              </div>
+              {!isMobile && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginTop: '4px', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+                  {activeAlbum.eventDate && (
+                    <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                      <Calendar size={13} color="var(--accent-cyan)" />
+                      {new Date(activeAlbum.eventDate).toLocaleDateString(undefined, {
+                        year: 'numeric',
+                        month: 'long',
+                        day: 'numeric',
+                      })}
+                    </span>
+                  )}
+                  {activeAlbum.description && <span>• {activeAlbum.description}</span>}
+                </div>
+              )}
             </div>
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', ...(isMobile ? { justifyContent: 'flex-end' } : {}) }}>
             <button
               className="btn btn-primary"
               onClick={() => {
@@ -236,7 +256,14 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                 setPhotoSearchQuery('');
                 setShowAddPhotosModal(true);
               }}
-              style={{ gap: '8px', padding: '10px 18px', height: '40px', fontSize: '0.88rem' }}
+              style={{
+                gap: '8px',
+                padding: isMobile ? '0 16px' : '10px 18px',
+                height: '40px',
+                fontSize: '0.88rem',
+                flex: isMobile ? 1 : undefined,
+                justifyContent: isMobile ? 'center' : undefined,
+              }}
             >
               <Plus size={18} />
               <span>Add Photos</span>
@@ -246,7 +273,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
               className="btn btn-secondary btn-icon"
               onClick={(e) => handleDeleteAlbum(activeAlbum.id, activeAlbum.title, e)}
               title="Delete this album"
-              style={{ width: '40px', height: '40px', color: 'var(--accent-rose)' }}
+              style={{ width: '40px', height: '40px', color: 'var(--accent-rose)', flexShrink: 0 }}
             >
               <Trash2 size={18} />
             </button>
@@ -301,7 +328,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                 return (
                   <div
                     key={photo.id}
-                    onClick={() => onSelectPhoto(photo)}
+                    onClick={() => onSelectPhoto(photo, albumPhotos)}
                     style={{
                       position: 'relative',
                       height: '210px',
@@ -443,7 +470,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
-              padding: '24px',
+              padding: isMobile ? '10px' : '24px',
             }}
             onClick={() => setShowAddPhotosModal(false)}
           >
@@ -465,7 +492,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
               {/* Picker Header */}
               <div
                 style={{
-                  padding: '16px 24px',
+                  padding: isMobile ? '12px 16px' : '16px 24px',
                   borderBottom: '1px solid var(--border-subtle)',
                   display: 'flex',
                   alignItems: 'center',
@@ -473,19 +500,31 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                   gap: '16px',
                 }}
               >
-                <div>
-                  <h3 style={{ fontSize: '1.15rem', fontWeight: 700, margin: 0, color: 'var(--text-primary)' }}>
+                <div style={{ minWidth: 0 }}>
+                  <h3
+                    style={{
+                      fontSize: isMobile ? '1rem' : '1.15rem',
+                      fontWeight: 700,
+                      margin: 0,
+                      color: 'var(--text-primary)',
+                      ...(isMobile
+                        ? { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+                        : {}),
+                    }}
+                  >
                     Add Photos to "{activeAlbum.title}"
                   </h3>
-                  <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '2px' }}>
-                    Select photos from your entire library across any drives or network folders.
-                  </div>
+                  {!isMobile && (
+                    <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '2px' }}>
+                      Select photos from your entire library across any drives or network folders.
+                    </div>
+                  )}
                 </div>
 
                 <button
                   className="btn btn-ghost btn-icon"
                   onClick={() => setShowAddPhotosModal(false)}
-                  style={{ width: '36px', height: '36px' }}
+                  style={{ width: '36px', height: '36px', flexShrink: 0 }}
                 >
                   <X size={20} />
                 </button>
@@ -494,16 +533,17 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
               {/* Picker Search & Select All Toolbar */}
               <div
                 style={{
-                  padding: '12px 24px',
+                  padding: isMobile ? '10px 16px' : '12px 24px',
                   backgroundColor: 'var(--bg-surface-elevated)',
                   borderBottom: '1px solid var(--border-subtle)',
                   display: 'flex',
-                  alignItems: 'center',
+                  flexDirection: isMobile ? 'column' : 'row',
+                  alignItems: isMobile ? 'stretch' : 'center',
                   justifyContent: 'space-between',
-                  gap: '12px',
+                  gap: isMobile ? '8px' : '12px',
                 }}
               >
-                <div style={{ position: 'relative', flex: 1, maxWidth: '380px' }}>
+                <div style={{ position: 'relative', flex: 1, maxWidth: isMobile ? 'none' : '380px' }}>
                   <Search
                     size={16}
                     color="var(--text-muted)"
@@ -515,7 +555,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                     placeholder="Search photos by filename, place..."
                     value={photoSearchQuery}
                     onChange={(e) => setPhotoSearchQuery(e.target.value)}
-                    style={{ paddingLeft: '36px', height: '36px', fontSize: '0.85rem' }}
+                    style={{ paddingLeft: '36px', height: '36px', fontSize: '0.85rem', width: isMobile ? '100%' : undefined }}
                   />
                 </div>
 
@@ -523,14 +563,14 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                   <button
                     className="btn btn-ghost"
                     onClick={() => setSelectedPhotoIdsToAdd(new Set(availablePhotosForAlbum.map((p) => p.id)))}
-                    style={{ fontSize: '0.8rem', height: '34px' }}
+                    style={{ fontSize: '0.8rem', height: '34px', flex: isMobile ? 1 : undefined }}
                   >
                     Select All ({availablePhotosForAlbum.length})
                   </button>
                   <button
                     className="btn btn-ghost"
                     onClick={() => setSelectedPhotoIdsToAdd(new Set())}
-                    style={{ fontSize: '0.8rem', height: '34px' }}
+                    style={{ fontSize: '0.8rem', height: '34px', flex: isMobile ? 1 : undefined }}
                   >
                     Clear
                   </button>
@@ -624,11 +664,13 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
               {/* Picker Footer */}
               <div
                 style={{
-                  padding: '14px 24px',
+                  padding: isMobile ? '10px 16px' : '14px 24px',
                   borderTop: '1px solid var(--border-subtle)',
                   display: 'flex',
-                  alignItems: 'center',
+                  flexDirection: isMobile ? 'column' : 'row',
+                  alignItems: isMobile ? 'stretch' : 'center',
                   justifyContent: 'space-between',
+                  gap: isMobile ? '8px' : undefined,
                 }}
               >
                 <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
@@ -639,7 +681,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                   <button
                     className="btn btn-ghost"
                     onClick={() => setShowAddPhotosModal(false)}
-                    style={{ height: '38px', padding: '0 16px' }}
+                    style={{ height: '38px', padding: '0 16px', flex: isMobile ? 1 : undefined }}
                   >
                     Cancel
                   </button>
@@ -647,7 +689,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                     className="btn btn-primary"
                     onClick={handleAddSelectedPhotos}
                     disabled={selectedPhotoIdsToAdd.size === 0}
-                    style={{ height: '38px', padding: '0 20px', gap: '8px' }}
+                    style={{ height: '38px', padding: '0 20px', gap: '8px', flex: isMobile ? 2 : undefined }}
                   >
                     <Check size={16} />
                     <span>Add to Album ({selectedPhotoIdsToAdd.size})</span>
@@ -669,34 +711,35 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
       {/* Header */}
       <div
         style={{
-          padding: '20px 28px',
+          padding: isMobile ? '12px 14px' : '20px 28px',
           backgroundColor: 'var(--bg-surface)',
           borderBottom: '1px solid var(--border-subtle)',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
           flexWrap: 'wrap',
-          gap: '16px',
+          gap: isMobile ? '10px' : '16px',
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: isMobile ? '10px' : '14px', minWidth: 0 }}>
           <div
             style={{
-              width: '42px',
-              height: '42px',
+              width: isMobile ? '34px' : '42px',
+              height: isMobile ? '34px' : '42px',
               borderRadius: 'var(--radius-md)',
               backgroundColor: 'rgba(59, 130, 246, 0.15)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
               border: '1px solid rgba(59, 130, 246, 0.3)',
+              flexShrink: 0,
             }}
           >
-            <BookImage size={22} color="var(--accent-primary)" />
+            <BookImage size={isMobile ? 18 : 22} color="var(--accent-primary)" />
           </div>
-          <div>
+          <div style={{ minWidth: 0 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-              <h2 style={{ fontSize: '1.35rem', fontWeight: 700, margin: 0, color: 'var(--text-primary)' }}>
+              <h2 style={{ fontSize: isMobile ? '1.05rem' : '1.35rem', fontWeight: 700, margin: 0, color: 'var(--text-primary)' }}>
                 Albums & Events
               </h2>
               <span
@@ -712,18 +755,28 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                 {albums.length}
               </span>
             </div>
-            <p style={{ margin: '3px 0 0', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
-              Group photos by event, trip, or story irrespective of their folder or drive location
-            </p>
+            {/* Descriptive subtitle is dropped on mobile — it's informational
+                only, and its wrapped 2-3 lines were the main contributor to
+                the toolbar eating up screen height on narrow viewports. */}
+            {!isMobile && (
+              <p style={{ margin: '3px 0 0', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+                Group photos by event, trip, or story irrespective of their folder or drive location
+              </p>
+            )}
           </div>
         </div>
 
         <button
           className="btn btn-primary"
           onClick={() => setShowCreateModal(true)}
-          style={{ gap: '8px', padding: '10px 20px', height: '42px', fontSize: '0.9rem' }}
+          style={{
+            gap: '8px',
+            padding: isMobile ? '0 14px' : '10px 20px',
+            height: isMobile ? '36px' : '42px',
+            fontSize: isMobile ? '0.82rem' : '0.9rem',
+          }}
         >
-          <FolderPlus size={18} />
+          <FolderPlus size={isMobile ? 16 : 18} />
           <span>New Album</span>
         </button>
       </div>
@@ -986,7 +1039,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            padding: '24px',
+            padding: isMobile ? '10px' : '24px',
           }}
           onClick={() => setShowCreateModal(false)}
         >

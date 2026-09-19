@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import {
   Calendar,
   Sliders,
@@ -20,7 +20,8 @@ import {
   ZoomIn,
   ZoomOut,
   Trash2,
-  AlertTriangle
+  AlertTriangle,
+  MoreVertical
 } from 'lucide-react';
 import { Photo, VirtualStorageConfig, Album } from '../../types';
 import { PhotoCard } from '../components/PhotoCard';
@@ -30,6 +31,7 @@ import { AiPhotoFilter } from '../services/aiSearchService';
 import { batchThumbnailStore, requestBatchThumbnails } from '../services/asyncImageLoader';
 import { createClusterFromSelectedPhotos } from '../services/deduplication';
 import { authFetch } from '../services/webAuthClient';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 interface GalleryViewProps {
   photos: Photo[];
@@ -70,6 +72,8 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   const [filterType, setFilterType] = useState<'all' | 'faces' | 'nofaces' | 'excluded'>('all');
   const [isSelectMode, setIsSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const isMobile = useIsMobile();
+  const [showMobileTools, setShowMobileTools] = useState(false);
 
   // Album Dialog states
   const [showAlbumDialog, setShowAlbumDialog] = useState(false);
@@ -107,6 +111,14 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [showAlbumDialog, showDeleteConfirmModal, isSelectMode, selectedIds]);
 
+  // Stable reference so the gallery's near-bottom/bootstrap load-more effects
+  // don't re-fire on every unrelated re-render. Loads several pages ahead
+  // (not just one) so there's a multi-screenful buffer of photos ready
+  // before the user actually scrolls into them.
+  const handleLoadMore = useCallback(() => {
+    libraryStore.loadNextCatalogPages(3);
+  }, []);
+
   // Mobile-style mouse drag-selection handler
   const handleDragSelect = (photoId: string) => {
     setSelectedIds((prev) => {
@@ -130,14 +142,30 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
     if (selectedIds.size === 0) return;
     setIsDeleting(true);
 
-    const count = selectedIds.size;
-    const deleteIds = Array.from(selectedIds);
     const toDelete = photos.filter((p) => selectedIds.has(p.id));
     const filePaths = toDelete.map((p) => p.originalRemotePath || p.filePath);
 
     try {
+      // Only remove photos from the library that were ACTUALLY deleted on disk —
+      // previously every selected photo was removed from the UI regardless of
+      // whether the delete succeeded, so a photo on an offline network storage
+      // would silently vanish from the library while its file was untouched.
+      let deletedIds = toDelete.map((p) => p.id);
+      let failureMessage: string | null = null;
+
       if (window.electronAPI?.deleteFilesPermanently) {
-        await window.electronAPI.deleteFilesPermanently(filePaths);
+        const result = await window.electronAPI.deleteFilesPermanently(filePaths);
+        const deletedPathSet = new Set(result.deletedPaths);
+        deletedIds = toDelete
+          .filter((p) => deletedPathSet.has(p.originalRemotePath || p.filePath))
+          .map((p) => p.id);
+
+        if (result.errors.length > 0) {
+          const offlineCount = result.errors.filter((e) => e.includes('network storage is not available')).length;
+          failureMessage = offlineCount > 0
+            ? `${offlineCount} of ${toDelete.length} photo(s) skipped — network storage is not available.`
+            : `${result.errors.length} of ${toDelete.length} photo(s) could not be deleted.`;
+        }
       } else {
         await authFetch('/api/delete-files', {
           method: 'POST',
@@ -146,16 +174,26 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
         });
       }
 
-      // Remove photos from library store
-      libraryStore.removePhotos(deleteIds);
+      if (deletedIds.length > 0) {
+        libraryStore.removePhotos(deletedIds);
+      }
 
       // Clear selection
       setSelectedIds(new Set());
       setIsSelectMode(false);
       setShowDeleteConfirmModal(false);
 
-      setAlbumSuccessToast(`✓ Permanently deleted ${count} photo(s) from storage.`);
-      setTimeout(() => setAlbumSuccessToast(null), 3500);
+      if (failureMessage) {
+        setAlbumSuccessToast(
+          deletedIds.length > 0
+            ? `⚠ Deleted ${deletedIds.length} photo(s). ${failureMessage}`
+            : `⚠ ${failureMessage}`
+        );
+        setTimeout(() => setAlbumSuccessToast(null), 6000);
+      } else {
+        setAlbumSuccessToast(`✓ Permanently deleted ${deletedIds.length} photo(s) from storage.`);
+        setTimeout(() => setAlbumSuccessToast(null), 3500);
+      }
     } catch (err: any) {
       alert(`Failed to permanently delete photos: ${err.message}`);
     } finally {
@@ -448,251 +486,497 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
 
   const existingAlbums = libraryStore.getState().albums || [];
 
+  // Shared JSX built once and arranged differently for desktop vs mobile
+  // below — mobile collapses everything but the title and filter chips
+  // behind a single "more options" toggle, instead of letting flex-wrap
+  // stack Select/Clean Duplicates/Rescan/Ask AI/zoom controls into four or
+  // five separate rows that ate roughly half the screen on a phone.
+  const titleBlock = (
+    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--text-secondary)', minWidth: 0, overflow: 'hidden' }}>
+      <Calendar size={isMobile ? 16 : 18} style={{ flexShrink: 0 }} />
+      <span style={{
+        fontSize: isMobile ? '0.82rem' : '0.9rem',
+        fontWeight: 600,
+        color: 'var(--text-primary)',
+        whiteSpace: 'nowrap',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+      }}>
+        {filterFavorite ? 'Favorite Photos' : 'Timeline'}
+      </span>
+      <span style={{ fontSize: isMobile ? '0.72rem' : '0.8rem', color: 'var(--text-muted)', flexShrink: 0 }}>
+        ({filterFavorite || filterType !== 'all' ? filteredPhotos.length : (totalCount || filteredPhotos.length)})
+      </span>
+
+      {!isMobile && filteredPhotos.some((p) => p.isVirtual) && (
+        <span style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: '4px',
+          fontSize: '11px',
+          padding: '2px 8px',
+          borderRadius: 'var(--radius-full)',
+          backgroundColor: 'rgba(6, 182, 212, 0.15)',
+          color: 'var(--accent-cyan)',
+          border: '1px solid rgba(6, 182, 212, 0.3)',
+          fontWeight: 600,
+          marginLeft: '6px',
+        }}>
+          <HardDrive size={12} />
+          {filteredPhotos.find((p) => p.isVirtual)?.storageName || 'Network Mirror'}
+        </span>
+      )}
+    </div>
+  );
+
+  const filterChips = (
+    <div style={{
+      display: 'flex',
+      alignItems: 'center',
+      backgroundColor: 'var(--bg-surface-elevated)',
+      padding: '2px',
+      borderRadius: 'var(--radius-md)',
+      border: '1px solid var(--border-subtle)',
+      flexShrink: 0,
+    }}>
+      <button
+        className={`btn ${filterType === 'all' ? 'btn-primary' : 'btn-ghost'}`}
+        onClick={() => setFilterType('all')}
+        style={{ padding: '3px 10px', fontSize: '0.75rem', height: '26px' }}
+      >
+        All
+      </button>
+      <button
+        className={`btn ${filterType === 'faces' ? 'btn-primary' : 'btn-ghost'}`}
+        onClick={() => setFilterType('faces')}
+        style={{ padding: '3px 10px', fontSize: '0.75rem', height: '26px' }}
+      >
+        Portraits
+      </button>
+      <button
+        className={`btn ${filterType === 'nofaces' ? 'btn-primary' : 'btn-ghost'}`}
+        onClick={() => setFilterType('nofaces')}
+        style={{ padding: '3px 10px', fontSize: '0.75rem', height: '26px' }}
+        title="Photos with no faces detected (scenery, objects, documents)"
+      >
+        No Faces
+      </button>
+      {excludedCount > 0 && (
+        <button
+          className={`btn ${filterType === 'excluded' ? 'btn-primary' : 'btn-ghost'}`}
+          onClick={() => setFilterType('excluded')}
+          style={{
+            padding: '3px 10px',
+            fontSize: '0.75rem',
+            height: '26px',
+            color: filterType === 'excluded' ? 'white' : 'var(--accent-rose)',
+          }}
+        >
+          Hidden ({excludedCount})
+        </button>
+      )}
+    </div>
+  );
+
+  const selectButton = (
+    <button
+      className={`btn ${isSelectMode ? 'btn-primary' : 'btn-secondary'}`}
+      onClick={() => {
+        setIsSelectMode(!isSelectMode);
+        if (isSelectMode) setSelectedIds(new Set());
+      }}
+      style={{ padding: '6px 14px', fontSize: '0.82rem', gap: '8px', height: '34px' }}
+    >
+      <CheckSquare size={16} />
+      <span>{isSelectMode ? 'Cancel Select' : 'Select'}</span>
+    </button>
+  );
+
+  const cleanDuplicatesButton = onOpenDuplicateCleaner ? (
+    <button
+      className="btn btn-secondary"
+      onClick={onOpenDuplicateCleaner}
+      style={{ padding: '6px 14px', fontSize: '0.82rem', gap: '8px', height: '34px', borderColor: 'rgba(99, 102, 241, 0.4)' }}
+      title="Identify duplicate bursts, score best shots, and safely delete inferior copies"
+    >
+      <Layers size={16} color="#818cf8" />
+      <span>Clean Duplicates</span>
+    </button>
+  ) : null;
+
+  const rescanButton = (filteredPhotos.some((p) => p.isVirtual) && onRefreshNetwork) ? (
+    <button
+      className="btn btn-secondary"
+      onClick={onRefreshNetwork}
+      style={{ padding: '6px 12px', fontSize: '0.82rem', gap: '8px', height: '34px' }}
+      title="Rescan network location for newly added photos"
+    >
+      <RefreshCw size={15} />
+      <span>Rescan</span>
+    </button>
+  ) : null;
+
+  const askAiButton = onOpenAiSearch ? (
+    <button
+      className="btn btn-secondary"
+      onClick={onOpenAiSearch}
+      style={{
+        padding: '6px 14px',
+        fontSize: '0.82rem',
+        gap: '8px',
+        height: '34px',
+        background: 'linear-gradient(135deg, rgba(99, 102, 241, 0.15) 0%, rgba(168, 85, 247, 0.15) 100%)',
+        borderColor: 'rgba(168, 85, 247, 0.4)',
+        fontWeight: 600,
+      }}
+      title="Natural language photo search with AI assistant"
+    >
+      <Sparkles size={16} color="#c084fc" />
+      <span>Ask AI</span>
+    </button>
+  ) : null;
+
+  const zoomControls = (
+    <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+      <button
+        className="btn btn-ghost btn-icon"
+        disabled={zoomLevel === 'years'}
+        onClick={() => {
+          const idx = ZOOM_LEVELS.indexOf(zoomLevel);
+          if (idx > 0) setZoomLevel(ZOOM_LEVELS[idx - 1]);
+        }}
+        style={{ width: '30px', height: '30px' }}
+        title="Zoom Out (Ctrl + Wheel Down)"
+      >
+        <ZoomOut size={15} />
+      </button>
+
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          backgroundColor: 'var(--bg-surface-elevated)',
+          padding: '2px',
+          borderRadius: 'var(--radius-md)',
+          border: '1px solid var(--border-subtle)',
+        }}
+        title="Ctrl + Mouse Wheel to zoom"
+      >
+        {([
+          { id: 'years', label: 'Years' },
+          { id: 'months', label: 'Months' },
+          { id: 'very_small', label: 'XS' },
+          { id: 'small', label: 'S' },
+          { id: 'medium', label: 'M' },
+          { id: 'large', label: 'L' },
+        ] as const).map(({ id, label }) => (
+          <button
+            key={id}
+            className={`btn ${zoomLevel === id ? 'btn-primary' : 'btn-ghost'}`}
+            onClick={() => setZoomLevel(id)}
+            style={{ padding: '3px 8px', fontSize: '0.74rem', height: '26px' }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <button
+        className="btn btn-ghost btn-icon"
+        disabled={zoomLevel === 'large'}
+        onClick={() => {
+          const idx = ZOOM_LEVELS.indexOf(zoomLevel);
+          if (idx < ZOOM_LEVELS.length - 1) setZoomLevel(ZOOM_LEVELS[idx + 1]);
+        }}
+        style={{ width: '30px', height: '30px' }}
+        title="Zoom In (Ctrl + Wheel Up)"
+      >
+        <ZoomIn size={15} />
+      </button>
+    </div>
+  );
+
+  // Compact mobile selection bar: replaces the whole normal mobile header
+  // (title/filters/tools toggle) while selecting, and packs the previous
+  // desktop-style sticky action bar's half-dozen buttons into two lines —
+  // a count/select-all/clear row, and a horizontally-scrollable row of
+  // short action buttons — instead of the multi-row wrap that used to run
+  // off the right edge of the screen.
+  const mobileSelectionBar = (
+    <div style={{
+      borderBottom: '1px solid var(--accent-primary)',
+      backgroundColor: 'rgba(15, 23, 42, 0.95)',
+      backdropFilter: 'blur(8px)',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 10px' }}>
+        <button
+          className="btn btn-ghost btn-icon"
+          onClick={() => {
+            setIsSelectMode(false);
+            setSelectedIds(new Set());
+          }}
+          style={{ width: '30px', height: '30px', flexShrink: 0 }}
+          title="Cancel selection"
+        >
+          <X size={16} />
+        </button>
+        <span style={{
+          fontSize: '0.8rem',
+          fontWeight: 600,
+          color: 'var(--accent-cyan)',
+          flex: 1,
+          minWidth: 0,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        }}>
+          {selectedIds.size} of {filteredPhotos.length} selected
+        </span>
+        <button
+          className="btn btn-ghost"
+          onClick={handleSelectAll}
+          style={{ fontSize: '0.74rem', padding: '4px 8px', flexShrink: 0 }}
+        >
+          All
+        </button>
+        <button
+          className="btn btn-ghost"
+          onClick={handleClearSelection}
+          style={{ fontSize: '0.74rem', padding: '4px 8px', flexShrink: 0 }}
+        >
+          Clear
+        </button>
+      </div>
+
+      <div style={{
+        display: 'flex',
+        gap: '8px',
+        padding: '0 10px 10px',
+        overflowX: 'auto',
+        WebkitOverflowScrolling: 'touch',
+      }}>
+        <button
+          className="btn btn-secondary"
+          onClick={handleRefreshThumbnailsFromSource}
+          disabled={isRefreshingThumbnails || selectedIds.size === 0}
+          style={{
+            fontSize: '0.78rem',
+            gap: '6px',
+            padding: '6px 10px',
+            flexShrink: 0,
+            borderColor: 'rgba(56, 189, 248, 0.4)',
+            backgroundColor: 'rgba(56, 189, 248, 0.1)',
+            color: 'var(--accent-cyan)',
+          }}
+          title="Purge cached thumbnails and regenerate fresh thumbnails directly from source files"
+        >
+          <RefreshCw size={14} className={isRefreshingThumbnails ? 'animate-spin' : ''} color="var(--accent-cyan)" />
+          <span>Refresh</span>
+        </button>
+
+        {selectedIds.size >= 2 && onOpenDuplicateCleaner && (
+          <button
+            className="btn btn-primary"
+            onClick={() => {
+              const selectedPhotos = photos.filter((p) => selectedIds.has(p.id));
+              const cluster = createClusterFromSelectedPhotos(selectedPhotos);
+              onOpenDuplicateCleaner(cluster);
+            }}
+            style={{
+              fontSize: '0.78rem',
+              gap: '6px',
+              padding: '6px 10px',
+              flexShrink: 0,
+              background: 'linear-gradient(135deg, #6366f1 0%, #a855f7 100%)',
+              borderColor: '#a855f7',
+              color: 'white',
+              fontWeight: 600,
+            }}
+            title="Treat selected photos as one cluster and launch Best Shot finder to compare quality and keep the best"
+          >
+            <Sparkles size={14} />
+            <span>Best Shot</span>
+          </button>
+        )}
+
+        <button
+          className="btn btn-secondary"
+          onClick={() => setShowAlbumDialog(true)}
+          disabled={selectedIds.size === 0}
+          style={{ fontSize: '0.78rem', gap: '6px', padding: '6px 10px', flexShrink: 0 }}
+          title="Add selected photos to an album"
+        >
+          <FolderPlus size={14} color="var(--accent-primary)" />
+          <span>Album</span>
+        </button>
+
+        <button
+          className="btn btn-secondary"
+          onClick={() => setShowDeleteConfirmModal(true)}
+          disabled={selectedIds.size === 0}
+          style={{
+            fontSize: '0.78rem',
+            gap: '6px',
+            padding: '6px 10px',
+            flexShrink: 0,
+            color: '#ef4444',
+            borderColor: 'rgba(239, 68, 68, 0.4)',
+            backgroundColor: 'rgba(239, 68, 68, 0.1)',
+          }}
+          title="Permanently delete selected photos from disk"
+        >
+          <Trash2 size={14} color="#ef4444" />
+          <span>Delete</span>
+        </button>
+
+        {filterType === 'excluded' ? (
+          <button
+            className="btn btn-primary"
+            onClick={() => handleExcludeSelected(false)}
+            disabled={selectedIds.size === 0}
+            style={{ fontSize: '0.78rem', gap: '6px', padding: '6px 10px', flexShrink: 0 }}
+          >
+            <Eye size={14} />
+            <span>Restore</span>
+          </button>
+        ) : (
+          <button
+            className="btn btn-secondary"
+            onClick={() => handleExcludeSelected(true)}
+            disabled={selectedIds.size === 0}
+            style={{ fontSize: '0.78rem', gap: '6px', padding: '6px 10px', flexShrink: 0, color: 'var(--accent-rose)' }}
+            title="Exclude selected photos from views without deleting source files"
+          >
+            <EyeOff size={14} />
+            <span>Exclude</span>
+          </button>
+        )}
+      </div>
+    </div>
+  );
+
+  const helpButton = onOpenHelp ? (
+    <button
+      className="btn btn-ghost btn-icon"
+      onClick={onOpenHelp}
+      style={{
+        width: '34px',
+        height: '34px',
+        borderRadius: 'var(--radius-full)',
+        color: 'var(--accent-primary)',
+        backgroundColor: 'rgba(59, 130, 246, 0.1)',
+      }}
+      title="User Guide & Feature Help"
+    >
+      <HelpCircle size={18} />
+    </button>
+  ) : null;
+
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       {/* Gallery Subheader Controls */}
-      <div style={{
-        padding: '10px 24px',
-        display: 'flex',
-        flexWrap: 'wrap',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        gap: '12px',
-        borderBottom: '1px solid var(--border-subtle)',
-        backgroundColor: 'var(--bg-app)',
-      }}>
-        {/* Left Section: Timeline title & Filters */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--text-secondary)' }}>
-            <Calendar size={18} />
-            <span style={{ fontSize: '0.9rem', fontWeight: 600, color: 'var(--text-primary)' }}>
-              {filterFavorite ? 'Favorite Photos' : 'Timeline'}
-            </span>
-            <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-              ({filterFavorite || filterType !== 'all' ? filteredPhotos.length : (totalCount || filteredPhotos.length)})
-            </span>
-
-            {filteredPhotos.some((p) => p.isVirtual) && (
-              <span style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: '4px',
-                fontSize: '11px',
-                padding: '2px 8px',
-                borderRadius: 'var(--radius-full)',
-                backgroundColor: 'rgba(6, 182, 212, 0.15)',
-                color: 'var(--accent-cyan)',
-                border: '1px solid rgba(6, 182, 212, 0.3)',
-                fontWeight: 600,
-                marginLeft: '6px',
-              }}>
-                <HardDrive size={12} />
-                {filteredPhotos.find((p) => p.isVirtual)?.storageName || 'Network Mirror'}
-              </span>
-            )}
+      {isMobile ? (
+        (isSelectMode || selectedIds.size > 0) ? (
+          // Selecting on mobile: swap the whole header (title/filters/tools
+          // toggle) for the compact 2-line selection bar instead — nothing
+          // from the normal toolbar is relevant mid-selection, and every
+          // pixel of width is needed for the selection actions themselves.
+          mobileSelectionBar
+        ) : (
+        <div style={{ borderBottom: '1px solid var(--border-subtle)', backgroundColor: 'var(--bg-app)' }}>
+          {/* Row 1: title + a single toggle for everything else, so the
+              persistent bar never grows past one compact row. */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', padding: '8px 12px' }}>
+            {titleBlock}
+            <button
+              className={`btn ${showMobileTools ? 'btn-primary' : 'btn-ghost'} btn-icon`}
+              onClick={() => setShowMobileTools((v) => !v)}
+              style={{ width: '34px', height: '34px', flexShrink: 0 }}
+              title="More options"
+              aria-expanded={showMobileTools}
+            >
+              <MoreVertical size={18} />
+            </button>
           </div>
 
-          {/* Quick Filters */}
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            backgroundColor: 'var(--bg-surface-elevated)',
-            padding: '2px',
-            borderRadius: 'var(--radius-md)',
-            border: '1px solid var(--border-subtle)',
-          }}>
-            <button
-              className={`btn ${filterType === 'all' ? 'btn-primary' : 'btn-ghost'}`}
-              onClick={() => setFilterType('all')}
-              style={{ padding: '3px 10px', fontSize: '0.75rem', height: '26px' }}
-            >
-              All
-            </button>
-            <button
-              className={`btn ${filterType === 'faces' ? 'btn-primary' : 'btn-ghost'}`}
-              onClick={() => setFilterType('faces')}
-              style={{ padding: '3px 10px', fontSize: '0.75rem', height: '26px' }}
-            >
-              Portraits
-            </button>
-            <button
-              className={`btn ${filterType === 'nofaces' ? 'btn-primary' : 'btn-ghost'}`}
-              onClick={() => setFilterType('nofaces')}
-              style={{ padding: '3px 10px', fontSize: '0.75rem', height: '26px' }}
-              title="Photos with no faces detected (scenery, objects, documents)"
-            >
-              No Faces
-            </button>
-            {excludedCount > 0 && (
-              <button
-                className={`btn ${filterType === 'excluded' ? 'btn-primary' : 'btn-ghost'}`}
-                onClick={() => setFilterType('excluded')}
-                style={{
-                  padding: '3px 10px',
-                  fontSize: '0.75rem',
-                  height: '26px',
-                  color: filterType === 'excluded' ? 'white' : 'var(--accent-rose)',
-                }}
-              >
-                Hidden ({excludedCount})
-              </button>
-            )}
+          {/* Row 2: filter chips, horizontally scrollable instead of
+              wrapping onto their own extra row(s). */}
+          <div className="filter-pills-row" style={{ padding: '0 12px 8px', display: 'flex' }}>
+            {filterChips}
           </div>
-        </div>
 
-        {/* Right Section: Tools, Select Mode, Cleaner, Grid Size */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-          {/* Select Photos Toggle */}
-          <button
-            className={`btn ${isSelectMode ? 'btn-primary' : 'btn-secondary'}`}
-            onClick={() => {
-              setIsSelectMode(!isSelectMode);
-              if (isSelectMode) setSelectedIds(new Set());
-            }}
-            style={{ padding: '6px 14px', fontSize: '0.82rem', gap: '8px', height: '34px' }}
-          >
-            <CheckSquare size={16} />
-            <span>{isSelectMode ? 'Cancel Select' : 'Select'}</span>
-          </button>
-
-          {/* Clean Duplicates Trigger */}
-          {onOpenDuplicateCleaner && (
-            <button
-              className="btn btn-secondary"
-              onClick={onOpenDuplicateCleaner}
-              style={{ padding: '6px 14px', fontSize: '0.82rem', gap: '8px', height: '34px', borderColor: 'rgba(99, 102, 241, 0.4)' }}
-              title="Identify duplicate bursts, score best shots, and safely delete inferior copies"
-            >
-              <Layers size={16} color="#818cf8" />
-              <span>Clean Duplicates</span>
-            </button>
-          )}
-
-          {filteredPhotos.some((p) => p.isVirtual) && onRefreshNetwork && (
-            <button
-              className="btn btn-secondary"
-              onClick={onRefreshNetwork}
-              style={{ padding: '6px 12px', fontSize: '0.82rem', gap: '8px', height: '34px' }}
-              title="Rescan network location for newly added photos"
-            >
-              <RefreshCw size={15} />
-              <span>Rescan</span>
-            </button>
-          )}
-
-          {/* Ask AI Search Button */}
-          {onOpenAiSearch && (
-            <button
-              className="btn btn-secondary"
-              onClick={onOpenAiSearch}
-              style={{
-                padding: '6px 14px',
-                fontSize: '0.82rem',
-                gap: '8px',
-                height: '34px',
-                background: 'linear-gradient(135deg, rgba(99, 102, 241, 0.15) 0%, rgba(168, 85, 247, 0.15) 100%)',
-                borderColor: 'rgba(168, 85, 247, 0.4)',
-                fontWeight: 600,
-              }}
-              title="Natural language photo search with AI assistant"
-            >
-              <Sparkles size={16} color="#c084fc" />
-              <span>Ask AI</span>
-            </button>
-          )}
-
-          {/* Zoom Controls: Out, 6 Levels, In */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-            <button
-              className="btn btn-ghost btn-icon"
-              disabled={zoomLevel === 'years'}
-              onClick={() => {
-                const idx = ZOOM_LEVELS.indexOf(zoomLevel);
-                if (idx > 0) setZoomLevel(ZOOM_LEVELS[idx - 1]);
-              }}
-              style={{ width: '30px', height: '30px' }}
-              title="Zoom Out (Ctrl + Wheel Down)"
-            >
-              <ZoomOut size={15} />
-            </button>
-
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                backgroundColor: 'var(--bg-surface-elevated)',
-                padding: '2px',
-                borderRadius: 'var(--radius-md)',
-                border: '1px solid var(--border-subtle)',
-              }}
-              title="Ctrl + Mouse Wheel to zoom"
-            >
-              {([
-                { id: 'years', label: 'Years' },
-                { id: 'months', label: 'Months' },
-                { id: 'very_small', label: 'XS' },
-                { id: 'small', label: 'S' },
-                { id: 'medium', label: 'M' },
-                { id: 'large', label: 'L' },
-              ] as const).map(({ id, label }) => (
-                <button
-                  key={id}
-                  className={`btn ${zoomLevel === id ? 'btn-primary' : 'btn-ghost'}`}
-                  onClick={() => setZoomLevel(id)}
-                  style={{ padding: '3px 8px', fontSize: '0.74rem', height: '26px' }}
-                >
-                  {label}
-                </button>
-              ))}
+          {/* Collapsed by default: Select/Clean Duplicates/Rescan/Ask AI +
+              zoom/grouping controls + help, only taking up space when the
+              user actually asks for them. */}
+          {showMobileTools && (
+            <div style={{
+              padding: '10px 12px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '10px',
+              borderTop: '1px solid var(--border-subtle)',
+              backgroundColor: 'var(--bg-surface-elevated)',
+            }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                {selectButton}
+                {cleanDuplicatesButton}
+                {rescanButton}
+                {askAiButton}
+                {helpButton}
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontWeight: 600 }}>Grid size</span>
+                {zoomControls}
+              </div>
             </div>
-
-            <button
-              className="btn btn-ghost btn-icon"
-              disabled={zoomLevel === 'large'}
-              onClick={() => {
-                const idx = ZOOM_LEVELS.indexOf(zoomLevel);
-                if (idx < ZOOM_LEVELS.length - 1) setZoomLevel(ZOOM_LEVELS[idx + 1]);
-              }}
-              style={{ width: '30px', height: '30px' }}
-              title="Zoom In (Ctrl + Wheel Up)"
-            >
-              <ZoomIn size={15} />
-            </button>
-          </div>
-
-          {onOpenHelp && (
-            <button
-              className="btn btn-ghost btn-icon"
-              onClick={onOpenHelp}
-              style={{
-                width: '34px',
-                height: '34px',
-                borderRadius: 'var(--radius-full)',
-                color: 'var(--accent-primary)',
-                backgroundColor: 'rgba(59, 130, 246, 0.1)',
-              }}
-              title="User Guide & Feature Help"
-            >
-              <HelpCircle size={18} />
-            </button>
           )}
         </div>
-      </div>
+        )
+      ) : (
+        <div style={{
+          padding: '10px 24px',
+          display: 'flex',
+          flexWrap: 'wrap',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '12px',
+          borderBottom: '1px solid var(--border-subtle)',
+          backgroundColor: 'var(--bg-app)',
+        }}>
+          {/* Left Section: Timeline title & Filters */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+            {titleBlock}
+            {filterChips}
+          </div>
 
-      {/* Multi-Selection Floating / Sticky Action Bar */}
-      {(isSelectMode || selectedIds.size > 0) && (
+          {/* Right Section: Tools, Select Mode, Cleaner, Grid Size */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+            {selectButton}
+            {cleanDuplicatesButton}
+            {rescanButton}
+            {askAiButton}
+            {zoomControls}
+            {helpButton}
+          </div>
+        </div>
+      )}
+
+      {/* Multi-Selection Floating / Sticky Action Bar (desktop only — mobile
+          uses the compact mobileSelectionBar swapped in above instead) */}
+      {(isSelectMode || selectedIds.size > 0) && !isMobile && (
         <div style={{
           backgroundColor: 'rgba(15, 23, 42, 0.95)',
           borderBottom: '1px solid var(--accent-primary)',
           padding: '10px 24px',
           display: 'flex',
+          flexWrap: 'wrap',
           alignItems: 'center',
           justifyContent: 'space-between',
           gap: '12px',
           backdropFilter: 'blur(8px)',
           zIndex: 20,
         }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '12px' }}>
             <span style={{ fontSize: '0.9rem', fontWeight: 600, color: 'var(--accent-cyan)' }}>
               {selectedIds.size} of {filteredPhotos.length} selected
             </span>
@@ -712,7 +996,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
             </button>
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '10px' }}>
             {/* Refresh Thumbnail Cache from Source Button */}
             <button
               className="btn btn-secondary"
@@ -902,6 +1186,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
         onDragSelect={handleDragSelect}
         onSelectionChange={handleSelectionChange}
         emptyMessage="No photos found matching the selected filter."
+        onLoadMore={handleLoadMore}
       />
 
       {/* Toast Notification */}

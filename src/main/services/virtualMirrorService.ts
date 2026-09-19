@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import sharp from 'sharp';
 import { parsePhotoMetadata } from './exifParser';
 import { isImageFile, scanDirectoryRecursive } from './fileOrganizer';
 import { getOrGenerateHeicThumbnail500 } from './heicService';
@@ -16,6 +17,28 @@ import {
   StorageDetails,
 } from '../../types';
 import { libraryStatusService } from './libraryStatusService';
+import { getFaceStatsForLibrary } from './libraryRepository';
+import { isPathReachable, isNetworkPath } from './networkReachabilityCache';
+import { runFaceDetectionStep, photoIdForSidecar } from './pipelineOrchestrator';
+import { logger } from './logger';
+import { getDbForLibraryPath } from './db';
+import { deletePhotos } from './libraryRepository';
+
+// The exact housekeeping filenames written alongside real photo sidecars in
+// a mirror folder (see saveStorageCheckpoint / discoverStoredMirrors) — NOT
+// a "starts with underscore" pattern, which used to also exclude any real
+// photo sidecar for a source file whose own name starts with an underscore
+// (a real, common camera-JPEG naming convention — e.g. Sony/Nikon bodies
+// write "_DSC1234.JPG" for Adobe RGB shots). That broader pattern silently
+// undercounted a library's real photos whenever any of them had such a
+// filename — exactly the mismatch between the sidebar/mirrored-count and
+// the Virtual Storage card's "X/Y" progress bars this rewrite was meant to
+// eliminate elsewhere, just via a different mechanism.
+const MIRROR_HOUSEKEEPING_FILENAMES = new Set(['_sync_checkpoint.json', '_mirror_summary.json']);
+
+function isMirrorHousekeepingFile(fileName: string): boolean {
+  return MIRROR_HOUSEKEEPING_FILENAMES.has(fileName) || fileName.startsWith('.');
+}
 
 // Dynamic import or require of electron nativeImage
 let nativeImage: any = null;
@@ -27,168 +50,32 @@ try {
 }
 
 /**
- * Fast synchronous JPEG EXIF orientation parser.
- * Reads the APP1 marker and extracts the orientation tag (0x0112).
- * Returns 1 (normal) if not found or orientation 1-8.
+ * Generates a resized JPEG thumbnail via sharp's async pipeline — including
+ * the file read itself, sharp/libvips does the whole decode+resize+encode on
+ * its own native thread pool, never blocking Electron's single main-process
+ * JS thread. This matters most for a network/OneDrive source file: reading
+ * one that isn't hydrated locally yet can take seconds while Windows fetches
+ * it, and previously that wait happened via fs.openSync/readSync plus
+ * Electron's synchronous nativeImage decode — both fully blocking every
+ * other IPC handler (list photos, open a menu, anything) for the duration.
+ * EXIF auto-orientation replaces the old hand-rolled orientation parser +
+ * pixel-rotation loop (also synchronous, also now unnecessary).
  */
-export function readExifOrientation(buffer: Buffer): number {
-  if (!buffer || buffer.length < 14) return 1;
-  // Check JPEG SOI marker
-  if (buffer[0] !== 0xff || buffer[1] !== 0xd8) return 1;
-
-  let offset = 2;
-  while (offset + 4 < buffer.length) {
-    if (buffer[offset] !== 0xff) break;
-    const marker = buffer[offset + 1];
-    // Variable length markers have 2-byte length
-    if (marker === 0xd9 || marker === 0xda) break; // EOI or SOS
-    const length = buffer.readUInt16BE(offset + 2);
-    if (length < 2) break;
-
-    // APP1 marker (0xFFE1) contains EXIF
-    if (marker === 0xe1 && offset + 4 + 6 <= buffer.length) {
-      const exifHeader = buffer.toString('ascii', offset + 4, offset + 10);
-      if (exifHeader === 'Exif\0\0') {
-        const tiffOffset = offset + 10;
-        if (tiffOffset + 8 > buffer.length) return 1;
-        const isLE = buffer.readUInt16BE(tiffOffset) === 0x4949; // 'II' (Intel little endian)
-        const tagRead16 = (o: number) => (isLE ? buffer.readUInt16LE(o) : buffer.readUInt16BE(o));
-        const tagRead32 = (o: number) => (isLE ? buffer.readUInt32LE(o) : buffer.readUInt32BE(o));
-
-        const firstIFDOffset = tagRead32(tiffOffset + 4);
-        let ifdOffset = tiffOffset + firstIFDOffset;
-        if (ifdOffset + 2 > buffer.length) return 1;
-        const numEntries = tagRead16(ifdOffset);
-        ifdOffset += 2;
-
-        for (let i = 0; i < numEntries && ifdOffset + 12 <= buffer.length; i++) {
-          const tag = tagRead16(ifdOffset);
-          if (tag === 0x0112) { // Tag 0x0112 = Orientation
-            const val = tagRead16(ifdOffset + 8);
-            if (val >= 1 && val <= 8) return val;
-            return 1;
-          }
-          ifdOffset += 12;
-        }
-      }
-    }
-    offset += 2 + length;
-  }
-  return 1;
-}
-
-/**
- * Rotates raw RGBA pixel buffer based on EXIF orientation tag.
- */
-export function rotateRgbaBitmap(
-  src: Buffer,
-  width: number,
-  height: number,
-  orientation: number
-): { buffer: Buffer; width: number; height: number } {
-  if (orientation <= 1 || orientation > 8) {
-    return { buffer: src, width, height };
-  }
-
-  const isRotated90 = orientation === 6 || orientation === 8 || orientation === 5 || orientation === 7;
-  const dstW = isRotated90 ? height : width;
-  const dstH = isRotated90 ? width : height;
-  const dst = Buffer.alloc(dstW * dstH * 4);
-
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      let dx = x;
-      let dy = y;
-
-      switch (orientation) {
-        case 2: // Flip horizontal
-          dx = width - 1 - x;
-          dy = y;
-          break;
-        case 3: // 180 deg
-          dx = width - 1 - x;
-          dy = height - 1 - y;
-          break;
-        case 4: // Flip vertical
-          dx = x;
-          dy = height - 1 - y;
-          break;
-        case 5: // Transpose
-          dx = y;
-          dy = x;
-          break;
-        case 6: // Rotate 90 deg CW
-          dx = height - 1 - y;
-          dy = x;
-          break;
-        case 7: // Transverse
-          dx = height - 1 - y;
-          dy = width - 1 - x;
-          break;
-        case 8: // Rotate 270 deg CW (90 deg CCW)
-          dx = y;
-          dy = width - 1 - x;
-          break;
-      }
-
-      const srcIdx = (y * width + x) * 4;
-      const dstIdx = (dy * dstW + dx) * 4;
-      dst[dstIdx] = src[srcIdx];
-      dst[dstIdx + 1] = src[srcIdx + 1];
-      dst[dstIdx + 2] = src[srcIdx + 2];
-      dst[dstIdx + 3] = src[srcIdx + 3];
-    }
-  }
-
-  return { buffer: dst, width: dstW, height: dstH };
-}
-
-export function generateThumbnailBuffer(filePath: string, maxDimension = 500): Buffer | null {
-  let orientation = 1;
+export async function generateThumbnailBuffer(filePath: string, maxDimension = 500): Promise<Buffer | null> {
   try {
-    const fd = fs.openSync(filePath, 'r');
-    const headerBuf = Buffer.alloc(Math.min(65536, fs.fstatSync(fd).size));
-    fs.readSync(fd, headerBuf, 0, headerBuf.length, 0);
-    fs.closeSync(fd);
-    orientation = readExifOrientation(headerBuf);
-  } catch {}
-
-  if (nativeImage) {
-    try {
-      const img = nativeImage.createFromPath(filePath);
-      if (!img.isEmpty()) {
-        const size = img.getSize();
-        const maxCurrent = Math.max(size.width, size.height);
-        const scale = maxCurrent > maxDimension ? maxDimension / maxCurrent : 1;
-        const targetW = Math.max(1, Math.round(size.width * scale));
-        const targetH = Math.max(1, Math.round(size.height * scale));
-
-        let resized = img.resize({
-          width: targetW,
-          height: targetH,
-          quality: 'good',
-        });
-
-        // Apply EXIF rotation if needed to ensure upright thumbnail
-        if (orientation > 1) {
-          const rawBitmap = resized.toBitmap();
-          const rotated = rotateRgbaBitmap(rawBitmap, targetW, targetH, orientation);
-          resized = nativeImage.createFromBitmap(rotated.buffer, {
-            width: rotated.width,
-            height: rotated.height,
-          });
-        }
-
-        return resized.toJPEG(82);
-      }
-    } catch (err) {
-      console.warn(`nativeImage thumbnail failed for ${filePath}:`, err);
-    }
+    return await sharp(filePath, { failOn: 'none' })
+      .rotate()
+      .resize(maxDimension, maxDimension, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 82 })
+      .toBuffer();
+  } catch (err) {
+    console.warn(`sharp thumbnail generation failed for ${filePath}:`, err);
   }
 
-  // Fallback: If nativeImage unavailable or failed, create a minimal JPEG or copy buffer if small
+  // Fallback: sharp couldn't process it at all (e.g. an unsupported/corrupt
+  // format) — return the raw file bytes rather than nothing.
   try {
-    return fs.readFileSync(filePath);
+    return await fs.promises.readFile(filePath);
   } catch {
     return null;
   }
@@ -275,6 +162,39 @@ export function saveStorageCheckpoint(checkpoint: StorageSyncCheckpoint): void {
   }
 }
 
+export interface InventoryScanResult {
+  status: 'completed' | 'failed';
+  totalFiles: number;
+  completedAt?: string;
+  error?: string;
+}
+
+/**
+ * Counts every eligible photo file under a storage's source folder,
+ * including subfolders — the inventory gate (see
+ * docs/PIPELINE_REDESIGN_DEV_DOC.md §3.2). Until this completes, nothing
+ * else should process this storage's photos, and once it completes, the
+ * resulting count becomes the single fixed number every UI surface shows
+ * (no more independently-computed, possibly-disagreeing counts).
+ */
+export async function scanStorageInventory(networkSourcePath: string): Promise<InventoryScanResult> {
+  if (!networkSourcePath) {
+    return { status: 'failed', totalFiles: 0, error: 'No source path configured' };
+  }
+
+  const reachable = await isPathReachable(networkSourcePath);
+  if (!reachable) {
+    return { status: 'failed', totalFiles: 0, error: 'Storage is not reachable' };
+  }
+
+  try {
+    const files = await scanDirectoryRecursive(networkSourcePath);
+    return { status: 'completed', totalFiles: files.length, completedAt: new Date().toISOString() };
+  } catch (err) {
+    return { status: 'failed', totalFiles: 0, error: String(err) };
+  }
+}
+
 export function getStorageDetails(storageName: string, mirrorRoot?: string): StorageDetails {
   const root = mirrorRoot || 'C:\\GPhotos_VirtualMirrors';
   const mirrorFolder = path.join(root, storageName);
@@ -293,19 +213,27 @@ export function getStorageDetails(storageName: string, mirrorRoot?: string): Sto
           const full = path.join(dir, entry.name);
           if (entry.isDirectory() && !entry.name.startsWith('.')) {
             scan(full, depth + 1);
-          } else if (entry.isFile() && entry.name.endsWith('.json') && !entry.name.startsWith('_')) {
+          } else if (
+            entry.isFile() &&
+            entry.name.endsWith('.json') &&
+            !isMirrorHousekeepingFile(entry.name)
+          ) {
+            // Excludes the two known housekeeping files that live alongside
+            // photo sidecars in the mirror folder — without this, they'd get
+            // counted as an extra "photo" that never gets a thumbnail/face-
+            // scan match, permanently capping progress just under 100% (e.g.
+            // 21/22) even once every real photo is done.
             totalPhotos++;
             try {
               const meta: VirtualPhotoMetadata = JSON.parse(fs.readFileSync(full, 'utf-8'));
               if (meta.thumbnailPath && fs.existsSync(meta.thumbnailPath)) {
                 thumbnailCachedCount++;
               }
-              if (meta.faceScanCompleted || (meta.faces && meta.faces.length > 0)) {
-                faceScannedCount++;
-              }
-              if (meta.faces && Array.isArray(meta.faces)) {
-                facesDetectedCount += meta.faces.length;
-              }
+              // Face-detection results are never written back to this sidecar
+              // JSON (only to the SQLite catalog — see getFaceStatsForLibrary
+              // below), so meta.faces/faceScanCompleted here would always
+              // read as empty. Thumbnail caching is the only thing this
+              // sidecar scan can answer accurately.
             } catch {}
           }
         }
@@ -334,6 +262,21 @@ export function getStorageDetails(storageName: string, mirrorRoot?: string): Sto
     thumbnailCachedCount = libStatus.thumbnailCachedCount;
     faceScannedCount = libStatus.faceScannedCount;
     facesDetectedCount = libStatus.faceDetectedCount;
+  }
+
+  // Face-detection results live only in this storage's own SQLite catalog
+  // (photos.face_scan_completed / the faces table) — never in the sidecar
+  // JSON files scanned above — so that's the only accurate source for these
+  // two counts, regardless of which sidecar-based numbers were used for
+  // totalPhotos/thumbnailCachedCount just above.
+  if (totalPhotos > 0) {
+    const faceStats = getFaceStatsForLibrary(mirrorFolder);
+    // Capped to totalPhotos: the catalog can briefly disagree in count with
+    // the sidecar scan (e.g. right after a source folder shrinks, before a
+    // fresh sync has pruned the stale catalog rows) — never let that make
+    // faceScannedCount exceed the total it's a fraction of.
+    faceScannedCount = Math.min(faceStats.faceScannedCount, totalPhotos);
+    facesDetectedCount = faceStats.facesDetectedCount;
   }
 
   let phase: 'completed' | 'thumbnails' | 'faces' | 'interrupted' | 'idle' = 'idle';
@@ -385,10 +328,183 @@ export function getAllStorageDetails(mirrorRoot?: string): Record<string, Storag
   return result;
 }
 
+interface OneFileSyncResult {
+  success: boolean;
+  skipped: boolean;
+  bytesRead: number;
+  originalSize: number;
+  thumbnailSize: number;
+  localThumbPath?: string;
+  localMetaPath?: string;
+  sidecar?: VirtualPhotoMetadata;
+  error?: string;
+}
+
+/**
+ * Thumbnail + EXIF sidecar generation for exactly one source file. Shared by
+ * the bulk syncVirtualStorage loop below and by mirror:sync-one-photo, which
+ * the renderer uses to interleave this step with face detection one photo at
+ * a time (rather than two full passes over the whole library) — important
+ * for OneDrive-backed sources, where every read here hydrates the file, and
+ * doing all files' thumbnails before any face detection would leave every
+ * file hydrated at once instead of one at a time.
+ */
+async function processOneMirrorFile(
+  remoteFile: string,
+  config: VirtualStorageConfig,
+  storageMirrorRoot: string
+): Promise<OneFileSyncResult> {
+  const fileName = path.basename(remoteFile);
+  const relFromRoot = path.relative(config.networkSourcePath, remoteFile);
+  const relDir = path.dirname(relFromRoot);
+
+  const targetLocalDir = path.join(storageMirrorRoot, relDir);
+  if (!fs.existsSync(targetLocalDir)) {
+    fs.mkdirSync(targetLocalDir, { recursive: true });
+  }
+
+  const localThumbPath = path.join(targetLocalDir, fileName);
+  const baseName = path.basename(fileName, path.extname(fileName));
+  const localMetaPath = path.join(targetLocalDir, `${baseName}.json`);
+
+  try {
+    const stats = fs.statSync(remoteFile);
+    const bytesRead = stats.size;
+
+    // Incremental sync check: if both thumbnail and metadata exist and remote was not modified after
+    if (fs.existsSync(localThumbPath) && fs.existsSync(localMetaPath)) {
+      const metaStats = fs.statSync(localMetaPath);
+      if (metaStats.mtime.getTime() >= stats.mtime.getTime()) {
+        const thumbStats = fs.statSync(localThumbPath);
+        // Still parse and return the existing sidecar even though the
+        // thumbnail step itself is skipped — the caller's face-detection
+        // step (see syncVirtualStorage) needs it to know which photo this
+        // is. Without this, any already-thumbnailed file (the overwhelming
+        // common case on every sync after the first) would never even be
+        // considered for face detection, since "skipped" previously meant
+        // "no sidecar returned" — silently starving the whole face pipeline.
+        let existingSidecar: VirtualPhotoMetadata | undefined;
+        try {
+          existingSidecar = JSON.parse(fs.readFileSync(localMetaPath, 'utf-8'));
+        } catch (parseErr) {
+          console.warn(`Failed to parse existing sidecar ${localMetaPath}, face detection will be skipped for this file this pass:`, parseErr);
+        }
+        // Backfill sourceMtimeMs for a sidecar written before this field
+        // existed (i.e. every file already synced before this fix shipped)
+        // — one-time self-heal using the stat() already done above, no
+        // extra I/O. Without this, detectFacesForPhoto's "file unchanged,
+        // skip re-detection" check can never activate for any
+        // already-synced photo (originalMtimeMs stays permanently null),
+        // so an unlocked-but-already-detected photo gets fully re-detected
+        // by EVERY future sync pass forever — including the background
+        // daemon's own periodic cycle, which can run within seconds of a
+        // user manually detecting faces on that exact photo and silently
+        // replace the result with whatever that pass independently found.
+        if (existingSidecar && existingSidecar.sourceMtimeMs == null) {
+          existingSidecar.sourceMtimeMs = stats.mtime.getTime();
+          try {
+            fs.writeFileSync(localMetaPath, JSON.stringify(existingSidecar, null, 2), 'utf-8');
+          } catch (writeErr) {
+            console.warn(`Failed to backfill sourceMtimeMs into sidecar ${localMetaPath}:`, writeErr);
+          }
+        }
+        return {
+          success: true,
+          skipped: true,
+          bytesRead: 0,
+          originalSize: stats.size,
+          thumbnailSize: thumbStats.size,
+          localThumbPath,
+          localMetaPath,
+          sidecar: existingSidecar,
+        };
+      }
+    }
+
+    // 1. Generate 500px thumbnail (supporting HEIC and standard formats)
+    let thumbBuffer: Buffer | null = null;
+    const isHeic = /\.(heic|heif)$/i.test(remoteFile);
+    if (isHeic) {
+      try {
+        thumbBuffer = await getOrGenerateHeicThumbnail500(remoteFile);
+      } catch (heicErr) {
+        console.warn(`HEIC thumbnail generation notice for ${remoteFile}:`, heicErr);
+      }
+    }
+    if (!thumbBuffer) {
+      thumbBuffer = await generateThumbnailBuffer(remoteFile, 500);
+    }
+    if (!thumbBuffer) {
+      throw new Error(`Failed to generate thumbnail for ${remoteFile}`);
+    }
+    fs.writeFileSync(localThumbPath, thumbBuffer);
+
+    // 2. Parse EXIF & GPS
+    const meta = await parsePhotoMetadata(remoteFile);
+
+    // 3. Write metadata sidecar JSON
+    const sidecar: VirtualPhotoMetadata = {
+      fileName,
+      originalFilePath: remoteFile,
+      originalFileSize: stats.size,
+      sourceMtimeMs: stats.mtime.getTime(),
+      dateTaken: meta.dateTaken,
+      width: meta.width,
+      height: meta.height,
+      thumbnailPath: localThumbPath,
+      storageName: config.name,
+      storageRoot: config.networkSourcePath,
+      relativePath: relFromRoot,
+      exif: meta.exif,
+      location: meta.location,
+    };
+    fs.writeFileSync(localMetaPath, JSON.stringify(sidecar, null, 2), 'utf-8');
+
+    return {
+      success: true,
+      skipped: false,
+      bytesRead,
+      originalSize: stats.size,
+      thumbnailSize: thumbBuffer.length,
+      localThumbPath,
+      localMetaPath,
+      sidecar,
+    };
+  } catch (err: any) {
+    return { success: false, skipped: false, bytesRead: 0, originalSize: 0, thumbnailSize: 0, error: err.message };
+  }
+}
+
+/**
+ * Same as processOneMirrorFile, but for a caller (mirror:sync-one-photo) that
+ * only has a single remote file and config, not a pre-resolved mirror root —
+ * ensures the mirror root directory exists first.
+ */
+export async function syncOnePhoto(
+  remoteFile: string,
+  config: VirtualStorageConfig
+): Promise<OneFileSyncResult> {
+  const storageMirrorRoot = path.join(config.localMirrorRoot, config.name);
+  if (!fs.existsSync(storageMirrorRoot)) {
+    fs.mkdirSync(storageMirrorRoot, { recursive: true });
+  }
+  return processOneMirrorFile(remoteFile, config, storageMirrorRoot);
+}
+
 export async function syncVirtualStorage(
   config: VirtualStorageConfig,
-  onProgress?: (progress: MirrorProgress) => void
+  onProgress?: (progress: MirrorProgress) => void,
+  options?: { runFaceDetection?: boolean }
 ): Promise<SyncVirtualStorageResult> {
+  // Unified per-photo pipeline (see docs/PIPELINE_REDESIGN_DEV_DOC.md §3.3):
+  // thumbnail+sidecar then, immediately for that same photo, face detection
+  // + lock + OneDrive reclaim — one shared implementation for plain network
+  // storages, OneDrive-backed ones, and the background daemon alike, instead
+  // of three divergent code paths. Callers that can't safely touch the
+  // shared per-library database right now (the daemon while a renderer
+  // window is visibly open — see backgroundDaemon.ts) pass
+  // runFaceDetection: false to fall back to thumbnail-only, unchanged.
+  const runFaceDetection = options?.runFaceDetection ?? true;
   const errors: string[] = [];
   let totalSynced = 0;
   let newlyAdded = 0;
@@ -400,7 +516,8 @@ export async function syncVirtualStorage(
     fs.mkdirSync(storageMirrorRoot, { recursive: true });
   }
 
-  const remoteFiles = scanDirectoryRecursive(config.networkSourcePath);
+  logger.info('Sync', `Checking library ${config.name} — scanning ${config.networkSourcePath}`);
+  const remoteFiles = await scanDirectoryRecursive(config.networkSourcePath);
   const total = remoteFiles.length;
 
   // Intermittent checkpoint resumption check:
@@ -434,18 +551,6 @@ export async function syncVirtualStorage(
   for (let i = startIndex; i < total; i++) {
     const remoteFile = remoteFiles[i];
     const fileName = path.basename(remoteFile);
-    const relFromRoot = path.relative(config.networkSourcePath, remoteFile);
-    const relDir = path.dirname(relFromRoot);
-
-    // Replicate folder structure locally
-    const targetLocalDir = path.join(storageMirrorRoot, relDir);
-    if (!fs.existsSync(targetLocalDir)) {
-      fs.mkdirSync(targetLocalDir, { recursive: true });
-    }
-
-    const localThumbPath = path.join(targetLocalDir, fileName);
-    const baseName = path.basename(fileName, path.extname(fileName));
-    const localMetaPath = path.join(targetLocalDir, `${baseName}.json`);
 
     const percent = Math.round(((i + 1) / Math.max(1, total)) * 100);
     if (onProgress) {
@@ -461,68 +566,50 @@ export async function syncVirtualStorage(
     }
 
     const fileStartTime = Date.now();
-    let bytesReadForBandwidth = 0;
 
-    try {
-      const stats = fs.statSync(remoteFile);
-      totalOriginalSize += stats.size;
-      bytesReadForBandwidth = stats.size;
+    const result = await processOneMirrorFile(remoteFile, config, storageMirrorRoot);
+    let bytesReadForBandwidth = result.bytesRead;
 
-      // Incremental sync check: if both thumbnail and metadata exist and remote was not modified after
-      if (fs.existsSync(localThumbPath) && fs.existsSync(localMetaPath)) {
-        const metaStats = fs.statSync(localMetaPath);
-        if (metaStats.mtime.getTime() >= stats.mtime.getTime()) {
-          const thumbStats = fs.statSync(localThumbPath);
-          totalThumbnailSize += thumbStats.size;
-          totalSynced++;
-          bytesReadForBandwidth = 0; // No actual network read happened — nothing to throttle for.
-          continue;
-        }
-      }
-
-      // 1. Generate 500px thumbnail (supporting HEIC and standard formats)
-      let thumbBuffer: Buffer | null = null;
-      const isHeic = /\.(heic|heif)$/i.test(remoteFile);
-      if (isHeic) {
-        try {
-          thumbBuffer = await getOrGenerateHeicThumbnail500(remoteFile);
-        } catch (heicErr) {
-          console.warn(`HEIC thumbnail generation notice for ${remoteFile}:`, heicErr);
-        }
-      }
-      if (!thumbBuffer) {
-        thumbBuffer = generateThumbnailBuffer(remoteFile, 500);
-      }
-      if (!thumbBuffer) {
-        throw new Error(`Failed to generate thumbnail for ${remoteFile}`);
-      }
-      fs.writeFileSync(localThumbPath, thumbBuffer);
-      totalThumbnailSize += thumbBuffer.length;
-
-      // 2. Parse EXIF & GPS
-      const meta = await parsePhotoMetadata(remoteFile);
-
-      // 3. Write metadata sidecar JSON
-      const sidecar: VirtualPhotoMetadata = {
-        fileName,
-        originalFilePath: remoteFile,
-        originalFileSize: stats.size,
-        dateTaken: meta.dateTaken,
-        width: meta.width,
-        height: meta.height,
-        thumbnailPath: localThumbPath,
-        storageName: config.name,
-        storageRoot: config.networkSourcePath,
-        relativePath: relFromRoot,
-        exif: meta.exif,
-        location: meta.location,
-      };
-
-      fs.writeFileSync(localMetaPath, JSON.stringify(sidecar, null, 2), 'utf-8');
+    if (result.success) {
+      totalOriginalSize += result.originalSize;
+      totalThumbnailSize += result.thumbnailSize;
       totalSynced++;
-      newlyAdded++;
-    } catch (err: any) {
-      const msg = `Error syncing ${remoteFile}: ${err.message}`;
+      if (!result.skipped) newlyAdded++;
+
+      if (!result.skipped) {
+        logger.info('Sync', `Background scan — Photo ${i + 1}/${total}: ${fileName}`);
+        logger.info('Sync', `  caching thumbnail ..... ${Math.round(result.thumbnailSize / 1024)}kb done`);
+      }
+
+      if (runFaceDetection && result.sidecar) {
+        if (onProgress) {
+          onProgress({
+            storageName: config.name,
+            phase: 'faces',
+            current: i + 1,
+            total,
+            currentFile: fileName,
+            status: 'syncing',
+            percent,
+          });
+        }
+        try {
+          const faceResult = await runFaceDetectionStep(remoteFile, result.sidecar, config);
+          if (faceResult.ran) {
+            logger.info('Sync', `  detecting faces ..... ${faceResult.faceCount} detected`);
+          } else if (!result.skipped) {
+            // Thumbnail was fresh but the face step itself was skipped
+            // (locked, or storage went unreachable mid-run) — worth a line
+            // since it explains why faces didn't increase for this photo.
+            logger.info('Sync', `  detecting faces ..... skipped (${faceResult.skippedReason})`);
+          }
+        } catch (faceErr) {
+          console.error(`Face detection step failed for ${remoteFile}:`, faceErr);
+          errors.push(`Face detection failed for ${fileName}: ${String(faceErr)}`);
+        }
+      }
+    } else {
+      const msg = `Error syncing ${remoteFile}: ${result.error}`;
       console.error(msg);
       errors.push(msg);
     }
@@ -559,8 +646,15 @@ export async function syncVirtualStorage(
       }
     }
 
-    // Configurable delay between photos to prevent bandwidth saturation and keep desktop 100% responsive
-    const delayMs = config.delayBetweenPhotosSec && config.delayBetweenPhotosSec > 0
+    // Configurable delay between photos to prevent bandwidth saturation and
+    // keep desktop 100% responsive — only meaningful when this file actually
+    // did real network I/O (result.skipped means the incremental check found
+    // it already up to date and touched nothing). Without this guard, a
+    // periodic re-verification pass over an already-fully-synced storage —
+    // every file skipped, zero bytes transferred — still paid the full
+    // configured delay on every single one, turning a should-be-instant
+    // "nothing changed" confirmation into minutes of pure waiting.
+    const delayMs = !result.skipped && config.delayBetweenPhotosSec && config.delayBetweenPhotosSec > 0
       ? Math.round(config.delayBetweenPhotosSec * 1000)
       : 4;
     await new Promise((r) => setTimeout(r, delayMs));
@@ -593,46 +687,133 @@ export async function syncVirtualStorage(
     });
   }
 
-  // Prune deleted files: if the source path is accessible, clean up mirror files whose remote file no longer exists
-  try {
-    const activeRemotePaths = new Set(remoteFiles.map((rf) => path.resolve(rf).toLowerCase()));
-    function pruneMirrorOrphans(current: string) {
-      if (!fs.existsSync(current)) return;
-      const entries = fs.readdirSync(current, { withFileTypes: true });
-      for (const entry of entries) {
-        const fullPath = path.join(current, entry.name);
-        if (entry.isDirectory()) {
-          if (!entry.name.startsWith('.')) {
-            pruneMirrorOrphans(fullPath);
+  // Prune deleted files: if the source path is accessible, clean up mirror files whose remote file no longer exists.
+  // Walks the LOCAL mirror (not the network path), but still yields periodically since a large
+  // library can mean thousands of sidecar JSON files to stat/parse in one pass.
+  //
+  // Also removes the catalog row (and its faces/album links) for each pruned
+  // photo — the mirror folder's sidecar+thumbnail files were always cleaned
+  // up here, but the SQLite row survived, so a deleted source photo (and
+  // anyone tagged in it) kept showing up when browsing this storage, with a
+  // thumbnail path that no longer existed on disk.
+  //
+  // Safety: only prune when the source folder was genuinely reachable this
+  // pass. scanDirectoryRecursive returns an empty list both for "the source
+  // is really empty" and "the source is temporarily unreachable" (dropped
+  // network drive, sleeping NAS, etc.) — pruning on the latter would treat
+  // every real photo as deleted and wipe the whole library's cached data
+  // and face tags over a connectivity blip.
+  const sourceReachableForPrune = await isPathReachable(config.networkSourcePath);
+  if (!sourceReachableForPrune) {
+    logger.warn('Sync', `Skipping delete-detection for ${config.name} — source folder was not reachable this pass.`);
+  } else {
+    try {
+      const activeRemotePaths = new Set(remoteFiles.map((rf) => path.resolve(rf).toLowerCase()));
+      const pruneDb = getDbForLibraryPath(storageMirrorRoot);
+      let prunedCount = 0;
+      let prunedSinceYield = 0;
+      const pruneMirrorOrphans = async (current: string): Promise<void> => {
+        if (!fs.existsSync(current)) return;
+        const entries = fs.readdirSync(current, { withFileTypes: true });
+        for (const entry of entries) {
+          prunedSinceYield++;
+          if (prunedSinceYield >= 200) {
+            prunedSinceYield = 0;
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          }
+
+          const fullPath = path.join(current, entry.name);
+          if (entry.isDirectory()) {
+            if (!entry.name.startsWith('.')) {
+              await pruneMirrorOrphans(fullPath);
+              try {
+                if (fs.readdirSync(fullPath).length === 0) {
+                  fs.rmdirSync(fullPath);
+                }
+              } catch {}
+            }
+          } else if (entry.isFile() && entry.name.endsWith('.json') && !isMirrorHousekeepingFile(entry.name)) {
             try {
-              if (fs.readdirSync(fullPath).length === 0) {
-                fs.rmdirSync(fullPath);
+              const raw = fs.readFileSync(fullPath, 'utf-8');
+              const meta: VirtualPhotoMetadata = JSON.parse(raw);
+              if (meta.originalFilePath) {
+                const origResolved = path.resolve(meta.originalFilePath).toLowerCase();
+                if (!activeRemotePaths.has(origResolved)) {
+                  try { fs.unlinkSync(fullPath); } catch {}
+                  if (meta.thumbnailPath) {
+                    try {
+                      deletePhotos([photoIdForSidecar(meta.thumbnailPath)], pruneDb);
+                    } catch (dbErr) {
+                      console.warn(`Failed to remove catalog row for deleted photo ${meta.originalFilePath}:`, dbErr);
+                    }
+                    if (fs.existsSync(meta.thumbnailPath)) {
+                      try { fs.unlinkSync(meta.thumbnailPath); } catch {}
+                    }
+                  }
+                  prunedCount++;
+                }
               }
             } catch {}
           }
-        } else if (entry.isFile() && entry.name.endsWith('.json')) {
+        }
+      };
+      await pruneMirrorOrphans(storageMirrorRoot);
+
+      // Catalog rows whose sidecar/thumbnail were ALREADY gone from disk
+      // before this fix existed (the mirror-file cleanup above used to run
+      // on its own, deleting sidecar+thumbnail but never the catalog row —
+      // so a photo removed from the source before this database-cleanup
+      // existed left an orphaned row with no file to walk to and therefore
+      // nothing to trigger the check above). Comparing every row's
+      // original_remote_path against the current source listing directly
+      // catches these regardless of what's left on disk.
+      const staleRows = pruneDb
+        .prepare('SELECT id, file_path, original_remote_path FROM photos WHERE original_remote_path IS NOT NULL')
+        .all() as Array<{ id: string; file_path: string; original_remote_path: string }>;
+      const staleIds: string[] = [];
+      for (const row of staleRows) {
+        const origResolved = path.resolve(row.original_remote_path).toLowerCase();
+        if (!activeRemotePaths.has(origResolved)) {
+          staleIds.push(row.id);
           try {
-            const raw = fs.readFileSync(fullPath, 'utf-8');
-            const meta: VirtualPhotoMetadata = JSON.parse(raw);
-            if (meta.originalFilePath) {
-              const origResolved = path.resolve(meta.originalFilePath).toLowerCase();
-              if (!activeRemotePaths.has(origResolved)) {
-                try { fs.unlinkSync(fullPath); } catch {}
-                if (meta.thumbnailPath && fs.existsSync(meta.thumbnailPath)) {
-                  try { fs.unlinkSync(meta.thumbnailPath); } catch {}
-                }
-              }
-            }
+            if (row.file_path && fs.existsSync(row.file_path)) fs.unlinkSync(row.file_path);
+            const sidecarPath = row.file_path
+              ? path.join(path.dirname(row.file_path), `${path.basename(row.file_path, path.extname(row.file_path))}.json`)
+              : null;
+            if (sidecarPath && fs.existsSync(sidecarPath)) fs.unlinkSync(sidecarPath);
           } catch {}
         }
       }
+      if (staleIds.length > 0) {
+        deletePhotos(staleIds, pruneDb);
+        prunedCount += staleIds.length;
+      }
+
+      if (prunedCount > 0) {
+        logger.info('Sync', `Library ${config.name} — removed ${prunedCount} photo(s) no longer present in the source folder.`);
+      }
+    } catch (pruneErr) {
+      console.warn('Failed to prune mirror orphans:', pruneErr);
     }
-    pruneMirrorOrphans(storageMirrorRoot);
-  } catch (pruneErr) {
-    console.warn('Failed to prune mirror orphans:', pruneErr);
   }
 
   const totalSizeSaved = Math.max(0, totalOriginalSize - totalThumbnailSize);
+
+  if (newlyAdded === 0 && total > 0) {
+    logger.info('Sync', `Checking library ${config.name} — old count: ${total}, new count: ${total} — nothing to do`);
+  } else if (runFaceDetection) {
+    try {
+      const db = getDbForLibraryPath(storageMirrorRoot);
+      const faceCount = (db.prepare('SELECT COUNT(*) as c FROM faces').get() as any)?.c ?? 0;
+      const personCount = (db.prepare('SELECT COUNT(DISTINCT person_id) as c FROM faces WHERE person_id IS NOT NULL').get() as any)?.c ?? 0;
+      logger.info(
+        'Sync',
+        `Library ${config.name} completed — ${total} photos scanned, ${totalSynced} thumbnails cached, ${faceCount} faces detected for ${personCount} people in total.`
+      );
+    } catch (summaryErr) {
+      logger.warn('Sync', 'Could not compute completion summary', { err: String(summaryErr) });
+    }
+  }
 
   if (onProgress) {
     onProgress({
@@ -759,7 +940,7 @@ export function discoverStoredMirrors(customRoot?: string): VirtualStorageConfig
             const p = path.join(dir, se.name);
             if (se.isDirectory() && !se.name.startsWith('.')) {
               quickScan(p, depth + 1);
-            } else if (se.isFile() && se.name.endsWith('.json') && !se.name.startsWith('_')) {
+            } else if (se.isFile() && se.name.endsWith('.json') && !isMirrorHousekeepingFile(se.name)) {
               totalPhotos++;
               if (!sampleMetaFound) {
                 try {
@@ -937,7 +1118,7 @@ export async function generateThumbnailOnTheFly(
   if (!fs.existsSync(sourceFilePath)) return null;
 
   try {
-    const thumbBuffer = generateThumbnailBuffer(sourceFilePath, 500);
+    const thumbBuffer = await generateThumbnailBuffer(sourceFilePath, 500);
     if (!thumbBuffer) return null;
 
     let targetDir = mirrorDirPath;
@@ -963,8 +1144,13 @@ export async function generateThumbnailOnTheFly(
  */
 export async function editPhotoFile(options: EditPhotoOptions): Promise<EditPhotoResult> {
   const targetPath = options.originalPath || options.filePath;
-  if (!fs.existsSync(targetPath)) {
-    return { success: false, error: `File not found: ${targetPath}` };
+  if (!(await isPathReachable(targetPath))) {
+    return {
+      success: false,
+      error: isNetworkPath(targetPath)
+        ? 'Network storage is not available (offline).'
+        : `File not found: ${targetPath}`,
+    };
   }
 
   const ext = path.extname(targetPath).toLowerCase();
@@ -975,11 +1161,35 @@ export async function editPhotoFile(options: EditPhotoOptions): Promise<EditPhot
         const cleaned = options.base64Data.replace(/^data:image\/\w+;base64,/, '');
         const outputBuffer = Buffer.from(cleaned, 'base64');
         fs.writeFileSync(thumbTarget, outputBuffer);
+
+        // The saved bytes are a baked preview of the LOCAL mirror thumbnail
+        // only — the remote .heic master (targetPath) is never touched. If
+        // this edit included a rotation, record it in the shared rotation
+        // flag store under both paths, the same way the quick-rotate path
+        // does, so viewing the photo at full resolution later (which reads
+        // the untouched remote master) still reflects it instead of the
+        // rotation silently reverting.
+        let totalRotation: number | undefined;
+        if (options.rotationDegrees) {
+          try {
+            const { saveHeicSavedRotation } = require('./heicRotationStore');
+            totalRotation = saveHeicSavedRotation(thumbTarget, options.rotationDegrees);
+            if (targetPath && targetPath !== thumbTarget) {
+              saveHeicSavedRotation(targetPath, options.rotationDegrees);
+            }
+          } catch (err) {
+            console.warn('[editPhotoFile] Failed persisting HEIC rotation flag:', err);
+          }
+        }
+
         return {
           success: true,
           newPhoto: {
             filePath: thumbTarget,
             originalRemotePath: targetPath,
+            ...(totalRotation !== undefined
+              ? { isHeicRotated: totalRotation !== 0, heicRotation: totalRotation, rotation: totalRotation }
+              : {}),
           } as any,
         };
       } catch (e: any) {
@@ -1040,7 +1250,7 @@ export async function editPhotoFile(options: EditPhotoOptions): Promise<EditPhot
     // Also update mirror thumbnail if provided
     if (options.mirrorThumbnailPath && fs.existsSync(options.mirrorThumbnailPath)) {
       try {
-        const thumbBuf = generateThumbnailBuffer(finalSavePath, 500);
+        const thumbBuf = await generateThumbnailBuffer(finalSavePath, 500);
         if (thumbBuf) {
           fs.writeFileSync(options.mirrorThumbnailPath, thumbBuf);
         }
@@ -1087,9 +1297,9 @@ export async function editPhotoFile(options: EditPhotoOptions): Promise<EditPhot
 /**
  * Moves multiple duplicate/inferior photos safely to the OS Recycle Bin.
  */
-export async function trashFiles(filePaths: string[]): Promise<{ success: boolean; trashedCount: number; errors: string[] }> {
+export async function trashFiles(filePaths: string[]): Promise<{ success: boolean; trashedCount: number; trashedPaths: string[]; errors: string[] }> {
   const errors: string[] = [];
-  let trashedCount = 0;
+  const trashedPaths: string[] = [];
 
   // Try electron shell.trashItem
   let shell: any = null;
@@ -1101,14 +1311,24 @@ export async function trashFiles(filePaths: string[]): Promise<{ success: boolea
   }
 
   for (const fp of filePaths) {
-    if (!fs.existsSync(fp)) continue;
+    // isPathReachable (not fs.existsSync) so an offline network share never
+    // gets attempted — it's a bounded, cached probe instead of a sync call
+    // that can hang the main process for the OS's full network timeout.
+    if (!(await isPathReachable(fp))) {
+      errors.push(
+        isNetworkPath(fp)
+          ? `${path.basename(fp)}: network storage is not available (offline). Skipped.`
+          : `${path.basename(fp)}: file not found. Skipped.`
+      );
+      continue;
+    }
     try {
       if (shell && typeof shell.trashItem === 'function') {
         await shell.trashItem(fp);
       } else {
         fs.unlinkSync(fp);
       }
-      trashedCount++;
+      trashedPaths.push(fp);
     } catch (err: any) {
       errors.push(`Failed to trash ${fp}: ${err.message}`);
     }
@@ -1116,7 +1336,8 @@ export async function trashFiles(filePaths: string[]): Promise<{ success: boolea
 
   return {
     success: errors.length === 0,
-    trashedCount,
+    trashedCount: trashedPaths.length,
+    trashedPaths,
     errors,
   };
 }
@@ -1124,12 +1345,21 @@ export async function trashFiles(filePaths: string[]): Promise<{ success: boolea
 /**
  * Permanently unlinks/deletes files from disk and cleans up any associated sidecar .json files.
  */
-export async function deleteFilesPermanently(filePaths: string[]): Promise<{ success: boolean; deletedCount: number; errors: string[] }> {
+export async function deleteFilesPermanently(filePaths: string[]): Promise<{ success: boolean; deletedCount: number; deletedPaths: string[]; errors: string[] }> {
   const errors: string[] = [];
-  let deletedCount = 0;
+  const deletedPaths: string[] = [];
 
   for (const fp of filePaths) {
-    if (!fs.existsSync(fp)) continue;
+    // Same reachability-first check as trashFiles — never attempt a delete
+    // against a path whose network storage is offline.
+    if (!(await isPathReachable(fp))) {
+      errors.push(
+        isNetworkPath(fp)
+          ? `${path.basename(fp)}: network storage is not available (offline). Skipped.`
+          : `${path.basename(fp)}: file not found. Skipped.`
+      );
+      continue;
+    }
     try {
       fs.unlinkSync(fp);
       // If this is a virtual mirror photo or has a matching .json sidecar, delete it too
@@ -1139,7 +1369,7 @@ export async function deleteFilesPermanently(filePaths: string[]): Promise<{ suc
           fs.unlinkSync(jsonSidecar);
         } catch {}
       }
-      deletedCount++;
+      deletedPaths.push(fp);
     } catch (err: any) {
       errors.push(`Failed to permanently delete ${fp}: ${err.message}`);
     }
@@ -1147,7 +1377,8 @@ export async function deleteFilesPermanently(filePaths: string[]): Promise<{ suc
 
   return {
     success: errors.length === 0,
-    deletedCount,
+    deletedCount: deletedPaths.length,
+    deletedPaths,
     errors,
   };
 }
@@ -1158,11 +1389,17 @@ export async function deleteFilesPermanently(filePaths: string[]): Promise<{ suc
  */
 export async function rotatePhotoFile(
   filePath: string,
-  rotationDegrees: number
-): Promise<{ success: boolean; newPath?: string; error?: string }> {
+  rotationDegrees: number,
+  secondaryPath?: string
+): Promise<{ success: boolean; newPath?: string; error?: string; delegatedToCacheRotation?: boolean }> {
   try {
-    if (!fs.existsSync(filePath)) {
-      return { success: false, error: `File not found: ${filePath}` };
+    if (!(await isPathReachable(filePath))) {
+      return {
+        success: false,
+        error: isNetworkPath(filePath)
+          ? 'Network storage is not available (offline).'
+          : `File not found: ${filePath}`,
+      };
     }
 
     const degrees = ((rotationDegrees % 360) + 360) % 360;
@@ -1180,13 +1417,17 @@ export async function rotatePhotoFile(
 
     if (isRawHeic && !isJpegBuffer && !isWebpBuffer) {
       // Raw HEIC files cannot be re-encoded on Windows with Sharp.
-      // Delegate to rotating multi-tier cached thumbnails and recording in heicRotationStore.
+      // Delegate to rotating multi-tier cached thumbnails and recording in
+      // heicRotationStore — under BOTH filePath and secondaryPath (e.g. a
+      // distinct remote/original path), since callers may look the saved
+      // rotation up under either one.
       try {
         const { rotateCachedHeicThumbnail } = require('./thumbnailCacheService');
-        await rotateCachedHeicThumbnail(filePath, degrees);
+        await rotateCachedHeicThumbnail(filePath, degrees, secondaryPath);
         return {
           success: true,
           newPath: filePath,
+          delegatedToCacheRotation: true,
         };
       } catch (rotErr: any) {
         return {
@@ -1335,7 +1576,7 @@ export async function processPendingRotations(): Promise<{ processed: number; re
 
   for (const item of items) {
     try {
-      if (fs.existsSync(item.originalRemotePath)) {
+      if (await isPathReachable(item.originalRemotePath)) {
         console.log(`[OfflineRotationSync] Applying pending rotation (${item.rotationDegrees}°) to reconnected source: ${item.originalRemotePath}`);
         const res = await rotatePhotoFile(item.originalRemotePath, item.rotationDegrees);
         if (res.success) {
@@ -1399,13 +1640,51 @@ export async function rotatePhotoWithOfflineQueue(params: {
 
       if (isMirrorThumbnail && localFilePath && fs.existsSync(localFilePath)) {
         // Physically rotate the real JPEG bytes on disk (also purges
-        // derived thumbnail-cache tiers so they regenerate with the new orientation).
-        await rotatePhotoFile(localFilePath, degrees);
+        // derived thumbnail-cache tiers so they regenerate with the new
+        // orientation). "Mirror thumbnail" here is a path-based guess — the
+        // local file is sometimes actually genuine raw HEIC bytes copied
+        // as-is (e.g. HEIC decoding failed during sync), in which case
+        // rotatePhotoFile detects that by sniffing the bytes and delegates
+        // to rotateCachedHeicThumbnail itself, passing the remote path
+        // through so both paths' flags get recorded in one place.
+        const rotateResult = await rotatePhotoFile(localFilePath, degrees, originalRemotePath);
+
+        if (!rotateResult.delegatedToCacheRotation) {
+          // Genuine physical rotation happened — rotatePhotoFile only
+          // rewrote the local file's pixels, it doesn't touch the rotation
+          // flag store. Persist the accumulated rotation under BOTH the
+          // local mirror thumbnail path and the remote original path here.
+          // Code that displays the photo at full resolution (the
+          // Lightbox's "preferOriginal" path) loads directly from the
+          // remote original whenever it's reachable — that file is never
+          // physically rotated — and its saved-rotation lookup is keyed by
+          // that same remote path. Without recording it there too, the
+          // rotation looked up 0° and the photo appeared to silently
+          // revert the next time that code path ran (e.g. opening the
+          // Lightbox once the network share was reachable again).
+          try {
+            const { saveHeicSavedRotation } = require('./heicRotationStore');
+            totalRot = saveHeicSavedRotation(localFilePath, degrees);
+            if (originalRemotePath && originalRemotePath !== localFilePath) {
+              saveHeicSavedRotation(originalRemotePath, degrees);
+            }
+          } catch (err) {
+            console.warn('[rotatePhotoWithOfflineQueue] Failed persisting mirror rotation flag:', err);
+          }
+        } else {
+          // rotatePhotoFile already recorded the accumulated rotation
+          // (under both paths) via rotateCachedHeicThumbnail — read it back
+          // rather than writing the delta again, which would double-count it.
+          try {
+            const { getHeicSavedRotation } = require('./heicRotationStore');
+            totalRot = getHeicSavedRotation(localFilePath);
+          } catch {}
+        }
       } else {
         // Genuinely raw HEIC/HEIF bytes cannot be re-encoded via Sharp on this
         // platform. Rotate the multi-tier cached thumbnails instead and record
         // the rotation persistently so it survives future re-reads.
-        const sourceHeicPath = (originalRemotePath && fs.existsSync(originalRemotePath))
+        const sourceHeicPath = (originalRemotePath && (await isPathReachable(originalRemotePath)))
           ? originalRemotePath
           : localFilePath;
         try {
@@ -1467,9 +1746,10 @@ export async function rotatePhotoWithOfflineQueue(params: {
       }
     }
 
-    // 2. Check source file
+    // 2. Check source file — isPathReachable (not fs.existsSync) so a dead
+    // network share can't block this for its full OS-level timeout.
     const remoteTarget = originalRemotePath || localFilePath;
-    const isRemoteOnline = remoteTarget && fs.existsSync(remoteTarget);
+    const isRemoteOnline = remoteTarget && (await isPathReachable(remoteTarget));
 
     if (isRemoteOnline) {
       // Source file is online: rotate remote file now

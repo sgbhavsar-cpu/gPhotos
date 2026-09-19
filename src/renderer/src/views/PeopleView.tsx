@@ -18,7 +18,9 @@ import {
   Camera,
   Star,
   ZoomIn,
-  ZoomOut
+  ZoomOut,
+  Search,
+  MoreVertical
 } from 'lucide-react';
 import { Person, Photo, DetectedFace } from '../../types';
 import { PhotoCard } from '../components/PhotoCard';
@@ -29,6 +31,7 @@ import { MergePeopleModal } from '../components/MergePeopleModal';
 import { PersonNameInput } from '../components/PersonNameInput';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { VirtualizedTimelineGallery, GalleryZoomLevel, ZOOM_LEVELS } from '../components/VirtualizedTimelineGallery';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 interface PeopleViewProps {
   people: Person[];
@@ -82,6 +85,14 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
   const [isMergeMode, setIsMergeMode] = useState(false);
   const [viewMode, setViewMode] = useState<'photos' | 'faces'>('photos');
   const [zoomLevel, setZoomLevel] = useState<GalleryZoomLevel>('medium');
+  const [peopleSearchQuery, setPeopleSearchQuery] = useState('');
+  const isMobile = useIsMobile();
+  // Collapsible "more options" panels so the persistent toolbar never grows
+  // past one compact row on mobile — mirrors the pattern established in
+  // GalleryView (see its `showMobileTools` state and titleBlock/filterChips
+  // extraction for the rationale).
+  const [showDetailTools, setShowDetailTools] = useState(false);
+  const [showGridTools, setShowGridTools] = useState(false);
 
   // Modal states
   const [reassignTarget, setReassignTarget] = useState<{
@@ -270,249 +281,344 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
       setSelectedPersonId(null);
     }
     await libraryStore.deletePerson(personId);
+    window.electronAPI?.deletePersonAvatar?.(personId).catch(() => {});
   };
 
   // ================= 1. Person Virtual Album Detail View =================
   if (selectedPerson) {
     const { photo: coverPhoto, face: coverFace } = getCoverDetails(selectedPerson);
 
+    // Shared JSX built once, arranged differently for desktop vs mobile below
+    // — same reasoning as GalleryView's titleBlock/filterChips extraction:
+    // this header used to let Change Cover/AI Best Face/Find More Photos/View
+    // Switcher/Zoom controls overflow off the right edge (no flexWrap) on a
+    // narrow screen instead of wrapping or collapsing.
+    const backButton = (
+      <button
+        className="btn btn-ghost btn-icon"
+        onClick={() => {
+          setSelectedPersonId(null);
+          if (onClearSelectedPerson) onClearSelectedPerson();
+        }}
+        title="Back to People"
+      >
+        <ArrowLeft size={20} />
+      </button>
+    );
+
+    const coverAvatarBlock = (
+      <div
+        style={{
+          position: 'relative',
+          border: '3px solid var(--accent-primary)',
+          borderRadius: 'var(--radius-full)',
+          boxShadow: '0 4px 14px rgba(59, 130, 246, 0.35)',
+          overflow: 'hidden',
+          cursor: 'pointer',
+          flexShrink: isMobile ? 0 : undefined,
+        }}
+        onClick={() => setPersonForCoverModal(selectedPerson)}
+        title="Click to choose a different face or photo as cover"
+      >
+        <FaceAvatar
+          photo={coverPhoto}
+          face={coverFace}
+          box={coverFace?.box}
+          size={isMobile ? 44 : 68}
+          alt={selectedPerson.name}
+          personId={selectedPerson.id}
+        />
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            backgroundColor: 'rgba(0,0,0,0.4)',
+            opacity: 0,
+            transition: 'opacity 0.2s ease',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.opacity = '1')}
+          onMouseLeave={(e) => (e.currentTarget.style.opacity = '0')}
+        >
+          <Camera size={isMobile ? 16 : 20} color="white" />
+        </div>
+      </div>
+    );
+
+    const nameBlock = (
+      <div style={isMobile ? { minWidth: 0, overflow: 'hidden' } : undefined}>
+        {editingPersonId === selectedPerson.id ? (
+          <PersonNameInput
+            initialValue={selectedPerson.name}
+            onSave={(val) => handleSaveRename(selectedPerson.id, val)}
+            onCancel={() => setEditingPersonId(null)}
+            isLarge={true}
+          />
+        ) : (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: isMobile ? 0 : undefined }}>
+            <h2
+              style={isMobile ? {
+                fontSize: '1.05rem',
+                fontWeight: 700,
+                color: 'var(--text-primary)',
+                cursor: 'pointer',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                minWidth: 0,
+              } : {
+                fontSize: '1.45rem',
+                fontWeight: 700,
+                color: 'var(--text-primary)',
+                cursor: 'pointer',
+              }}
+              onClick={() => handleStartRename(selectedPerson)}
+              title="Click to rename"
+            >
+              {selectedPerson.name}
+            </h2>
+            <button
+              className="btn btn-ghost btn-icon"
+              style={{ width: '36px', height: '36px', flexShrink: isMobile ? 0 : undefined }}
+              onClick={(e) => handleStartRename(selectedPerson, e)}
+              title="Rename Person"
+            >
+              <Edit2 size={18} color="var(--text-muted)" />
+            </button>
+            <button
+              className="btn btn-ghost btn-icon"
+              style={{ width: '36px', height: '36px', color: 'var(--accent-rose)', flexShrink: isMobile ? 0 : undefined }}
+              onClick={(e) => handleDeletePerson(selectedPerson.id, selectedPerson.name, e)}
+              title={`Delete ${selectedPerson.name}`}
+            >
+              <Trash2 size={18} />
+            </button>
+          </div>
+        )}
+
+        <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginTop: '2px' }}>
+          {personPhotoItems.length} {personPhotoItems.length === 1 ? 'photo' : 'photos'} recognized
+        </div>
+      </div>
+    );
+
+    const changeCoverButton = (
+      <button
+        className="btn btn-secondary"
+        onClick={() => setPersonForCoverModal(selectedPerson)}
+        style={{ fontSize: '0.75rem', padding: '6px 12px', gap: '6px' }}
+        title="Select which face or photo is displayed as the cover in People"
+      >
+        <Camera size={14} color="var(--accent-primary)" />
+        <span>Change Cover Face</span>
+      </button>
+    );
+
+    const aiBestFaceButton = (
+      <button
+        className="btn btn-secondary"
+        onClick={() => {
+          const updated = libraryStore.autoSelectBestFaceCover(selectedPerson.id);
+          if (updated) {
+            setLearningNotification(
+              `✓ AI auto-selected the clearest, smiling, high-resolution face for ${selectedPerson.name}!`
+            );
+            setTimeout(() => setLearningNotification(null), 4500);
+          }
+        }}
+        style={{ fontSize: '0.75rem', padding: '6px 12px', gap: '6px' }}
+        title="Automatically pick the sharpest, largest, and clearest smiling face"
+      >
+        <Star size={14} color="#f59e0b" fill="#f59e0b" />
+        <span>AI Best Face</span>
+      </button>
+    );
+
+    const findMorePhotosButton = (
+      <button
+        className="btn btn-secondary"
+        onClick={() => {
+          const res = libraryStore.propagateLearnedFaces(selectedPerson.id);
+          if (res.newlyAssignedCount > 0) {
+            setLearningNotification(
+              `✓ Added ${res.newlyAssignedCount} newly discovered photo${res.newlyAssignedCount > 1 ? 's' : ''} to ${selectedPerson.name}'s album using quality-weighted centroid!`
+            );
+          } else {
+            setLearningNotification(
+              `Scanned library with ${selectedPerson.name}'s 2.5x weighted centroid profile. All eligible faces are up to date.`
+            );
+          }
+          setTimeout(() => setLearningNotification(null), 5000);
+        }}
+        style={{ fontSize: '0.75rem', padding: '6px 12px', gap: '6px' }}
+        title="Scan library for matching unassigned faces using refined biometric centroid"
+      >
+        <Sparkles size={14} color="var(--accent-primary)" />
+        <span>Find More Photos</span>
+      </button>
+    );
+
+    const viewModeSwitcher = (
+      <div style={{ display: 'flex', alignItems: 'center', gap: '4px', borderLeft: isMobile ? 'none' : '1px solid var(--border-subtle)', paddingLeft: isMobile ? 0 : '8px' }}>
+        <button
+          className={`btn ${viewMode === 'photos' ? 'btn-primary' : 'btn-secondary'}`}
+          onClick={() => setViewMode('photos')}
+          style={{ fontSize: '0.75rem', padding: '6px 12px' }}
+        >
+          <ImageIcon size={14} />
+          <span>Full Photos</span>
+        </button>
+        <button
+          className={`btn ${viewMode === 'faces' ? 'btn-primary' : 'btn-secondary'}`}
+          onClick={() => setViewMode('faces')}
+          style={{ fontSize: '0.75rem', padding: '6px 12px' }}
+        >
+          <Crop size={14} />
+          <span>Zoomed Faces</span>
+        </button>
+      </div>
+    );
+
+    const zoomControlsBlock = (
+      <div style={{ display: 'flex', alignItems: 'center', gap: '4px', borderLeft: isMobile ? 'none' : '1px solid var(--border-subtle)', paddingLeft: isMobile ? 0 : '8px' }}>
+        <button
+          className="btn btn-ghost btn-icon"
+          disabled={zoomLevel === 'years'}
+          onClick={() => {
+            const idx = ZOOM_LEVELS.indexOf(zoomLevel);
+            if (idx > 0) setZoomLevel(ZOOM_LEVELS[idx - 1]);
+          }}
+          style={{ width: '28px', height: '28px' }}
+          title="Zoom Out (Ctrl + Wheel Down)"
+        >
+          <ZoomOut size={14} />
+        </button>
+
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            backgroundColor: 'var(--bg-surface-elevated)',
+            padding: '2px',
+            borderRadius: 'var(--radius-md)',
+            border: '1px solid var(--border-subtle)',
+          }}
+          title="Ctrl + Mouse Wheel to zoom"
+        >
+          {([
+            { id: 'years', label: 'Years' },
+            { id: 'months', label: 'Months' },
+            { id: 'very_small', label: 'XS' },
+            { id: 'small', label: 'S' },
+            { id: 'medium', label: 'M' },
+            { id: 'large', label: 'L' },
+          ] as const).map(({ id, label }) => (
+            <button
+              key={id}
+              className={`btn ${zoomLevel === id ? 'btn-primary' : 'btn-ghost'}`}
+              onClick={() => setZoomLevel(id)}
+              style={{ padding: '2px 8px', fontSize: '0.72rem', height: '24px' }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <button
+          className="btn btn-ghost btn-icon"
+          disabled={zoomLevel === 'large'}
+          onClick={() => {
+            const idx = ZOOM_LEVELS.indexOf(zoomLevel);
+            if (idx < ZOOM_LEVELS.length - 1) setZoomLevel(ZOOM_LEVELS[idx + 1]);
+          }}
+          style={{ width: '28px', height: '28px' }}
+          title="Zoom In (Ctrl + Wheel Up)"
+        >
+          <ZoomIn size={14} />
+        </button>
+      </div>
+    );
+
     return (
       <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         {/* Person Header */}
-        <div style={{
-          padding: '20px 32px',
-          borderBottom: '1px solid var(--border-subtle)',
-          backgroundColor: 'var(--bg-surface)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
-            <button
-              className="btn btn-ghost btn-icon"
-              onClick={() => {
-                setSelectedPersonId(null);
-                if (onClearSelectedPerson) onClearSelectedPerson();
-              }}
-              title="Back to People"
-            >
-              <ArrowLeft size={20} />
-            </button>
-
-            {/* Zoomed Face Avatar - Click to choose cover face */}
-            <div
-              style={{
-                position: 'relative',
-                border: '3px solid var(--accent-primary)',
-                borderRadius: 'var(--radius-full)',
-                boxShadow: '0 4px 14px rgba(59, 130, 246, 0.35)',
-                overflow: 'hidden',
-                cursor: 'pointer',
-              }}
-              onClick={() => setPersonForCoverModal(selectedPerson)}
-              title="Click to choose a different face or photo as cover"
-            >
-              <FaceAvatar
-                photo={coverPhoto}
-                face={coverFace}
-                box={coverFace?.box}
-                size={68}
-                alt={selectedPerson.name}
-              />
-              <div
-                style={{
-                  position: 'absolute',
-                  inset: 0,
-                  backgroundColor: 'rgba(0,0,0,0.4)',
-                  opacity: 0,
-                  transition: 'opacity 0.2s ease',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                }}
-                onMouseEnter={(e) => (e.currentTarget.style.opacity = '1')}
-                onMouseLeave={(e) => (e.currentTarget.style.opacity = '0')}
-              >
-                <Camera size={20} color="white" />
+        {isMobile ? (
+          <div style={{ borderBottom: '1px solid var(--border-subtle)', backgroundColor: 'var(--bg-surface)' }}>
+            {/* Row 1: back + avatar + name/rename/delete + a single toggle
+                for the rest, so the persistent bar stays one compact row. */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', padding: '10px 12px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0, flex: 1 }}>
+                {backButton}
+                {coverAvatarBlock}
+                {nameBlock}
               </div>
-            </div>
-
-            <div>
-              {editingPersonId === selectedPerson.id ? (
-                <PersonNameInput
-                  initialValue={selectedPerson.name}
-                  onSave={(val) => handleSaveRename(selectedPerson.id, val)}
-                  onCancel={() => setEditingPersonId(null)}
-                  isLarge={true}
-                />
-              ) : (
-                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                  <h2
-                    style={{ fontSize: '1.45rem', fontWeight: 700, color: 'var(--text-primary)', cursor: 'pointer' }}
-                    onClick={() => handleStartRename(selectedPerson)}
-                    title="Click to rename"
-                  >
-                    {selectedPerson.name}
-                  </h2>
-                  <button
-                    className="btn btn-ghost btn-icon"
-                    style={{ width: '36px', height: '36px' }}
-                    onClick={(e) => handleStartRename(selectedPerson, e)}
-                    title="Rename Person"
-                  >
-                    <Edit2 size={18} color="var(--text-muted)" />
-                  </button>
-                  <button
-                    className="btn btn-ghost btn-icon"
-                    style={{ width: '36px', height: '36px', color: 'var(--accent-rose)' }}
-                    onClick={(e) => handleDeletePerson(selectedPerson.id, selectedPerson.name, e)}
-                    title={`Delete ${selectedPerson.name}`}
-                  >
-                    <Trash2 size={18} />
-                  </button>
-                </div>
-              )}
-
-              <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginTop: '2px' }}>
-                {personPhotoItems.length} {personPhotoItems.length === 1 ? 'photo' : 'photos'} recognized
-              </div>
-            </div>
-          </div>
-
-          {/* Action Bar: Cover Face, Find More Photos via Learned Centroid & View Switcher */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <button
-              className="btn btn-secondary"
-              onClick={() => setPersonForCoverModal(selectedPerson)}
-              style={{ fontSize: '0.75rem', padding: '6px 12px', gap: '6px' }}
-              title="Select which face or photo is displayed as the cover in People"
-            >
-              <Camera size={14} color="var(--accent-primary)" />
-              <span>Change Cover Face</span>
-            </button>
-
-            <button
-              className="btn btn-secondary"
-              onClick={() => {
-                const updated = libraryStore.autoSelectBestFaceCover(selectedPerson.id);
-                if (updated) {
-                  setLearningNotification(
-                    `✓ AI auto-selected the clearest, smiling, high-resolution face for ${selectedPerson.name}!`
-                  );
-                  setTimeout(() => setLearningNotification(null), 4500);
-                }
-              }}
-              style={{ fontSize: '0.75rem', padding: '6px 12px', gap: '6px' }}
-              title="Automatically pick the sharpest, largest, and clearest smiling face"
-            >
-              <Star size={14} color="#f59e0b" fill="#f59e0b" />
-              <span>AI Best Face</span>
-            </button>
-
-            <button
-              className="btn btn-secondary"
-              onClick={() => {
-                const res = libraryStore.propagateLearnedFaces(selectedPerson.id);
-                if (res.newlyAssignedCount > 0) {
-                  setLearningNotification(
-                    `✓ Added ${res.newlyAssignedCount} newly discovered photo${res.newlyAssignedCount > 1 ? 's' : ''} to ${selectedPerson.name}'s album using quality-weighted centroid!`
-                  );
-                } else {
-                  setLearningNotification(
-                    `Scanned library with ${selectedPerson.name}'s 2.5x weighted centroid profile. All eligible faces are up to date.`
-                  );
-                }
-                setTimeout(() => setLearningNotification(null), 5000);
-              }}
-              style={{ fontSize: '0.75rem', padding: '6px 12px', gap: '6px' }}
-              title="Scan library for matching unassigned faces using refined biometric centroid"
-            >
-              <Sparkles size={14} color="var(--accent-primary)" />
-              <span>Find More Photos</span>
-            </button>
-
-            {/* View Mode Switcher: Full Photos vs Zoomed Face Headshots */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '4px', borderLeft: '1px solid var(--border-subtle)', paddingLeft: '8px' }}>
               <button
-                className={`btn ${viewMode === 'photos' ? 'btn-primary' : 'btn-secondary'}`}
-                onClick={() => setViewMode('photos')}
-                style={{ fontSize: '0.75rem', padding: '6px 12px' }}
+                className={`btn ${showDetailTools ? 'btn-primary' : 'btn-ghost'} btn-icon`}
+                onClick={() => setShowDetailTools((v) => !v)}
+                style={{ width: '34px', height: '34px', flexShrink: 0 }}
+                title="More options"
+                aria-expanded={showDetailTools}
               >
-                <ImageIcon size={14} />
-                <span>Full Photos</span>
-              </button>
-              <button
-                className={`btn ${viewMode === 'faces' ? 'btn-primary' : 'btn-secondary'}`}
-                onClick={() => setViewMode('faces')}
-                style={{ fontSize: '0.75rem', padding: '6px 12px' }}
-              >
-                <Crop size={14} />
-                <span>Zoomed Faces</span>
+                <MoreVertical size={18} />
               </button>
             </div>
 
-            {/* 6-Level Zoom Controls for Person Photos */}
-            {viewMode === 'photos' && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: '4px', borderLeft: '1px solid var(--border-subtle)', paddingLeft: '8px' }}>
-                <button
-                  className="btn btn-ghost btn-icon"
-                  disabled={zoomLevel === 'years'}
-                  onClick={() => {
-                    const idx = ZOOM_LEVELS.indexOf(zoomLevel);
-                    if (idx > 0) setZoomLevel(ZOOM_LEVELS[idx - 1]);
-                  }}
-                  style={{ width: '28px', height: '28px' }}
-                  title="Zoom Out (Ctrl + Wheel Down)"
-                >
-                  <ZoomOut size={14} />
-                </button>
-
-                <div
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    backgroundColor: 'var(--bg-surface-elevated)',
-                    padding: '2px',
-                    borderRadius: 'var(--radius-md)',
-                    border: '1px solid var(--border-subtle)',
-                  }}
-                  title="Ctrl + Mouse Wheel to zoom"
-                >
-                  {([
-                    { id: 'years', label: 'Years' },
-                    { id: 'months', label: 'Months' },
-                    { id: 'very_small', label: 'XS' },
-                    { id: 'small', label: 'S' },
-                    { id: 'medium', label: 'M' },
-                    { id: 'large', label: 'L' },
-                  ] as const).map(({ id, label }) => (
-                    <button
-                      key={id}
-                      className={`btn ${zoomLevel === id ? 'btn-primary' : 'btn-ghost'}`}
-                      onClick={() => setZoomLevel(id)}
-                      style={{ padding: '2px 8px', fontSize: '0.72rem', height: '24px' }}
-                    >
-                      {label}
-                    </button>
-                  ))}
+            {/* Collapsed by default: Change Cover/AI Best Face/Find More
+                Photos + View Switcher + Zoom controls, only taking up space
+                when the user actually asks for them. */}
+            {showDetailTools && (
+              <div style={{
+                padding: '10px 12px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '10px',
+                borderTop: '1px solid var(--border-subtle)',
+                backgroundColor: 'var(--bg-surface-elevated)',
+              }}>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                  {changeCoverButton}
+                  {aiBestFaceButton}
+                  {findMorePhotosButton}
                 </div>
-
-                <button
-                  className="btn btn-ghost btn-icon"
-                  disabled={zoomLevel === 'large'}
-                  onClick={() => {
-                    const idx = ZOOM_LEVELS.indexOf(zoomLevel);
-                    if (idx < ZOOM_LEVELS.length - 1) setZoomLevel(ZOOM_LEVELS[idx + 1]);
-                  }}
-                  style={{ width: '28px', height: '28px' }}
-                  title="Zoom In (Ctrl + Wheel Up)"
-                >
-                  <ZoomIn size={14} />
-                </button>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                  {viewModeSwitcher}
+                </div>
+                {viewMode === 'photos' && (
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
+                    <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontWeight: 600 }}>Grid size</span>
+                    {zoomControlsBlock}
+                  </div>
+                )}
               </div>
             )}
           </div>
-        </div>
+        ) : (
+          <div style={{
+            padding: '20px 32px',
+            borderBottom: '1px solid var(--border-subtle)',
+            backgroundColor: 'var(--bg-surface)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
+              {backButton}
+              {coverAvatarBlock}
+              {nameBlock}
+            </div>
+
+            {/* Action Bar: Cover Face, Find More Photos via Learned Centroid & View Switcher */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              {changeCoverButton}
+              {aiBestFaceButton}
+              {findMorePhotosButton}
+              {viewModeSwitcher}
+              {viewMode === 'photos' && zoomControlsBlock}
+            </div>
+          </div>
+        )}
 
         {/* Active Learning Guidance & Feedback Banner */}
         {learningNotification ? (
@@ -752,84 +858,173 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
   }
 
   // ================= 2. All People Grid View =================
+  const filteredPeople = peopleSearchQuery.trim()
+    ? people.filter((p) => p.name.toLowerCase().includes(peopleSearchQuery.trim().toLowerCase()))
+    : people;
+
+  // Shared JSX built once, arranged differently for desktop vs mobile below —
+  // same reasoning as GalleryView's titleBlock/filterChips extraction: this
+  // header used to let Merge/Detect Faces/Reset & Rescan overflow off the
+  // right edge (no flexWrap, fixed height:56px) on a narrow screen.
+  const peopleTitleBlock = (
+    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexShrink: 0, minWidth: isMobile ? 0 : undefined, overflow: isMobile ? 'hidden' : undefined }}>
+      <Users size={20} color="#ec4899" style={isMobile ? { flexShrink: 0 } : undefined} />
+      <h2 style={{
+        fontSize: '1.1rem',
+        fontWeight: 700,
+        overflow: isMobile ? 'hidden' : undefined,
+        textOverflow: isMobile ? 'ellipsis' : undefined,
+        whiteSpace: isMobile ? 'nowrap' : undefined,
+      }}>
+        People & Faces
+      </h2>
+      <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', flexShrink: 0 }}>
+        ({people.length} recognized)
+      </span>
+    </div>
+  );
+
+  const peopleSearchInput = people.length > 0 ? (
+    <div style={{ position: 'relative', flex: 1, maxWidth: isMobile ? undefined : '360px' }}>
+      <Search
+        size={14}
+        color="var(--text-muted)"
+        style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}
+      />
+      <input
+        type="text"
+        value={peopleSearchQuery}
+        onChange={(e) => setPeopleSearchQuery(e.target.value)}
+        onKeyDown={(e) => e.stopPropagation()}
+        placeholder="Search people by name..."
+        className="input"
+        style={{ width: '100%', fontSize: '0.82rem', padding: '6px 10px 6px 30px' }}
+      />
+    </div>
+  ) : null;
+
+  const mergePeopleButton = people.length >= 2 ? (
+    <button
+      className={`btn ${isMergeMode ? 'btn-primary' : 'btn-secondary'}`}
+      onClick={() => {
+        setIsMergeMode(!isMergeMode);
+        setMergeSelection([]);
+      }}
+      style={{ fontSize: '0.8rem' }}
+    >
+      <Merge size={15} />
+      <span>{isMergeMode ? 'Cancel Merge' : 'Merge People'}</span>
+    </button>
+  ) : null;
+
+  const confirmMergeButton = (isMergeMode && mergeSelection.length === 2) ? (
+    <button className="btn btn-primary" onClick={handleExecuteMerge} style={{ fontSize: '0.8rem' }}>
+      Confirm Merge
+    </button>
+  ) : null;
+
+  const detectFacesButton = (
+    <button
+      className="btn btn-secondary"
+      onClick={onTriggerFaceDetection}
+      disabled={isDetectingFaces}
+      style={{ fontSize: '0.8rem' }}
+    >
+      <Sparkles size={15} color="#ec4899" />
+      <span>{isDetectingFaces ? 'Scanning...' : 'Detect Faces'}</span>
+    </button>
+  );
+
+  const resetRescanButton = (people.length > 0 || photos.length > 0) ? (
+    <button
+      className="btn btn-ghost"
+      onClick={() => {
+        const confirmed = window.confirm(
+          'Reset all people data and restart face detection from scratch?\n\nThis will remove all recognized people, face clusters, and manual tags, and re-scan your photos using the face detection engine.'
+        );
+        if (confirmed) {
+          if (onResetAndRescan) {
+            onResetAndRescan();
+          } else {
+            libraryStore.resetAllPeopleAndFaces();
+            onTriggerFaceDetection();
+          }
+        }
+      }}
+      disabled={isDetectingFaces}
+      style={{ fontSize: '0.8rem', color: 'var(--accent-rose)', gap: '6px' }}
+      title="Remove all people related data and restart face detection"
+    >
+      <RotateCcw size={14} />
+      <span>Reset & Rescan</span>
+    </button>
+  ) : null;
+
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       {/* Header Bar */}
-      <div style={{
-        height: '56px',
-        padding: '0 24px',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        borderBottom: '1px solid var(--border-subtle)',
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <Users size={20} color="#ec4899" />
-          <h2 style={{ fontSize: '1.1rem', fontWeight: 700 }}>
-            People & Faces
-          </h2>
-          <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-            ({people.length} recognized)
-          </span>
-        </div>
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          {people.length >= 2 && (
+      {isMobile ? (
+        <div style={{ borderBottom: '1px solid var(--border-subtle)' }}>
+          {/* Row 1: title + a single toggle for Merge/Detect Faces/Reset, so
+              the persistent bar stays one compact row. */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', padding: '10px 12px' }}>
+            {peopleTitleBlock}
             <button
-              className={`btn ${isMergeMode ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => {
-                setIsMergeMode(!isMergeMode);
-                setMergeSelection([]);
-              }}
-              style={{ fontSize: '0.8rem' }}
+              className={`btn ${showGridTools ? 'btn-primary' : 'btn-ghost'} btn-icon`}
+              onClick={() => setShowGridTools((v) => !v)}
+              style={{ width: '34px', height: '34px', flexShrink: 0 }}
+              title="More options"
+              aria-expanded={showGridTools}
             >
-              <Merge size={15} />
-              <span>{isMergeMode ? 'Cancel Merge' : 'Merge People'}</span>
+              <MoreVertical size={18} />
             </button>
+          </div>
+
+          {/* Row 2: search, full width instead of capped at 360px. */}
+          {peopleSearchInput && (
+            <div style={{ padding: '0 12px 10px' }}>
+              {peopleSearchInput}
+            </div>
           )}
 
-          {isMergeMode && mergeSelection.length === 2 && (
-            <button className="btn btn-primary" onClick={handleExecuteMerge} style={{ fontSize: '0.8rem' }}>
-              Confirm Merge
-            </button>
-          )}
-
-          <button
-            className="btn btn-secondary"
-            onClick={onTriggerFaceDetection}
-            disabled={isDetectingFaces}
-            style={{ fontSize: '0.8rem' }}
-          >
-            <Sparkles size={15} color="#ec4899" />
-            <span>{isDetectingFaces ? 'Scanning...' : 'Detect Faces'}</span>
-          </button>
-
-          {(people.length > 0 || photos.length > 0) && (
-            <button
-              className="btn btn-ghost"
-              onClick={() => {
-                const confirmed = window.confirm(
-                  'Reset all people data and restart face detection from scratch?\n\nThis will remove all recognized people, face clusters, and manual tags, and re-scan your photos using the updated CosFace face detection engine.'
-                );
-                if (confirmed) {
-                  if (onResetAndRescan) {
-                    onResetAndRescan();
-                  } else {
-                    libraryStore.resetAllPeopleAndFaces();
-                    onTriggerFaceDetection();
-                  }
-                }
-              }}
-              disabled={isDetectingFaces}
-              style={{ fontSize: '0.8rem', color: 'var(--accent-rose)', gap: '6px' }}
-              title="Remove all people related data and restart face detection"
-            >
-              <RotateCcw size={14} />
-              <span>Reset & Rescan</span>
-            </button>
+          {/* Collapsed by default: Merge/Confirm Merge/Detect Faces/Reset &
+              Rescan, only taking up space when the user actually asks. */}
+          {showGridTools && (
+            <div style={{
+              padding: '10px 12px',
+              display: 'flex',
+              flexWrap: 'wrap',
+              gap: '8px',
+              borderTop: '1px solid var(--border-subtle)',
+              backgroundColor: 'var(--bg-surface-elevated)',
+            }}>
+              {mergePeopleButton}
+              {confirmMergeButton}
+              {detectFacesButton}
+              {resetRescanButton}
+            </div>
           )}
         </div>
-      </div>
+      ) : (
+        <div style={{
+          height: '56px',
+          padding: '0 24px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '16px',
+          borderBottom: '1px solid var(--border-subtle)',
+        }}>
+          {peopleTitleBlock}
+          {peopleSearchInput}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+            {mergePeopleButton}
+            {confirmMergeButton}
+            {detectFacesButton}
+            {resetRescanButton}
+          </div>
+        </div>
+      )}
 
       {/* People Grid */}
       <div style={{ flex: 1, overflowY: 'auto', padding: '24px' }}>
@@ -924,13 +1119,28 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
               </button>
             </div>
           )
+        ) : filteredPeople.length === 0 ? (
+          <div style={{
+            height: '50%',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            textAlign: 'center',
+            gap: '10px',
+          }}>
+            <Search size={28} color="var(--text-muted)" />
+            <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+              No people match "{peopleSearchQuery}".
+            </span>
+          </div>
         ) : (
           <div style={{
             display: 'grid',
             gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))',
             gap: '20px',
           }}>
-            {people.map((person) => {
+            {filteredPeople.map((person) => {
               const { photo: coverPhoto, face: coverFace } = getCoverDetails(person);
               const isSelectedForMerge = mergeSelection.includes(person.id);
               const isEditingThisPerson = editingPersonId === person.id;
@@ -983,6 +1193,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                       box={coverFace?.box}
                       size={110}
                       alt={person.name}
+                      personId={person.id}
                     />
                     <button
                       className="btn btn-ghost btn-icon"

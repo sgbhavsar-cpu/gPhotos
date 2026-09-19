@@ -17,6 +17,18 @@ interface FaceAvatarProps {
   size?: number;
   alt?: string;
   borderRadius?: string;
+  /**
+   * When set, this is a person's profile photo (not a one-off face crop):
+   * the cropped image is cached to a local file under the app's userData
+   * folder, keyed by personId + a cache key derived from the source
+   * face/photo. On future renders the local file is used directly, so the
+   * profile photo keeps showing even if the source photo's network storage
+   * is offline or a different storage is currently selected. The cache key
+   * should change whenever the underlying cover face/photo changes (e.g.
+   * pass face?.id ?? photo?.id) so a cover-face change invalidates the old
+   * cached crop instead of leaving it stale.
+   */
+  personId?: string;
 }
 
 export const FaceAvatar: React.FC<FaceAvatarProps> = ({
@@ -28,12 +40,16 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
   size = 110,
   alt = 'Face Avatar',
   borderRadius = 'var(--radius-full)',
+  personId,
 }) => {
   const [croppedDataUrl, setCroppedDataUrl] = useState<string | null>(null);
   const [hasError, setHasError] = useState(false);
 
   // Use explicit box if passed, or fall back to face.box
   const box = explicitBox || face?.box;
+  const avatarCacheKey = face?.id || photo?.id || '';
+  const api = typeof window !== 'undefined' ? window.electronAPI : undefined;
+  const usesPersonCache = Boolean(personId && avatarCacheKey && api?.getPersonAvatarPath);
 
   useEffect(() => {
     if (!photo) {
@@ -48,14 +64,16 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
     }
 
     let isCancelled = false;
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.src = getLocalPhotoUrl(photo.filePath);
 
-    img.onload = () => {
-      if (isCancelled) return;
-      try {
-        const canvas = document.createElement('canvas');
+    const cropLiveFromSource = () => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.src = getLocalPhotoUrl(photo.filePath);
+
+      img.onload = () => {
+        if (isCancelled) return;
+        try {
+          const canvas = document.createElement('canvas');
         const targetSize = size * 2; // 2x for retina / high-DPI sharpness
         canvas.width = targetSize;
         canvas.height = targetSize;
@@ -144,21 +162,59 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
         const cropSide = Math.min(side, img.naturalWidth - cropX, img.naturalHeight - cropY);
 
         ctx.drawImage(img, cropX, cropY, cropSide, cropSide, 0, 0, targetSize, targetSize);
-        setCroppedDataUrl(canvas.toDataURL('image/jpeg', 0.88));
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.88);
+        setCroppedDataUrl(dataUrl);
+
+        // Persist this crop locally so it's available next time without
+        // needing the (possibly network) source photo at all.
+        if (usesPersonCache) {
+          api!.savePersonAvatar!(personId!, avatarCacheKey, dataUrl).catch(() => {});
+        }
       } catch (err) {
         console.warn('Failed to crop face avatar canvas:', err);
         setCroppedDataUrl(getLocalPhotoUrl(photo.filePath));
       }
+      };
+
+      img.onerror = () => {
+        if (!isCancelled) setHasError(true);
+      };
     };
 
-    img.onerror = () => {
-      if (!isCancelled) setHasError(true);
-    };
+    if (usesPersonCache) {
+      api!.getPersonAvatarPath!(personId!, avatarCacheKey).then((localPath) => {
+        if (isCancelled) return;
+        if (localPath) {
+          setCroppedDataUrl(getLocalPhotoUrl(localPath));
+        } else {
+          cropLiveFromSource();
+        }
+      }).catch(() => {
+        if (!isCancelled) cropLiveFromSource();
+      });
+    } else {
+      cropLiveFromSource();
+    }
 
     return () => {
       isCancelled = true;
     };
-  }, [photo?.filePath, box?.x, box?.y, box?.width, box?.height, face?.id, face?.imageWidth, face?.imageHeight, imageWidth, imageHeight, size]);
+  }, [
+    photo?.filePath,
+    box?.x,
+    box?.y,
+    box?.width,
+    box?.height,
+    face?.id,
+    face?.imageWidth,
+    face?.imageHeight,
+    imageWidth,
+    imageHeight,
+    size,
+    personId,
+    avatarCacheKey,
+    usesPersonCache,
+  ]);
 
   if (!photo || hasError) {
     return (

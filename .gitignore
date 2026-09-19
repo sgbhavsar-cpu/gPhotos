@@ -35,3 +35,8 @@ Desktop.ini
 # Temporary Test Dumps
 test/temp_*
 scratch/
+
+# Local virtual-mirror test data created by running the app/tests from this
+# working directory (a per-storage SQLite catalog + sync checkpoint) — never
+# real user photo data, but never something to commit either.
+GPhotos_VirtualMirrors/

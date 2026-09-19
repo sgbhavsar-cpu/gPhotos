@@ -64,6 +64,26 @@ export function getSpriteCoordinate(photoPath: string): SpriteCoordinate | null 
   return index[photoPath.toLowerCase()] || null;
 }
 
+/**
+ * Looks up sprite coordinates for many photo paths in one call. The index is
+ * already fully resident in memory, so this is a single pass over a plain
+ * object — callers should always prefer this over calling
+ * getSpriteCoordinate() once per photo, which turns into one HTTP/IPC
+ * round-trip per visible photo card and was measured to be a major
+ * contributor to scroll stutter on large libraries (dozens of requests per
+ * screenful, each paying full request/response overhead for a lookup that
+ * costs nothing server-side).
+ */
+export function getSpriteCoordinatesBatch(photoPaths: string[]): Record<string, SpriteCoordinate | null> {
+  const index = loadSpriteIndex();
+  const result: Record<string, SpriteCoordinate | null> = {};
+  for (const p of photoPaths) {
+    if (!p) continue;
+    result[p] = index[p.toLowerCase()] || null;
+  }
+  return result;
+}
+
 export function getSpritePath(spriteId: string): string {
   return path.join(getSpriteCacheDir(), `${spriteId}.webp`);
 }

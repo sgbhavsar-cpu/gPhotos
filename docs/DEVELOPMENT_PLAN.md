@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-13
 **Based on:** [`CURRENT_STATUS_AND_GAPS.md`](CURRENT_STATUS_AND_GAPS.md) and the decisions recorded below.
-**Purpose:** A phased, file-level plan to close the identified gaps and move toward a "full proof" (robust, production-ready) Google-Photos-style app. Each phase should ship as one or more reviewable branches; later phases assume earlier ones are merged.
+**Purpose:** A phased, file-level plan to close the identified gaps and move toward a "full proof" (robust, production-ready) gPhotos app. Each phase should ship as one or more reviewable branches; later phases assume earlier ones are merged.
 
 ---
 

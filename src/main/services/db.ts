@@ -7,10 +7,12 @@ import os from 'os';
 // better-sqlite3, which requires a C++ toolchain to rebuild against Electron's
 // ABI and fails on machines without Visual Studio Build Tools installed.
 import { DatabaseSync, StatementSync } from 'node:sqlite';
+import { FACE_DATA_VERSION } from './faceEngineVersion';
+import type { Photo } from '../../types';
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
-function getGlobalUserDataDir(): string {
+export function getGlobalUserDataDir(): string {
   if (process.env.GPHOTOS_TEST_DB_DIR) {
     return process.env.GPHOTOS_TEST_DB_DIR;
   }
@@ -48,8 +50,30 @@ export function getDbPath(customDir?: string | null): string {
 const openConnections = new Map<string, DatabaseSync>();
 let activeDbPath: string | null = null;
 
-/** Points subsequent getDb() calls at the database for this library folder (or the default one if null/omitted). */
+/**
+ * Points subsequent getDb() calls at the database for this library folder.
+ *
+ * Passing no directory (undefined/null) is a no-op once a library has
+ * already been activated — it does NOT reset back to the global default.
+ * This matters because several call sites (e.g. paginated catalog reads)
+ * legitimately omit the directory to mean "whatever's currently active",
+ * not "switch to no library" — treating an omitted directory as a reset
+ * caused loading additional catalog pages to silently start reading from
+ * the wrong (global, essentially photo-less) database after the first
+ * page, since that call never re-specified the library folder. The global
+ * default is only used the very first time this is called in the process
+ * (before any library has been explicitly activated); callers that
+ * genuinely need the global/cross-library database regardless of the
+ * active library should use getGlobalDb() instead, which never touches
+ * this pointer.
+ */
 export function setActiveLibrary(customDir?: string | null): void {
+  if (!customDir) {
+    if (activeDbPath === null) {
+      activeDbPath = getDbPath(null);
+    }
+    return;
+  }
   activeDbPath = getDbPath(customDir);
 }
 
@@ -72,12 +96,16 @@ const SCHEMA_STATEMENTS: string[] = [
     storage_name TEXT,
     is_excluded INTEGER NOT NULL DEFAULT 0,
     face_scan_completed INTEGER NOT NULL DEFAULT 0,
+    faces_locked INTEGER NOT NULL DEFAULT 0,
     sharpness_score REAL,
     rotation INTEGER,
     is_heic_rotated INTEGER NOT NULL DEFAULT 0,
     heic_rotation INTEGER,
     exif_json TEXT,
-    location_json TEXT
+    location_json TEXT,
+    thumbnail_cached_at TEXT,
+    onedrive_released_at TEXT,
+    original_mtime_ms INTEGER
   )`,
   `CREATE INDEX IF NOT EXISTS idx_photos_date_taken ON photos(date_taken DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_photos_year_month ON photos(year, month)`,
@@ -112,7 +140,8 @@ const SCHEMA_STATEMENTS: string[] = [
     gender TEXT,
     gender_probability REAL,
     expressions_json TEXT,
-    dominant_expression TEXT
+    dominant_expression TEXT,
+    detector_version TEXT
   )`,
   `CREATE INDEX IF NOT EXISTS idx_faces_photo_id ON faces(photo_id)`,
   `CREATE INDEX IF NOT EXISTS idx_faces_person_id ON faces(person_id)`,
@@ -144,7 +173,13 @@ const SCHEMA_STATEMENTS: string[] = [
     total_size_saved INTEGER,
     newly_added INTEGER,
     delay_between_photos_sec REAL,
-    bandwidth_limit_mbps REAL
+    bandwidth_limit_mbps REAL,
+    storage_type TEXT NOT NULL DEFAULT 'plain',
+    inventory_status TEXT NOT NULL DEFAULT 'not_started',
+    inventory_total_files INTEGER NOT NULL DEFAULT 0,
+    inventory_completed_at TEXT,
+    inventory_error TEXT,
+    last_reachable_at TEXT
   )`,
 
   `CREATE TABLE IF NOT EXISTS settings (
@@ -158,17 +193,93 @@ const SCHEMA_STATEMENTS: string[] = [
   )`,
 ];
 
+/**
+ * Adds a column to an already-existing table if it's missing. `CREATE TABLE
+ * IF NOT EXISTS` only applies to brand-new databases — every database
+ * created before a column was added to SCHEMA_STATEMENTS needs this to
+ * actually gain that column, since SQLite has no "ADD COLUMN IF NOT EXISTS".
+ */
+function ensureColumn(db: DatabaseSync, table: string, column: string, definition: string): void {
+  const existing = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!existing.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+/** Drops a column if the table has it. Safe no-op on older SQLite builds that don't support DROP COLUMN. */
+function dropColumnIfExists(db: DatabaseSync, table: string, column: string): void {
+  const existing = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (existing.some((c) => c.name === column)) {
+    try {
+      db.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
+    } catch {
+      // Older SQLite without DROP COLUMN support — leave the unused column in place.
+    }
+  }
+}
+
+function getMetaValue(db: DatabaseSync, key: string): string | undefined {
+  const row = db.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined;
+  return row?.value;
+}
+
+function setMetaValue(db: DatabaseSync, key: string, value: string): void {
+  db.prepare(
+    `INSERT INTO meta (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+  ).run(key, value);
+}
+
+/**
+ * One-time reset of face/person data whenever the detection engine changes
+ * in a way that makes previously-stored descriptors incomparable to newly
+ * produced ones (see docs/PIPELINE_REDESIGN_DEV_DOC.md decision #3 — the
+ * face-api.js -> ONNX/ArcFace engine switch is exactly such a change).
+ * Gated per-database via a stored 'face_data_version' meta value, so each
+ * library's database resets itself exactly once, whenever it's next opened
+ * after an engine change — no need to enumerate every library folder on
+ * disk up front. A no-op on an empty/new database (nothing to lose).
+ */
+function resetFaceDataIfEngineChanged(db: DatabaseSync): void {
+  const storedVersion = getMetaValue(db, 'face_data_version');
+  if (storedVersion === FACE_DATA_VERSION) return;
+
+  db.exec('DELETE FROM faces');
+  db.exec('DELETE FROM people');
+  db.exec('UPDATE photos SET face_scan_completed = 0, faces_locked = 0');
+  setMetaValue(db, 'face_data_version', FACE_DATA_VERSION);
+}
+
 function applySchema(db: DatabaseSync): void {
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA foreign_keys = ON');
   for (const stmt of SCHEMA_STATEMENTS) {
     db.exec(stmt);
   }
+  // Columns added after a table's original CREATE TABLE IF NOT EXISTS need
+  // an explicit ALTER for databases created before they existed.
+  ensureColumn(db, 'photos', 'faces_locked', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'photos', 'thumbnail_cached_at', 'TEXT');
+  ensureColumn(db, 'photos', 'onedrive_released_at', 'TEXT');
+  ensureColumn(db, 'faces', 'detector_version', 'TEXT');
+  ensureColumn(db, 'virtual_storages', 'storage_type', `TEXT NOT NULL DEFAULT 'plain'`);
+  ensureColumn(db, 'virtual_storages', 'inventory_status', `TEXT NOT NULL DEFAULT 'not_started'`);
+  ensureColumn(db, 'virtual_storages', 'inventory_total_files', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'virtual_storages', 'inventory_completed_at', 'TEXT');
+  ensureColumn(db, 'virtual_storages', 'inventory_error', 'TEXT');
+  ensureColumn(db, 'virtual_storages', 'last_reachable_at', 'TEXT');
+  ensureColumn(db, 'photos', 'original_mtime_ms', 'INTEGER');
+  dropColumnIfExists(db, 'photos', 'faces_manually_verified');
+
+  resetFaceDataIfEngineChanged(db);
+
   const row = db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version') as
     | { value: string }
     | undefined;
   if (!row) {
     db.prepare('INSERT INTO meta (key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
+  } else {
+    setMetaValue(db, 'schema_version', String(SCHEMA_VERSION));
   }
 }
 
@@ -203,6 +314,51 @@ export function getDb(): DatabaseSync {
  */
 export function getGlobalDb(): DatabaseSync {
   return openConnection(getDbPath(null));
+}
+
+/**
+ * Opens (or reuses) the connection for a specific library folder's own
+ * catalog database, without touching which library is currently "active" —
+ * for read-only cross-library queries like a storage card's stats, which
+ * need one specific library's data regardless of what the user has open in
+ * the main gallery right now.
+ */
+export function getDbForLibraryPath(libraryDir: string): DatabaseSync {
+  return openConnection(getDbPath(libraryDir));
+}
+
+/**
+ * Resolves the SAME database a virtual photo's own storage sync/browsing
+ * reads from, without depending on the ambient "active library" pointer
+ * (getDb()'s default) — that pointer is a single mutable value shared across
+ * the whole main process, and can legitimately point somewhere else than
+ * whatever library the renderer happens to be showing right now (browsing a
+ * different storage earlier in the session, a concurrent background daemon
+ * cycle, etc). Found causing a real, confusing bug: a per-photo action would
+ * detect/persist correctly, but a later, unrelated write through this same
+ * ambient default (e.g. the renderer's periodic debounced "save all current
+ * photos" autosave, upsertPhotos in libraryRepository.ts) would silently
+ * land in — or overwrite via — a different database than the one just
+ * written to, making the correct write vanish from the storage it actually
+ * belongs to.
+ *
+ * Derived directly from the photo's own local thumbnail path
+ * (<mirrorRoot>\<storageName>\...\file) plus its storageName, so it's
+ * correct regardless of which library happens to be "active" right now and
+ * regardless of which subfolder within the storage the photo lives in — no
+ * dependency on VirtualStorageConfig.localMirrorRoot being passed around.
+ * Falls back to getDb() for a non-virtual (local library) photo.
+ */
+export function resolveDbForPhoto(photo: Photo): DatabaseSync {
+  if (photo.isVirtual && photo.storageName && photo.filePath) {
+    const segments = photo.filePath.split(/[\\/]+/);
+    const idx = segments.findIndex((s) => s.toLowerCase() === photo.storageName!.toLowerCase());
+    if (idx !== -1) {
+      const mirrorFolder = segments.slice(0, idx + 1).join(path.sep);
+      return getDbForLibraryPath(mirrorFolder);
+    }
+  }
+  return getDb();
 }
 
 /** Test-only: closes all open connections and clears the active-library pointer. */

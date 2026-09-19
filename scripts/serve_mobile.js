@@ -708,27 +708,100 @@ async function handleRequest(req, res) {
   }
 
   // Endpoint: /api/discover-mirrors
+  //
+  // This used to be its own throwaway reimplementation that always sent
+  // sourcePath: '' (not even the real field name — that's
+  // networkSourcePath) and a shape (syncIntervalMinutes,
+  // isVirtualServerRunning) nothing else in the app recognizes. Accessing
+  // the app from a phone browser hit this endpoint, and the renderer wrote
+  // its broken object straight into the same persisted storage list the
+  // desktop Electron app reads — permanently overwriting a correctly
+  // configured storage's real network source path with an empty string,
+  // which is exactly what made "Rescan" fail with "No source path
+  // configured" and every displayed count go wrong afterward. This is now a
+  // direct port of discoverStoredMirrors() in
+  // src/main/services/virtualMirrorService.ts (same sample-sidecar ->
+  // storageRoot/storageName extraction), kept in sync by hand since this
+  // script runs standalone, outside the compiled Electron main process.
   if (pathname === '/api/discover-mirrors') {
     const defaultRoot = 'C:\\GPhotos_VirtualMirrors';
+    const housekeepingFiles = new Set(['_sync_checkpoint.json', '_mirror_summary.json']);
+    const isHousekeeping = (name) => housekeepingFiles.has(name) || name.startsWith('.');
     const mirrors = [];
     if (fs.existsSync(defaultRoot)) {
       try {
         const entries = fs.readdirSync(defaultRoot, { withFileTypes: true });
         for (const entry of entries) {
-          if (entry.isDirectory()) {
-            const mirrorPath = path.join(defaultRoot, entry.name);
-            const files = fs.readdirSync(mirrorPath);
-            mirrors.push({
-              id: `mirror_${entry.name}`,
-              name: entry.name,
-              sourcePath: '',
+          if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+
+          const subDir = path.join(defaultRoot, entry.name);
+          const summaryFile = path.join(subDir, '_mirror_summary.json');
+
+          if (fs.existsSync(summaryFile)) {
+            try {
+              const cached = JSON.parse(fs.readFileSync(summaryFile, 'utf-8'));
+              if (cached && cached.name) {
+                mirrors.push(cached);
+                continue;
+              }
+            } catch {}
+          }
+
+          let detectedName = entry.name;
+          let networkSourcePath = '';
+          let sampleMetaFound = false;
+          let totalPhotos = 0;
+          let sampleOrigSize = 0;
+          let sampleThumbSize = 0;
+          let latestMtime = 0;
+
+          const quickScan = (dir, depth) => {
+            if (depth > 6) return;
+            try {
+              const subEntries = fs.readdirSync(dir, { withFileTypes: true });
+              for (const se of subEntries) {
+                const p = path.join(dir, se.name);
+                if (se.isDirectory() && !se.name.startsWith('.')) {
+                  quickScan(p, depth + 1);
+                } else if (se.isFile() && se.name.endsWith('.json') && !isHousekeeping(se.name)) {
+                  totalPhotos++;
+                  if (!sampleMetaFound) {
+                    try {
+                      const stat = fs.statSync(p);
+                      if (stat.mtimeMs > latestMtime) latestMtime = stat.mtimeMs;
+                      const meta = JSON.parse(fs.readFileSync(p, 'utf-8'));
+                      if (meta.storageName) detectedName = meta.storageName;
+                      if (meta.storageRoot) networkSourcePath = meta.storageRoot;
+                      sampleOrigSize = meta.originalFileSize || 3500000;
+                      if (meta.thumbnailPath && fs.existsSync(meta.thumbnailPath)) {
+                        sampleThumbSize = fs.statSync(meta.thumbnailPath).size;
+                      }
+                      sampleMetaFound = true;
+                    } catch {}
+                  }
+                }
+              }
+            } catch {}
+          };
+
+          quickScan(subDir, 0);
+
+          if (totalPhotos > 0) {
+            const estOriginal = totalPhotos * (sampleOrigSize || 3500000);
+            const estThumb = totalPhotos * (sampleThumbSize || 65000);
+            const config = {
+              id: `storage_${entry.name}`,
+              name: detectedName,
+              networkSourcePath: networkSourcePath || subDir,
               localMirrorRoot: defaultRoot,
-              syncIntervalMinutes: 60,
-              lastSynced: Date.now(),
-              totalItems: files.filter((f) => /\.(jpe?g|png|webp|gif|bmp)$/i.test(f)).length,
-              totalSizeSaved: files.length * 2500000,
-              isVirtualServerRunning: true,
-            });
+              lastSynced: latestMtime > 0 ? new Date(latestMtime).toISOString() : new Date().toISOString(),
+              totalItems: totalPhotos,
+              totalSizeSaved: Math.max(0, estOriginal - estThumb),
+            };
+            mirrors.push(config);
+            try {
+              fs.writeFileSync(summaryFile, JSON.stringify(config, null, 2), 'utf-8');
+            } catch {}
           }
         }
       } catch {}
@@ -799,7 +872,7 @@ function startServer(port) {
     const primaryIp = ips.find((i) => i.name.toLowerCase().includes('wi-fi') || i.name.toLowerCase().includes('wireless'))?.address || ips[0]?.address || 'localhost';
 
     console.log('\n================================================================');
-    console.log('   ✨ Google Photos Desktop — Mobile Web Server is Running! ✨');
+    console.log('   ✨ gPhotos Desktop — Mobile Web Server is Running! ✨');
     console.log('================================================================\n');
     console.log(`  📱 Open on your iPhone or Android browser (Chrome / Safari):`);
     console.log(`     👉 http://${primaryIp}:${port}/\n`);

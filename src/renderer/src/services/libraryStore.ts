@@ -1,5 +1,6 @@
 import { Photo, Person, DetectedFace, PlaceAlbum, Album, CatalogMeta } from '../../types';
 import { groupPhotosByPlace } from './placesService';
+import { logger } from './logger';
 import { trackBackendCall } from './responseTracker';
 import { appendAuthToken, authFetch } from './webAuthClient';
 import {
@@ -7,6 +8,7 @@ import {
   euclideanDistance,
   cosineDistance,
   computeQualityWeightedCentroid,
+  DEFAULT_MATCH_THRESHOLD,
 } from './clustering';
 
 export interface LibraryState {
@@ -355,7 +357,7 @@ export class LibraryManager {
     if (peopleMap.size === 0 && allFaces.length > 0) {
       const facesWithDesc = allFaces.filter((f) => f.descriptor && f.descriptor.length > 0);
       if (facesWithDesc.length > 0) {
-        const { people, updatedFaces } = clusterFaces(allFaces, [], 0.55, true);
+        const { people, updatedFaces } = clusterFaces(allFaces, [], DEFAULT_MATCH_THRESHOLD, true);
         for (const p of people) {
           const registered = this.globalPeopleRegistry.get(p.id);
           if (registered && !/^Person(\s+\d+)?$/i.test(registered.name)) {
@@ -369,7 +371,7 @@ export class LibraryManager {
       }
     } else if (unassignedFaces.length > 0 && peopleMap.size > 0) {
       // If we have some unassigned faces, cluster them matching to existing people or create new clusters
-      const { people, updatedFaces } = clusterFaces(allFaces, Array.from(peopleMap.values()), 0.55, true);
+      const { people, updatedFaces } = clusterFaces(allFaces, Array.from(peopleMap.values()), DEFAULT_MATCH_THRESHOLD, true);
       for (const p of people) {
         const registered = this.globalPeopleRegistry.get(p.id);
         if (registered && !/^Person(\s+\d+)?$/i.test(registered.name)) {
@@ -507,17 +509,27 @@ export class LibraryManager {
             this.state.currentDirectory = meta.currentDirectory;
             this.state.recentLibraries = meta.recentLibraries || [];
 
-            // Fast Screen 1: Load Page 0 (first 100 photos)
+            // Fast Screen 1: Load Page 0 (first 100 photos). Pass the
+            // just-resolved library explicitly rather than letting the main
+            // process fall back to whatever it currently considers "active"
+            // — that shared pointer can be repointed by another concurrent
+            // request (another device's session, a background scan) between
+            // this call and the meta call just above.
+            const libraryDir = this.state.selectedFolder || undefined;
             const tPageStart = performance.now();
-            const p0 = await window.electronAPI.getCatalogPage({ pageIndex: 0, pageSize: 100 });
+            const p0 = await window.electronAPI.getCatalogPage({ pageIndex: 0, pageSize: 100, libraryDir });
             const tPageEnd = performance.now();
             if (p0 && p0.photos && p0.photos.length > 0) {
               console.log(`[STARTUP AUDIT] Page 0 (${p0.photos.length} photos) loaded in ${(tPageEnd - tPageStart).toFixed(1)}ms. Total renderer startup time to first screen: ${(tPageEnd - t0).toFixed(1)}ms`);
               this.state.photos = p0.photos;
               this.currentCatalogPage = 0;
 
-              // Restore persisted people, faces, and albums from central store
-              const data = await window.electronAPI.loadLibraryData(STORAGE_KEY);
+              // Restore persisted people, faces, and albums from central
+              // store — same explicit-library reasoning as above; without
+              // it, Albums/People/Faces here could silently come from a
+              // different library than the one this session's Photos/Places
+              // just loaded from (see catalog-meta/catalog-page calls above).
+              const data = await window.electronAPI.loadLibraryData(STORAGE_KEY, libraryDir);
               if (data) {
                 this.state.people = data.people || [];
                 this.state.faces = data.faces || [];
@@ -553,14 +565,16 @@ export class LibraryManager {
               this.state.currentDirectory = meta.currentDirectory;
               this.state.recentLibraries = meta.recentLibraries || [];
 
-              const pageRes = await authFetch('/api/catalog-page?page=0&size=100', { signal: AbortSignal.timeout(2000) });
+              const libraryDirParam = this.state.selectedFolder ? `&libraryDir=${encodeURIComponent(this.state.selectedFolder)}` : '';
+              const pageRes = await authFetch(`/api/catalog-page?page=0&size=100${libraryDirParam}`, { signal: AbortSignal.timeout(2000) });
               if (pageRes.ok) {
                 const pageData = await pageRes.json();
                 if (pageData && pageData.photos && pageData.photos.length > 0) {
                   this.state.photos = pageData.photos;
                   this.currentCatalogPage = 0;
                   try {
-                    const libRes = await authFetch('/api/library', { signal: AbortSignal.timeout(2000) });
+                    const libDirParam = this.state.selectedFolder ? `?libraryDir=${encodeURIComponent(this.state.selectedFolder)}` : '';
+                    const libRes = await authFetch(`/api/library${libDirParam}`, { signal: AbortSignal.timeout(2000) });
                     if (libRes.ok) {
                       const full = await libRes.json();
                       const libData = full[STORAGE_KEY] || full;
@@ -727,22 +741,47 @@ export class LibraryManager {
   }
 
   /**
-   * Seamlessly loads the next 100-photo catalog page as the user scrolls.
+   * Loads several catalog pages ahead in one go (instead of one page per
+   * scroll-triggered call), so the buffer stays several screenfuls deep
+   * while it's cheap to do so (each page is a fast indexed SQLite read).
+   * Stops early once the whole catalog is loaded or another load is
+   * already in flight.
    */
-  public async loadNextCatalogPage(): Promise<void> {
-    if (this.isLoadingCatalogPage || !this.state.catalogMeta) return;
-    if (this.currentCatalogPage + 1 >= this.state.catalogMeta.totalPages) return;
+  public async loadNextCatalogPages(count: number = 3): Promise<void> {
+    for (let i = 0; i < count; i++) {
+      const loadedMore = await this.loadNextCatalogPage();
+      if (!loadedMore) break;
+    }
+  }
+
+  /**
+   * Seamlessly loads the next 100-photo catalog page as the user scrolls.
+   * Returns whether a page was actually loaded (false if already loading,
+   * or the whole catalog is already loaded).
+   */
+  public async loadNextCatalogPage(): Promise<boolean> {
+    if (this.isLoadingCatalogPage || !this.state.catalogMeta) return false;
+    if (this.currentCatalogPage + 1 >= this.state.catalogMeta.totalPages) return false;
 
     this.isLoadingCatalogPage = true;
     try {
       this.currentCatalogPage += 1;
       let newPhotos: Photo[] = [];
+      // Always pass the currently active library explicitly — omitting it
+      // relies on the main process still having the right library active
+      // from whenever it was last switched, which isn't guaranteed once
+      // other catalog calls may have run in between.
+      const libraryDir = this.state.selectedFolder || this.state.currentDirectory || undefined;
 
       if (window.electronAPI?.getCatalogPage) {
-        const res = await trackBackendCall(window.electronAPI.getCatalogPage({ pageIndex: this.currentCatalogPage }), 'Loading photos...');
+        const res = await trackBackendCall(
+          window.electronAPI.getCatalogPage({ pageIndex: this.currentCatalogPage, libraryDir }),
+          'Loading photos...'
+        );
         if (res && res.photos) newPhotos = res.photos;
       } else if (window.location?.protocol?.startsWith('http')) {
-        const res = await authFetch(`/api/catalog-page?page=${this.currentCatalogPage}&size=100`);
+        const libraryDirParam = libraryDir ? `&libraryDir=${encodeURIComponent(libraryDir)}` : '';
+        const res = await authFetch(`/api/catalog-page?page=${this.currentCatalogPage}&size=100${libraryDirParam}`);
         if (res.ok) {
           const data = await res.json();
           if (data && data.photos) newPhotos = data.photos;
@@ -752,9 +791,12 @@ export class LibraryManager {
       if (newPhotos.length > 0) {
         this.state.photos = deduplicatePhotoList([...this.state.photos, ...newPhotos]);
         this.notifyListeners();
+        return true;
       }
+      return false;
     } catch (err) {
       console.warn('[LibraryStore] Failed loading next catalog page:', err);
+      return false;
     } finally {
       this.isLoadingCatalogPage = false;
     }
@@ -831,8 +873,22 @@ export class LibraryManager {
         this.reconcilePeopleAndFaces();
       }
 
+      // When the SQLite catalog fast-path is active, this.state.photos is
+      // usually only a PARTIAL view — whatever catalog pages have been
+      // loaded so far (starts at just the first 100). Telling the main
+      // process this is the complete library, and having it destructively
+      // replace the library's full photo set with just that partial view,
+      // silently deleted every not-yet-loaded photo from SQLite the moment
+      // any save fired (e.g. immediately after switching libraries, or
+      // toggling one favorite) — this is what made libraries randomly
+      // appear "stuck" at whatever count happened to be loaded at the time.
+      const isPartialPageSet =
+        !!this.state.catalogMeta &&
+        this.state.photos.length < (this.state.catalogMeta.totalPhotos || 0);
+
       const dataToSave = {
         photos: this.state.photos,
+        isPartialPageSet,
         people: this.state.people,
         faces: this.state.faces,
         albums: this.state.albums,
@@ -841,6 +897,13 @@ export class LibraryManager {
       };
 
       const cacheEntries = Array.from(this.globalFaceCache.entries()).slice(-20000);
+
+      logger.debug('libraryStore', 'savePersistedData: debounced autosave firing', {
+        isPartialPageSet,
+        photoCount: this.state.photos.length,
+        totalFacesAcrossPhotos: this.state.photos.reduce((sum, p) => sum + (p.faces?.length || 0), 0),
+        peopleCount: this.state.people.length,
+      });
 
       if (typeof window !== 'undefined' && window.electronAPI && typeof window.electronAPI.saveLibraryData === 'function') {
         await window.electronAPI.saveLibraryData(STORAGE_KEY, dataToSave);
@@ -895,11 +958,20 @@ export class LibraryManager {
         this.cachePhotoFaces(newPhoto, faces, faceScanCompleted);
       }
 
+      // A rescan/resync builds a fresh Photo record from disk metadata alone
+      // (e.g. scanVirtualMirrorDirectory's sidecar JSON), which never carries
+      // this flag — without preserving it from the existing in-memory
+      // record, a re-sync would silently un-verify a photo the user had
+      // already manually curated, letting the next auto face-scan pass
+      // touch it again.
+      const facesLocked = newPhoto.facesLocked ?? existing?.facesLocked ?? false;
+
       return {
         ...newPhoto,
         isFavorite: newPhoto.isFavorite ?? existing?.isFavorite ?? false,
         faces,
         faceScanCompleted: Boolean(faceScanCompleted || (faces && faces.length > 0)),
+        facesLocked,
         location: newPhoto.location || existing?.location,
         isExcluded: newPhoto.isExcluded ?? existing?.isExcluded,
         sharpnessScore: newPhoto.sharpnessScore ?? existing?.sharpnessScore,
@@ -948,6 +1020,12 @@ export class LibraryManager {
     const filtered = current.filter((f) => f.toLowerCase() !== normalized.toLowerCase());
     this.state.recentLibraries = [normalized, ...filtered].slice(0, 10);
     this.notify();
+  }
+
+  /** Replaces the recent-libraries list outright — used to drop entries whose folder no longer exists. */
+  public setRecentLibraries(list: string[]) {
+    this.state.recentLibraries = list;
+    this.notify(true);
   }
 
   public getRecentLibraries(): string[] {
@@ -1231,7 +1309,7 @@ export class LibraryManager {
     }
 
     if (newlyAssignedCount > 0) {
-      const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people, 0.55, false);
+      const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
       this.state.people = people;
       this.state.faces = updatedFaces;
       this.notify();
@@ -1369,6 +1447,7 @@ export class LibraryManager {
     const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people);
     this.state.people = people;
     this.state.faces = updatedFaces;
+    this.recomputeFacesLockedForPhoto(face.photoId);
     this.notify();
 
     // Propagate learned manual input to improve face detection across other photos!
@@ -1381,6 +1460,7 @@ export class LibraryManager {
     let unassigned = false;
     let photoName: string | undefined;
     let personName: string | undefined;
+    let affectedPhotoId: string | undefined;
 
     // 1. Unassign in state.faces
     for (const f of this.state.faces) {
@@ -1392,6 +1472,7 @@ export class LibraryManager {
         f.personId = undefined;
         f.isConfirmed = false;
         unassigned = true;
+        affectedPhotoId = f.photoId;
       }
     }
 
@@ -1419,9 +1500,12 @@ export class LibraryManager {
 
     if (unassigned) {
       // Re-calculate people without creating unwanted new clusters for unassigned faces
-      const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people, 0.55, false);
+      const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
       this.state.people = people;
       this.state.faces = updatedFaces;
+      if (affectedPhotoId) {
+        this.recomputeFacesLockedForPhoto(affectedPhotoId);
+      }
       this.savePersistedData();
       this.notify();
     }
@@ -1451,6 +1535,7 @@ export class LibraryManager {
           photoFace.isConfirmed = true;
         }
       }
+      this.recomputeFacesLockedForPhoto(face.photoId);
       this.notify();
 
       // Active learning: User confirmation anchors ground truth with 2.5x weight in centroid.
@@ -1463,6 +1548,7 @@ export class LibraryManager {
   }
 
   public deleteFaceDetection(faceId: string) {
+    const removedFace = this.state.faces.find((f) => f.id === faceId);
     this.state.faces = this.state.faces.filter((f) => f.id !== faceId);
     for (const photo of this.state.photos) {
       if (photo.faces) {
@@ -1472,7 +1558,146 @@ export class LibraryManager {
     const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people);
     this.state.people = people;
     this.state.faces = updatedFaces;
+    if (removedFace) {
+      this.recomputeFacesLockedForPhoto(removedFace.photoId);
+    }
     this.notify();
+  }
+
+  /**
+   * Removes every unnamed/unrecognized face from one photo in a single
+   * action — useful for a crowd/public photo where only a couple of people
+   * are actually known and tagging or deleting each stray detection one by
+   * one isn't worth it. Also flags the photo as manually verified so
+   * automatic/bulk face (re-)detection (runFaceDetectionForPhotos,
+   * FaceQueueService) skips it going forward, and it stays skipped even
+   * through a re-sync — until the user explicitly re-runs "Scan Faces" on
+   * this specific photo (detectAndMatchFacesForPhoto clears the flag).
+   */
+  public removeUnknownFacesFromPhoto(photoId: string): { removedCount: number } {
+    const photo = this.state.photos.find((p) => p.id === photoId);
+    if (!photo) return { removedCount: 0 };
+
+    const peopleById = new Map(this.state.people.map((p) => [p.id, p]));
+    const isUnnamed = (face: DetectedFace): boolean => {
+      if (!face.personId) return true;
+      const person = peopleById.get(face.personId);
+      if (!person) return true;
+      return /^Person(\s+\d+)?$/i.test(person.name);
+    };
+
+    const idsToRemove = new Set((photo.faces || []).filter(isUnnamed).map((f) => f.id));
+
+    if (idsToRemove.size > 0) {
+      this.state.faces = this.state.faces.filter((f) => !idsToRemove.has(f.id));
+      for (const p of this.state.photos) {
+        if (p.faces) {
+          p.faces = p.faces.filter((f) => !idsToRemove.has(f.id));
+        }
+      }
+      const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people);
+      this.state.people = people;
+      this.state.faces = updatedFaces;
+    }
+
+    photo.facesLocked = true;
+    this.notify(true);
+
+    return { removedCount: idsToRemove.size };
+  }
+
+  /**
+   * Auto-lock rule: a photo locks itself the moment every face currently on
+   * it is confirmed (including the trivial zero-faces case) — no separate
+   * "verify" click required. Called after any action that changes a face's
+   * confirmed state (confirm, reassign, unassign, delete) so the lock always
+   * reflects current reality. Explicit bulk-curation actions (e.g. "Remove
+   * Unknown Faces") still force-lock directly, since those already mean
+   * "I'm done with this photo" regardless of what's left unconfirmed.
+   */
+  private recomputeFacesLockedForPhoto(photoId: string): void {
+    const photo = this.state.photos.find((p) => p.id === photoId);
+    if (!photo) return;
+    const faces = this.state.faces.filter((f) => f.photoId === photoId);
+    photo.facesLocked = faces.every((f) => f.isConfirmed);
+  }
+
+  /** A face tagged to a real named person that the user has not yet confirmed correct. */
+  private isUnconfirmedNamedFace = (face: DetectedFace): boolean => {
+    if (face.isConfirmed) return false;
+    if (!face.personId) return false;
+    const person = this.state.people.find((p) => p.id === face.personId);
+    if (!person) return false;
+    return !/^Person(\s+\d+)?$/i.test(person.name);
+  };
+
+  /**
+   * Deletes every unconfirmed named-person face detection from one photo —
+   * a tentative auto-match (e.g. "Monika") the user never verified with the
+   * checkmark. Unlike removeUnknownFacesFromPhoto (faces with no name at
+   * all), this targets guesses that do have a name but aren't trusted yet.
+   * Also locks the photo from auto-rescanning, since the same face
+   * embedding would otherwise immediately reproduce the same guess.
+   */
+  public removeUnconfirmedFacesFromPhoto(photoId: string): { removedCount: number } {
+    const photo = this.state.photos.find((p) => p.id === photoId);
+    if (!photo) return { removedCount: 0 };
+
+    const idsToRemove = new Set((photo.faces || []).filter(this.isUnconfirmedNamedFace).map((f) => f.id));
+
+    if (idsToRemove.size > 0) {
+      this.state.faces = this.state.faces.filter((f) => !idsToRemove.has(f.id));
+      for (const p of this.state.photos) {
+        if (p.faces) {
+          p.faces = p.faces.filter((f) => !idsToRemove.has(f.id));
+        }
+      }
+      const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people);
+      this.state.people = people;
+      this.state.faces = updatedFaces;
+    }
+
+    photo.facesLocked = true;
+    this.notify(true);
+
+    return { removedCount: idsToRemove.size };
+  }
+
+  /**
+   * Clears the person assignment (back to unlabeled) on every unconfirmed
+   * named-person face in a photo, keeping the face boxes intact — unlike
+   * removeUnconfirmedFacesFromPhoto, nothing is deleted so the faces remain
+   * available to be manually re-tagged or re-matched on a future scan.
+   */
+  public resetUnconfirmedFacesToUnknown(photoId: string): { resetCount: number } {
+    const photo = this.state.photos.find((p) => p.id === photoId);
+    if (!photo) return { resetCount: 0 };
+
+    const idsToReset = new Set((photo.faces || []).filter(this.isUnconfirmedNamedFace).map((f) => f.id));
+
+    if (idsToReset.size > 0) {
+      for (const f of this.state.faces) {
+        if (idsToReset.has(f.id)) {
+          f.personId = undefined;
+          f.isConfirmed = false;
+        }
+      }
+      this.state.photos = this.state.photos.map((p) => {
+        if (p.faces && p.faces.some((f) => idsToReset.has(f.id))) {
+          return {
+            ...p,
+            faces: p.faces.map((f) => (idsToReset.has(f.id) ? { ...f, personId: undefined, isConfirmed: false } : f)),
+          };
+        }
+        return p;
+      });
+      const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
+      this.state.people = people;
+      this.state.faces = updatedFaces;
+      this.notify(true);
+    }
+
+    return { resetCount: idsToReset.size };
   }
 
   public updateFacesAndPeople(newFaces: DetectedFace[]) {
@@ -1508,6 +1733,61 @@ export class LibraryManager {
     this.notify();
   }
 
+  /**
+   * Adopts face-detection results the main process already clustered and
+   * persisted to SQLite (see pipelineOrchestrator.ts) as-is, instead of
+   * re-clustering them again renderer-side — the main process is now the
+   * single source of truth for face data, so this only mirrors it into the
+   * in-memory view rather than recomputing it a second time.
+   */
+  public applyServerDetectedFaces(
+    perPhotoFaces: Array<{ photoId: string; faces: DetectedFace[]; faceScanCompleted: boolean; facesLocked: boolean }>,
+    people: Person[]
+  ) {
+    const facesByPhoto = new Map(perPhotoFaces.map((p) => [p.photoId, p]));
+
+    // Drop this library's cached copy of each touched photo's faces — the
+    // authoritative per-photo list below replaces them.
+    this.state.faces = this.state.faces.filter((f) => !facesByPhoto.has(f.photoId));
+    for (const entry of perPhotoFaces) {
+      this.state.faces.push(...entry.faces);
+    }
+    this.state.people = people;
+
+    let matchedInStatePhotos = 0;
+    for (const photo of this.state.photos) {
+      const entry = facesByPhoto.get(photo.id);
+      if (entry) {
+        matchedInStatePhotos++;
+        photo.faces = entry.faces;
+        photo.faceScanCompleted = entry.faceScanCompleted;
+        photo.facesLocked = entry.facesLocked;
+        this.cachePhotoFaces(photo, entry.faces, true);
+      }
+    }
+    // If a requested photoId isn't found in this.state.photos at all (e.g.
+    // the user navigated to a different library/folder while detection was
+    // still in flight, replacing this array), its face update above is
+    // silently skipped — the returned faces are real, but nothing in the
+    // renderer's photo objects ever reflects them, so no marker/panel entry
+    // can appear no matter what the backend correctly persisted.
+    if (matchedInStatePhotos < perPhotoFaces.length) {
+      logger.warn('libraryStore', 'applyServerDetectedFaces: some photoIds were not found in state.photos (update skipped for those)', {
+        requestedPhotoIds: perPhotoFaces.map((p) => p.photoId),
+        requestedFaceCounts: perPhotoFaces.map((p) => p.faces.length),
+        matchedInStatePhotos,
+        totalStatePhotos: this.state.photos.length,
+      });
+    } else {
+      logger.debug('libraryStore', 'applyServerDetectedFaces applied', {
+        photoIds: perPhotoFaces.map((p) => p.photoId),
+        faceCounts: perPhotoFaces.map((p) => p.faces.length),
+      });
+    }
+
+    this.notify();
+  }
+
   public deletePerson(personId: string): boolean {
     const person = this.state.people.find((p) => p.id === personId);
     if (!person) return false;
@@ -1535,7 +1815,7 @@ export class LibraryManager {
     const remainingPeople = this.state.people.filter((p) => p.id !== personId);
 
     // 3. Recalculate people and faces without creating new clusters for unassigned faces
-    const { people, updatedFaces } = clusterFaces(this.state.faces, remainingPeople, 0.55, false);
+    const { people, updatedFaces } = clusterFaces(this.state.faces, remainingPeople, DEFAULT_MATCH_THRESHOLD, false);
     this.state.people = people;
     this.state.faces = updatedFaces;
     this.notify();
@@ -1695,6 +1975,13 @@ export class LibraryManager {
     this.state.people = people;
     this.state.faces = updatedFaces;
     photo.faces = updatedFaces.filter((f) => f.photoId === photoId);
+
+    // The user explicitly asked to (re-)scan this specific photo, so lift
+    // any earlier manual-verification lock — that lock exists only to keep
+    // automatic/bulk scans from touching a photo the user already curated,
+    // not to block a deliberate single-photo re-scan.
+    photo.facesLocked = false;
+
     this.notify();
 
     return photo;
@@ -1781,6 +2068,21 @@ export class LibraryManager {
     this.state.albums = [];
     this.state.selectedFolder = null;
     this.notify();
+  }
+
+  /**
+   * Clears the "active library" pointer and its photos when the folder it
+   * points at no longer exists on disk (deleted outside the app, a network
+   * share gone offline for good, a drive unplugged) — unlike clearLibrary(),
+   * leaves people/faces/albums alone, since those are the global cross-library
+   * registry, not specific to whichever folder happened to be open.
+   */
+  public clearMissingActiveLibrary() {
+    this.state.photos = [];
+    this.state.places = [];
+    this.state.selectedFolder = null;
+    this.state.currentDirectory = null;
+    this.notify(true);
   }
 
   // ================= ALBUM OPERATIONS =================

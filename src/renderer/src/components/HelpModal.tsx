@@ -118,7 +118,7 @@ export const HelpModal: React.FC<HelpModalProps> = ({ onClose }) => {
         <div style={{ flex: 1, backgroundColor: '#090d16', position: 'relative' }}>
           <iframe
             src={window.electronAPI ? "gphoto://help" : "/help.html"}
-            title="Google Photos Desktop User Guide"
+            title="gPhotos Desktop User Guide"
             style={{
               width: '100%',
               height: '100%',

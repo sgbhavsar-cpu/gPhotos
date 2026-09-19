@@ -15,10 +15,12 @@ import {
   Plus,
   CheckSquare,
   Square,
+  MoreVertical,
 } from 'lucide-react';
 import { Photo, PlaceAlbum } from '../../types';
 import { PhotoCard } from '../components/PhotoCard';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 interface PlacesMapViewProps {
   photos: Photo[];
@@ -67,6 +69,9 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
   const mapInstanceRef = useRef<L.Map | null>(null);
   const currentTileLayerRef = useRef<L.TileLayer | null>(null);
   const markersLayerRef = useRef<L.LayerGroup | null>(null);
+
+  const isMobile = useIsMobile();
+  const [showMobileTools, setShowMobileTools] = useState(false);
 
   const [activeTileType, setActiveTileType] = useState<'osm' | 'satellite' | 'dark'>('osm');
   const [selectedCluster, setSelectedCluster] = useState<PhotoCluster | null>(null);
@@ -521,138 +526,229 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
     );
   }
 
+  // Shared JSX built once and arranged differently for desktop vs mobile
+  // below — mobile collapses the tile selector / Fit All / Assign Location
+  // buttons behind a single "more options" toggle instead of letting them
+  // overflow (or wrap into extra rows) next to the title on a phone-width
+  // header, mirroring the pattern established in GalleryView.
+  const tileSelector = (
+    <div
+      style={{
+        display: 'flex',
+        backgroundColor: 'rgba(30, 41, 59, 0.8)',
+        padding: '2px',
+        borderRadius: '8px',
+        border: '1px solid var(--border-subtle)',
+      }}
+    >
+      {(['osm', 'satellite', 'dark'] as const).map((type) => (
+        <button
+          key={type}
+          onClick={() => setActiveTileType(type)}
+          style={{
+            padding: '4px 10px',
+            fontSize: '0.75rem',
+            fontWeight: 600,
+            border: 'none',
+            borderRadius: '6px',
+            cursor: 'pointer',
+            backgroundColor: activeTileType === type ? 'var(--accent-primary)' : 'transparent',
+            color: activeTileType === type ? '#ffffff' : 'var(--text-muted)',
+            transition: 'all 0.15s ease',
+          }}
+        >
+          {TILE_LAYERS[type].name}
+        </button>
+      ))}
+    </div>
+  );
+
+  const fitAllButton = (
+    <button
+      onClick={handleFitAllPhotos}
+      className="btn btn-secondary"
+      title="Center and fit all photos on map"
+      style={{
+        fontSize: '0.78rem',
+        padding: '6px 12px',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '6px',
+      }}
+    >
+      <Compass size={15} />
+      <span>Fit All</span>
+    </button>
+  );
+
+  const assignLocationButton = unlocatedPhotos.length > 0 ? (
+    <button
+      onClick={() => {
+        setAssignModalOverridePhotos(null);
+        setShowAssignModal(true);
+      }}
+      className="btn btn-secondary"
+      title="Assign geographical location to photos without geotags"
+      style={{
+        fontSize: '0.78rem',
+        padding: '6px 12px',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '6px',
+        color: '#f43f5e',
+        borderColor: 'rgba(244, 63, 94, 0.4)',
+      }}
+    >
+      <MapPin size={15} color="#f43f5e" />
+      <span>Assign Location ({unlocatedPhotos.length})</span>
+    </button>
+  ) : null;
+
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', position: 'relative', overflow: 'hidden' }}>
       {/* Sleek Top Navigation Header */}
-      <div
-        style={{
-          height: '56px',
-          padding: '0 20px',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          borderBottom: '1px solid var(--border-subtle)',
-          backgroundColor: 'rgba(15, 23, 42, 0.95)',
-          backdropFilter: 'blur(12px)',
-          zIndex: 30,
-        }}
-      >
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+      {isMobile ? (
+        <div
+          style={{
+            borderBottom: '1px solid var(--border-subtle)',
+            backgroundColor: 'rgba(15, 23, 42, 0.95)',
+            backdropFilter: 'blur(12px)',
+            zIndex: 30,
+          }}
+        >
+          {/* Row 1: title + a single toggle for everything else, so the
+              persistent bar never grows past one compact row. */}
           <div
             style={{
-              width: '34px',
-              height: '34px',
-              borderRadius: '10px',
-              backgroundColor: 'rgba(56, 189, 248, 0.15)',
-              border: '1px solid rgba(56, 189, 248, 0.3)',
+              height: '56px',
+              padding: '0 12px',
               display: 'flex',
               alignItems: 'center',
-              justifyContent: 'center',
-              color: '#38bdf8',
+              justifyContent: 'space-between',
+              gap: '8px',
             }}
           >
-            <MapPin size={18} />
-          </div>
-          <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <h2 style={{ fontSize: '1.05rem', fontWeight: 700, letterSpacing: '-0.01em' }}>
-                Photos Map
-              </h2>
-              <span
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0, overflow: 'hidden' }}>
+              <div
                 style={{
-                  fontSize: '0.72rem',
-                  fontWeight: 700,
-                  backgroundColor: 'rgba(56, 189, 248, 0.2)',
-                  color: '#38bdf8',
-                  padding: '2px 8px',
-                  borderRadius: '12px',
+                  width: '30px',
+                  height: '30px',
+                  borderRadius: '9px',
+                  backgroundColor: 'rgba(56, 189, 248, 0.15)',
                   border: '1px solid rgba(56, 189, 248, 0.3)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: '#38bdf8',
+                  flexShrink: 0,
                 }}
               >
-                iPhone Style
-              </span>
+                <MapPin size={16} />
+              </div>
+              <div style={{ minWidth: 0, overflow: 'hidden' }}>
+                <h2 style={{ fontSize: '0.92rem', fontWeight: 700, letterSpacing: '-0.01em', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  Photos Map
+                </h2>
+                <p style={{ fontSize: '0.7rem', color: 'var(--text-muted)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {geoPhotos.length} geotagged {geoPhotos.length === 1 ? 'photo' : 'photos'}
+                </p>
+              </div>
             </div>
-            <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-              {geoPhotos.length} geotagged {geoPhotos.length === 1 ? 'photo' : 'photos'} across {places?.length || 0} locations
-            </p>
-          </div>
-        </div>
-
-        {/* Map Controls */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          {/* Tile Layer Selector */}
-          <div
-            style={{
-              display: 'flex',
-              backgroundColor: 'rgba(30, 41, 59, 0.8)',
-              padding: '2px',
-              borderRadius: '8px',
-              border: '1px solid var(--border-subtle)',
-            }}
-          >
-            {(['osm', 'satellite', 'dark'] as const).map((type) => (
-              <button
-                key={type}
-                onClick={() => setActiveTileType(type)}
-                style={{
-                  padding: '4px 10px',
-                  fontSize: '0.75rem',
-                  fontWeight: 600,
-                  border: 'none',
-                  borderRadius: '6px',
-                  cursor: 'pointer',
-                  backgroundColor: activeTileType === type ? 'var(--accent-primary)' : 'transparent',
-                  color: activeTileType === type ? '#ffffff' : 'var(--text-muted)',
-                  transition: 'all 0.15s ease',
-                }}
-              >
-                {TILE_LAYERS[type].name}
-              </button>
-            ))}
-          </div>
-
-          {/* Fit All Photos Button */}
-          <button
-            onClick={handleFitAllPhotos}
-            className="btn btn-secondary"
-            title="Center and fit all photos on map"
-            style={{
-              fontSize: '0.78rem',
-              padding: '6px 12px',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-            }}
-          >
-            <Compass size={15} />
-            <span>Fit All</span>
-          </button>
-
-          {/* Assign Location to unlocated photos Button */}
-          {unlocatedPhotos.length > 0 && (
             <button
-              onClick={() => {
-                setAssignModalOverridePhotos(null);
-                setShowAssignModal(true);
-              }}
-              className="btn btn-secondary"
-              title="Assign geographical location to photos without geotags"
+              className={`btn ${showMobileTools ? 'btn-primary' : 'btn-ghost'} btn-icon`}
+              onClick={() => setShowMobileTools((v) => !v)}
+              style={{ width: '34px', height: '34px', flexShrink: 0 }}
+              title="More options"
+              aria-expanded={showMobileTools}
+            >
+              <MoreVertical size={18} />
+            </button>
+          </div>
+
+          {/* Collapsed by default: tile selector / Fit All / Assign Location,
+              only taking up space when the user actually asks for them. */}
+          {showMobileTools && (
+            <div
               style={{
-                fontSize: '0.78rem',
-                padding: '6px 12px',
+                padding: '10px 12px',
                 display: 'flex',
-                alignItems: 'center',
-                gap: '6px',
-                color: '#f43f5e',
-                borderColor: 'rgba(244, 63, 94, 0.4)',
+                flexDirection: 'column',
+                gap: '10px',
+                borderTop: '1px solid var(--border-subtle)',
+                backgroundColor: 'rgba(30, 41, 59, 0.6)',
               }}
             >
-              <MapPin size={15} color="#f43f5e" />
-              <span>Assign Location ({unlocatedPhotos.length})</span>
-            </button>
+              {tileSelector}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                {fitAllButton}
+                {assignLocationButton}
+              </div>
+            </div>
           )}
         </div>
-      </div>
+      ) : (
+        <div
+          style={{
+            height: '56px',
+            padding: '0 20px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            borderBottom: '1px solid var(--border-subtle)',
+            backgroundColor: 'rgba(15, 23, 42, 0.95)',
+            backdropFilter: 'blur(12px)',
+            zIndex: 30,
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <div
+              style={{
+                width: '34px',
+                height: '34px',
+                borderRadius: '10px',
+                backgroundColor: 'rgba(56, 189, 248, 0.15)',
+                border: '1px solid rgba(56, 189, 248, 0.3)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                color: '#38bdf8',
+              }}
+            >
+              <MapPin size={18} />
+            </div>
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <h2 style={{ fontSize: '1.05rem', fontWeight: 700, letterSpacing: '-0.01em' }}>
+                  Photos Map
+                </h2>
+                <span
+                  style={{
+                    fontSize: '0.72rem',
+                    fontWeight: 700,
+                    backgroundColor: 'rgba(56, 189, 248, 0.2)',
+                    color: '#38bdf8',
+                    padding: '2px 8px',
+                    borderRadius: '12px',
+                    border: '1px solid rgba(56, 189, 248, 0.3)',
+                  }}
+                >
+                  iPhone Style
+                </span>
+              </div>
+              <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                {geoPhotos.length} geotagged {geoPhotos.length === 1 ? 'photo' : 'photos'} across {places?.length || 0} locations
+              </p>
+            </div>
+          </div>
+
+          {/* Map Controls */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            {tileSelector}
+            {fitAllButton}
+            {assignLocationButton}
+          </div>
+        </div>
+      )}
 
       {/* Main Map Container */}
       <div style={{ flex: 1, position: 'relative', width: '100%', height: '100%' }}>
@@ -696,9 +792,10 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                 alignItems: 'center',
                 justifyContent: 'space-between',
                 borderBottom: '1px solid rgba(255, 255, 255, 0.1)',
+                gap: isMobile ? '10px' : undefined,
               }}
             >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: isMobile ? 0 : undefined, flex: isMobile ? 1 : undefined }}>
                 <div
                   style={{
                     width: '32px',
@@ -709,12 +806,13 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                     alignItems: 'center',
                     justifyContent: 'center',
                     color: '#60a5fa',
+                    flexShrink: 0,
                   }}
                 >
                   <MapPin size={16} />
                 </div>
                 {isEditingClusterLocation ? (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: isMobile ? 0 : undefined, flex: isMobile ? 1 : undefined }}>
                     <input
                       type="text"
                       value={clusterLocationInput}
@@ -726,7 +824,11 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                       }}
                       className="input"
                       placeholder="Enter location name..."
-                      style={{ fontSize: '0.85rem', padding: '4px 8px', height: '30px', width: '220px' }}
+                      style={
+                        isMobile
+                          ? { fontSize: '0.85rem', padding: '4px 8px', height: '30px', flex: 1, minWidth: 0 }
+                          : { fontSize: '0.85rem', padding: '4px 8px', height: '30px', width: '220px' }
+                      }
                       autoFocus
                     />
                     <button
@@ -747,14 +849,23 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                     </button>
                   </div>
                 ) : (
-                  <div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                      <span style={{ fontWeight: 700, fontSize: '0.95rem', color: '#ffffff' }}>
+                  <div style={{ minWidth: isMobile ? 0 : undefined }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: isMobile ? 0 : undefined }}>
+                      <span
+                        style={{
+                          fontWeight: 700,
+                          fontSize: '0.95rem',
+                          color: '#ffffff',
+                          ...(isMobile
+                            ? { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const }
+                            : {}),
+                        }}
+                      >
                         {selectedCluster.title}
                       </span>
                       <button
                         className="btn btn-ghost btn-icon"
-                        style={{ width: '24px', height: '24px', padding: 0 }}
+                        style={{ width: '24px', height: '24px', padding: 0, flexShrink: 0 }}
                         onClick={() => {
                           setIsEditingClusterLocation(true);
                           setClusterLocationInput(selectedCluster.title);
@@ -765,7 +876,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                       </button>
                       <button
                         className="btn btn-ghost btn-icon"
-                        style={{ width: '24px', height: '24px', padding: 0 }}
+                        style={{ width: '24px', height: '24px', padding: 0, flexShrink: 0 }}
                         onClick={() => {
                           setAssignModalOverridePhotos(selectedCluster.photos);
                           setShowAssignModal(true);
@@ -796,6 +907,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
+                  flexShrink: 0,
                   transition: 'background 0.15s ease',
                 }}
                 onMouseEnter={(e) => (e.currentTarget.style.background = 'rgba(255, 255, 255, 0.25)')}

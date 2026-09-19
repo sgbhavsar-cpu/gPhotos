@@ -100,8 +100,8 @@ export function computePlacesSummary(photos: SummaryPhoto[]): PlaceSummaryItem[]
   return Array.from(map.values()).sort((a, b) => b.photoCount - a.photoCount);
 }
 
-function buildMeta(customDir?: string | null): CatalogMeta {
-  const photos = getAllPhotosForSummary();
+async function buildMeta(customDir?: string | null): Promise<CatalogMeta> {
+  const photos = await getAllPhotosForSummary();
   const people = getAllPeople();
   const albums = getAllAlbums();
 
@@ -187,11 +187,20 @@ export function ensureMigratedIfEmpty(): void {
 /**
  * Returns catalog summary metadata (timeline/places/people/albums summaries)
  * for the given library folder, computed from SQLite.
+ *
+ * When no folder is given (the normal case on app startup, before the
+ * renderer knows what was last active), this resolves the persisted
+ * selectedFolder from the global settings database first — without that,
+ * the very first call of the process would activate the library-independent
+ * global database (which holds no photos), making the "instant" startup
+ * fast-path always report 0 photos and silently fall through to a slower
+ * legacy load.
  */
 export async function getCatalogMeta(customDir?: string): Promise<CatalogMeta> {
-  setActiveLibrary(customDir || null);
+  const targetDir = customDir || getSetting<string | null>('selectedFolder', null) || undefined;
+  setActiveLibrary(targetDir || null);
   ensureMigratedIfEmpty();
-  return buildMeta(customDir || null);
+  return await buildMeta(targetDir || null);
 }
 
 /**
@@ -247,7 +256,7 @@ export async function switchCatalogLibrary(
   setSetting('recentLibraries', updatedRecent);
   setSetting('selectedFolder', targetDir);
 
-  const meta = buildMeta(targetDir);
+  const meta = await buildMeta(targetDir);
   const firstPageResult = await getCatalogPage(0, PAGE_SIZE, targetDir);
 
   return {

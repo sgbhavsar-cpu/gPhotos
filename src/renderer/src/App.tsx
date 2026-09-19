@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Sidebar, ActiveTab } from './components/Sidebar';
 import { GalleryView } from './views/GalleryView';
 import { AlbumsView } from './views/AlbumsView';
@@ -17,22 +17,33 @@ import { MobileTopBar } from './components/MobileTopBar';
 import { MobileBottomNav } from './components/MobileBottomNav';
 import { MobileMenuDrawer } from './components/MobileMenuDrawer';
 import { libraryStore, LibraryState, getLocalPhotoUrl } from './services/libraryStore';
-import { detectFacesInImage, loadFaceModels } from './services/faceEngine';
 import { faceQueue } from './services/faceQueue';
 import { Photo, DetectedFace, VirtualStorageConfig, BackgroundScanProgress, NetworkStorageProgress, DuplicateCluster } from '../types';
 import { AiPhotoFilter } from './services/aiSearchService';
 import { RefreshCw, CheckCircle2, X } from 'lucide-react';
 import { ResponseActivityIndicator } from './components/ResponseActivityIndicator';
+import { PrefetchStatusIndicator } from './components/PrefetchStatusIndicator';
 import { responseTracker } from './services/responseTracker';
+import { splitStoragesByExistence } from './services/storageValidation';
+import { useIsMobile } from './hooks/useIsMobile';
 
 export const App: React.FC = () => {
   const [libraryState, setLibraryState] = useState<LibraryState>(libraryStore.getState());
   const [activeTab, setActiveTab] = useState<ActiveTab>('photos');
   const [activeLightboxPhoto, setActiveLightboxPhoto] = useState<Photo | null>(null);
+  // When the lightbox is opened from a context narrower than the whole
+  // library (currently: an album), this holds that context's photo ids so
+  // next/prev navigation stays inside it instead of falling through to
+  // libraryState.photos. Storing ids (not Photo objects) and re-deriving the
+  // list below keeps it live — a favorite toggle or removal while the
+  // lightbox is open is reflected immediately, the same way the album view
+  // itself stays in sync.
+  const [activeLightboxContextIds, setActiveLightboxContextIds] = useState<string[] | null>(null);
   const [selectedPersonIdForView, setSelectedPersonIdForView] = useState<string | null>(null);
   const [virtualStorages, setVirtualStorages] = useState<VirtualStorageConfig[]>([]);
   const [storageProgressMap, setStorageProgressMap] = useState<Record<string, NetworkStorageProgress>>({});
   const [toastMessage, setToastMessage] = useState<{ message: string; type?: 'info' | 'success' | 'warning' } | null>(null);
+  const [switchingLibraryLabel, setSwitchingLibraryLabel] = useState<string | null>(null);
   const [selectedFolderForTree, setSelectedFolderForTree] = useState<string | null>(null);
   const [showDuplicateCleaner, setShowDuplicateCleaner] = useState(false);
   const [duplicateCleanerCluster, setDuplicateCleanerCluster] = useState<DuplicateCluster | null>(null);
@@ -40,7 +51,7 @@ export const App: React.FC = () => {
   const [showAiAssistant, setShowAiAssistant] = useState(false);
   const [showLibrarySwitcher, setShowLibrarySwitcher] = useState(false);
   const [showMobileDrawer, setShowMobileDrawer] = useState(false);
-  const [isMobile, setIsMobile] = useState<boolean>(typeof window !== 'undefined' ? window.innerWidth <= 768 : false);
+  const isMobile = useIsMobile();
   const [activeAiFilter, setActiveAiFilter] = useState<AiPhotoFilter | null>(null);
   const [aiFilteredPhotos, setAiFilteredPhotos] = useState<Photo[] | null>(null);
   const [bgScanProgress, setBgScanProgress] = useState<BackgroundScanProgress | null>(null);
@@ -84,7 +95,7 @@ export const App: React.FC = () => {
 
       // 2. Resume / enqueue face detection queue
       const unscannedPhotos = currentPhotos.filter(
-        (p) => !p.faceScanCompleted && (!p.faces || p.faces.length === 0)
+        (p) => !p.facesLocked && !p.faceScanCompleted && (!p.faces || p.faces.length === 0)
       );
       if (unscannedPhotos.length > 0) {
         faceQueue.enqueue(unscannedPhotos);
@@ -108,6 +119,7 @@ export const App: React.FC = () => {
       // 1. Close lightbox if active
       if (activeLightboxPhoto) {
         setActiveLightboxPhoto(null);
+        setActiveLightboxContextIds(null);
         return;
       }
 
@@ -215,19 +227,45 @@ export const App: React.FC = () => {
     }, 4500);
   };
 
-  // Detect mobile viewport on mount and resize
-  useEffect(() => {
-    const handleResize = () => {
-      setIsMobile(window.innerWidth <= 768);
-    };
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, []);
-
   // Subscribe to library store updates and ensure persisted data is fetched on mount
   useEffect(() => {
     responseTracker.installSafeFetchInterceptor();
-    libraryStore.loadPersistedData().finally(() => {
+    libraryStore.loadPersistedData().finally(async () => {
+      // The "active library" pointer (shown in the sidebar) is a path
+      // remembered independently of whether that folder still exists —
+      // deleting it outside the app (or a network share/drive going
+      // permanently unreachable) otherwise leaves the sidebar forever
+      // pointing at a folder that's gone. Verified once here, at startup,
+      // since this is the one place every load path converges afterward.
+      const activeFolder = libraryStore.getState().selectedFolder;
+      if (activeFolder && window.electronAPI?.checkFileExists) {
+        try {
+          const exists = await window.electronAPI.checkFileExists(activeFolder);
+          if (!exists) {
+            libraryStore.clearMissingActiveLibrary();
+          }
+        } catch {}
+      }
+
+      // Same check for the "Recent Libraries" list in the Switch Library
+      // modal — a separate remembered list from both the active-folder
+      // pointer above and the configured-storages list, with the exact same
+      // "never re-verified against disk" gap.
+      if (window.electronAPI?.checkFileExists) {
+        const recent = libraryStore.getRecentLibraries();
+        if (recent.length > 0) {
+          try {
+            const checks = await Promise.all(
+              recent.map(async (p) => ({ path: p, exists: await window.electronAPI!.checkFileExists(p).catch(() => true) }))
+            );
+            const stillValid = checks.filter((c) => c.exists).map((c) => c.path);
+            if (stillValid.length !== recent.length) {
+              libraryStore.setRecentLibraries(stillValid);
+            }
+          } catch {}
+        }
+      }
+
       // Smoothly dismiss browser inline splash screen
       const splash = document.getElementById('app-splash-screen');
       if (splash) {
@@ -268,6 +306,31 @@ export const App: React.FC = () => {
       let combined: VirtualStorageConfig[] = saved
         ? [...saved].filter((s) => !unlinkedSet.has(s.name.toLowerCase()))
         : [];
+
+      // Prune entries whose local mirror folder no longer exists — this is
+      // a second, independent copy of the same load VirtualStorageView.tsx
+      // does (this one feeds the sidebar's "Switch Library" modal and
+      // FolderTreeView, which mount before that screen ever does), so it
+      // needs the same check or a folder deleted outside the app keeps
+      // showing up here even after being cleaned up there.
+      if (window.electronAPI?.checkFileExists && combined.length > 0) {
+        const { valid, removed } = await splitStoragesByExistence(combined, window.electronAPI.checkFileExists);
+        if (removed.length > 0) {
+          combined = valid;
+          const removedNames = removed.map((s) => s.name.toLowerCase());
+          const nextUnlinked = Array.from(new Set([...unlinked, ...removedNames]));
+          unlinked = nextUnlinked;
+          unlinkedSet.clear();
+          nextUnlinked.forEach((n) => unlinkedSet.add(n));
+          if (window.electronAPI) {
+            await window.electronAPI.saveLibraryData('gphotos_unlinked_storages_v1', nextUnlinked);
+            await window.electronAPI.saveLibraryData('gphotos_virtual_storages_v1', combined);
+          }
+          for (const s of removed) {
+            libraryStore.removePhotosByStorage(s.name);
+          }
+        }
+      }
 
       // Immediate paint of configured storages without blocking startup
       setVirtualStorages(combined);
@@ -330,6 +393,91 @@ export const App: React.FC = () => {
     loadStorages();
   }, []);
 
+  // The load above only runs once, at mount — but the background sync
+  // daemon (backgroundDaemon.ts, on its own ~15 min timer / 45s after
+  // launch) keeps updating each storage's totalItems/lastSynced/
+  // totalSizeSaved in the persisted setting the whole time the app is
+  // running, entirely independent of whether this state ever re-reads it.
+  // Without this, the sidebar's photo count for a storage stays frozen at
+  // whatever it happened to be at app launch, even while a sync is visibly
+  // progressing underneath it — exactly what looks like the count "never
+  // updates". Cheap merge, not a full reload: only touches the few fields
+  // the daemon actually writes, so it can't clobber in-progress UI state.
+  useEffect(() => {
+    const refreshStorageTotals = async () => {
+      if (!window.electronAPI?.loadLibraryData) return;
+      try {
+        const saved: VirtualStorageConfig[] | null = await window.electronAPI.loadLibraryData('gphotos_virtual_storages_v1');
+        if (!saved || saved.length === 0) return;
+        const byName = new Map(saved.map((s) => [s.name.toLowerCase(), s]));
+        setVirtualStorages((prev) => {
+          if (prev.length === 0) return prev;
+          let changed = false;
+          const merged = prev.map((s) => {
+            const fresh = byName.get(s.name.toLowerCase());
+            if (
+              fresh &&
+              (fresh.totalItems !== s.totalItems ||
+                fresh.lastSynced !== s.lastSynced ||
+                fresh.totalSizeSaved !== s.totalSizeSaved)
+            ) {
+              changed = true;
+              return { ...s, totalItems: fresh.totalItems, lastSynced: fresh.lastSynced, totalSizeSaved: fresh.totalSizeSaved };
+            }
+            return s;
+          });
+          return changed ? merged : prev;
+        });
+
+        // The settings blob above only tells us what the LAST FULLY-COMPLETED
+        // sync pass wrote — for a large library still working through its
+        // first pass (thumbnails done, face detection still catching up over
+        // many minutes), that stays stale until the whole pass finishes.
+        // getStorageDetails is a live DB + filesystem query with no such lag
+        // (it reflects however many photos have actually finished face
+        // detection RIGHT NOW), so polling it here keeps the sidebar's
+        // "Cached X/Y · Faces X/Y" row correct continuously — updating within
+        // this 5s window of each photo actually completing — rather than
+        // only once an entire multi-thousand-photo pass finishes, and rather
+        // than depending on an active mirror:progress stream from a sync this
+        // session happens to be watching live.
+        if (window.electronAPI?.getStorageDetails) {
+          for (const s of saved) {
+            try {
+              const details = await window.electronAPI.getStorageDetails(s.name, s.localMirrorRoot);
+              if (!details || details.totalPhotos <= 0) continue;
+              setStorageProgressMap((prev) => {
+                const existing = prev[s.name];
+                // Don't fight an actively-streaming local sync — its
+                // per-photo mirror:progress updates are more frequent and
+                // already correct; only fill in when nothing fresher is
+                // already driving this storage's row.
+                if (existing && existing.phase !== 'completed' && existing.phase !== 'idle' && existing.currentFile) {
+                  return prev;
+                }
+                return {
+                  ...prev,
+                  [s.name]: {
+                    storageName: s.name,
+                    phase: details.phase === 'completed' ? 'completed' : (details.thumbnailCachedCount < details.totalPhotos ? 'thumbnails' : 'faces'),
+                    thumbnailCurrent: details.thumbnailCachedCount,
+                    thumbnailTotal: details.totalPhotos,
+                    faceCurrent: details.faceScannedCount,
+                    faceTotal: details.totalPhotos,
+                    percent: details.percent,
+                  },
+                };
+              });
+            } catch {}
+          }
+        }
+      } catch {}
+    };
+    const intervalId = setInterval(refreshStorageTotals, 5000);
+    refreshStorageTotals();
+    return () => clearInterval(intervalId);
+  }, []);
+
   // Listen for non-blocking background folder/drive scan events
   useEffect(() => {
     if (!window.electronAPI?.onBackgroundScanProgress) return;
@@ -338,7 +486,22 @@ export const App: React.FC = () => {
       const photosToAdd = progress.newPhotos || progress.newlyAddedPhotos;
       if (photosToAdd && photosToAdd.length > 0) {
         libraryStore.addPhotos(photosToAdd, progress.mirrorDirPath);
-        faceQueue.enqueue(photosToAdd);
+      }
+      // Run face detection through the same restart-safe pipeline "Rescan"
+      // uses, once the whole background scan finishes — rather than the old
+      // per-batch faceQueue.enqueue(), which lived only in memory: if the app
+      // restarted before the queue drained, those photos were left with no
+      // face data and nothing ever retried them. runFaceDetectionForPhotos
+      // re-derives its candidate list fresh (skipping anything already
+      // scanned), so this is a safe, idempotent catch-up pass every time.
+      if (progress.isComplete && progress.storageName && !progress.error) {
+        const mirrorRoot = progress.mirrorRoot || 'C:\\GPhotos_VirtualMirrors';
+        handleScanStorageFaces({
+          id: `storage_${progress.storageName}`,
+          name: progress.storageName,
+          networkSourcePath: progress.sourcePath || '',
+          localMirrorRoot: mirrorRoot,
+        }).catch((err) => console.warn('Post-scan face detection failed:', err));
       }
       if (progress.storageName) {
         const pct = progress.percent || Math.round((progress.processedCount / Math.max(1, progress.totalDiscovered)) * 100);
@@ -373,6 +536,17 @@ export const App: React.FC = () => {
     const unsubscribe = window.electronAPI.onMirrorProgress((progress: any) => {
       const storageName = progress.storageName || 'Network Storage';
       const pct = progress.percent ?? (progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0);
+      // The backend reports both the thumbnail step and the face-detection
+      // step for the SAME file index through the same current/total fields,
+      // distinguished only by `phase` — this used to always be written into
+      // thumbnailCurrent/Total regardless of which phase the event actually
+      // was, so faceCurrent/faceTotal never updated from a live event at all
+      // (stuck at whatever they defaulted to, usually 0/0). Thumbnails are
+      // always done for a file by the time any progress event fires for it
+      // (face detection runs strictly after), so thumbnailCurrent can track
+      // progress.current unconditionally; faceCurrent only advances during
+      // an actual 'faces' phase event, carrying its previous value otherwise.
+      const isFacesPhase = progress.phase === 'faces';
       setStorageProgressMap((prev) => ({
         ...prev,
         [storageName]: {
@@ -380,8 +554,8 @@ export const App: React.FC = () => {
           phase: (progress.phase as any) || (progress.status === 'completed' ? 'completed' : 'thumbnails'),
           thumbnailCurrent: progress.current,
           thumbnailTotal: progress.total,
-          faceCurrent: prev[storageName]?.faceCurrent || 0,
-          faceTotal: prev[storageName]?.faceTotal || 0,
+          faceCurrent: isFacesPhase ? progress.current : (prev[storageName]?.faceCurrent || 0),
+          faceTotal: progress.total,
           percent: pct,
           currentFile: progress.currentFile,
         },
@@ -459,6 +633,38 @@ export const App: React.FC = () => {
         });
       }).catch(() => {});
     }
+
+    // Reconcile against the live, freshly-recomputed truth from each
+    // storage's own catalog database — a stale checkpoint or status file
+    // (e.g. left over from before a sync pipeline started keeping them
+    // updated, or from an interrupted run that never got a final save) can
+    // otherwise misreport a storage as "interrupted"/"resumable" forever,
+    // even once it's genuinely 100% done. Only ever overrides *toward*
+    // "completed" when the live data unambiguously says so — never invents
+    // a worse status than what was already shown.
+    if (window.electronAPI?.getAllStorageDetails) {
+      window.electronAPI.getAllStorageDetails().then((details) => {
+        if (!details || typeof details !== 'object') return;
+        setStorageProgressMap((prev) => {
+          const next = { ...prev };
+          for (const [name, d] of Object.entries(details)) {
+            if (d && d.phase === 'completed' && next[name] && next[name].phase !== 'completed') {
+              next[name] = {
+                storageName: name,
+                phase: 'completed',
+                thumbnailCurrent: d.totalPhotos,
+                thumbnailTotal: d.totalPhotos,
+                faceCurrent: d.totalPhotos,
+                faceTotal: d.totalPhotos,
+                percent: 100,
+                message: '✓ Up to date',
+              };
+            }
+          }
+          return next;
+        });
+      }).catch(() => {});
+    }
   }, []);
 
   // Run AI face detection helper for any given batch of photos
@@ -473,8 +679,12 @@ export const App: React.FC = () => {
       return;
     }
 
-    // Skip photos that already have face scan completed or already have faces identified
+    // Skip photos that already have face scan completed, already have faces
+    // identified, or were manually verified by the user (e.g. via "Remove
+    // Unknown Faces") — that lock only lifts when the user explicitly
+    // re-runs "Scan Faces" on that specific photo.
     const candidates = photosToScan.filter((p) => {
+      if (p.facesLocked) return false;
       if (p.faceScanCompleted) return false;
       if (p.faces && p.faces.length > 0) return false;
       return true;
@@ -503,10 +713,55 @@ export const App: React.FC = () => {
       return;
     }
 
+    // Requirement: face detection on an ad-hoc/manual basis must not run
+    // against an unreachable network storage. Local (non-virtual) photos
+    // have no such gate. Checked per-storage (not just the first virtual
+    // candidate found) so scanning a mixed local+network batch still
+    // processes whatever's actually reachable instead of bailing outright.
+    // See docs/PIPELINE_REDESIGN_DEV_DOC.md §3.6.
+    const reachabilityByDir = new Map<string, boolean>();
+    const offlineStorageNames = new Set<string>();
+    let scannable = candidates;
+    if (candidates.some((p) => p.isVirtual)) {
+      scannable = [];
+      for (const p of candidates) {
+        if (!p.isVirtual) {
+          scannable.push(p);
+          continue;
+        }
+        const sourceDir = p.originalRemotePath
+          ? p.originalRemotePath.substring(0, p.originalRemotePath.lastIndexOf('\\'))
+          : undefined;
+        if (!sourceDir) {
+          scannable.push(p);
+          continue;
+        }
+        if (!reachabilityByDir.has(sourceDir)) {
+          reachabilityByDir.set(sourceDir, (await window.electronAPI?.checkFileExists?.(sourceDir)) ?? true);
+        }
+        if (reachabilityByDir.get(sourceDir)) {
+          scannable.push(p);
+        } else {
+          offlineStorageNames.add(p.storageName || sourceDir);
+        }
+      }
+    }
+
+    if (offlineStorageNames.size > 0 && isManualTrigger) {
+      showToast(
+        `Skipping ${offlineStorageNames.size} offline storage${offlineStorageNames.size === 1 ? '' : 's'} (${[...offlineStorageNames].join(', ')}) — reconnect to detect faces there.`,
+        'warning'
+      );
+    }
+
+    if (scannable.length === 0) {
+      return;
+    }
+
     libraryStore.setDetectingFaces(true, {
       current: alreadyScannedCount,
       total: totalPhotos,
-      currentPhotoName: 'Loading AI face models...',
+      currentPhotoName: 'Detecting faces...',
     });
 
     if (storageName) {
@@ -527,30 +782,28 @@ export const App: React.FC = () => {
       }));
     }
 
-    const loaded = await loadFaceModels();
-    if (!loaded) {
-      console.warn('Face models could not be loaded.');
-      if (isManualTrigger) {
-        showToast('Failed to load Face-API neural network models. Make sure model weights are present.', 'warning');
-      }
+    if (!window.electronAPI?.detectFacesBatch) {
       libraryStore.setDetectingFaces(false, null);
       return;
     }
 
-    const allNewFaces: DetectedFace[] = [];
-
     try {
-      for (let i = 0; i < candidates.length; i++) {
-        const photo = candidates[i];
-        const currentScanned = alreadyScannedCount + i + 1;
+      // Detection, clustering and persistence all happen in the main
+      // process now (see faceDetectionEngine.ts + pipelineOrchestrator.ts)
+      // — this just hands over the candidates and adopts the authoritative
+      // result, in chunks so progress/UI stays responsive on a large batch.
+      const CHUNK_SIZE = 8;
+      let totalDetected = 0;
+      for (let i = 0; i < scannable.length; i += CHUNK_SIZE) {
+        const chunk = scannable.slice(i, i + CHUNK_SIZE);
+        const currentScanned = Math.min(alreadyScannedCount + i + chunk.length, totalPhotos);
         const facePct = Math.round((currentScanned / Math.max(1, totalPhotos)) * 100);
 
         libraryStore.setDetectingFaces(true, {
           current: currentScanned,
           total: totalPhotos,
-          currentPhotoName: photo.fileName,
+          currentPhotoName: chunk[chunk.length - 1]?.fileName,
         });
-
         if (storageName) {
           setStorageProgressMap((prev) => ({
             ...prev,
@@ -561,69 +814,41 @@ export const App: React.FC = () => {
               faceCurrent: currentScanned,
               faceTotal: totalPhotos,
               percent: facePct,
-              currentFile: photo.fileName,
               message: `Recognizing faces: ${currentScanned}/${totalPhotos} (${facePct}%)`,
             },
           }));
         }
 
-        try {
-          let preferOriginal = true;
-          if (photo.isVirtual && photo.originalRemotePath && window.electronAPI?.checkFileExists) {
-            preferOriginal = await window.electronAPI.checkFileExists(photo.originalRemotePath);
-          }
+        const { results, people } = await window.electronAPI.detectFacesBatch(chunk);
+        const perPhotoFaces = results.map((r) => ({
+          photoId: r.photoId,
+          faces: r.faces,
+          faceScanCompleted: true,
+          facesLocked: r.locked,
+        }));
+        libraryStore.applyServerDetectedFaces(perPhotoFaces, people);
+        totalDetected += results.reduce((sum, r) => sum + r.faceCount, 0);
 
-          const detectedFaces = await detectFacesInImage(
-            photo.filePath,
-            photo.id,
-            photo.originalRemotePath,
-            preferOriginal
-          );
-          photo.faces = detectedFaces;
-          photo.faceScanCompleted = true;
-          libraryStore.updatePhotoQuietly(photo);
-
-          if (detectedFaces.length > 0) {
-            allNewFaces.push(...detectedFaces);
-          }
-        } catch (err) {
-          console.warn(`Face detection skipped for ${photo.fileName}:`, err);
-          photo.faceScanCompleted = true;
-          libraryStore.updatePhotoQuietly(photo);
+        if (window.electronAPI?.saveLibraryStatus) {
+          await window.electronAPI.saveLibraryStatus({
+            libraryPath,
+            totalPhotos,
+            faceScannedCount: currentScanned,
+            faceTotalCount: totalPhotos,
+            faceDetectedCount: totalDetected,
+            faceLastFile: chunk[chunk.length - 1]?.fileName,
+            faceCompleted: currentScanned >= totalPhotos,
+            facePercent: facePct,
+            phase: currentScanned >= totalPhotos ? 'completed' : 'faces',
+          }).catch(() => {});
         }
 
-        // Intermittent persistence: save library photos and faces to disk every 8 photos so stopping never loses progress!
-        if ((i + 1) % 8 === 0 || i === candidates.length - 1) {
-          if (allNewFaces.length > 0) {
-            libraryStore.updateFacesAndPeople(allNewFaces);
-          } else {
-            libraryStore.notifyListeners();
-          }
-          await libraryStore.persistNow();
-          if (window.electronAPI?.saveLibraryStatus) {
-            await window.electronAPI.saveLibraryStatus({
-              libraryPath,
-              totalPhotos,
-              faceScannedCount: currentScanned,
-              faceTotalCount: totalPhotos,
-              faceDetectedCount: allNewFaces.length,
-              faceLastIndex: currentScanned - 1,
-              faceLastFile: photo.fileName,
-              faceCompleted: i === candidates.length - 1,
-              facePercent: facePct,
-              phase: i === candidates.length - 1 ? 'completed' : 'faces',
-            });
-          }
-        }
-
-        // Non-blocking yield to event loop for smooth background execution and 60fps UI
-        await new Promise((r) => setTimeout(r, 20));
+        await libraryStore.persistNow();
       }
 
-      if (allNewFaces.length > 0) {
-        libraryStore.updateFacesAndPeople(allNewFaces);
+      if (totalDetected > 0) {
         if (isManualTrigger) {
-          showToast(`Face recognition complete! Detected ${allNewFaces.length} new face instances.`, 'success');
+          showToast(`Face recognition complete! Detected ${totalDetected} new face instances.`, 'success');
         }
       } else if (isManualTrigger) {
         showToast('Face recognition finished. No faces detected.', 'info');
@@ -642,7 +867,6 @@ export const App: React.FC = () => {
             message: '✓ Up to date',
           },
         }));
-        // Keep completed status in storageProgressMap
       }
     } finally {
       libraryStore.setDetectingFaces(false, null);
@@ -660,6 +884,7 @@ export const App: React.FC = () => {
     if (!dir) return;
 
     libraryStore.setScanning(true);
+    setSwitchingLibraryLabel(`Opening ${dir}...`);
     try {
       const switched = await libraryStore.switchLibrary(dir);
       if (switched) {
@@ -668,6 +893,7 @@ export const App: React.FC = () => {
         return;
       }
 
+      setSwitchingLibraryLabel(`Scanning ${dir}...`);
       const photos = await window.electronAPI.scanDirectory(dir);
       const enriched = libraryStore.setPhotos(photos, dir);
       setActiveTab('photos');
@@ -678,12 +904,14 @@ export const App: React.FC = () => {
       showToast(`Error opening folder: ${err.message}`, 'warning');
     } finally {
       libraryStore.setScanning(false);
+      setSwitchingLibraryLabel(null);
     }
   };
 
   const handleSelectLibrary = async (dirPath: string) => {
     responseTracker.clearAll();
     libraryStore.setScanning(true);
+    setSwitchingLibraryLabel(`Switching to ${dirPath}...`);
     try {
       const switched = await libraryStore.switchLibrary(dirPath);
       if (switched) {
@@ -693,6 +921,7 @@ export const App: React.FC = () => {
       }
 
       if (window.electronAPI) {
+        setSwitchingLibraryLabel(`Scanning ${dirPath}...`);
         const photos = await window.electronAPI.scanDirectory(dirPath);
         const enriched = libraryStore.setPhotos(photos, dirPath);
         setActiveTab('photos');
@@ -702,6 +931,7 @@ export const App: React.FC = () => {
       showToast(`Failed to load selected library: ${err.message}`, 'warning');
     } finally {
       libraryStore.setScanning(false);
+      setSwitchingLibraryLabel(null);
     }
   };
 
@@ -750,22 +980,54 @@ export const App: React.FC = () => {
   const handleLoadMirroredPhotos = async (mirrorRootPath: string) => {
     if (window.electronAPI) {
       libraryStore.setScanning(true);
-      const mirroredPhotos = await window.electronAPI.scanVirtualMirror(mirrorRootPath);
-      const enriched = libraryStore.setPhotos(mirroredPhotos, mirrorRootPath);
-      libraryStore.setScanning(false);
-      setActiveTab('photos');
+      try {
+        const mirroredPhotos = await window.electronAPI.scanVirtualMirror(mirrorRootPath);
+        const enriched = libraryStore.setPhotos(mirroredPhotos, mirrorRootPath);
+        setActiveTab('photos');
 
-      // Auto-run face detection on any remaining unscanned photos
-      await runFaceDetectionForPhotos(enriched, false);
+        // Auto-run face detection on any remaining unscanned photos
+        await runFaceDetectionForPhotos(enriched, false);
+      } finally {
+        libraryStore.setScanning(false);
+      }
     }
   };
 
   const handleSelectVirtualStorage = async (config: VirtualStorageConfig) => {
     responseTracker.clearAll();
     const mirrorLocalPath = `${config.localMirrorRoot}\\${config.name}`;
-    await handleLoadMirroredPhotos(mirrorLocalPath);
+    setSwitchingLibraryLabel(`Switching to ${config.name}...`);
+    try {
+      // Fast path: this mirror's photos are indexed in its own SQLite database
+      // (written the first time it was synced/saved) — reuse the same
+      // instant meta + first-page switch used for regular library folders,
+      // instead of re-walking every sidecar JSON file in the mirror
+      // directory on disk, which is what made switching to a large network
+      // storage take a long time and feel stuck.
+      const switched = await libraryStore.switchLibrary(mirrorLocalPath);
+      if (switched) {
+        setActiveTab('photos');
+        return;
+      }
+
+      // First-ever switch to this mirror (nothing indexed yet) — fall back
+      // to scanning the mirror directory directly.
+      await handleLoadMirroredPhotos(mirrorLocalPath);
+    } finally {
+      setSwitchingLibraryLabel(null);
+    }
   };
 
+  /**
+   * Unified sync: syncVirtualStorage now runs the full per-photo pipeline
+   * itself — thumbnail, then (for whichever photos aren't already locked,
+   * and only while the storage is reachable) face detection, then OneDrive
+   * space-reclaim if applicable — one shared implementation for plain
+   * network and OneDrive-backed storages alike (see
+   * docs/PIPELINE_REDESIGN_DEV_DOC.md §3.3). Faces land straight in SQLite
+   * from the main process, so this just re-reads them afterward rather than
+   * running a separate renderer-side detection pass.
+   */
   const handleRefreshNetworkStorage = async (targetConfig?: VirtualStorageConfig) => {
     if (!window.electronAPI) return;
 
@@ -802,21 +1064,37 @@ export const App: React.FC = () => {
     }));
 
     try {
-      // 1. Sync any new photos from remote source, generate 500px local thumbnails & EXIF metadata sidecars
+      // 1. Thumbnail + face detection + OneDrive reclaim, per photo, in the main process.
       const res = await window.electronAPI.syncVirtualStorage(config);
       const mirrorLocalPath = `${config.localMirrorRoot}\\${config.name}`;
-      const updatedPhotos = await window.electronAPI.scanVirtualMirror(mirrorLocalPath);
 
-      // 2. Update library photos (preserves recognized faces and favorites)
-      const enriched = libraryStore.setPhotos(updatedPhotos, mirrorLocalPath);
+      // 2. Pick up the result — including any faces the pipeline just
+      // detected and persisted straight to SQLite — from the DB rather than
+      // the sidecar JSON (which never carries face data).
+      const updatedPhotos = (await window.electronAPI.getPhotosByStorageName?.(config.name, config.localMirrorRoot)) ||
+        (await window.electronAPI.scanVirtualMirror(mirrorLocalPath));
+      libraryStore.setPhotos(updatedPhotos, mirrorLocalPath);
 
-      // 3. Update storage metadata and persist
+      // 3. Update storage metadata and persist. totalItems must come from
+      // the catalog's own authoritative count (getStorageDetails, DB-backed),
+      // NOT res.totalSynced — that's just how many source files THIS ONE
+      // pass touched, which silently undercounts whenever the network/
+      // OneDrive source listing is briefly incomplete (a transient hiccup),
+      // permanently sticking the sidebar at that smaller number until some
+      // later pass happens to see every file again. The catalog only grows
+      // via confirmed processed photos, so it can't regress this way.
+      let authoritativeTotal = res.totalSynced;
+      try {
+        const details = await window.electronAPI.getStorageDetails?.(config.name, config.localMirrorRoot);
+        if (details && details.totalPhotos > 0) authoritativeTotal = details.totalPhotos;
+      } catch {}
+
       const updatedList = virtualStorages.map((s) =>
         s.id === config!.id
           ? {
               ...s,
               lastSynced: new Date().toISOString(),
-              totalItems: res.totalSynced,
+              totalItems: authoritativeTotal,
               totalSizeSaved: res.totalSizeSaved,
               newlyAdded: res.newlyAdded,
             }
@@ -825,27 +1103,25 @@ export const App: React.FC = () => {
       setVirtualStorages(updatedList);
       await window.electronAPI.saveLibraryData('gphotos_virtual_storages_v1', updatedList);
 
-      // 4. Automatically recognize faces on any newly added photos or unscanned photos
-      const photosNeedingFaces = enriched.filter((p) => !p.faceScanCompleted && (!p.faces || p.faces.length === 0));
-      if (res.newlyAdded > 0 || photosNeedingFaces.length > 0) {
-        showToast(`Mirrored ${res.newlyAdded} new photos from ${config.name}. Starting face recognition...`, 'info');
-        await runFaceDetectionForPhotos(enriched, false, config.name);
-      } else {
-        setStorageProgressMap((prev) => ({
-          ...prev,
-          [config!.name]: {
-            storageName: config!.name,
-            phase: 'completed',
-            thumbnailCurrent: res.totalSynced,
-            thumbnailTotal: res.totalSynced,
-            faceCurrent: 0,
-            faceTotal: 0,
-            percent: 100,
-            message: '✓ Up to date',
-          },
-        }));
-        showToast(`Rescan Complete: ${config.name} is up-to-date (${res.totalSynced} photos).`, 'success');
-      }
+      setStorageProgressMap((prev) => ({
+        ...prev,
+        [config!.name]: {
+          storageName: config!.name,
+          phase: 'completed',
+          thumbnailCurrent: res.totalSynced,
+          thumbnailTotal: res.totalSynced,
+          faceCurrent: res.totalSynced,
+          faceTotal: res.totalSynced,
+          percent: 100,
+          message: '✓ Up to date',
+        },
+      }));
+      showToast(
+        res.newlyAdded > 0
+          ? `Synced ${res.newlyAdded} new photo(s) from ${config.name} (thumbnails + faces).`
+          : `Rescan Complete: ${config.name} is up-to-date (${res.totalSynced} photos).`,
+        'success'
+      );
     } catch (err: any) {
       setStorageProgressMap((prev) => ({
         ...prev,
@@ -864,15 +1140,56 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleScanStorageFaces = async (storage: VirtualStorageConfig) => {
+  /**
+   * Turns an arbitrary folder browsed via the folder-tree view into a new
+   * virtual storage and runs it through the same unified inventory ->
+   * thumbnail -> face -> reclaim pipeline as one added from the Virtual
+   * Storage tab — replaces the old "Scan in Background" button's separate
+   * thumbnail-only startBackgroundScan call (which never ran face detection
+   * at all and used its own, different photo-id scheme).
+   */
+  const handleScanFolderAsStorage = async (path: string, name?: string) => {
     if (!window.electronAPI) return;
-    const mirrorPath = `${storage.localMirrorRoot}\\${storage.name}`;
-    libraryStore.setScanning(true);
-    const mirroredPhotos = await window.electronAPI.scanVirtualMirror(mirrorPath);
-    const enriched = libraryStore.setPhotos(mirroredPhotos, mirrorPath);
-    libraryStore.setScanning(false);
+    const storageName = name || path.split(/[\\/]/).filter(Boolean).pop() || 'Folder';
+
+    const newConfig: VirtualStorageConfig = {
+      id: `storage_${Date.now()}`,
+      name: storageName,
+      networkSourcePath: path,
+      localMirrorRoot: 'C:\\GPhotos_VirtualMirrors',
+      inventoryStatus: 'not_started',
+    };
+
+    setVirtualStorages((prev) => {
+      const updated = [...prev.filter((s) => s.name.toLowerCase() !== storageName.toLowerCase()), newConfig];
+      window.electronAPI?.saveLibraryData('gphotos_virtual_storages_v1', updated).catch(() => {});
+      return updated;
+    });
+
+    // Inventory gate: count everything under the folder and fix that number
+    // before any thumbnail/face processing starts.
+    if (window.electronAPI.scanStorageInventory) {
+      const result = await window.electronAPI.scanStorageInventory(path);
+      newConfig.inventoryStatus = result.status;
+      newConfig.inventoryTotalFiles = result.totalFiles;
+      newConfig.inventoryCompletedAt = result.completedAt;
+      newConfig.inventoryError = result.error;
+      if (result.status !== 'completed') {
+        showToast(`Could not inventory ${storageName}: ${result.error || 'unknown error'}`, 'warning');
+        return;
+      }
+    }
+
+    await handleRefreshNetworkStorage(newConfig);
+  };
+
+  // "Scan Faces" on a storage card: syncVirtualStorage's per-photo pipeline
+  // already runs face detection as part of sync (and cheaply no-ops the
+  // thumbnail step for anything already up to date), so this is just an
+  // explicit re-entry into the same unified path rather than a separate one.
+  const handleScanStorageFaces = async (storage: VirtualStorageConfig) => {
     showToast(`Starting face recognition for ${storage.name}...`, 'info');
-    await runFaceDetectionForPhotos(enriched, true, storage.name);
+    await handleRefreshNetworkStorage(storage);
   };
 
   const [tabResetTrigger, setTabResetTrigger] = useState<number>(0);
@@ -890,6 +1207,19 @@ export const App: React.FC = () => {
     setDuplicateCleanerCluster(cluster || null);
     setShowDuplicateCleaner(true);
   };
+
+  // Re-derived from the live library on every render (rather than freezing
+  // the Photo objects at the moment the lightbox opened) so a favorite
+  // toggle or an album removal while browsing is reflected immediately —
+  // same as the album grid itself. Falls back to the whole library when the
+  // lightbox wasn't opened from a narrower context (e.g. the main gallery).
+  const activeLightboxPhotoList = useMemo(() => {
+    if (!activeLightboxContextIds) return libraryState.photos;
+    const photoMap = new Map(libraryState.photos.map((p) => [p.id, p]));
+    return activeLightboxContextIds
+      .map((id) => photoMap.get(id))
+      .filter((p): p is Photo => p !== undefined);
+  }, [activeLightboxContextIds, libraryState.photos]);
 
   return (
     <div
@@ -979,7 +1309,10 @@ export const App: React.FC = () => {
           <AlbumsView
             photos={libraryState.photos}
             albums={libraryState.albums || []}
-            onSelectPhoto={(p) => setActiveLightboxPhoto(p)}
+            onSelectPhoto={(p, contextPhotos) => {
+              setActiveLightboxPhoto(p);
+              setActiveLightboxContextIds(contextPhotos ? contextPhotos.map((cp) => cp.id) : null);
+            }}
             resetTrigger={tabResetTrigger}
           />
         )}
@@ -1018,13 +1351,7 @@ export const App: React.FC = () => {
             initialFolderPath={selectedFolderForTree}
             resetTrigger={tabResetTrigger}
             onStartBackgroundScan={(path, name) => {
-              if (window.electronAPI?.startBackgroundScan) {
-                window.electronAPI.startBackgroundScan({
-                  sourcePath: path,
-                  storageName: name || path.split(/[/\\]/).filter(Boolean).pop() || 'Folder',
-                  mirrorDir: 'C:\\GPhotos_VirtualMirrors'
-                });
-              }
+              handleScanFolderAsStorage(path, name);
             }}
             onPhotosDiscovered={(newPhotos) => {
               libraryStore.addPhotos(newPhotos);
@@ -1038,7 +1365,6 @@ export const App: React.FC = () => {
             onLoadMirroredPhotos={handleLoadMirroredPhotos}
             onStoragesUpdated={(storages) => setVirtualStorages(storages)}
             storageProgressMap={storageProgressMap}
-            onScanStorageFaces={handleScanStorageFaces}
             onBrowseFolderTree={(folderPath) => {
               setSelectedFolderForTree(folderPath);
               setActiveTab('folders');
@@ -1062,9 +1388,12 @@ export const App: React.FC = () => {
       {activeLightboxPhoto && (
         <PhotoLightbox
           photo={libraryState.photos.find((p) => p.id === activeLightboxPhoto.id) || activeLightboxPhoto}
-          allPhotos={libraryState.photos}
+          allPhotos={activeLightboxPhotoList}
           people={libraryState.people}
-          onClose={() => setActiveLightboxPhoto(null)}
+          onClose={() => {
+            setActiveLightboxPhoto(null);
+            setActiveLightboxContextIds(null);
+          }}
           onSelectPhoto={(p) => setActiveLightboxPhoto(p)}
           onToggleFavorite={handleToggleFavorite}
           onNavigateToPerson={handleNavigateToPerson}
@@ -1254,6 +1583,64 @@ export const App: React.FC = () => {
 
       {/* Global 20ms Latency Response Indicator & Wait Dialog */}
       <ResponseActivityIndicator />
+
+      {/* Thumbnail pre-fetch activity indicator (bottom-left) */}
+      <PrefetchStatusIndicator />
+
+      {/* Small centered "please wait" popup shown while a library/storage switch is in flight */}
+      {switchingLibraryLabel && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 10000,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            backgroundColor: 'rgba(5, 8, 15, 0.35)',
+            pointerEvents: 'none',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '12px',
+              padding: '16px 22px',
+              borderRadius: 'var(--radius-lg)',
+              backgroundColor: 'rgba(15, 23, 42, 0.95)',
+              border: '1px solid rgba(56, 189, 248, 0.45)',
+              boxShadow: '0 20px 50px rgba(0, 0, 0, 0.6), 0 0 24px rgba(6, 182, 212, 0.2)',
+              backdropFilter: 'blur(16px)',
+              maxWidth: '420px',
+              animation: 'fadeIn 0.2s ease',
+            }}
+          >
+            <RefreshCw
+              size={20}
+              color="var(--accent-cyan)"
+              className="animate-spin"
+              style={{ animationDuration: '0.85s', flexShrink: 0 }}
+            />
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 }}>
+              <span style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--text-primary)' }}>
+                Please wait
+              </span>
+              <span
+                style={{
+                  fontSize: '0.78rem',
+                  color: 'var(--text-secondary)',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {switchingLibraryLabel}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

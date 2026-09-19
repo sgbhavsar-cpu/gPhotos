@@ -19,7 +19,7 @@ import { getLocalPhotoUrl, libraryStore } from '../src/renderer/src/services/lib
 import { discoverStoredMirrors } from '../src/main/services/virtualMirrorService';
 import { DetectedFace, Person, Photo } from '../src/types';
 
-console.log('=== RUNNING TESTS FOR GOOGLE PHOTOS DESKTOP CORE LOGIC ===\n');
+console.log('=== RUNNING TESTS FOR GPHOTOS DESKTOP CORE LOGIC ===\n');
 
 // 1. Test Physical Date Organizer Directory Formats
 console.log('Test 1: Testing Directory Formatting by Date...');
@@ -762,7 +762,61 @@ async function testRescan() {
   assert.strictEqual(photoAliceUnassigned.faces![0].personId, 'p_alice_learn', 'Unassigned photo must be matched to Alice');
   console.log('✓ confirmFace automatically triggered 2.5x weighted centroid propagation and discovered matching library photos!\n');
 
-  console.log('=== ALL 23 CORE TESTS PASSED WITH 100% SUCCESS ===\n');
+  // 24. Test "Remove Unknown Faces" bulk action + the manually-verified lock
+  console.log('Test 24: Testing Remove Unknown Faces (bulk) & the manually-verified auto-scan lock...');
+  libraryStore.resetAllPeopleAndFaces();
+
+  const namedPerson: Person = { id: 'p_named', name: 'Bob', faceCount: 1, photoCount: 1, createdAt: '' };
+  const placeholderPerson: Person = { id: 'p_placeholder', name: 'Person 3', faceCount: 1, photoCount: 1, createdAt: '' };
+
+  const crowdPhoto: Photo = {
+    id: 'photo_crowd',
+    filePath: 'C:\\Photos\\crowd.jpg',
+    fileName: 'crowd.jpg',
+    fileSize: 1000,
+    fileDate: '', dateTaken: '2026-01-01', year: 2026, month: 1, day: 1,
+    faces: [
+      // Known, named person — must survive the bulk removal.
+      { id: 'face_named', photoId: 'photo_crowd', box: { x: 0, y: 0, width: 40, height: 40 }, descriptor: new Array(128).fill(0.3), personId: 'p_named', confidence: 0.9 },
+      // Matched to an auto-generated placeholder name ("Person 3") — counts as unknown.
+      { id: 'face_placeholder', photoId: 'photo_crowd', box: { x: 50, y: 0, width: 40, height: 40 }, descriptor: new Array(128).fill(0.4), personId: 'p_placeholder', confidence: 0.85 },
+      // Never matched to anyone at all — counts as unknown.
+      { id: 'face_unmatched', photoId: 'photo_crowd', box: { x: 100, y: 0, width: 40, height: 40 }, descriptor: new Array(128).fill(0.5), confidence: 0.8 },
+    ],
+  };
+
+  libraryStore.setPhotos([crowdPhoto]);
+  libraryStore.getState().people = [namedPerson, placeholderPerson];
+  const statePhotoCrowd = libraryStore.getState().photos.find((p) => p.id === 'photo_crowd')!;
+  statePhotoCrowd.faces = crowdPhoto.faces!.map((f) => ({ ...f }));
+  libraryStore.getState().faces = statePhotoCrowd.faces!.map((f) => ({ ...f }));
+
+  const removeResult = libraryStore.removeUnknownFacesFromPhoto('photo_crowd');
+  assert.strictEqual(removeResult.removedCount, 2, 'Should remove exactly the 2 unknown faces (placeholder-named + unmatched)');
+
+  const afterRemove = libraryStore.getState().photos.find((p) => p.id === 'photo_crowd')!;
+  assert.strictEqual(afterRemove.faces?.length, 1, 'Only the named Bob face should remain on the photo');
+  assert.strictEqual(afterRemove.faces?.[0].personId, 'p_named', 'The one remaining face must still belong to Bob');
+  assert.strictEqual(afterRemove.facesLocked, true, 'Photo must be flagged facesLocked after the bulk removal');
+  assert(!libraryStore.getState().faces.some((f) => f.id === 'face_placeholder' || f.id === 'face_unmatched'), 'Removed faces must also be gone from the flat faces list');
+
+  // A rescan that rebuilds Photo objects from disk (no facesLocked
+  // field at all) must not silently clear the lock.
+  const rescannedCrowdPhoto: Photo = { ...afterRemove, faces: undefined, facesLocked: undefined };
+  libraryStore.setPhotos([rescannedCrowdPhoto]);
+  const afterRescan = libraryStore.getState().photos.find((p) => p.id === 'photo_crowd')!;
+  assert.strictEqual(afterRescan.facesLocked, true, 'facesLocked must survive a rescan/resync (setPhotos) even when the fresh record omits it');
+
+  // Explicitly re-running "Scan Faces" on this specific photo must lift the lock.
+  const rescanDetections: DetectedFace[] = [
+    { id: 'face_new_detect', photoId: 'photo_crowd', box: { x: 0, y: 0, width: 40, height: 40 }, descriptor: new Array(128).fill(0.6), confidence: 0.9 },
+  ];
+  libraryStore.detectAndMatchFacesForPhoto('photo_crowd', rescanDetections, 0.48);
+  const afterExplicitScan = libraryStore.getState().photos.find((p) => p.id === 'photo_crowd')!;
+  assert.strictEqual(afterExplicitScan.facesLocked, false, 'Explicitly re-running Scan Faces on this photo must lift the manually-verified lock');
+  console.log('✓ Remove Unknown Faces removed only unnamed/placeholder faces, locked the photo from auto-scanning, survived a rescan, and the lock lifted only on an explicit re-scan!\n');
+
+  console.log('=== ALL 24 CORE TESTS PASSED WITH 100% SUCCESS ===\n');
 
   // One-time sync of existing disk sidecars with new city entries
   const mirrorDir = 'C:\\GPhotos_VirtualMirrors\\photo1';

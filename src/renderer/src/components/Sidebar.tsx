@@ -382,7 +382,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
                               {storage.name}
                             </div>
                             <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>
-                              {storage.totalItems || 0} photos
+                              {/* inventoryTotalFiles is the single fixed count
+                                  every UI surface is meant to show once
+                                  inventory completes (see VirtualStorageConfig's
+                                  doc comment) — totalItems instead reflects
+                                  whatever the last FULLY COMPLETED sync pass
+                                  processed, which for a large library whose
+                                  first pass is still catching up on face
+                                  detection (thumbnails done, faces lagging)
+                                  stays far below the real total until that
+                                  entire pass finishes end to end. */}
+                              {(storage.inventoryStatus === 'completed' ? storage.inventoryTotalFiles : undefined) ?? storage.totalItems ?? 0} photos
                             </div>
                           </div>
                         </div>
@@ -411,7 +421,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
                         </button>
                       </div>
 
-                      {/* Live Thumbnail & Face Recognition Progress Indicators */}
+                      {/* Live progress: a stable "Cached X/Y · Faces X/Y" stat
+                          row that only ever updates its numbers in place —
+                          the previous version swapped between entirely
+                          different single-line messages ("Scanning...",
+                          "Thumbnails: X/Y", "Faces: X/Y", "✓ Up to date")
+                          with a different text color and progress-bar color
+                          at each phase change. That was fine when a sync
+                          took minutes, but now that an already-cached
+                          storage's refresh finishes in a couple of seconds
+                          (see the clustering/thumbnail fixes), those phases
+                          fly by fast enough to read as a flicker/blink
+                          rather than a smooth fill — and made a refresh of
+                          an up-to-date storage look like it was "re-caching
+                          everything" even though every file was just a fast
+                          skip-check. One stable layout, one color, numbers
+                          only, fixes both. */}
                       {isProgressActive && (
                         <div
                           style={{
@@ -427,13 +452,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
                             <span
                               style={{
                                 color:
-                                  prog.phase === 'faces'
-                                    ? '#f472b6'
-                                    : prog.phase === 'completed'
+                                  prog.phase === 'completed'
                                     ? '#10b981'
                                     : prog.phase === 'error'
                                     ? '#ef4444'
-                                    : 'var(--accent-cyan)',
+                                    : 'var(--text-muted)',
                                 fontWeight: 600,
                                 overflow: 'hidden',
                                 textOverflow: 'ellipsis',
@@ -441,11 +464,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
                                 maxWidth: '140px',
                               }}
                             >
-                              {prog.phase === 'scanning' && 'Scanning remote folder...'}
-                              {prog.phase === 'thumbnails' && `Thumbnails: ${prog.thumbnailCurrent}/${prog.thumbnailTotal || '?'}`}
-                              {prog.phase === 'faces' && `Faces: ${prog.faceCurrent}/${prog.faceTotal || '?'}`}
-                              {prog.phase === 'completed' && '✓ Up to date'}
-                              {prog.phase === 'error' && 'Sync error'}
+                              {prog.phase === 'error'
+                                ? 'Sync error'
+                                : prog.phase === 'completed'
+                                ? '✓ Up to date'
+                                : prog.phase === 'scanning' && !prog.thumbnailTotal
+                                ? 'Scanning remote folder...'
+                                : `Cached ${prog.thumbnailCurrent}/${prog.thumbnailTotal || '?'} · Faces ${prog.faceCurrent}/${prog.faceTotal || '?'}`}
                             </span>
                             <span style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 600 }}>
                               {prog.percent}%
@@ -466,9 +491,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                                 height: '100%',
                                 width: `${Math.min(100, Math.max(prog.phase === 'scanning' ? 12 : 0, prog.percent))}%`,
                                 background:
-                                  prog.phase === 'faces'
-                                    ? 'linear-gradient(90deg, #ec4899, #a855f7)'
-                                    : prog.phase === 'completed'
+                                  prog.phase === 'completed'
                                     ? '#10b981'
                                     : prog.phase === 'error'
                                     ? '#ef4444'

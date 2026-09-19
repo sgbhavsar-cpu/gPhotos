@@ -103,4 +103,83 @@ describe('storage:save / storage:load handlers (end-to-end)', () => {
     setActiveLibrary(libraryDir);
     expect(handleStorageLoad(STORAGE_KEY)).toBeNull();
   });
+
+  it('isPartialPageSet:true merges instead of destructively replacing (SQLite catalog pagination contract)', () => {
+    // Simulates the SQLite fast-path: a library with 3 photos indexed, but
+    // the renderer has only loaded the first "page" (1 photo) into memory
+    // when an immediate save fires (e.g. right after switchLibrary, or
+    // toggling a favorite on the one loaded photo). Before this contract
+    // existed, sending that partial photos array through the ordinary
+    // (destructive) save path deleted the other two photos' rows the
+    // instant any save happened — this is what made a switched-to library
+    // randomly appear "stuck" at whatever count happened to be loaded.
+    handleStorageSave(STORAGE_KEY, {
+      photos: [makePhoto('p1'), makePhoto('p2'), makePhoto('p3')],
+      selectedFolder: libraryDir,
+    });
+    expect(handleStorageLoad(STORAGE_KEY).photos).toHaveLength(3);
+
+    handleStorageSave(STORAGE_KEY, {
+      photos: [makePhoto('p1')],
+      isPartialPageSet: true,
+      selectedFolder: libraryDir,
+    });
+    const loaded = handleStorageLoad(STORAGE_KEY);
+    expect(loaded.photos.map((p: Photo) => p.id).sort()).toEqual(['p1', 'p2', 'p3']);
+  });
+
+  it('isPartialPageSet:true still updates fields on the photos it does include (e.g. a favorite toggle)', () => {
+    handleStorageSave(STORAGE_KEY, {
+      photos: [makePhoto('p1'), makePhoto('p2')],
+      selectedFolder: libraryDir,
+    });
+
+    const favorited = { ...makePhoto('p1'), isFavorite: true };
+    handleStorageSave(STORAGE_KEY, {
+      photos: [favorited],
+      isPartialPageSet: true,
+      selectedFolder: libraryDir,
+    });
+
+    const loaded = handleStorageLoad(STORAGE_KEY);
+    expect(loaded.photos).toHaveLength(2);
+    const p1 = loaded.photos.find((p: Photo) => p.id === 'p1');
+    expect(p1.isFavorite).toBe(true);
+  });
+
+  it('gphotos_virtual_storages_v1 collapses entries pointing at the same network source, keeping the most recently synced', () => {
+    const VIRTUAL_STORAGES_KEY = 'gphotos_virtual_storages_v1';
+    setActiveLibrary(libraryDir);
+
+    // Reproduces the real bug: two saved configs for the same underlying
+    // network folder (one under the user's chosen name, one under a stale
+    // auto-derived name from a since-fixed code path) — a save carrying
+    // both (e.g. from a stale renderer snapshot written after a fresher
+    // session had already deduped) must not let the duplicate survive.
+    handleStorageSave(VIRTUAL_STORAGES_KEY, [
+      {
+        id: 'storage_correct',
+        name: 'hemlata',
+        networkSourcePath: 'V:\\Backups\\hemlata',
+        lastSynced: '2026-09-14T11:06:27.611Z',
+      },
+      {
+        id: 'storage_stale_duplicate',
+        name: '20230423 varshitap parna mom hemlataben',
+        networkSourcePath: 'V:\\Backups\\hemlata',
+        lastSynced: '2026-09-14T08:20:52.675Z',
+      },
+      {
+        id: 'storage_other',
+        name: 'Jainish',
+        networkSourcePath: 'C:\\OneDrive\\J',
+        lastSynced: '2026-09-14T09:00:00.000Z',
+      },
+    ]);
+
+    const loaded = handleStorageLoad(VIRTUAL_STORAGES_KEY);
+    expect(loaded).toHaveLength(2);
+    const names = loaded.map((s: any) => s.name).sort();
+    expect(names).toEqual(['Jainish', 'hemlata']);
+  });
 });

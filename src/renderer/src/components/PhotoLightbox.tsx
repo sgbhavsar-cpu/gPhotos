@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   X,
+  Image as ImageIcon,
   ChevronLeft,
   ChevronRight,
   Info,
@@ -17,6 +18,7 @@ import {
   CheckCircle2,
   UserX,
   UserCheck,
+  UserMinus,
   Trash2,
   ZoomIn,
   ZoomOut,
@@ -33,16 +35,21 @@ import {
   Frame,
   FolderPlus,
   Check,
-  AlertCircle
+  AlertCircle,
+  Cloud,
+  CloudOff,
+  MoreVertical
 } from 'lucide-react';
 import { Photo, Person, DetectedFace, LocationMetadata } from '../../types';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { FaceAvatar } from './FaceAvatar';
 import { ReassignFaceModal } from './ReassignFaceModal';
 import { PersonNameInput } from './PersonNameInput';
-import { detectFacesInImage, computeDescriptorForBox } from '../services/faceEngine';
 import { evictAndRefreshThumbnail } from '../services/asyncImageLoader';
 import { authFetch } from '../services/webAuthClient';
+import { isOneDriveBackedPath } from '../services/storageValidation';
+import { logger } from '../services/logger';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 function getExpressionEmoji(expr?: string): string {
   if (!expr) return '';
@@ -85,8 +92,15 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   onToggleFavorite,
   onNavigateToPerson,
 }) => {
-  const [showInfo, setShowInfo] = useState(true);
+  const isMobile = useIsMobile();
+  // On mobile the info panel is a full-width overlay on top of the photo
+  // (see the "Right-Side EXIF & Info Inspector" render below), not a
+  // side-by-side 370px pane — defaulting it open would hide the photo
+  // behind the panel the instant the lightbox opens, so mobile starts closed.
+  const [showInfo, setShowInfo] = useState(!isMobile);
+  const [showMobileActions, setShowMobileActions] = useState(false);
   const [showFaces, setShowFaces] = useState(true);
+  const [hoveredFaceId, setHoveredFaceId] = useState<string | null>(null);
   const [reassignFace, setReassignFace] = useState<{
     face: DetectedFace;
     currentPersonName: string;
@@ -146,6 +160,23 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   const [lightboxImgError, setLightboxImgError] = useState(false);
   const [fallbackToThumbnail, setFallbackToThumbnail] = useState(false);
 
+  // OneDrive roots, fetched once — used to default a OneDrive-backed photo
+  // to its cached thumbnail instead of the full-resolution original, so
+  // simply browsing through the lightbox doesn't hydrate every OneDrive
+  // file it passes over. A toolbar toggle lets the user explicitly ask for
+  // the real full-resolution original when they actually need it.
+  // Once the user explicitly toggles the full-res/cached preference below,
+  // remember their choice across next/prev navigation instead of resetting
+  // to the OneDrive-backed default on every photo change.
+  const userFallbackPreference = useRef<boolean | null>(null);
+  const [oneDriveRoots, setOneDriveRoots] = useState<string[]>([]);
+  useEffect(() => {
+    window.electronAPI?.getOneDriveStatus?.().then((status) => {
+      if (status?.detectedRoots) setOneDriveRoots(status.detectedRoots);
+    });
+  }, []);
+  const isOneDriveBacked = !!(photo.isVirtual && photo.originalRemotePath && isOneDriveBackedPath(photo.originalRemotePath, oneDriveRoots));
+
   useEffect(() => {
     let isMounted = true;
     if (photo.isVirtual && photo.originalRemotePath && window.electronAPI?.checkFileExists) {
@@ -163,6 +194,23 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     };
   }, [photo.id, photo.originalRemotePath, photo.isVirtual]);
 
+  // Once a OneDrive-backed original has been explicitly viewed full-res and
+  // the user moves away from it, ask OneDrive to free the local space back
+  // up again — mirrors the same reclaim-after-use pattern the sync pipeline
+  // already follows, just for this on-demand ad-hoc view.
+  const previousFullResOneDrivePath = useRef<string | null>(null);
+  useEffect(() => {
+    if (isOneDriveBacked && !fallbackToThumbnail && photo.originalRemotePath) {
+      previousFullResOneDrivePath.current = photo.originalRemotePath;
+    }
+    return () => {
+      if (previousFullResOneDrivePath.current) {
+        window.electronAPI?.markOneDriveReclaimable?.([previousFullResOneDrivePath.current]).catch(() => {});
+        previousFullResOneDrivePath.current = null;
+      }
+    };
+  }, [photo.id, isOneDriveBacked, fallbackToThumbnail, photo.originalRemotePath]);
+
   // Reset zoom & pan when photo changes
   useEffect(() => {
     setZoom(1);
@@ -176,8 +224,15 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     setIsEditingLocation(false);
     setIsLightboxImgLoaded(false);
     setLightboxImgError(false);
-    setFallbackToThumbnail(false);
-  }, [photo.id]);
+    // Default to the cached thumbnail for a OneDrive-backed photo (avoid
+    // hydrating it just by browsing past it); every other source keeps
+    // showing full-resolution by default, unchanged from before. Once the
+    // user has explicitly toggled the preference, honor that choice instead
+    // of resetting to the default on every next/prev navigation.
+    setFallbackToThumbnail(
+      userFallbackPreference.current !== null ? userFallbackPreference.current : isOneDriveBacked
+    );
+  }, [photo.id, isOneDriveBacked]);
 
   // Album states
   const [showAddToAlbumModal, setShowAddToAlbumModal] = useState(false);
@@ -278,6 +333,14 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
           base64Data,
           saveAsCopy,
           mirrorThumbnailPath: photo.isVirtual ? photo.filePath : undefined,
+          // For HEIC-sourced photos, the saved bytes are always a baked JPEG
+          // preview of the local mirror thumbnail — the remote .heic master
+          // is never touched. Passing the rotation delta lets the main
+          // process record it in the shared rotation-flag store (keyed by
+          // both the local and remote paths), so viewing the photo at full
+          // resolution later — which reads the untouched remote master —
+          // still shows it rotated instead of silently reverting.
+          rotationDegrees: editRotation !== 0 ? editRotation : undefined,
         });
 
         if (res.success && res.newPhoto) {
@@ -349,8 +412,15 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
       };
     }
 
-    const baseW = imgNatural.width || photoW || 1;
-    const baseH = imgNatural.height || photoH || 1;
+    // face.box was measured against the photo's true full-resolution
+    // dimensions (photoW/photoH, from EXIF metadata), NOT necessarily
+    // whatever is currently on screen — a OneDrive-backed photo defaults to
+    // showing its small cached thumbnail, whose natural size is unrelated to
+    // the coordinate space the box was computed in. photoW/photoH must win
+    // here; imgNatural is only a last-resort fallback for the rare case
+    // metadata width/height is missing entirely.
+    const baseW = photoW || imgNatural.width || 1;
+    const baseH = photoH || imgNatural.height || 1;
     return {
       x: face.box.x / baseW,
       y: face.box.y / baseH,
@@ -359,35 +429,65 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     };
   };
 
+  // Per-photo forced "Detect Faces" button (requirement: a locked photo —
+  // all faces already confirmed — stays locked and un-rescanned until the
+  // user explicitly clicks this). Detection, clustering and persistence all
+  // happen in the main process now (see faceDetectionEngine.ts +
+  // pipelineOrchestrator.ts); this just adopts the authoritative result.
   const handleScanFacesInPhoto = async () => {
     if (isScanningSinglePhoto) return;
+
+    // Requirement: face detection must not run against an unreachable
+    // network storage, ad-hoc or otherwise (offline edits like confirm/
+    // reassign/delete-mark remain available regardless). isOriginalAvailable
+    // is already tracked (see the effect above) for the full-res viewer.
+    if (photo.isVirtual && isOriginalAvailable === false) {
+      setScanStatusMessage('Storage unavailable — reconnect to detect faces.');
+      setTimeout(() => setScanStatusMessage(null), 3500);
+      return;
+    }
+
+    if (!window.electronAPI?.detectFacesForced) return;
+
     setIsScanningSinglePhoto(true);
     setScanStatusMessage('Scanning faces with precision matching...');
 
+    logger.debug('PhotoLightbox', 'detectFacesForced: sending photo to main process', {
+      photoId: photo.id,
+      isVirtual: photo.isVirtual,
+      storageName: photo.storageName,
+      filePath: photo.filePath,
+      originalRemotePath: photo.originalRemotePath,
+    });
+
     try {
-      let preferOriginal = false;
-      if (photo.isVirtual && photo.originalRemotePath && window.electronAPI?.checkFileExists) {
-        preferOriginal = await window.electronAPI.checkFileExists(photo.originalRemotePath);
-      }
-
-      const detections = await detectFacesInImage(
-        photo.filePath,
-        photo.id,
-        photo.originalRemotePath,
-        preferOriginal
+      const result = await window.electronAPI.detectFacesForced(photo);
+      logger.info('PhotoLightbox', 'detectFacesForced: IPC result received', {
+        photoId: photo.id,
+        faceCount: result.faceCount,
+        actualFacesArrayLength: result.faces?.length ?? -1,
+        faceIds: (result.faces || []).map((f: DetectedFace) => f.id),
+        peopleCount: result.people?.length ?? -1,
+        locked: result.locked,
+        ran: result.ran,
+        skippedReason: result.skippedReason,
+      });
+      libraryStore.applyServerDetectedFaces(
+        [{ photoId: photo.id, faces: result.faces, faceScanCompleted: true, facesLocked: result.locked }],
+        result.people
       );
-      if (detections.length === 0) {
-        setScanStatusMessage('No faces detected in this photo.');
-        setTimeout(() => setScanStatusMessage(null), 3500);
-        return;
-      }
-
-      const updatedPhoto = await libraryStore.detectAndMatchFacesForPhoto(photo.id, detections, 0.48);
+      const afterPhoto = libraryStore.getState().photos.find((p) => p.id === photo.id);
+      logger.info('PhotoLightbox', 'detectFacesForced: local store state after applyServerDetectedFaces', {
+        photoId: photo.id,
+        storedFacesLength: afterPhoto?.faces?.length ?? -1,
+        storedFacesLocked: afterPhoto?.facesLocked,
+        storedFaceScanCompleted: afterPhoto?.faceScanCompleted,
+      });
       setShowFaces(true);
-      const faceCount = updatedPhoto.faces?.length || 0;
-      setScanStatusMessage(`Scan complete: ${faceCount} face${faceCount === 1 ? '' : 's'} recognized!`);
+      setScanStatusMessage(`Scan complete: ${result.faceCount} face${result.faceCount === 1 ? '' : 's'} recognized!`);
       setTimeout(() => setScanStatusMessage(null), 3500);
     } catch (err) {
+      logger.error('PhotoLightbox', 'detectFacesForced: threw an exception', { photoId: photo.id, err: String(err) });
       console.error('Failed to scan faces in photo:', err);
       setScanStatusMessage('Error scanning faces.');
       setTimeout(() => setScanStatusMessage(null), 3500);
@@ -519,6 +619,57 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   const handleDeleteDetection = (faceId: string, e: React.MouseEvent) => {
     e.stopPropagation();
     libraryStore.deleteFaceDetection(faceId);
+  };
+
+  const unknownFaceCount = (photo.faces || []).filter((f) => {
+    if (!f.personId) return true;
+    const person = libraryStore.getState().people.find((p) => p.id === f.personId);
+    return !person || /^Person(\s+\d+)?$/i.test(person.name);
+  }).length;
+
+  const unconfirmedFaceCount = (photo.faces || []).filter((f) => {
+    if (f.isConfirmed || !f.personId) return false;
+    const person = libraryStore.getState().people.find((p) => p.id === f.personId);
+    return !!person && !/^Person(\s+\d+)?$/i.test(person.name);
+  }).length;
+
+  // People panel ordering: known & confirmed first, then known but
+  // unconfirmed, then unknown/generic ("Person N") faces last.
+  const getFaceSortRank = (face: DetectedFace): number => {
+    const person = face.personId ? people.find((p) => p.id === face.personId) : undefined;
+    const isKnown = !!person && !/^Person(\s+\d+)?$/i.test(person.name);
+    if (!isKnown) return 2;
+    return face.isConfirmed ? 0 : 1;
+  };
+
+  const handleRemoveUnknownFaces = () => {
+    const { removedCount } = libraryStore.removeUnknownFacesFromPhoto(photo.id);
+    setScanStatusMessage(
+      removedCount > 0
+        ? `✓ Removed ${removedCount} unknown face${removedCount === 1 ? '' : 's'}. This photo is locked from auto face-scanning until you click Scan Faces again.`
+        : 'This photo is now locked from auto face-scanning until you click Scan Faces again.'
+    );
+    setTimeout(() => setScanStatusMessage(null), 4500);
+  };
+
+  const handleRemoveUnconfirmedFaces = () => {
+    const { removedCount } = libraryStore.removeUnconfirmedFacesFromPhoto(photo.id);
+    setScanStatusMessage(
+      removedCount > 0
+        ? `✓ Removed ${removedCount} unconfirmed face${removedCount === 1 ? '' : 's'}. This photo is locked from auto face-scanning until you click Scan Faces again.`
+        : 'This photo is now locked from auto face-scanning until you click Scan Faces again.'
+    );
+    setTimeout(() => setScanStatusMessage(null), 4500);
+  };
+
+  const handleResetUnconfirmedFaces = () => {
+    const { resetCount } = libraryStore.resetUnconfirmedFacesToUnknown(photo.id);
+    setScanStatusMessage(
+      resetCount > 0
+        ? `✓ Reset ${resetCount} unconfirmed face${resetCount === 1 ? '' : 's'} to unknown.`
+        : 'No unconfirmed faces to reset.'
+    );
+    setTimeout(() => setScanStatusMessage(null), 4500);
   };
 
   // Keyboard navigation
@@ -673,7 +824,37 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
           </div>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        {/* On mobile this whole action row (Rotate, View Full Res/Cached,
+            Edit, Scan Faces, Tag Manually, Show/Hide Faces, Add to Album,
+            Favorite, Info — up to 9 buttons) would either overflow the
+            60px-tall header horizontally or need to wrap into several extra
+            rows, since none of these fixed-height/no-wrap buttons shrink.
+            None of the buttons below are touched — only where this
+            container renders changes: inline in the header on desktop, or
+            collapsed into a dropdown panel toggled by a single icon button
+            on mobile. */}
+        <div style={isMobile ? (
+          showMobileActions
+            ? {
+                position: 'fixed',
+                top: 'calc(60px + env(safe-area-inset-top, 0px) + 6px)',
+                right: '8px',
+                zIndex: 70,
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'stretch',
+                gap: '6px',
+                padding: '10px',
+                maxWidth: '85vw',
+                maxHeight: '70vh',
+                overflowY: 'auto',
+                backgroundColor: 'var(--bg-surface)',
+                border: '1px solid var(--border-subtle)',
+                borderRadius: 'var(--radius-md)',
+                boxShadow: '0 12px 32px rgba(0, 0, 0, 0.45)',
+              }
+            : { display: 'none' }
+        ) : { display: 'flex', alignItems: 'center', gap: '8px' }}>
           {/* Quick Rotate button (rotates photo or local HEIC thumbnail) */}
           <button
             className="btn btn-secondary"
@@ -720,6 +901,32 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
             <span>Rotate</span>
           </button>
 
+          {/* Cached thumbnail <-> OneDrive full-resolution toggle. Defaults to
+              the cached thumbnail for OneDrive-backed photos (see the reset
+              effect above) so browsing through the lightbox doesn't hydrate
+              every file it passes over — this lets the user explicitly ask
+              for the real full-resolution original when they need it, and
+              releases it again once they move on or switch back. */}
+          {isOneDriveBacked && isOriginalAvailable && (
+            <button
+              className="btn btn-secondary"
+              onClick={() => setFallbackToThumbnail((prev) => {
+                const next = !prev;
+                userFallbackPreference.current = next;
+                return next;
+              })}
+              style={{ fontSize: '0.8rem', gap: '6px' }}
+              title={
+                fallbackToThumbnail
+                  ? 'Showing cached thumbnail — click to load the full-resolution OneDrive original'
+                  : 'Showing full-resolution OneDrive original — click to switch back to the cached thumbnail'
+              }
+            >
+              {fallbackToThumbnail ? <Cloud size={15} /> : <CloudOff size={15} />}
+              <span>{fallbackToThumbnail ? 'View Full Res' : 'View Cached'}</span>
+            </button>
+          )}
+
           {/* Edit photo button (available when local or online source, or virtual mirror) */}
           {(!photo.isVirtual || isOriginalAvailable || isHeic) && (
             <button
@@ -745,13 +952,20 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
           <button
             className="btn btn-secondary"
             onClick={handleScanFacesInPhoto}
-            disabled={isScanningSinglePhoto}
+            disabled={isScanningSinglePhoto || (photo.isVirtual && isOriginalAvailable === false)}
             style={{ fontSize: '0.8rem', gap: '6px' }}
-            title="Scan faces in this photo only and match known people with high precision"
+            title={
+              photo.isVirtual && isOriginalAvailable === false
+                ? 'Storage unavailable — reconnect to detect faces'
+                : 'Scan faces in this photo only and match known people with high precision'
+            }
           >
             <Sparkles size={15} color="#ec4899" className={isScanningSinglePhoto ? 'animate-spin' : ''} />
             <span>{isScanningSinglePhoto ? 'Scanning...' : 'Scan Faces'}</span>
           </button>
+
+          {/* Remove Unknown / Remove Unconfirmed / Reset Unconfirmed live in the
+              People panel (right side) next to the face list they act on, not here */}
 
           {/* 2. Tag face manually */}
           <button
@@ -806,6 +1020,26 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
             <Info size={22} />
           </button>
         </div>
+
+        {isMobile && (
+          <>
+            <button
+              className={`btn btn-icon ${showMobileActions ? 'btn-secondary' : 'btn-ghost'}`}
+              onClick={() => setShowMobileActions((v) => !v)}
+              style={{ width: '38px', height: '38px' }}
+              title="More actions"
+              aria-expanded={showMobileActions}
+            >
+              <MoreVertical size={22} />
+            </button>
+            {showMobileActions && (
+              <div
+                onClick={() => setShowMobileActions(false)}
+                style={{ position: 'fixed', inset: 0, zIndex: 65 }}
+              />
+            )}
+          </>
+        )}
       </header>
 
       {/* Main Content Area */}
@@ -1131,8 +1365,19 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                   setDrawBox(null);
 
                   if (w > 10 && h > 10) {
-                    const natW = imgNaturalSize?.width || imgRef.current.naturalWidth || photo.width || imgRef.current.clientWidth || 500;
-                    const natH = imgNaturalSize?.height || imgRef.current.naturalHeight || photo.height || imgRef.current.clientHeight || 500;
+                    // photo.width/height (true full-resolution EXIF dimensions)
+                    // must win here, not whatever's currently rendered — a
+                    // OneDrive-backed photo can be showing its small cached
+                    // thumbnail (fallbackToThumbnail), whose natural size has
+                    // nothing to do with the coordinate space
+                    // computeDescriptorForRegion decodes server-side (always
+                    // the true full-res source). Getting this wrong doesn't
+                    // just mis-draw a box, it crops the wrong region of the
+                    // real photo for the descriptor. clientWidth/Height (the
+                    // rendered CSS box) is unaffected either way, since a
+                    // browser scales any loaded image to fit its layout box.
+                    const natW = photo.width || imgNaturalSize?.width || imgRef.current.naturalWidth || imgRef.current.clientWidth || 500;
+                    const natH = photo.height || imgNaturalSize?.height || imgRef.current.naturalHeight || imgRef.current.clientHeight || 500;
                     const clientW = imgRef.current.clientWidth || 1;
                     const clientH = imgRef.current.clientHeight || 1;
 
@@ -1148,7 +1393,9 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
 
                     let descriptor: number[] | undefined;
                     try {
-                      descriptor = await computeDescriptorForBox(imgRef.current, box);
+                      const sourceFilePath = photo.isVirtual ? (photo.originalRemotePath || photo.filePath) : photo.filePath;
+                      const result = await window.electronAPI?.computeDescriptorForRegion?.(sourceFilePath, box);
+                      descriptor = result?.descriptor;
                     } catch (err) {
                       console.warn('Could not compute descriptor for manual box:', err);
                     }
@@ -1335,11 +1582,34 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                 // Counter-scale label gently so it remains legible without occluding faces at high zoom
                 const labelScale = 1 / Math.min(Math.max(zoom * 0.75, 1), 2.2);
 
+                // Hovering a face box, its name label, or its chip in the People panel
+                // hides every other marker so the face underneath and its label are
+                // fully visible, unobstructed by neighbors — and highlights this one,
+                // since a person chip hover has no native CSS :hover on the marker itself.
+                const isDimmedByHover = hoveredFaceId !== null && hoveredFaceId !== face.id;
+                const isHighlighted = hoveredFaceId === face.id;
+
                 return (
                   <div
                     key={face.id}
                     className="face-box-overlay"
-                    style={{ left: `${left}px`, top: `${top}px`, width: `${width}px`, height: `${height}px` }}
+                    onMouseEnter={() => setHoveredFaceId(face.id)}
+                    onMouseLeave={() => setHoveredFaceId((prev) => (prev === face.id ? null : prev))}
+                    style={{
+                      left: `${left}px`,
+                      top: `${top}px`,
+                      width: `${width}px`,
+                      height: `${height}px`,
+                      opacity: isDimmedByHover ? 0 : 1,
+                      pointerEvents: isDimmedByHover ? 'none' : undefined,
+                      ...(isHighlighted
+                        ? {
+                            borderColor: '#60a5fa',
+                            background: 'rgba(59, 130, 246, 0.28)',
+                            boxShadow: '0 0 12px rgba(59, 130, 246, 0.5)',
+                          }
+                        : null),
+                    }}
                   >
                     <div
                       className="face-tag-label"
@@ -1606,9 +1876,27 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
           </div>
         </div>
 
-        {/* Right-Side EXIF & Info Inspector */}
+        {/* Right-Side EXIF & Info Inspector — a fixed 370px side-by-side
+            pane would leave almost no room for the photo itself (or
+            overflow outright) on a 375-600px phone screen, so on mobile
+            this renders as a full-screen overlay on top of the photo
+            instead of squishing it. */}
         {showInfo && (
-          <aside style={{
+          <aside style={isMobile ? {
+            position: 'fixed',
+            inset: 0,
+            width: '100%',
+            height: '100%',
+            zIndex: 60,
+            backgroundColor: 'var(--bg-surface)',
+            padding: '16px',
+            paddingTop: 'calc(16px + env(safe-area-inset-top, 0px))',
+            paddingBottom: 'calc(16px + env(safe-area-inset-bottom, 0px))',
+            overflowY: 'auto',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '16px',
+          } : {
             width: '370px',
             minWidth: '370px',
             height: '100%',
@@ -1658,9 +1946,13 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                 <button
                   className="btn btn-ghost btn-icon"
                   onClick={handleScanFacesInPhoto}
-                  disabled={isScanningSinglePhoto}
+                  disabled={isScanningSinglePhoto || (photo.isVirtual && isOriginalAvailable === false)}
                   style={{ width: '32px', height: '32px', padding: 0, color: '#ec4899' }}
-                  title="Scan faces in this photo only (CosFace)"
+                  title={
+                    photo.isVirtual && isOriginalAvailable === false
+                      ? 'Storage unavailable — reconnect to detect faces'
+                      : 'Scan faces in this photo only'
+                  }
                 >
                   <Sparkles size={16} className={isScanningSinglePhoto ? 'animate-spin' : ''} />
                 </button>
@@ -1949,29 +2241,82 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                   <span style={{ fontSize: '0.85rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-muted)' }}>
                     People ({photo.faces?.length || 0})
                   </span>
-                  <div style={{ display: 'flex', gap: '4px' }}>
-                    <button
-                      className="btn btn-secondary"
-                      onClick={handleScanFacesInPhoto}
-                      disabled={isScanningSinglePhoto}
-                      style={{ fontSize: '0.72rem', padding: '2px 8px', height: '24px', gap: '4px' }}
-                      title="Scan faces in this photo only"
-                    >
-                      <Sparkles size={12} color="#ec4899" className={isScanningSinglePhoto ? 'animate-spin' : ''} />
-                      <span>Scan</span>
-                    </button>
-                    <button
-                      className={`btn ${isTaggingMode ? 'btn-primary' : 'btn-secondary'}`}
-                      onClick={() => {
-                        setIsTaggingMode(!isTaggingMode);
-                        setDrawBox(null);
+                  {photo.facesLocked && (
+                    <span
+                      style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '3px',
+                        fontSize: '10px',
+                        fontWeight: 600,
+                        padding: '2px 6px',
+                        borderRadius: 'var(--radius-full)',
+                        backgroundColor: 'rgba(16, 185, 129, 0.15)',
+                        color: '#10b981',
+                        textTransform: 'none',
                       }}
-                      style={{ fontSize: '0.72rem', padding: '2px 8px', height: '24px', gap: '4px' }}
-                      title="Draw bounding box to tag a face manually"
+                      title="Manually verified — locked from automatic face scanning until you click Scan again"
                     >
-                      <Plus size={12} />
-                      <span>Tag</span>
-                    </button>
+                      <CheckCircle2 size={11} />
+                      Verified
+                    </span>
+                  )}
+                  <div style={{ display: 'flex', gap: '4px' }}>
+                    {unknownFaceCount > 0 && (
+                      <button
+                        className="btn btn-secondary"
+                        onClick={handleRemoveUnknownFaces}
+                        style={{ fontSize: '0.72rem', padding: '2px 8px', height: '24px', gap: '4px' }}
+                        title={`Remove ${unknownFaceCount} unknown/unnamed face${unknownFaceCount === 1 ? '' : 's'} and lock this photo from auto face-scanning until you click Scan again`}
+                      >
+                        <X size={12} color="#ef4444" strokeWidth={2.5} />
+                        <span>Unknown</span>
+                      </button>
+                    )}
+                    {unconfirmedFaceCount > 0 && (
+                      <button
+                        className="btn btn-secondary"
+                        onClick={handleRemoveUnconfirmedFaces}
+                        style={{ fontSize: '0.72rem', padding: '2px 8px', height: '24px', gap: '4px' }}
+                        title={`Remove ${unconfirmedFaceCount} unconfirmed face${unconfirmedFaceCount === 1 ? '' : 's'} and lock this photo from auto face-scanning until you click Scan again`}
+                      >
+                        <span style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          width: '14px',
+                          height: '14px',
+                          borderRadius: '3px',
+                          border: '1.5px solid #ef4444',
+                          flexShrink: 0,
+                        }}>
+                          <Check size={9} color="#ef4444" strokeWidth={3} />
+                        </span>
+                        <span>Unconfirmed</span>
+                      </button>
+                    )}
+                    {unconfirmedFaceCount > 0 && (
+                      <button
+                        className="btn btn-secondary"
+                        onClick={handleResetUnconfirmedFaces}
+                        style={{ fontSize: '0.72rem', padding: '2px 8px', height: '24px', gap: '4px' }}
+                        title={`Reset ${unconfirmedFaceCount} unconfirmed face${unconfirmedFaceCount === 1 ? '' : 's'} to unknown, keeping the face boxes`}
+                      >
+                        <span style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          width: '14px',
+                          height: '14px',
+                          borderRadius: '3px',
+                          border: '1.5px solid #ef4444',
+                          flexShrink: 0,
+                        }}>
+                          <ImageIcon size={9} color="#ef4444" />
+                        </span>
+                        <span>Unconfirmed</span>
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -1991,21 +2336,29 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
 
               {photo.faces && photo.faces.length > 0 ? (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                  {photo.faces.map((face) => {
+                  {[...photo.faces]
+                    .sort((a, b) => getFaceSortRank(a) - getFaceSortRank(b))
+                    .map((face) => {
                     const person = people.find((p) => p.id === face.personId);
                     const personName = person ? person.name : 'Unknown Person';
+
+                    const isChipHovered = hoveredFaceId === face.id;
 
                     return (
                       <div
                         key={face.id}
+                        onMouseEnter={() => setHoveredFaceId(face.id)}
+                        onMouseLeave={() => setHoveredFaceId((prev) => (prev === face.id ? null : prev))}
                         style={{
                           display: 'flex',
                           alignItems: 'center',
                           justifyContent: 'space-between',
                           padding: '8px 10px',
                           borderRadius: 'var(--radius-md)',
-                          backgroundColor: 'var(--bg-surface-elevated)',
-                          border: '1px solid var(--border-subtle)',
+                          backgroundColor: isChipHovered ? 'rgba(59, 130, 246, 0.18)' : 'var(--bg-surface-elevated)',
+                          border: isChipHovered ? '1px solid var(--accent-primary)' : '1px solid var(--border-subtle)',
+                          boxShadow: isChipHovered ? '0 0 12px rgba(59, 130, 246, 0.35)' : 'none',
+                          transition: 'all 0.15s ease',
                         }}
                       >
                         <div
