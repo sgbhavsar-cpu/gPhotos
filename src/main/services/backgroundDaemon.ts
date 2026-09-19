@@ -10,6 +10,7 @@ import { setActiveLibrary } from './db';
 import { isPathReachable } from './networkReachabilityCache';
 import { isOneDrivePath, markFilesForSpaceReclaim, runReclaimHealthCheck, getReclaimHealth } from './oneDriveService';
 import { libraryStatusService } from './libraryStatusService';
+import { getDefaultMirrorRoot } from './pathSecurity';
 
 let tray: Tray | null = null;
 let syncTimer: NodeJS.Timeout | null = null;
@@ -317,7 +318,7 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
       activeScanStorage = storage.name;
       if (mainWindow) updateTrayMenu(mainWindow);
 
-      const mirrorDir = path.join(storage.localMirrorRoot || 'C:\\GPhotos_VirtualMirrors', storage.name);
+      const mirrorDir = path.join(storage.localMirrorRoot || getDefaultMirrorRoot(), storage.name);
       if (!fs.existsSync(mirrorDir)) {
         fs.mkdirSync(mirrorDir, { recursive: true });
       }

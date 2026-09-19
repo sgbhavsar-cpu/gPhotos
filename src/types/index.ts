@@ -354,6 +354,7 @@ export interface IElectronAPI {
   syncVirtualStorage: (config: VirtualStorageConfig) => Promise<SyncVirtualStorageResult>;
   scanVirtualMirror: (mirrorDirPath: string) => Promise<Photo[]>;
   discoverMirrors: (rootPath?: string) => Promise<VirtualStorageConfig[]>;
+  getDefaultMirrorRoot?: () => Promise<string>;
   openOriginalFile: (filePath: string) => Promise<boolean>;
   checkFileExists: (filePath: string) => Promise<boolean>;
   onMirrorProgress: (callback: (progress: MirrorProgress) => void) => () => void;

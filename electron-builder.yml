@@ -28,3 +28,19 @@ nsis:
   createStartMenuShortcut: true
 portable:
   artifactName: ${productName}-Portable-${version}.${ext}
+linux:
+  icon: public/icon.png
+  category: Graphics
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+appImage:
+  artifactName: ${productName}-${version}.${ext}
+deb:
+  artifactName: ${productName}-${version}.${ext}
+  maintainer: Sachin Bhavsar <claude.ssminfotech@gmail.com>
+  compression: gz

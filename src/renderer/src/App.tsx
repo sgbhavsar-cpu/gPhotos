@@ -1151,12 +1151,13 @@ export const App: React.FC = () => {
   const handleScanFolderAsStorage = async (path: string, name?: string) => {
     if (!window.electronAPI) return;
     const storageName = name || path.split(/[\\/]/).filter(Boolean).pop() || 'Folder';
+    const defaultMirrorRoot = (await window.electronAPI.getDefaultMirrorRoot?.()) || 'GPhotos_VirtualMirrors';
 
     const newConfig: VirtualStorageConfig = {
       id: `storage_${Date.now()}`,
       name: storageName,
       networkSourcePath: path,
-      localMirrorRoot: 'C:\\GPhotos_VirtualMirrors',
+      localMirrorRoot: defaultMirrorRoot,
       inventoryStatus: 'not_started',
     };
 

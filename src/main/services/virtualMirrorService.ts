@@ -18,6 +18,7 @@ import {
 } from '../../types';
 import { libraryStatusService } from './libraryStatusService';
 import { getFaceStatsForLibrary } from './libraryRepository';
+import { getDefaultMirrorRoot } from './pathSecurity';
 import { isPathReachable, isNetworkPath } from './networkReachabilityCache';
 import { runFaceDetectionStep, photoIdForSidecar } from './pipelineOrchestrator';
 import { logger } from './logger';
@@ -113,7 +114,7 @@ export function getAllStorageCheckpoints(customMirrorRoot?: string): Record<stri
   }
 
   try {
-    const root = customMirrorRoot || 'C:\\GPhotos_VirtualMirrors';
+    const root = customMirrorRoot || getDefaultMirrorRoot();
     if (fs.existsSync(root)) {
       const entries = fs.readdirSync(root, { withFileTypes: true });
       for (const entry of entries) {
@@ -141,7 +142,7 @@ export function loadStorageCheckpoint(storageName: string, localMirrorRoot?: str
 
 export function saveStorageCheckpoint(checkpoint: StorageSyncCheckpoint): void {
   try {
-    const mirrorFolder = path.join(checkpoint.localMirrorRoot || 'C:\\GPhotos_VirtualMirrors', checkpoint.storageName);
+    const mirrorFolder = path.join(checkpoint.localMirrorRoot || getDefaultMirrorRoot(), checkpoint.storageName);
     if (!fs.existsSync(mirrorFolder)) {
       try { fs.mkdirSync(mirrorFolder, { recursive: true }); } catch {}
     }
@@ -196,7 +197,7 @@ export async function scanStorageInventory(networkSourcePath: string): Promise<I
 }
 
 export function getStorageDetails(storageName: string, mirrorRoot?: string): StorageDetails {
-  const root = mirrorRoot || 'C:\\GPhotos_VirtualMirrors';
+  const root = mirrorRoot || getDefaultMirrorRoot();
   const mirrorFolder = path.join(root, storageName);
 
   let totalPhotos = 0;
@@ -311,7 +312,7 @@ export function getStorageDetails(storageName: string, mirrorRoot?: string): Sto
 }
 
 export function getAllStorageDetails(mirrorRoot?: string): Record<string, StorageDetails> {
-  const root = mirrorRoot || 'C:\\GPhotos_VirtualMirrors';
+  const root = mirrorRoot || getDefaultMirrorRoot();
   const result: Record<string, StorageDetails> = {};
   if (!fs.existsSync(root)) return result;
 
@@ -900,7 +901,7 @@ export function scanVirtualMirrorDirectory(mirrorDirPath: string): Photo[] {
 }
 
 export function discoverStoredMirrors(customRoot?: string): VirtualStorageConfig[] {
-  const root = customRoot || 'C:\\GPhotos_VirtualMirrors';
+  const root = customRoot || getDefaultMirrorRoot();
   if (!fs.existsSync(root)) return [];
 
   const storages: VirtualStorageConfig[] = [];

@@ -78,7 +78,7 @@ import { getPhotosByStorageName, getFacesForPhoto, getAllPeople } from './servic
 import { getDbForLibraryPath } from './services/db';
 import { detectFacesForPhoto, forceRedetectFacesForPhoto, resolveDbForPhoto } from './services/pipelineOrchestrator';
 import { detectFaceInRegion } from './services/faceDetectionEngine';
-import { assertPathsAllowed } from './services/pathSecurity';
+import { assertPathsAllowed, getDefaultMirrorRoot } from './services/pathSecurity';
 import {
   getSpriteCoordinate,
   getSpriteCoordinatesBatch,
@@ -880,6 +880,10 @@ ipcMain.handle('mirror:list-stored-mirrors', async (_event, rootPath?: string) =
   }
 });
 
+ipcMain.handle('mirror:get-default-root', async () => {
+  return getDefaultMirrorRoot();
+});
+
 ipcMain.handle('mirror:get-storage-checkpoints', async (_event, mirrorRoot?: string) => {
   try {
     return getAllStorageCheckpoints(mirrorRoot);
@@ -917,7 +921,7 @@ ipcMain.handle('mirror:get-photos-by-storage', async (_event, storageName: strin
     // pipelineOrchestrator.ts's runFaceDetectionStep, which writes there) —
     // must resolve the SAME path here, not the ambient active library, or
     // this returns stale/empty results right after a sync.
-    const mirrorFolder = path.join(mirrorRoot || 'C:\\GPhotos_VirtualMirrors', storageName);
+    const mirrorFolder = path.join(mirrorRoot || getDefaultMirrorRoot(), storageName);
     return getPhotosByStorageName(storageName, getDbForLibraryPath(mirrorFolder));
   } catch (err) {
     logger.error('Pipeline', 'mirror:get-photos-by-storage failed', { storageName, err: String(err) });
@@ -1173,7 +1177,7 @@ ipcMain.handle('mirror:start-bg-scan', async (event, sourcePath: string, mirrorR
   const jobId = `job_${Date.now()}`;
   activeScanJobs.set(jobId, true);
 
-  const finalMirrorRoot = mirrorRoot || 'C:\\GPhotos_VirtualMirrors';
+  const finalMirrorRoot = mirrorRoot || getDefaultMirrorRoot();
   const name = storageName || path.basename(sourcePath) || 'Storage';
   const targetMirrorDir = path.join(finalMirrorRoot, name);
 
@@ -1513,7 +1517,7 @@ ipcMain.handle('mirror:delete-storage', async (_event, params: { storageName: st
     if (!storageName || /[\\/]|\.\./.test(storageName)) {
       throw new Error(`Invalid storage name: "${storageName}"`);
     }
-    const finalRoot = localMirrorRoot || 'C:\\GPhotos_VirtualMirrors';
+    const finalRoot = localMirrorRoot || getDefaultMirrorRoot();
     const mirrorDir = path.join(finalRoot, storageName);
     if (deleteDiskFiles) {
       assertPathsAllowed([mirrorDir], 'mirror:delete-storage');
@@ -1605,7 +1609,7 @@ ipcMain.handle('service:start-precache', async (_event, photos?: Photo[]) => {
       thumbnailWorker.enqueuePhotos(photos);
     } else {
       try {
-        const mirrorRoot = 'C:\\GPhotos_VirtualMirrors';
+        const mirrorRoot = getDefaultMirrorRoot();
         if (fs.existsSync(mirrorRoot)) {
           const subdirs = fs.readdirSync(mirrorRoot, { withFileTypes: true });
           for (const dirent of subdirs) {

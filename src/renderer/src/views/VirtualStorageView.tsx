@@ -62,7 +62,11 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
 
   const [name, setName] = useState('');
   const [networkSourcePath, setNetworkSourcePath] = useState('');
-  const [localMirrorRoot, setLocalMirrorRoot] = useState('C:\\GPhotos_VirtualMirrors');
+  // Starts empty and is filled in from the main process once known — the
+  // real default depends on platform (C:\GPhotos_VirtualMirrors on Windows,
+  // ~/GPhotos_VirtualMirrors elsewhere), which only the main process/host
+  // server can answer correctly.
+  const [localMirrorRoot, setLocalMirrorRoot] = useState('');
   const [delaySec, setDelaySec] = useState<number>(0.5);
   const [bandwidthLimit, setBandwidthLimit] = useState<number>(0);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -235,6 +239,21 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
       }
     };
     load();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // Fill in the platform-appropriate default mirror root once known — only
+  // if the field is still untouched, so this never clobbers something the
+  // user already typed.
+  useEffect(() => {
+    let isMounted = true;
+    window.electronAPI?.getDefaultMirrorRoot?.().then((root) => {
+      if (isMounted && root) {
+        setLocalMirrorRoot((prev) => (prev === '' ? root : prev));
+      }
+    }).catch(() => {});
     return () => {
       isMounted = false;
     };

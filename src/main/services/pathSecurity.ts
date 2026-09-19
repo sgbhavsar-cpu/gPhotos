@@ -1,7 +1,22 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { getSetting } from './libraryRepository';
 import { VirtualStorageConfig } from '../../types';
+
+/**
+ * Default local root for virtual/network storage mirrors when the user
+ * hasn't configured a custom one. Windows keeps the long-standing
+ * C:\GPhotos_VirtualMirrors default (existing installs already have data
+ * there); other platforms have no C: drive to anchor to, so they get an
+ * equivalent folder under the user's home directory instead.
+ */
+export function getDefaultMirrorRoot(): string {
+  if (process.platform === 'win32') {
+    return 'C:\\GPhotos_VirtualMirrors';
+  }
+  return path.join(os.homedir(), 'GPhotos_VirtualMirrors');
+}
 
 /**
  * Computes every filesystem root the app currently considers "known/trusted"
@@ -40,7 +55,7 @@ export function getAllowedRoots(): string[] {
     }
   } catch {}
 
-  roots.add('C:\\GPhotos_VirtualMirrors');
+  roots.add(getDefaultMirrorRoot());
 
   try {
     const { app } = require('electron');

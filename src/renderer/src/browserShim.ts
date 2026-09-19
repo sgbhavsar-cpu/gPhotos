@@ -62,6 +62,17 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
       }
     },
 
+    getDefaultMirrorRoot: async () => {
+      try {
+        const res = await authFetch('/api/default-mirror-root');
+        if (!res.ok) return 'GPhotos_VirtualMirrors';
+        const data = await res.json();
+        return data.path || 'GPhotos_VirtualMirrors';
+      } catch {
+        return 'GPhotos_VirtualMirrors';
+      }
+    },
+
     selectDirectory: async () => null,
 
     scanDirectory: async (dirPath?: string) => {

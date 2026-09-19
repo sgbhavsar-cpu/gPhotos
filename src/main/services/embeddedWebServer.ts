@@ -15,7 +15,7 @@ import { scanPhotoDirectory } from './fileOrganizer';
 import { getOrGenerateCachedThumbnail, clearThumbnailCache, refreshThumbnailsFromSource } from './thumbnailCacheService';
 import { getCatalogMeta, getCatalogPage, switchCatalogLibrary, ensureMigratedIfEmpty } from './catalogService';
 import { handleStorageSave, handleStorageLoad, STORAGE_KEY, GLOBAL_PEOPLE_KEY } from './storageHandlers';
-import { isPathAllowed } from './pathSecurity';
+import { isPathAllowed, getDefaultMirrorRoot } from './pathSecurity';
 import { getSpriteCoordinate, getSpriteCoordinatesBatch, getSpritePath } from './spriteService';
 import { thumbnailWorker } from './thumbnailWorkerService';
 import { getBackgroundServiceStatus } from './backgroundDaemon';
@@ -837,6 +837,15 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     } catch {}
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify(mirrors));
+    return;
+  }
+
+  // Endpoint: /api/default-mirror-root — the host machine's platform-aware
+  // default (a mobile client should suggest what the HOST would create the
+  // mirror under, not guess from the phone's own OS).
+  if (pathname === '/api/default-mirror-root') {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ path: getDefaultMirrorRoot() }));
     return;
   }
 
