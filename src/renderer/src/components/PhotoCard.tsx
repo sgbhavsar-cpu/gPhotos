@@ -7,7 +7,7 @@ import { authFetch } from '../services/webAuthClient';
 
 interface PhotoCardProps {
   photo: Photo;
-  onClick: () => void;
+  onClick: (e: React.MouseEvent) => void;
   onToggleFavorite: (e: React.MouseEvent) => void;
   size?: 'very_small' | 'small' | 'medium' | 'large';
   isSelected?: boolean;

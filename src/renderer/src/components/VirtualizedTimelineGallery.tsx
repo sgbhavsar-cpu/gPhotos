@@ -797,8 +797,12 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
                         }
                       }
                     }}
-                    onClick={() => {
+                    onClick={(e) => {
                       if (isDragSelectingRef.current) return;
+                      if (e.ctrlKey || e.metaKey) {
+                        onToggleSelect && onToggleSelect(photo.id);
+                        return;
+                      }
                       if (isSelectMode || selectedIds.size > 0) {
                         onToggleSelect && onToggleSelect(photo.id);
                       } else {
