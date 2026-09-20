@@ -165,6 +165,10 @@ const electronAPI: IElectronAPI = {
     ipcRenderer.invoke('mirror:get-storage-details', storageName, mirrorRoot),
   getAllStorageDetails: (mirrorRoot?: string) =>
     ipcRenderer.invoke('mirror:get-all-storage-details', mirrorRoot),
+  getAllStorageDetailsFast: (mirrorRoot?: string) =>
+    ipcRenderer.invoke('mirror:get-all-storage-details-fast', mirrorRoot),
+  confirmAllStorageDetailsPhysical: (mirrorRoot?: string) =>
+    ipcRenderer.invoke('mirror:confirm-all-storage-details-physical', mirrorRoot),
   getPersonAvatarPath: (personId: string, cacheKey: string) =>
     ipcRenderer.invoke('person:get-avatar-path', personId, cacheKey),
   savePersonAvatar: (personId: string, cacheKey: string, dataUrl: string) =>

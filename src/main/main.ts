@@ -29,6 +29,8 @@ import {
   getAllStorageCheckpoints,
   getStorageDetails,
   getAllStorageDetails,
+  getAllStorageDetailsFast,
+  confirmAllStorageDetailsPhysical,
   syncOnePhoto,
   scanStorageInventory
 } from './services/virtualMirrorService';
@@ -913,6 +915,28 @@ ipcMain.handle('mirror:get-all-storage-details', async (_event, mirrorRoot?: str
     return getAllStorageDetails(mirrorRoot);
   } catch (err) {
     console.error('mirror:get-all-storage-details error:', err);
+    return {};
+  }
+});
+
+// Checkpoint/SQLite-only version of the above — no sidecar-folder walk, safe
+// to poll frequently (see getStorageDetailsFast's doc comment).
+ipcMain.handle('mirror:get-all-storage-details-fast', async (_event, mirrorRoot?: string) => {
+  try {
+    return getAllStorageDetailsFast(mirrorRoot);
+  } catch (err) {
+    console.error('mirror:get-all-storage-details-fast error:', err);
+    return {};
+  }
+});
+
+// One-time, yielding physical confirmation pass — run once after the
+// storage screen's initial fast load, not on any recurring poll.
+ipcMain.handle('mirror:confirm-all-storage-details-physical', async (_event, mirrorRoot?: string) => {
+  try {
+    return await confirmAllStorageDetailsPhysical(mirrorRoot);
+  } catch (err) {
+    console.error('mirror:confirm-all-storage-details-physical error:', err);
     return {};
   }
 });

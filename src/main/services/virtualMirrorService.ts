@@ -329,6 +329,219 @@ export function getAllStorageDetails(mirrorRoot?: string): Record<string, Storag
   return result;
 }
 
+function computeStorageDetails(
+  storageName: string,
+  totalPhotos: number,
+  thumbnailCachedCount: number,
+  faceScannedCount: number,
+  facesDetectedCount: number,
+  checkpointPhase: StorageSyncCheckpoint['phase'] | undefined
+): StorageDetails {
+  let phase: 'completed' | 'thumbnails' | 'faces' | 'interrupted' | 'idle' = 'idle';
+  if (totalPhotos > 0) {
+    if (thumbnailCachedCount >= totalPhotos && faceScannedCount >= totalPhotos) {
+      phase = 'completed';
+    } else if (checkpointPhase === 'interrupted' || (thumbnailCachedCount > 0 && thumbnailCachedCount < totalPhotos && checkpointPhase !== 'completed')) {
+      phase = 'interrupted';
+    } else if (thumbnailCachedCount >= totalPhotos && faceScannedCount < totalPhotos) {
+      phase = 'faces';
+    } else {
+      phase = 'thumbnails';
+    }
+  }
+
+  const percent = totalPhotos > 0
+    ? Math.round(((thumbnailCachedCount + faceScannedCount) / (totalPhotos * 2)) * 100)
+    : 0;
+
+  return {
+    storageName,
+    totalPhotos,
+    thumbnailCachedCount,
+    thumbnailTotalCount: totalPhotos,
+    faceScannedCount,
+    faceTotalCount: totalPhotos,
+    facesDetectedCount,
+    phase,
+    percent,
+    canResume: phase === 'interrupted' || (totalPhotos > 0 && phase !== 'completed'),
+  };
+}
+
+/**
+ * Same result shape as getStorageDetails, but WITHOUT the live sidecar-folder
+ * walk — reads only the sync checkpoint (one small JSON file, all storages
+ * combined) and the SQLite catalog's own COUNT/SUM aggregates, both of which
+ * are already kept live by the actual sync/detection pipeline as it runs.
+ * getAllStorageDetails' live scan is the real ground truth (catches drift a
+ * stale checkpoint wouldn't), but doing that full recursive
+ * readdir+readFile+JSON.parse walk of every synced photo's sidecar on every
+ * call is what made polling it every 2 seconds (VirtualStorageView's status
+ * refresh) block the main process repeatedly. Use this for anything that
+ * polls frequently; reserve the live scan (or scanStorageDetailsPhysical
+ * below) for a one-time confirmation instead.
+ */
+export function getStorageDetailsFast(storageName: string, mirrorRoot?: string): StorageDetails {
+  const root = mirrorRoot || getDefaultMirrorRoot();
+  const mirrorFolder = path.join(root, storageName);
+
+  let totalPhotos = 0;
+  let thumbnailCachedCount = 0;
+  let faceScannedCount = 0;
+  let facesDetectedCount = 0;
+
+  const cp = loadStorageCheckpoint(storageName, root);
+  if (cp) {
+    totalPhotos = cp.totalDiscovered;
+    thumbnailCachedCount = cp.processedCount;
+  }
+
+  const libStatus = libraryStatusService.getLibraryStatus(mirrorFolder);
+  if (totalPhotos === 0 && libStatus) {
+    totalPhotos = libStatus.totalPhotos;
+    thumbnailCachedCount = libStatus.thumbnailCachedCount;
+    faceScannedCount = libStatus.faceScannedCount;
+    facesDetectedCount = libStatus.faceDetectedCount;
+  }
+
+  if (totalPhotos > 0) {
+    const faceStats = getFaceStatsForLibrary(mirrorFolder);
+    faceScannedCount = Math.min(faceStats.faceScannedCount, totalPhotos);
+    facesDetectedCount = faceStats.facesDetectedCount;
+  }
+
+  return computeStorageDetails(storageName, totalPhotos, thumbnailCachedCount, faceScannedCount, facesDetectedCount, cp?.phase);
+}
+
+/** Bulk form of getStorageDetailsFast — see its doc comment. Safe to poll often. */
+export function getAllStorageDetailsFast(mirrorRoot?: string): Record<string, StorageDetails> {
+  const root = mirrorRoot || getDefaultMirrorRoot();
+  const result: Record<string, StorageDetails> = {};
+  if (!fs.existsSync(root)) return result;
+
+  try {
+    const entries = fs.readdirSync(root, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory() && !entry.name.startsWith('.')) {
+        result[entry.name] = getStorageDetailsFast(entry.name, root);
+      }
+    }
+  } catch (err) {
+    console.warn('[StorageSync] Failed to scan storage details (fast):', err);
+  }
+  return result;
+}
+
+const PHYSICAL_SCAN_YIELD_EVERY_FILES = 200;
+
+/**
+ * The actual ground-truth sidecar walk (identical logic to getStorageDetails'
+ * live scan), as an async generator that yields to the event loop
+ * periodically instead of running as one uninterrupted synchronous call —
+ * for a mirror with many thousands of synced photos, the plain synchronous
+ * version can block the main process for a very long time. Meant to be run
+ * ONCE per storage screen load, as a background confirmation pass over
+ * whatever getAllStorageDetailsFast already showed instantly from the
+ * checkpoint — never on a tight poll (see confirmAllStorageDetailsPhysical).
+ */
+export async function scanStorageDetailsPhysical(storageName: string, mirrorRoot?: string): Promise<StorageDetails> {
+  const root = mirrorRoot || getDefaultMirrorRoot();
+  const mirrorFolder = path.join(root, storageName);
+
+  let totalPhotos = 0;
+  let thumbnailCachedCount = 0;
+
+  if (fs.existsSync(mirrorFolder)) {
+    let sinceYield = 0;
+    const scan = async (dir: string, depth = 0): Promise<void> => {
+      if (depth > 6) return;
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory() && !entry.name.startsWith('.')) {
+          await scan(full, depth + 1);
+        } else if (
+          entry.isFile() &&
+          entry.name.endsWith('.json') &&
+          !isMirrorHousekeepingFile(entry.name)
+        ) {
+          totalPhotos++;
+          try {
+            const meta: VirtualPhotoMetadata = JSON.parse(fs.readFileSync(full, 'utf-8'));
+            if (meta.thumbnailPath && fs.existsSync(meta.thumbnailPath)) {
+              thumbnailCachedCount++;
+            }
+          } catch {}
+          sinceYield++;
+          if (sinceYield >= PHYSICAL_SCAN_YIELD_EVERY_FILES) {
+            sinceYield = 0;
+            await new Promise((resolve) => setImmediate(resolve));
+          }
+        }
+      }
+    };
+    await scan(mirrorFolder);
+  }
+
+  const cp = loadStorageCheckpoint(storageName, root);
+  if (totalPhotos === 0 && cp) {
+    totalPhotos = cp.totalDiscovered;
+    thumbnailCachedCount = cp.processedCount;
+  }
+
+  const libStatus = libraryStatusService.getLibraryStatus(mirrorFolder);
+  let faceScannedCount = 0;
+  let facesDetectedCount = 0;
+  if (totalPhotos === 0 && libStatus) {
+    totalPhotos = libStatus.totalPhotos;
+    thumbnailCachedCount = libStatus.thumbnailCachedCount;
+    faceScannedCount = libStatus.faceScannedCount;
+    facesDetectedCount = libStatus.faceDetectedCount;
+  }
+
+  if (totalPhotos > 0) {
+    const faceStats = getFaceStatsForLibrary(mirrorFolder);
+    faceScannedCount = Math.min(faceStats.faceScannedCount, totalPhotos);
+    facesDetectedCount = faceStats.facesDetectedCount;
+  }
+
+  return computeStorageDetails(storageName, totalPhotos, thumbnailCachedCount, faceScannedCount, facesDetectedCount, cp?.phase);
+}
+
+/**
+ * Runs scanStorageDetailsPhysical for every configured storage, one at a
+ * time, yielding between each — the "physical confirmation" background pass
+ * meant to run once after the storage screen's initial (fast, checkpoint-
+ * based) load, per the yield/chunk pattern already used elsewhere
+ * (getAllPhotosChunked, scanVirtualMirrorDirectory).
+ */
+export async function confirmAllStorageDetailsPhysical(mirrorRoot?: string): Promise<Record<string, StorageDetails>> {
+  const root = mirrorRoot || getDefaultMirrorRoot();
+  const result: Record<string, StorageDetails> = {};
+  if (!fs.existsSync(root)) return result;
+
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch (err) {
+    console.warn('[StorageSync] Failed to list storages for physical confirmation:', err);
+    return result;
+  }
+
+  for (const entry of entries) {
+    if (entry.isDirectory() && !entry.name.startsWith('.')) {
+      result[entry.name] = await scanStorageDetailsPhysical(entry.name, root);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+  return result;
+}
+
 interface OneFileSyncResult {
   success: boolean;
   skipped: boolean;

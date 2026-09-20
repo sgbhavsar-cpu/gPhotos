@@ -263,13 +263,6 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
       };
     },
 
-    getBackgroundServiceStatus: async () => ({
-      isRunning: false,
-      minimizeToTray: false,
-      autoLaunchOnStartup: false,
-      syncIntervalMinutes: 30,
-      lastSyncTime: Date.now(),
-    }),
     setBackgroundServiceSettings: async () => true,
     triggerBackgroundServiceSync: async () => ({ started: false }),
     installSystemService: async () => ({ success: false }),
@@ -399,5 +392,7 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     },
     getStorageDetails: async (_storageName: string) => null,
     getAllStorageDetails: async () => ({}),
+    getAllStorageDetailsFast: async () => ({}),
+    confirmAllStorageDetailsPhysical: async () => ({}),
   };
 }

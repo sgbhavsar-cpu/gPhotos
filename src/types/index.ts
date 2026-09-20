@@ -448,6 +448,8 @@ export interface IElectronAPI {
   ) => Promise<{ refreshedCount: number; errors: string[] }>;
   getStorageDetails?: (storageName: string, mirrorRoot?: string) => Promise<StorageDetails | null>;
   getAllStorageDetails?: (mirrorRoot?: string) => Promise<Record<string, StorageDetails>>;
+  getAllStorageDetailsFast?: (mirrorRoot?: string) => Promise<Record<string, StorageDetails>>;
+  confirmAllStorageDetailsPhysical?: (mirrorRoot?: string) => Promise<Record<string, StorageDetails>>;
 
   // Person profile-photo local cache (independent of network storage reachability)
   getPersonAvatarPath?: (personId: string, cacheKey: string) => Promise<string | null>;

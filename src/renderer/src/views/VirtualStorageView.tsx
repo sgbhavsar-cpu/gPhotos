@@ -57,9 +57,12 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
 
   const [storageDetailsMap, setStorageDetailsMap] = useState<Record<string, StorageDetails>>({});
   // Cards would otherwise briefly render with 0/empty stats before the first
-  // getAllStorageDetails() round-trip (a live disk + SQLite read per storage)
+  // getAllStorageDetailsFast() round-trip (checkpoint + SQLite, no disk walk)
   // resolves, which reads as the screen being stuck rather than loading.
   const [isLoadingStorageDetails, setIsLoadingStorageDetails] = useState(true);
+  // Guards the one-time physical confirmation scan (see the effect below)
+  // so it runs exactly once per screen load, never on every re-render.
+  const hasConfirmedPhysicalRef = useRef(false);
   const [prunedStoragesNotice, setPrunedStoragesNotice] = useState<string | null>(null);
 
   const [name, setName] = useState('');
@@ -246,6 +249,27 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
     };
   }, []);
 
+  // One-time "physical confirmation" background pass: the fast/checkpoint-
+  // based numbers shown everywhere else on this screen (initial load, the
+  // 2s poll) can drift from what's actually on disk (e.g. a checkpoint that
+  // never got its final save after an interrupted sync). Rather than pay
+  // for a full sidecar-folder walk on every poll, confirm once per screen
+  // load in the background and merge in whatever it finds — see
+  // confirmAllStorageDetailsPhysical's doc comment in virtualMirrorService.ts.
+  useEffect(() => {
+    if (hasConfirmedPhysicalRef.current) return;
+    if (isLoadingStorages || storages.length === 0) return;
+    hasConfirmedPhysicalRef.current = true;
+
+    if (!window.electronAPI?.confirmAllStorageDetailsPhysical) return;
+    window.electronAPI.confirmAllStorageDetailsPhysical()
+      .then((confirmed) => {
+        if (!confirmed || Object.keys(confirmed).length === 0) return;
+        setStorageDetailsMap((prev) => ({ ...prev, ...confirmed }));
+      })
+      .catch(() => {});
+  }, [isLoadingStorages, storages]);
+
   // Fill in the platform-appropriate default mirror root once known — only
   // if the field is still untouched, so this never clobbers something the
   // user already typed.
@@ -284,9 +308,16 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
       } catch {}
     };
 
+    // Checkpoint/SQLite-only — no sidecar-folder walk. This is what runs on
+    // the 2-second poll below, so it must stay cheap; the one-time physical
+    // confirmation (see the mount effect further down) is what catches any
+    // drift between the checkpoint and what's actually on disk.
     const fetchStorageDetails = async () => {
       try {
-        if (window.electronAPI?.getAllStorageDetails) {
+        if (window.electronAPI?.getAllStorageDetailsFast) {
+          const details = await window.electronAPI.getAllStorageDetailsFast();
+          setStorageDetailsMap(details || {});
+        } else if (window.electronAPI?.getAllStorageDetails) {
           const details = await window.electronAPI.getAllStorageDetails();
           setStorageDetailsMap(details || {});
         }
