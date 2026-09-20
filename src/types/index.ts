@@ -362,6 +362,15 @@ export interface IElectronAPI {
   scanVirtualMirror: (mirrorDirPath: string) => Promise<Photo[]>;
   discoverMirrors: (rootPath?: string) => Promise<VirtualStorageConfig[]>;
   getDefaultMirrorRoot?: () => Promise<string>;
+  // Lists a directory's subfolders for an in-app "browse for a folder"
+  // dialog — used on both Electron (native filesystem access) and the
+  // mobile/LAN web client (no native folder picker exists in a browser).
+  browseDirectory?: (targetPath?: string) => Promise<{
+    path: string | null;
+    parent: string | null;
+    entries: Array<{ name: string; path: string }>;
+    error?: string;
+  }>;
   openOriginalFile: (filePath: string) => Promise<boolean>;
   checkFileExists: (filePath: string) => Promise<boolean>;
   onMirrorProgress: (callback: (progress: MirrorProgress) => void) => () => void;

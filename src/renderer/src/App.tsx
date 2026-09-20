@@ -8,6 +8,7 @@ import { OrganizerView } from './views/OrganizerView';
 import { VirtualStorageView } from './views/VirtualStorageView';
 import { FolderTreeView } from './views/FolderTreeView';
 import { PhotoLightbox } from './components/PhotoLightbox';
+import { FolderBrowserModalHost } from './components/FolderBrowserModal';
 import { DuplicateCleanerModal } from './components/DuplicateCleanerModal';
 import { HelpModal } from './components/HelpModal';
 import { AiAssistantModal } from './components/AiAssistantModal';
@@ -18,6 +19,7 @@ import { MobileBottomNav } from './components/MobileBottomNav';
 import { MobileMenuDrawer } from './components/MobileMenuDrawer';
 import { libraryStore, LibraryState, getLocalPhotoUrl } from './services/libraryStore';
 import { selectDirectoryOrPrompt } from './services/selectDirectory';
+import { joinMirrorPath } from './services/pathUtils';
 import { faceQueue } from './services/faceQueue';
 import { Photo, DetectedFace, VirtualStorageConfig, BackgroundScanProgress, NetworkStorageProgress, DuplicateCluster } from '../types';
 import { AiPhotoFilter } from './services/aiSearchService';
@@ -893,6 +895,12 @@ export const App: React.FC = () => {
       if (switched) {
         setActiveTab('photos');
         showToast(`Opened library: ${dir}`, 'success');
+        // Cheap no-op for a library that was already indexed (every
+        // candidate is filtered out by faceScanCompleted) — but for a
+        // folder opened for the very first time, switchLibrary's server
+        // side just scanned it fresh and these photos have never been
+        // through face detection at all.
+        await runFaceDetectionForPhotos(libraryStore.getState().photos, false);
         return;
       }
 
@@ -920,6 +928,7 @@ export const App: React.FC = () => {
       if (switched) {
         setActiveTab('photos');
         showToast(`Switched library: ${dirPath}`, 'success');
+        await runFaceDetectionForPhotos(libraryStore.getState().photos, false);
         return;
       }
 
@@ -998,7 +1007,7 @@ export const App: React.FC = () => {
 
   const handleSelectVirtualStorage = async (config: VirtualStorageConfig) => {
     responseTracker.clearAll();
-    const mirrorLocalPath = `${config.localMirrorRoot}\\${config.name}`;
+    const mirrorLocalPath = joinMirrorPath(config.localMirrorRoot, config.name);
     setSwitchingLibraryLabel(`Switching to ${config.name}...`);
     try {
       // Fast path: this mirror's photos are indexed in its own SQLite database
@@ -1010,6 +1019,7 @@ export const App: React.FC = () => {
       const switched = await libraryStore.switchLibrary(mirrorLocalPath);
       if (switched) {
         setActiveTab('photos');
+        await runFaceDetectionForPhotos(libraryStore.getState().photos, false);
         return;
       }
 
@@ -1069,7 +1079,7 @@ export const App: React.FC = () => {
     try {
       // 1. Thumbnail + face detection + OneDrive reclaim, per photo, in the main process.
       const res = await window.electronAPI.syncVirtualStorage(config);
-      const mirrorLocalPath = `${config.localMirrorRoot}\\${config.name}`;
+      const mirrorLocalPath = joinMirrorPath(config.localMirrorRoot, config.name);
 
       // 2. Pick up the result — including any faces the pipeline just
       // detected and persisted straight to SQLite — from the DB rather than
@@ -1403,6 +1413,10 @@ export const App: React.FC = () => {
           onNavigateToPerson={handleNavigateToPerson}
         />
       )}
+
+      {/* Shared folder-picker dialog — renders itself only when some other
+          component (via selectDirectoryOrPrompt) has an active request */}
+      <FolderBrowserModalHost />
 
       {/* Duplicate & Burst Cleaner Modal */}
       {showDuplicateCleaner && (

@@ -79,6 +79,7 @@ import { getDbForLibraryPath } from './services/db';
 import { detectFacesForPhoto, forceRedetectFacesForPhoto, resolveDbForPhoto } from './services/pipelineOrchestrator';
 import { detectFaceInRegion } from './services/faceDetectionEngine';
 import { assertPathsAllowed, getDefaultMirrorRoot } from './services/pathSecurity';
+import { browseDirectory } from './services/directoryBrowser';
 import {
   getSpriteCoordinate,
   getSpriteCoordinatesBatch,
@@ -882,6 +883,10 @@ ipcMain.handle('mirror:list-stored-mirrors', async (_event, rootPath?: string) =
 
 ipcMain.handle('mirror:get-default-root', async () => {
   return getDefaultMirrorRoot();
+});
+
+ipcMain.handle('fs:browse-directory', async (_event, targetPath?: string) => {
+  return browseDirectory(targetPath);
 });
 
 ipcMain.handle('mirror:get-storage-checkpoints', async (_event, mirrorRoot?: string) => {

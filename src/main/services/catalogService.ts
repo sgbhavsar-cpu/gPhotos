@@ -1,5 +1,6 @@
+import fs from 'fs';
 import { Photo, CatalogMeta, TimelineMonthSummary, PlaceSummaryItem } from '../../types';
-import { setActiveLibrary } from './db';
+import { setActiveLibrary, getDbPath, getDbForLibraryPath } from './db';
 import {
   getPhotosPage,
   getAllPhotosForSummary,
@@ -8,8 +9,10 @@ import {
   getAllAlbums,
   getSetting,
   setSetting,
+  replaceAllPhotos,
 } from './libraryRepository';
 import { migrateLibraryJsonToSqliteIfNeeded } from './libraryMigration';
+import { scanPhotoDirectory } from './fileOrganizer';
 
 const PAGE_SIZE = 100;
 
@@ -247,8 +250,40 @@ export async function getCatalogPage(
 export async function switchCatalogLibrary(
   targetDir: string
 ): Promise<{ meta: CatalogMeta; firstPage: Photo[] }> {
+  // A folder whose database file doesn't exist yet has never been indexed —
+  // opening it used to just activate a freshly-created, empty catalog and
+  // report success, leaving the caller to separately notice 0 photos and
+  // trigger its own fallback scan. That fallback only ever existed in one
+  // client code path (the desktop "Select Local Photo Folder" button) and
+  // treated ANY truthy result as success regardless of photo count, so in
+  // practice a brand-new folder opened via switchLibrary — from the desktop
+  // recent-library list, from a virtual-storage "Browse in Library", or from
+  // the web/mobile client at all — silently showed an empty library instead
+  // of what's actually on disk. Scanning it here instead means every caller,
+  // on every platform, gets the real contents the first time, with no extra
+  // round trip.
+  const dbPath = getDbPath(targetDir);
+  const isFirstOpen = !fs.existsSync(dbPath);
+
   setActiveLibrary(targetDir);
   ensureMigratedIfEmpty();
+
+  if (isFirstOpen && getTotalPhotoCount() === 0) {
+    try {
+      const scanned = await scanPhotoDirectory(targetDir);
+      if (scanned.length > 0) {
+        // Resolved explicitly rather than trusting the ambient active-library
+        // pointer after this await — another request (a different paired
+        // device, a background sync cycle) can legitimately repoint it while
+        // scanPhotoDirectory is walking a large folder (see db.ts's
+        // setActiveLibrary doc comment for the exact failure class this
+        // avoids).
+        replaceAllPhotos(scanned, getDbForLibraryPath(targetDir));
+      }
+    } catch (err) {
+      console.warn('[CatalogService] Initial scan of new library folder failed:', err);
+    }
+  }
 
   const recent = new Set(getSetting<string[]>('recentLibraries', []));
   recent.delete(targetDir);

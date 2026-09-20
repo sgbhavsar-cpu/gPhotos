@@ -28,6 +28,7 @@ const electronAPI: IElectronAPI = {
   scanVirtualMirror: (mirrorDirPath) => ipcRenderer.invoke('mirror:scan-virtual-mirror', mirrorDirPath),
   discoverMirrors: (rootPath) => ipcRenderer.invoke('mirror:list-stored-mirrors', rootPath),
   getDefaultMirrorRoot: () => ipcRenderer.invoke('mirror:get-default-root'),
+  browseDirectory: (targetPath) => ipcRenderer.invoke('fs:browse-directory', targetPath),
   openOriginalFile: (filePath) => ipcRenderer.invoke('mirror:open-original', filePath),
   checkFileExists: (filePath) => ipcRenderer.invoke('file:check-exists', filePath),
   onMirrorProgress: (callback) => {

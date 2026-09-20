@@ -62,6 +62,15 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
       }
     },
 
+    browseDirectory: async (targetPath?: string) => {
+      try {
+        const qs = targetPath ? `?path=${encodeURIComponent(targetPath)}` : '';
+        const res = await authFetch(`/api/browse-directory${qs}`);
+        if (res.ok) return await res.json();
+      } catch {}
+      return { path: targetPath || null, parent: null, entries: [], error: 'Failed to browse directory' };
+    },
+
     getDefaultMirrorRoot: async () => {
       try {
         const res = await authFetch('/api/default-mirror-root');

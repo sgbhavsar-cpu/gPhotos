@@ -30,6 +30,7 @@ import { DeleteStorageModal } from '../components/DeleteStorageModal';
 import { libraryStore } from '../services/libraryStore';
 import { splitStoragesByExistence } from '../services/storageValidation';
 import { selectDirectoryOrPrompt } from '../services/selectDirectory';
+import { joinMirrorPath } from '../services/pathUtils';
 import { useIsMobile } from '../hooks/useIsMobile';
 
 interface VirtualStorageViewProps {
@@ -496,7 +497,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
       // docs/PIPELINE_REDESIGN_DEV_DOC.md §3.3).
       const result = await window.electronAPI.syncVirtualStorage(config);
       if (result.success) {
-        const fullLocalPath = `${config.localMirrorRoot}\\${config.name}`;
+        const fullLocalPath = joinMirrorPath(config.localMirrorRoot, config.name);
         setSyncSummary({
           storageName: config.name,
           totalSynced: result.totalSynced,
@@ -1026,7 +1027,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
             {storages.map((s) => {
-              const fullLocalPath = `${s.localMirrorRoot}\\${s.name}`;
+              const fullLocalPath = joinMirrorPath(s.localMirrorRoot, s.name);
               const isThisSyncing = isSyncing && activeSyncStorageId === s.id;
 
               return (

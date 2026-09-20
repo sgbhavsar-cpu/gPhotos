@@ -16,6 +16,7 @@ import { getOrGenerateCachedThumbnail, clearThumbnailCache, refreshThumbnailsFro
 import { getCatalogMeta, getCatalogPage, switchCatalogLibrary, ensureMigratedIfEmpty } from './catalogService';
 import { handleStorageSave, handleStorageLoad, STORAGE_KEY, GLOBAL_PEOPLE_KEY } from './storageHandlers';
 import { isPathAllowed, getDefaultMirrorRoot } from './pathSecurity';
+import { browseDirectory } from './directoryBrowser';
 import { getSpriteCoordinate, getSpriteCoordinatesBatch, getSpritePath } from './spriteService';
 import { thumbnailWorker } from './thumbnailWorkerService';
 import { getBackgroundServiceStatus } from './backgroundDaemon';
@@ -622,10 +623,18 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
           res.end(JSON.stringify({ error: 'targetPath required' }));
           return;
         }
-        // Only allow switching to an already-known (recently used) library —
-        // a remote/paired device shouldn't be able to repoint the whole app
-        // at an arbitrary new disk path it has never been told about.
-        if (rejectIfPathNotAllowed(res, [targetPath], '/api/switch-library')) return;
+        // Deliberately NOT gated by rejectIfPathNotAllowed, unlike most of
+        // this file's other path-accepting routes. That gate used to reject
+        // any folder the mobile/web client hadn't already been told about —
+        // which meant a paired device could never open a first-time library
+        // at all, only re-open one already known (see /api/browse-directory
+        // below and its doc comment: opening a library is now something the
+        // user reaches by browsing the host's own folder structure through
+        // this same PIN-authenticated session, the same trust level the
+        // Electron desktop app's native folder dialog already has — this
+        // channel doesn't delete or modify anything at targetPath, it only
+        // reads photos from it and creates this app's own .gphotos_catalog
+        // index alongside them.
         const result = await switchCatalogLibrary(targetPath);
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify(result));
@@ -634,6 +643,28 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
         res.end(JSON.stringify({ error: err.message }));
       }
     });
+    return;
+  }
+
+  // Endpoint: /api/browse-directory?path=... — lets the mobile/LAN client
+  // browse the host's own folder structure (directory NAMES only, never
+  // file contents) to build a real folder-picker dialog, since a browser has
+  // no native OS folder dialog of its own. Deliberately NOT gated by
+  // rejectIfPathNotAllowed — restricting it to already-known paths would
+  // make it useless for its one job, discovering folders that aren't known
+  // yet. This is the same visibility a native folder dialog already gives
+  // any local user of this machine; it's just reachable from a
+  // PIN-authenticated paired device instead of only in front of the screen.
+  if (pathname === '/api/browse-directory') {
+    const targetPath = parsedUrl.searchParams.get('path') || undefined;
+    try {
+      const result = browseDirectory(targetPath);
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify(result));
+    } catch (err: any) {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: err.message }));
+    }
     return;
   }
 

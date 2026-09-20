@@ -281,7 +281,7 @@ export async function getAllPhotosForSummary(): Promise<Pick<Photo, 'id' | 'file
  * it's treated as a no-op — matching the equivalent guard that used to
  * protect library.json from being truncated by a stray empty save.
  */
-export function replaceAllPhotos(photos: Photo[]): { upsertedCount: number; deletedCount: number; skipped: boolean } {
+export function replaceAllPhotos(photos: Photo[], dbHint?: DatabaseSync): { upsertedCount: number; deletedCount: number; skipped: boolean } {
   // This is a "this batch IS the complete library" operation — it deletes
   // whatever's in the target database but missing from `photos`, so it must
   // resolve that database from the batch's OWN content (its first virtual
@@ -291,8 +291,11 @@ export function replaceAllPhotos(photos: Photo[]): { upsertedCount: number; dele
   // wrong here is worse than the face-overwrite bug it's fixed alongside:
   // it would delete photos from whatever library getDb() happened to
   // resolve to, based on an incoming set that was never meant to replace it.
+  // A caller that already resolved the exact target database itself (e.g.
+  // across an earlier await, where the ambient pointer could have moved on)
+  // can pass it explicitly via dbHint instead of relying on getDb() here.
   const virtualPhoto = photos.find((p) => p.isVirtual);
-  const db = virtualPhoto ? resolveDbForPhoto(virtualPhoto) : getDb();
+  const db = virtualPhoto ? resolveDbForPhoto(virtualPhoto) : (dbHint || getDb());
 
   const existingCount = getTotalPhotoCount(db);
   if (photos.length === 0 && existingCount > 0) {
