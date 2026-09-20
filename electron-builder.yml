@@ -22,6 +22,12 @@ extraResources:
 asarUnpack:
   - "**/node_modules/@img/**"
   - "**/node_modules/onnxruntime-node/**"
+  # Spawned via worker_threads (see faceDetectionWorkerClient.ts) to keep
+  # ONNX inference off the main process's event loop. worker_threads.Worker
+  # loading a script straight out of app.asar works on current Electron, but
+  # unpacking this one small file removes any doubt/edge cases around it —
+  # essentially free, since it's not a native binary.
+  - "**/dist-electron/main/services/faceDetectionWorker.js"
 win:
   icon: public/icon.png
   target:

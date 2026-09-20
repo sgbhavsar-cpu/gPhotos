@@ -2,7 +2,7 @@ import path from 'path';
 import fs from 'fs';
 import sharp from 'sharp';
 import * as ort from 'onnxruntime-node';
-import { logger } from './logger';
+import { logger } from './workerSafeLogger';
 import { FACE_DATA_VERSION } from './faceEngineVersion';
 
 // Native, main-process face detection + recognition — replaces the renderer's

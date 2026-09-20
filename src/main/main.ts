@@ -77,7 +77,7 @@ import { handleStorageSave, handleStorageLoad } from './services/storageHandlers
 import { getPhotosByStorageName, getFacesForPhoto, getAllPeople } from './services/libraryRepository';
 import { getDbForLibraryPath } from './services/db';
 import { detectFacesForPhoto, forceRedetectFacesForPhoto, resolveDbForPhoto } from './services/pipelineOrchestrator';
-import { detectFaceInRegion } from './services/faceDetectionEngine';
+import { detectFaceInRegion, terminateFaceDetectionWorker } from './services/faceDetectionWorkerClient';
 import { assertPathsAllowed, getDefaultMirrorRoot } from './services/pathSecurity';
 import { browseDirectory } from './services/directoryBrowser';
 import {
@@ -541,6 +541,7 @@ app.on('before-quit', () => {
   try {
     thumbnailWorker.flushCheckpoint();
   } catch {}
+  terminateFaceDetectionWorker();
 });
 
 app.whenReady().then(() => {
@@ -935,11 +936,12 @@ ipcMain.handle('mirror:get-photos-by-storage', async (_event, storageName: strin
 });
 
 // Bulk face detection for local (or already-thumbnailed virtual) photos —
-// the engine now runs in the main process (see faceDetectionEngine.ts), so
-// this replaces the renderer's old face-api.js-driven loop everywhere
-// EXCEPT the virtual-storage sync pipeline, which calls
-// pipelineOrchestrator.ts's detectFacesForPhoto directly per photo instead
-// of round-tripping one at a time over IPC (see syncVirtualStorage).
+// the engine runs off the main thread in a worker (see faceDetectionEngine.ts
+// + faceDetectionWorkerClient.ts), so this replaces the renderer's old
+// face-api.js-driven loop everywhere EXCEPT the virtual-storage sync
+// pipeline, which calls pipelineOrchestrator.ts's detectFacesForPhoto
+// directly per photo instead of round-tripping one at a time over IPC (see
+// syncVirtualStorage).
 ipcMain.handle('faces:detect-batch', async (_event, photos: Photo[]) => {
   const results: Array<{ photoId: string; ran: boolean; faceCount: number; locked: boolean; skippedReason?: string; faces: any[] }> = [];
   for (const photo of photos) {

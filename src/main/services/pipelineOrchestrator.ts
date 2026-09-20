@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import type { DatabaseSync } from 'node:sqlite';
 import { VirtualStorageConfig, VirtualPhotoMetadata, Photo, DetectedFace } from '../../types';
-import { detectFaces } from './faceDetectionEngine';
+import { detectFaces } from './faceDetectionWorkerClient';
 import { clusterFaces } from './faceClustering';
 import { getHeicFullResolutionBufferForDetection } from './heicService';
 import { isPathReachable } from './networkReachabilityCache';
