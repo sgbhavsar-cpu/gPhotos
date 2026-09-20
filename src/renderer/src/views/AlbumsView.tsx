@@ -14,7 +14,9 @@ import {
   FolderHeart,
   Camera,
   Layers,
-  Sparkles
+  Sparkles,
+  ZoomIn,
+  ZoomOut
 } from 'lucide-react';
 import { Album, Photo } from '../../types';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
@@ -39,6 +41,21 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
 }) => {
   const [selectedAlbumId, setSelectedAlbumId] = useState<string | null>(null);
   const isMobile = useIsMobile();
+
+  // Image size toolbar for the album detail grid — same XS/S/M/L levels and
+  // controls as the main Photos gallery's zoom toolbar, for a consistent
+  // feel, but independent of it: an album's grid is a plain (non-virtualized)
+  // CSS grid, not the timeline's column-virtualized one, so it just needs a
+  // pixel-size knob rather than the full years/months zoom system.
+  const ALBUM_GRID_SIZES = ['very_small', 'small', 'medium', 'large'] as const;
+  type AlbumGridSize = (typeof ALBUM_GRID_SIZES)[number];
+  const ALBUM_GRID_SIZE_PX: Record<AlbumGridSize, number> = {
+    very_small: 120,
+    small: 160,
+    medium: 200,
+    large: 280,
+  };
+  const [albumGridSize, setAlbumGridSize] = useState<AlbumGridSize>('medium');
 
   useEffect(() => {
     if (resetTrigger) {
@@ -172,6 +189,63 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
     });
   };
 
+  const sizeControls = (
+    <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+      <button
+        className="btn btn-ghost btn-icon"
+        disabled={albumGridSize === ALBUM_GRID_SIZES[0]}
+        onClick={() => {
+          const idx = ALBUM_GRID_SIZES.indexOf(albumGridSize);
+          if (idx > 0) setAlbumGridSize(ALBUM_GRID_SIZES[idx - 1]);
+        }}
+        style={{ width: '30px', height: '30px' }}
+        title="Smaller thumbnails"
+      >
+        <ZoomOut size={15} />
+      </button>
+
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          backgroundColor: 'var(--bg-surface-elevated)',
+          padding: '2px',
+          borderRadius: 'var(--radius-md)',
+          border: '1px solid var(--border-subtle)',
+        }}
+      >
+        {([
+          { id: 'very_small', label: 'XS' },
+          { id: 'small', label: 'S' },
+          { id: 'medium', label: 'M' },
+          { id: 'large', label: 'L' },
+        ] as const).map(({ id, label }) => (
+          <button
+            key={id}
+            className={`btn ${albumGridSize === id ? 'btn-primary' : 'btn-ghost'}`}
+            onClick={() => setAlbumGridSize(id)}
+            style={{ padding: '3px 8px', fontSize: '0.74rem', height: '26px' }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <button
+        className="btn btn-ghost btn-icon"
+        disabled={albumGridSize === ALBUM_GRID_SIZES[ALBUM_GRID_SIZES.length - 1]}
+        onClick={() => {
+          const idx = ALBUM_GRID_SIZES.indexOf(albumGridSize);
+          if (idx < ALBUM_GRID_SIZES.length - 1) setAlbumGridSize(ALBUM_GRID_SIZES[idx + 1]);
+        }}
+        style={{ width: '30px', height: '30px' }}
+        title="Larger thumbnails"
+      >
+        <ZoomIn size={15} />
+      </button>
+    </div>
+  );
+
   // -------------------------------------------------------------
   // DETAIL VIEW: An album is currently open
   // -------------------------------------------------------------
@@ -248,7 +322,8 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
             </div>
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', ...(isMobile ? { justifyContent: 'flex-end' } : {}) }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', ...(isMobile ? { justifyContent: 'space-between' } : {}) }}>
+            {!isMobile && sizeControls}
             <button
               className="btn btn-primary"
               onClick={() => {
@@ -279,6 +354,20 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
             </button>
           </div>
         </div>
+
+        {isMobile && (
+          <div style={{
+            padding: '8px 14px',
+            borderBottom: '1px solid var(--border-subtle)',
+            backgroundColor: 'var(--bg-surface)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+          }}>
+            <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontWeight: 600 }}>Grid size</span>
+            {sizeControls}
+          </div>
+        )}
 
         {/* Photos in Album Scroll Area */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '24px' }}>
@@ -319,8 +408,8 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
             <div
               style={{
                 display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))',
-                gap: '16px',
+                gridTemplateColumns: `repeat(auto-fill, minmax(${ALBUM_GRID_SIZE_PX[albumGridSize]}px, 1fr))`,
+                gap: albumGridSize === 'very_small' ? '10px' : '16px',
               }}
             >
               {albumPhotos.map((photo) => {
@@ -331,7 +420,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                     onClick={() => onSelectPhoto(photo, albumPhotos)}
                     style={{
                       position: 'relative',
-                      height: '210px',
+                      height: `${Math.round(ALBUM_GRID_SIZE_PX[albumGridSize] * 1.05)}px`,
                       borderRadius: 'var(--radius-md)',
                       overflow: 'hidden',
                       backgroundColor: 'var(--bg-surface-elevated)',

@@ -45,6 +45,19 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
     p.name.toLowerCase().includes(searchFilter.toLowerCase().trim())
   );
 
+  // Live duplicate-prevention check for "Name as New Person": if someone
+  // with a matching (or very similar) name already exists, surface them
+  // instead of letting the user create a second, separate person by
+  // accident — this is exactly how a stale "Person 7" placeholder used to
+  // end up alongside a freshly-created "Trupti" instead of just renaming
+  // Person 7 in place.
+  const trimmedNewName = newPersonName.trim().toLowerCase();
+  const possibleDuplicatePeople = trimmedNewName
+    ? personList.filter(
+        (p) => !isGenericPersonName(p.name) && p.name.toLowerCase().includes(trimmedNewName)
+      )
+    : [];
+
   // Handle Escape key
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -357,9 +370,52 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
                 autoFocus
                 required
               />
-              <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '6px' }}>
-                A new virtual album will be created for this person and this face will be assigned as verified.
-              </div>
+
+              {possibleDuplicatePeople.length > 0 ? (
+                <div
+                  style={{
+                    marginTop: '10px',
+                    padding: '10px 12px',
+                    borderRadius: 'var(--radius-md)',
+                    backgroundColor: 'rgba(245, 158, 11, 0.1)',
+                    border: '1px solid rgba(245, 158, 11, 0.35)',
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8rem', fontWeight: 600, color: '#fbbf24' }}>
+                    <AlertCircle size={15} />
+                    <span>
+                      {possibleDuplicatePeople.length === 1 ? 'Someone with this name already exists' : 'People with this name already exist'} — did you mean:
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: '8px' }}>
+                    {possibleDuplicatePeople.map((p) => (
+                      <button
+                        key={p.id}
+                        type="button"
+                        className="btn btn-secondary"
+                        onClick={() => {
+                          setMode('existing');
+                          setSelectedPersonId(p.id);
+                          setNewPersonName('');
+                          setErrorMessage(null);
+                        }}
+                        style={{ fontSize: '0.8rem', padding: '6px 12px', gap: '6px' }}
+                        title={`Use existing person "${p.name}" instead of creating a new one`}
+                      >
+                        <UserCheck size={14} />
+                        <span>{p.name} ({p.photoCount} {p.photoCount === 1 ? 'photo' : 'photos'})</span>
+                      </button>
+                    ))}
+                  </div>
+                  <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '8px' }}>
+                    Not the same person? Ignore this and keep typing to create a new one.
+                  </div>
+                </div>
+              ) : (
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '6px' }}>
+                  A new virtual album will be created for this person and this face will be assigned as verified.
+                </div>
+              )}
             </div>
           )}
 

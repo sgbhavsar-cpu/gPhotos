@@ -406,19 +406,17 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
 
     const changeCoverButton = (
       <button
-        className="btn btn-secondary"
+        className="btn btn-ghost btn-icon"
         onClick={() => setPersonForCoverModal(selectedPerson)}
-        style={{ fontSize: '0.75rem', padding: '6px 12px', gap: '6px' }}
-        title="Select which face or photo is displayed as the cover in People"
+        title="Change cover face — pick which face or photo represents this person in People"
       >
-        <Camera size={14} color="var(--accent-primary)" />
-        <span>Change Cover Face</span>
+        <Camera size={18} />
       </button>
     );
 
     const aiBestFaceButton = (
       <button
-        className="btn btn-secondary"
+        className="btn btn-ghost btn-icon"
         onClick={() => {
           const updated = libraryStore.autoSelectBestFaceCover(selectedPerson.id);
           if (updated) {
@@ -428,17 +426,15 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
             setTimeout(() => setLearningNotification(null), 4500);
           }
         }}
-        style={{ fontSize: '0.75rem', padding: '6px 12px', gap: '6px' }}
-        title="Automatically pick the sharpest, largest, and clearest smiling face"
+        title="AI Best Face — automatically pick the sharpest, largest, clearest smiling face as cover"
       >
-        <Star size={14} color="#f59e0b" fill="#f59e0b" />
-        <span>AI Best Face</span>
+        <Star size={18} color="#f59e0b" fill="#f59e0b" />
       </button>
     );
 
     const findMorePhotosButton = (
       <button
-        className="btn btn-secondary"
+        className="btn btn-ghost btn-icon"
         onClick={() => {
           const res = libraryStore.propagateLearnedFaces(selectedPerson.id);
           if (res.newlyAssignedCount > 0) {
@@ -452,13 +448,21 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
           }
           setTimeout(() => setLearningNotification(null), 5000);
         }}
-        style={{ fontSize: '0.75rem', padding: '6px 12px', gap: '6px' }}
-        title="Scan library for matching unassigned faces using refined biometric centroid"
+        title="Find More Photos — scan the library for matching unassigned faces (AI)"
       >
-        <Sparkles size={14} color="var(--accent-primary)" />
-        <span>Find More Photos</span>
+        <Sparkles size={18} color="#c084fc" />
       </button>
     );
+
+    const mergePersonButton = people.length >= 2 ? (
+      <button
+        className="btn btn-ghost btn-icon"
+        onClick={() => setMergeModalPair({ personA: selectedPerson })}
+        title={`Merge ${selectedPerson.name} with another person`}
+      >
+        <Merge size={18} />
+      </button>
+    ) : null;
 
     const viewModeSwitcher = (
       <div style={{ display: 'flex', alignItems: 'center', gap: '4px', borderLeft: isMobile ? 'none' : '1px solid var(--border-subtle)', paddingLeft: isMobile ? 0 : '8px' }}>
@@ -581,6 +585,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                   {changeCoverButton}
                   {aiBestFaceButton}
                   {findMorePhotosButton}
+                  {mergePersonButton}
                 </div>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
                   {viewModeSwitcher}
@@ -614,6 +619,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
               {changeCoverButton}
               {aiBestFaceButton}
               {findMorePhotosButton}
+              {mergePersonButton}
               {viewModeSwitcher}
               {viewMode === 'photos' && zoomControlsBlock}
             </div>

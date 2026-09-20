@@ -857,7 +857,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
         ) : { display: 'flex', alignItems: 'center', gap: '8px' }}>
           {/* Quick Rotate button (rotates photo or local HEIC thumbnail) */}
           <button
-            className="btn btn-secondary"
+            className="btn btn-ghost btn-icon"
             onClick={async () => {
               const localPath = photo.filePath;
               const remotePath = photo.originalRemotePath;
@@ -894,11 +894,9 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                 console.error('[PhotoLightbox] Rotate error:', err);
               }
             }}
-            style={{ fontSize: '0.8rem', gap: '6px' }}
             title="Rotate photo 90° clockwise"
           >
-            <RotateCw size={15} />
-            <span>Rotate</span>
+            <RotateCw size={18} />
           </button>
 
           {/* Cached thumbnail <-> OneDrive full-resolution toggle. Defaults to
@@ -909,28 +907,26 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
               releases it again once they move on or switch back. */}
           {isOneDriveBacked && isOriginalAvailable && (
             <button
-              className="btn btn-secondary"
+              className={`btn btn-icon ${fallbackToThumbnail ? 'btn-ghost' : 'btn-secondary'}`}
               onClick={() => setFallbackToThumbnail((prev) => {
                 const next = !prev;
                 userFallbackPreference.current = next;
                 return next;
               })}
-              style={{ fontSize: '0.8rem', gap: '6px' }}
               title={
                 fallbackToThumbnail
-                  ? 'Showing cached thumbnail — click to load the full-resolution OneDrive original'
-                  : 'Showing full-resolution OneDrive original — click to switch back to the cached thumbnail'
+                  ? 'Showing cached thumbnail (tap to load the full-resolution OneDrive original)'
+                  : 'Showing full-resolution OneDrive original (tap to switch back to the cached thumbnail)'
               }
             >
-              {fallbackToThumbnail ? <Cloud size={15} /> : <CloudOff size={15} />}
-              <span>{fallbackToThumbnail ? 'View Full Res' : 'View Cached'}</span>
+              {fallbackToThumbnail ? <Cloud size={18} /> : <CloudOff size={18} />}
             </button>
           )}
 
           {/* Edit photo button (available when local or online source, or virtual mirror) */}
           {(!photo.isVirtual || isOriginalAvailable || isHeic) && (
             <button
-              className={`btn ${isEditing ? 'btn-primary' : 'btn-secondary'}`}
+              className={`btn btn-icon ${isEditing ? 'btn-primary' : 'btn-ghost'}`}
               onClick={() => {
                 setIsEditing(!isEditing);
                 if (isEditing) {
@@ -940,28 +936,26 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                   setIsCropping(false);
                 }
               }}
-              style={{ fontSize: '0.8rem', gap: '6px' }}
-              title="Rotate, flip, or edit photo"
+              title={isEditing ? 'Exit photo editor' : 'Edit photo (crop, rotate, flip)'}
             >
-              <Edit2 size={15} />
-              <span>{isEditing ? 'Exit Edit' : 'Edit'}</span>
+              <Edit2 size={18} />
             </button>
           )}
 
           {/* 1. Run face detection for current photo */}
           <button
-            className="btn btn-secondary"
+            className="btn btn-icon btn-ghost"
             onClick={handleScanFacesInPhoto}
             disabled={isScanningSinglePhoto || (photo.isVirtual && isOriginalAvailable === false)}
-            style={{ fontSize: '0.8rem', gap: '6px' }}
             title={
               photo.isVirtual && isOriginalAvailable === false
-                ? 'Storage unavailable — reconnect to detect faces'
-                : 'Scan faces in this photo only and match known people with high precision'
+                ? 'Scan Faces — storage unavailable, reconnect to detect faces'
+                : isScanningSinglePhoto
+                ? 'Scanning faces in this photo...'
+                : 'Scan faces in this photo (AI face detection)'
             }
           >
-            <Sparkles size={15} color="#ec4899" className={isScanningSinglePhoto ? 'animate-spin' : ''} />
-            <span>{isScanningSinglePhoto ? 'Scanning...' : 'Scan Faces'}</span>
+            <Sparkles size={18} color="#c084fc" className={isScanningSinglePhoto ? 'animate-spin' : ''} />
           </button>
 
           {/* Remove Unknown / Remove Unconfirmed / Reset Unconfirmed live in the
@@ -969,55 +963,49 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
 
           {/* 2. Tag face manually */}
           <button
-            className={`btn ${isTaggingMode ? 'btn-primary' : 'btn-secondary'}`}
+            className={`btn btn-icon ${isTaggingMode ? 'btn-primary' : 'btn-ghost'}`}
             onClick={() => {
               setIsTaggingMode(!isTaggingMode);
               setDrawBox(null);
             }}
-            style={{ fontSize: '0.8rem', gap: '6px' }}
-            title="Select and tag a person manually on the photo"
+            title={isTaggingMode ? 'Cancel manual tagging' : 'Manually tag a person by drawing a box on the photo'}
           >
-            <Crop size={15} />
-            <span>{isTaggingMode ? 'Cancel Tagging' : 'Tag Manually'}</span>
+            <Crop size={18} />
           </button>
 
           {photo.faces && photo.faces.length > 0 && (
             <button
-              className={`btn ${showFaces ? 'btn-secondary' : 'btn-ghost'}`}
+              className={`btn btn-icon ${showFaces ? 'btn-secondary' : 'btn-ghost'}`}
               onClick={() => setShowFaces(!showFaces)}
-              style={{ fontSize: '0.8rem' }}
-              title="Toggle Face Tag Overlays"
+              title={showFaces ? 'Hide face tag overlays' : 'Show face tag overlays'}
             >
-              {showFaces ? <Eye size={16} /> : <EyeOff size={16} />}
-              <span>{showFaces ? 'Hide Faces' : 'Show Faces'}</span>
+              {showFaces ? <Eye size={18} /> : <EyeOff size={18} />}
             </button>
           )}
 
           <button
             className="btn btn-ghost btn-icon"
             onClick={() => setShowAddToAlbumModal(true)}
-            style={{ width: '38px', height: '38px', color: 'var(--accent-primary)' }}
             title="Add photo to an album"
           >
-            <FolderPlus size={22} />
+            <FolderPlus size={18} />
           </button>
 
           <button
             className="btn btn-ghost btn-icon"
             onClick={() => onToggleFavorite(photo.id)}
-            style={{ width: '38px', height: '38px', color: photo.isFavorite ? 'var(--accent-rose)' : 'inherit' }}
-            title="Favorite (F)"
+            style={{ color: photo.isFavorite ? 'var(--accent-rose)' : undefined }}
+            title={photo.isFavorite ? 'Remove from favorites (F)' : 'Add to favorites (F)'}
           >
-            <Heart size={22} fill={photo.isFavorite ? 'currentColor' : 'none'} />
+            <Heart size={18} fill={photo.isFavorite ? 'currentColor' : 'none'} />
           </button>
 
           <button
             className={`btn btn-icon ${showInfo ? 'btn-secondary' : 'btn-ghost'}`}
             onClick={() => setShowInfo(!showInfo)}
-            style={{ width: '38px', height: '38px' }}
-            title="Toggle Info Inspector (I)"
+            title={showInfo ? 'Hide photo info panel (I)' : 'Show photo info panel (I)'}
           >
-            <Info size={22} />
+            <Info size={18} />
           </button>
         </div>
 
