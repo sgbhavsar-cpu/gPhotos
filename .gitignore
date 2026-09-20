@@ -40,3 +40,7 @@ scratch/
 # working directory (a per-storage SQLite catalog + sync checkpoint) — never
 # real user photo data, but never something to commit either.
 GPhotos_VirtualMirrors/
+
+# Scratch Dockerfile + copied .deb used to manually smoke-test Linux
+# packages in a container — not part of the app or its build.
+.docker-test/

@@ -10,7 +10,7 @@ import {
   prepareHeicHqTemp,
   cleanupHeicHqTemp,
 } from './heicService';
-import { scanVirtualMirrorDirectory, syncVirtualStorage, deleteFilesPermanently, trashFiles, rotatePhotoFile, rotatePhotoWithOfflineQueue, processPendingRotations, discoverStoredMirrors } from './virtualMirrorService';
+import { scanVirtualMirrorDirectory, syncVirtualStorage, deleteFilesPermanently, trashFiles, rotatePhotoFile, rotatePhotoWithOfflineQueue, processPendingRotations, discoverStoredMirrors, scanStorageInventory } from './virtualMirrorService';
 import { scanPhotoDirectory } from './fileOrganizer';
 import { getOrGenerateCachedThumbnail, clearThumbnailCache, refreshThumbnailsFromSource } from './thumbnailCacheService';
 import { getCatalogMeta, getCatalogPage, switchCatalogLibrary, ensureMigratedIfEmpty } from './catalogService';
@@ -20,7 +20,9 @@ import { getSpriteCoordinate, getSpriteCoordinatesBatch, getSpritePath } from '.
 import { thumbnailWorker } from './thumbnailWorkerService';
 import { getBackgroundServiceStatus } from './backgroundDaemon';
 import { isPathReachable, clearOfflineCache } from './networkReachabilityCache';
-import { WebServerStatus } from '../../types';
+import { detectFacesForPhoto, resolveDbForPhoto } from './pipelineOrchestrator';
+import { getFacesForPhoto, getAllPeople } from './libraryRepository';
+import { WebServerStatus, Photo } from '../../types';
 import {
   getOrCreatePin,
   verifyPin,
@@ -296,6 +298,26 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     }
   }
 
+  // Endpoint: /api/scan-storage-inventory?path=... — the mobile/LAN
+  // counterpart of the mirror:scan-inventory IPC channel. Without this,
+  // adding a network storage from the mobile/web UI silently never started
+  // syncing: ensureInventoryCompleted() in VirtualStorageView.tsx treats a
+  // missing scanStorageInventory capability as "not completed yet" and the
+  // caller bails out rather than proceeding, with no error shown.
+  if (pathname === '/api/scan-storage-inventory') {
+    const sourcePath = parsedUrl.searchParams.get('path');
+    if (rejectIfPathNotAllowed(res, [sourcePath], '/api/scan-storage-inventory')) return;
+    try {
+      const result = await scanStorageInventory(sourcePath || '');
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify(result));
+    } catch (err: any) {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ status: 'failed', totalFiles: 0, error: err.message }));
+    }
+    return;
+  }
+
   // Endpoint: /api/sync-virtual-storage (POST)
   if (pathname === '/api/sync-virtual-storage' && req.method === 'POST') {
     let body = '';
@@ -322,6 +344,40 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
         } catch {}
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify(result));
+      } catch (err: any) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // Endpoint: /api/faces/detect-batch (POST) — the mobile/LAN counterpart of
+  // the faces:detect-batch IPC channel. Without this, runFaceDetectionForPhotos
+  // in App.tsx checks `window.electronAPI?.detectFacesBatch` and silently
+  // returns when it's missing — so photos synced from the mobile/web UI got
+  // thumbnails but face detection never ran, with no error surfaced anywhere.
+  if (pathname === '/api/faces/detect-batch' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', async () => {
+      try {
+        const photos: Photo[] = JSON.parse(body);
+        const results: Array<{ photoId: string; ran: boolean; faceCount: number; locked: boolean; skippedReason?: string; faces: any[] }> = [];
+        for (const photo of photos) {
+          try {
+            const sourceFilePath = photo.isVirtual ? (photo.originalRemotePath || photo.filePath) : photo.filePath;
+            const db = resolveDbForPhoto(photo);
+            const result = await detectFacesForPhoto(photo, sourceFilePath!, db);
+            results.push({ photoId: photo.id, ...result, faces: getFacesForPhoto(photo.id, db) });
+          } catch (err: any) {
+            results.push({ photoId: photo.id, ran: false, faceCount: 0, locked: false, skippedReason: 'decode-failed', faces: [] });
+          }
+        }
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ results, people: getAllPeople() }));
       } catch (err: any) {
         res.statusCode = 500;
         res.end(JSON.stringify({ error: err.message }));

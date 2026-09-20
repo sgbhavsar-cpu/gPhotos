@@ -137,6 +137,26 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
         return { success: false, newMirroredCount: 0, totalMirroredCount: 0, totalSizeSaved: 0 };
       }
     },
+    detectFacesBatch: async (photos: any[]) => {
+      try {
+        const res = await authFetch('/api/faces/detect-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(photos),
+        });
+        if (res.ok) return await res.json();
+      } catch {}
+      return { results: photos.map((p) => ({ photoId: p.id, ran: false, faceCount: 0, locked: false, skippedReason: 'decode-failed', faces: [] })), people: [] };
+    },
+
+    scanStorageInventory: async (networkSourcePath: string) => {
+      try {
+        const res = await authFetch(`/api/scan-storage-inventory?path=${encodeURIComponent(networkSourcePath)}`);
+        if (res.ok) return await res.json();
+      } catch {}
+      return { status: 'failed', totalFiles: 0, error: 'Inventory scan request failed' };
+    },
+
     scanVirtualMirror: async (dirPath?: string) => {
       try {
         if (!dirPath) return [];
