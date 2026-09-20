@@ -29,6 +29,7 @@ import { VirtualStorageConfig, MirrorProgress, BackgroundServiceStatus, NetworkS
 import { DeleteStorageModal } from '../components/DeleteStorageModal';
 import { libraryStore } from '../services/libraryStore';
 import { splitStoragesByExistence } from '../services/storageValidation';
+import { selectDirectoryOrPrompt } from '../services/selectDirectory';
 import { useIsMobile } from '../hooks/useIsMobile';
 
 interface VirtualStorageViewProps {
@@ -393,23 +394,19 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
   };
 
   const handleSelectNetworkSource = async () => {
-    if (window.electronAPI) {
-      const dir = await window.electronAPI.selectDirectory();
-      if (dir) {
-        setNetworkSourcePath(dir);
-        if (!name) {
-          const folderName = dir.split('\\').pop() || 'NetworkStorage';
-          setName(folderName);
-        }
+    const dir = await selectDirectoryOrPrompt('Enter the full path to the network/remote source folder (e.g. \\\\NAS\\FamilyPhotos or /mnt/nas/FamilyPhotos):');
+    if (dir) {
+      setNetworkSourcePath(dir);
+      if (!name) {
+        const folderName = dir.split(/[\\/]/).pop() || 'NetworkStorage';
+        setName(folderName);
       }
     }
   };
 
   const handleSelectLocalMirror = async () => {
-    if (window.electronAPI) {
-      const dir = await window.electronAPI.selectDirectory();
-      if (dir) setLocalMirrorRoot(dir);
-    }
+    const dir = await selectDirectoryOrPrompt('Enter the full path for the local mirror cache root:');
+    if (dir) setLocalMirrorRoot(dir);
   };
 
   const handleAddStorage = async (e: React.FormEvent) => {

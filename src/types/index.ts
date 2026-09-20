@@ -342,6 +342,13 @@ export interface Album {
 }
 
 export interface IElectronAPI {
+  // Set by browserShim.ts when running over HTTP (mobile/LAN browser)
+  // instead of via real Electron IPC — some capabilities (a native folder
+  // picker chief among them) have no browser equivalent, so callers use
+  // this flag to fall back to something that works instead of silently
+  // no-oping on a call the shim can't actually fulfil.
+  isBrowserShim?: boolean;
+  isElectron?: boolean;
   selectDirectory: () => Promise<string | null>;
   scanDirectory: (dirPath: string) => Promise<Photo[]>;
   readExif: (filePath: string) => Promise<{ exif?: ExifMetadata; location?: LocationMetadata; dateTaken?: string }>;

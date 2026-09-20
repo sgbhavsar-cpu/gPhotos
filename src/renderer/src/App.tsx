@@ -17,6 +17,7 @@ import { MobileTopBar } from './components/MobileTopBar';
 import { MobileBottomNav } from './components/MobileBottomNav';
 import { MobileMenuDrawer } from './components/MobileMenuDrawer';
 import { libraryStore, LibraryState, getLocalPhotoUrl } from './services/libraryStore';
+import { selectDirectoryOrPrompt } from './services/selectDirectory';
 import { faceQueue } from './services/faceQueue';
 import { Photo, DetectedFace, VirtualStorageConfig, BackgroundScanProgress, NetworkStorageProgress, DuplicateCluster } from '../types';
 import { AiPhotoFilter } from './services/aiSearchService';
@@ -880,7 +881,9 @@ export const App: React.FC = () => {
       return;
     }
 
-    const dir = await window.electronAPI.selectDirectory();
+    const dir = await selectDirectoryOrPrompt(
+      'Enter the full path to the photo folder on the computer running gPhotos (e.g. C:\\Photos or /home/user/Photos):'
+    );
     if (!dir) return;
 
     libraryStore.setScanning(true);

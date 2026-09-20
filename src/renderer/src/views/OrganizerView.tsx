@@ -32,6 +32,7 @@ import {
   OrganizeProgress
 } from '../../types';
 import { getLocalPhotoUrl } from '../services/libraryStore';
+import { selectDirectoryOrPrompt } from '../services/selectDirectory';
 import { useIsMobile } from '../hooks/useIsMobile';
 
 interface OrganizerViewProps {
@@ -81,22 +82,18 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
   }, []);
 
   const handleSelectSource = async () => {
-    if (window.electronAPI) {
-      const dir = await window.electronAPI.selectDirectory();
-      if (dir) {
-        setSourceDir(dir);
-        setDryRunResult(null);
-      }
+    const dir = await selectDirectoryOrPrompt('Enter the full path to the source folder:');
+    if (dir) {
+      setSourceDir(dir);
+      setDryRunResult(null);
     }
   };
 
   const handleSelectTarget = async () => {
-    if (window.electronAPI) {
-      const dir = await window.electronAPI.selectDirectory();
-      if (dir) {
-        setTargetDir(dir);
-        setDryRunResult(null);
-      }
+    const dir = await selectDirectoryOrPrompt('Enter the full path to the target folder:');
+    if (dir) {
+      setTargetDir(dir);
+      setDryRunResult(null);
     }
   };
 
