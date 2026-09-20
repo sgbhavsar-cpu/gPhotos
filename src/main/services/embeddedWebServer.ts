@@ -220,8 +220,8 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
       if (libraryDir && rejectIfPathNotAllowed(res, [libraryDir], '/api/library')) return;
       try {
         ensureMigratedIfEmpty();
-        const libraryData = handleStorageLoad(STORAGE_KEY, libraryDir) || { photos: [], people: [], faces: [], albums: [] };
-        const peopleRegistry = handleStorageLoad(GLOBAL_PEOPLE_KEY);
+        const libraryData = (await handleStorageLoad(STORAGE_KEY, libraryDir)) || { photos: [], people: [], faces: [], albums: [] };
+        const peopleRegistry = await handleStorageLoad(GLOBAL_PEOPLE_KEY);
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify({ [STORAGE_KEY]: libraryData, [GLOBAL_PEOPLE_KEY]: peopleRegistry }));
       } catch (err: any) {

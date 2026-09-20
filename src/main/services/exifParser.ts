@@ -166,13 +166,20 @@ export async function parsePhotoMetadata(filePath: string): Promise<{
     // Non-fatal, fallback to filesystem metadata
   }
 
-  // Fallback to file creation time or modified time if no EXIF date
+  // Fallback to the file's modified time if no EXIF date — NOT its creation
+  // time. Creation time reflects whenever the file was last copied/moved
+  // onto this filesystem (e.g. imported from a camera, synced from
+  // OneDrive, restored from backup), which is unrelated to when the photo
+  // was actually taken and routinely lands weeks/months after the fact.
+  // Modified time survives most copy/sync tools unchanged from the
+  // original capture, so it's the closer of the two to the truth whenever
+  // there's no embedded metadata to go by.
   if (!dateTaken) {
     try {
       const stats = fs.statSync(filePath);
-      dateTaken = stats.birthtime && !isNaN(stats.birthtime.getTime()) && stats.birthtime.getFullYear() > 1980
-        ? stats.birthtime
-        : stats.mtime;
+      dateTaken = stats.mtime && !isNaN(stats.mtime.getTime()) && stats.mtime.getFullYear() > 1980
+        ? stats.mtime
+        : stats.birthtime;
     } catch {
       dateTaken = new Date();
     }

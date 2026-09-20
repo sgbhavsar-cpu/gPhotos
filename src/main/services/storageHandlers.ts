@@ -5,10 +5,10 @@ import {
   upsertPeople,
   replaceAllPeople,
   replaceAllAlbums,
-  getAllPhotos,
+  getAllPhotosChunked,
   getAllPeople,
   getAllAlbums,
-  getAllFaces,
+  getAllFacesChunked,
   getSetting,
   setSetting,
 } from './libraryRepository';
@@ -160,19 +160,24 @@ function dedupeVirtualStorages(storages: any[]): any[] {
  * a mobile browser tab and the desktop window disagree on Albums/People
  * counts for the "same" library open on both.
  */
-export function handleStorageLoad(key: string, libraryDir?: string | null): any {
+export async function handleStorageLoad(key: string, libraryDir?: string | null): Promise<any> {
   ensureMigratedIfEmpty();
 
   if (key === STORAGE_KEY) {
     const db = libraryDir ? getDbForLibraryPath(libraryDir) : getDb();
-    const photos = getAllPhotos(db);
+    // Chunked + yielding, not the plain sync getAllPhotos/getAllFaces — a
+    // single un-yielding read across a several-thousand-photo library
+    // measured as an 80+ second main-process block (see
+    // getAllPhotosChunked's doc comment), which froze the whole app,
+    // including this same handler's own dispatch, at every startup.
+    const photos = await getAllPhotosChunked(db);
     const people = getAllPeople();
     const albums = getAllAlbums(db);
     if (photos.length === 0 && people.length === 0 && albums.length === 0) return null;
     return {
       photos,
       people,
-      faces: getAllFaces(db),
+      faces: await getAllFacesChunked(db),
       albums,
       selectedFolder: getSetting<string | null>('selectedFolder', null),
       recentLibraries: getSetting<string[]>('recentLibraries', []),

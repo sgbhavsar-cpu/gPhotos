@@ -40,7 +40,7 @@ describe('storage:save / storage:load handlers (end-to-end)', () => {
     } catch {}
   });
 
-  it('round-trips a full library save through to load, matching what the renderer expects back', () => {
+  it('round-trips a full library save through to load, matching what the renderer expects back', async () => {
     const payload = {
       photos: [makePhoto('p1'), makePhoto('p2')],
       people: [{ id: 'p_alice', name: 'Alice', faceCount: 0, photoCount: 0, createdAt: '2026-01-01T00:00:00Z' }],
@@ -54,57 +54,57 @@ describe('storage:save / storage:load handlers (end-to-end)', () => {
     expect(saveResult.enqueuePhotos).toHaveLength(2);
     expect(saveResult.enqueueLibraryPath).toBe(libraryDir);
 
-    const loaded = handleStorageLoad(STORAGE_KEY);
+    const loaded = await handleStorageLoad(STORAGE_KEY);
     expect(loaded.photos.map((p: Photo) => p.id).sort()).toEqual(['p1', 'p2']);
     expect(loaded.people.map((p: any) => p.name)).toEqual(['Alice']);
     expect(loaded.selectedFolder).toBe(libraryDir);
     expect(loaded.recentLibraries).toEqual([libraryDir]);
   });
 
-  it('a later save with fewer photos deletes the removed ones (matches "send full current state" contract)', () => {
+  it('a later save with fewer photos deletes the removed ones (matches "send full current state" contract)', async () => {
     handleStorageSave(STORAGE_KEY, { photos: [makePhoto('p1'), makePhoto('p2'), makePhoto('p3')], selectedFolder: libraryDir });
-    expect(handleStorageLoad(STORAGE_KEY).photos).toHaveLength(3);
+    expect((await handleStorageLoad(STORAGE_KEY)).photos).toHaveLength(3);
 
     handleStorageSave(STORAGE_KEY, { photos: [makePhoto('p1')], selectedFolder: libraryDir });
-    const loaded = handleStorageLoad(STORAGE_KEY);
+    const loaded = await handleStorageLoad(STORAGE_KEY);
     expect(loaded.photos.map((p: Photo) => p.id)).toEqual(['p1']);
   });
 
-  it('an ordinary library save never wipes people, even with an empty people array', () => {
+  it('an ordinary library save never wipes people, even with an empty people array', async () => {
     setActiveLibrary(libraryDir);
     handleStorageSave(STORAGE_KEY, {
       photos: [makePhoto('p1')],
       people: [{ id: 'p_alice', name: 'Alice', faceCount: 0, photoCount: 0, createdAt: '2026-01-01T00:00:00Z' }],
       selectedFolder: libraryDir,
     });
-    expect(handleStorageLoad(STORAGE_KEY).people).toHaveLength(1);
+    expect((await handleStorageLoad(STORAGE_KEY)).people).toHaveLength(1);
 
     // A subsequent save with no/empty people (e.g. a stale in-memory snapshot) must not erase Alice.
     handleStorageSave(STORAGE_KEY, { photos: [makePhoto('p1')], people: [], selectedFolder: libraryDir });
-    expect(handleStorageLoad(STORAGE_KEY).people.map((p: any) => p.name)).toEqual(['Alice']);
+    expect((await handleStorageLoad(STORAGE_KEY)).people.map((p: any) => p.name)).toEqual(['Alice']);
   });
 
-  it('a gphotos_people_v2 save with an empty array DOES clear the registry (Reset & Rescan contract)', () => {
+  it('a gphotos_people_v2 save with an empty array DOES clear the registry (Reset & Rescan contract)', async () => {
     setActiveLibrary(libraryDir);
     handleStorageSave(GLOBAL_PEOPLE_KEY, [{ id: 'p_alice', name: 'Alice', faceCount: 0, photoCount: 0, createdAt: '2026-01-01T00:00:00Z' }]);
-    expect(handleStorageLoad(GLOBAL_PEOPLE_KEY)).toHaveLength(1);
+    expect(await handleStorageLoad(GLOBAL_PEOPLE_KEY)).toHaveLength(1);
 
     handleStorageSave(GLOBAL_PEOPLE_KEY, []);
-    expect(handleStorageLoad(GLOBAL_PEOPLE_KEY)).toHaveLength(0);
+    expect(await handleStorageLoad(GLOBAL_PEOPLE_KEY)).toHaveLength(0);
   });
 
-  it('stores an unrecognized key (e.g. the face descriptor cache) as an opaque settings blob without loss', () => {
+  it('stores an unrecognized key (e.g. the face descriptor cache) as an opaque settings blob without loss', async () => {
     const cacheEntries = [['C:\\Photos\\p1.jpg', { faces: [1, 2, 3] }]];
     handleStorageSave('gphotos_face_cache_v2', cacheEntries);
-    expect(handleStorageLoad('gphotos_face_cache_v2')).toEqual(cacheEntries);
+    expect(await handleStorageLoad('gphotos_face_cache_v2')).toEqual(cacheEntries);
   });
 
-  it('returns null for an empty/never-saved library, matching the old library.json-absent behavior', () => {
+  it('returns null for an empty/never-saved library, matching the old library.json-absent behavior', async () => {
     setActiveLibrary(libraryDir);
-    expect(handleStorageLoad(STORAGE_KEY)).toBeNull();
+    expect(await handleStorageLoad(STORAGE_KEY)).toBeNull();
   });
 
-  it('isPartialPageSet:true merges instead of destructively replacing (SQLite catalog pagination contract)', () => {
+  it('isPartialPageSet:true merges instead of destructively replacing (SQLite catalog pagination contract)', async () => {
     // Simulates the SQLite fast-path: a library with 3 photos indexed, but
     // the renderer has only loaded the first "page" (1 photo) into memory
     // when an immediate save fires (e.g. right after switchLibrary, or
@@ -117,18 +117,18 @@ describe('storage:save / storage:load handlers (end-to-end)', () => {
       photos: [makePhoto('p1'), makePhoto('p2'), makePhoto('p3')],
       selectedFolder: libraryDir,
     });
-    expect(handleStorageLoad(STORAGE_KEY).photos).toHaveLength(3);
+    expect((await handleStorageLoad(STORAGE_KEY)).photos).toHaveLength(3);
 
     handleStorageSave(STORAGE_KEY, {
       photos: [makePhoto('p1')],
       isPartialPageSet: true,
       selectedFolder: libraryDir,
     });
-    const loaded = handleStorageLoad(STORAGE_KEY);
+    const loaded = await handleStorageLoad(STORAGE_KEY);
     expect(loaded.photos.map((p: Photo) => p.id).sort()).toEqual(['p1', 'p2', 'p3']);
   });
 
-  it('isPartialPageSet:true still updates fields on the photos it does include (e.g. a favorite toggle)', () => {
+  it('isPartialPageSet:true still updates fields on the photos it does include (e.g. a favorite toggle)', async () => {
     handleStorageSave(STORAGE_KEY, {
       photos: [makePhoto('p1'), makePhoto('p2')],
       selectedFolder: libraryDir,
@@ -141,13 +141,13 @@ describe('storage:save / storage:load handlers (end-to-end)', () => {
       selectedFolder: libraryDir,
     });
 
-    const loaded = handleStorageLoad(STORAGE_KEY);
+    const loaded = await handleStorageLoad(STORAGE_KEY);
     expect(loaded.photos).toHaveLength(2);
     const p1 = loaded.photos.find((p: Photo) => p.id === 'p1');
     expect(p1.isFavorite).toBe(true);
   });
 
-  it('gphotos_virtual_storages_v1 collapses entries pointing at the same network source, keeping the most recently synced', () => {
+  it('gphotos_virtual_storages_v1 collapses entries pointing at the same network source, keeping the most recently synced', async () => {
     const VIRTUAL_STORAGES_KEY = 'gphotos_virtual_storages_v1';
     setActiveLibrary(libraryDir);
 
@@ -177,7 +177,7 @@ describe('storage:save / storage:load handlers (end-to-end)', () => {
       },
     ]);
 
-    const loaded = handleStorageLoad(VIRTUAL_STORAGES_KEY);
+    const loaded = await handleStorageLoad(VIRTUAL_STORAGES_KEY);
     expect(loaded).toHaveLength(2);
     const names = loaded.map((s: any) => s.name).sort();
     expect(names).toEqual(['Jainish', 'hemlata']);

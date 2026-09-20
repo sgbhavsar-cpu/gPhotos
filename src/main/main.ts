@@ -764,7 +764,7 @@ ipcMain.handle('storage:save', async (_event, key: string, data: any) => {
 
 ipcMain.handle('storage:load', async (_event, key: string, libraryDir?: string) => {
   try {
-    return handleStorageLoad(key, libraryDir);
+    return await handleStorageLoad(key, libraryDir);
   } catch (err) {
     console.error('Failed to load library data:', err);
     return null;

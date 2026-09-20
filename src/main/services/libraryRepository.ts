@@ -214,6 +214,38 @@ export function getAllPhotos(db: DatabaseSync = getDb()): Photo[] {
   return photos;
 }
 
+const FULL_LOAD_CHUNK_SIZE = 2000;
+
+/**
+ * Same result as getAllPhotos, but reads+maps in chunks and yields to the
+ * event loop between them. node:sqlite's DatabaseSync is fully synchronous —
+ * one plain getAllPhotos() call against a library with several thousand
+ * photos (row fetch + rowToPhoto's per-row JSON.parse + attachFacesToPhotos'
+ * own queries) measured as an 80+ second, completely un-yielding
+ * main-process block on a real ~9,800-photo library, which is exactly what
+ * made storage:load (and every other IPC call queued behind it) pile up and
+ * made the whole app look hung at every startup. Use this from any caller
+ * that can be async (storage:load's handler, the mobile web API) instead of
+ * the plain sync version above.
+ */
+export async function getAllPhotosChunked(db: DatabaseSync = getDb()): Promise<Photo[]> {
+  const total = getTotalPhotoCount(db);
+  const stmt = db.prepare('SELECT * FROM photos ORDER BY date_taken DESC, id DESC LIMIT ? OFFSET ?');
+  const photos: Photo[] = [];
+
+  for (let offset = 0; offset < total; offset += FULL_LOAD_CHUNK_SIZE) {
+    const rows = stmt.all(FULL_LOAD_CHUNK_SIZE, offset) as any[];
+    if (rows.length === 0) break;
+    const chunk = rows.map(rowToPhoto);
+    attachFacesToPhotos(chunk, db);
+    photos.push(...chunk);
+    if (rows.length < FULL_LOAD_CHUNK_SIZE) break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  return photos;
+}
+
 /**
  * Photos (with faces attached) for one virtual storage by name — used after
  * the unified sync pipeline (see pipelineOrchestrator.ts) writes face
@@ -464,6 +496,20 @@ export function replaceFacesForPhoto(photoId: string, faces: DetectedFace[], ski
 export function getAllFaces(db: DatabaseSync = getDb()): DetectedFace[] {
   const rows = db.prepare('SELECT * FROM faces').all() as any[];
   return rows.map(rowToFace);
+}
+
+/** Same result as getAllFaces, chunked + yielding — see getAllPhotosChunked's doc comment for why. */
+export async function getAllFacesChunked(db: DatabaseSync = getDb()): Promise<DetectedFace[]> {
+  const stmt = db.prepare('SELECT * FROM faces LIMIT ? OFFSET ?');
+  const faces: DetectedFace[] = [];
+  for (let offset = 0; ; offset += FULL_LOAD_CHUNK_SIZE) {
+    const rows = stmt.all(FULL_LOAD_CHUNK_SIZE, offset) as any[];
+    if (rows.length === 0) break;
+    faces.push(...rows.map(rowToFace));
+    if (rows.length < FULL_LOAD_CHUNK_SIZE) break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  return faces;
 }
 
 // ---------------------------------------------------------------------------
