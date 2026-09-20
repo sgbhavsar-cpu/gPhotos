@@ -437,6 +437,8 @@ export interface IElectronAPI {
   }>;
   startThumbnailPreCache?: (photos?: Photo[]) => Promise<{ started: boolean }>;
    pauseThumbnailPreCache?: () => Promise<{ paused: boolean }>;
+   pauseThumbnailPreCacheForActivity?: () => Promise<{ paused: boolean }>;
+   resumeThumbnailPreCacheForActivity?: () => Promise<{ paused: boolean }>;
   getStorageCheckpoints?: () => Promise<Record<string, StorageSyncCheckpoint>>;
   getLibraryStatus?: (libraryPath: string) => Promise<LibraryScanStatus | null>;
   saveLibraryStatus?: (status: Partial<LibraryScanStatus> & { libraryPath: string }) => Promise<LibraryScanStatus>;

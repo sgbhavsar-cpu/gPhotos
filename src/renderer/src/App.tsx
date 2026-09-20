@@ -70,15 +70,21 @@ export const App: React.FC = () => {
     }
   }, [activeTab]);
 
-  // Stop background tasks immediately (called on Navigation click or Escape key press)
+  // Stop background tasks immediately (called on any qualifying user
+  // activity — navigation, Escape, mouse/keyboard input — see the 15-second
+  // idle detector effect below). Uses the activity-specific thumbnail
+  // pause/resume pair, not the Settings page's manual one, so this never
+  // clears a pause the user set deliberately (and can never itself be
+  // overridden by one) — see thumbnailWorkerService.ts's activityPaused doc
+  // comment.
   const stopBackgroundTasksImmediately = useCallback(() => {
     try {
       console.log('[IdleControl] User interacted/navigated/pressed Esc: Stopping background tasks immediately');
       if (!faceQueue.getStatus().isPaused) {
         faceQueue.pause();
       }
-      if (window.electronAPI?.pauseThumbnailPreCache) {
-        window.electronAPI.pauseThumbnailPreCache().catch(() => {});
+      if (window.electronAPI?.pauseThumbnailPreCacheForActivity) {
+        window.electronAPI.pauseThumbnailPreCacheForActivity().catch(() => {});
       }
     } catch (e) {
       console.warn('[IdleControl] Error stopping background tasks:', e);
@@ -94,6 +100,9 @@ export const App: React.FC = () => {
       console.log('[IdleControl] User idle for 15s: Auto-starting background caching and face detection...');
 
       // 1. Resume / start background thumbnail pre-caching
+      if (window.electronAPI?.resumeThumbnailPreCacheForActivity) {
+        window.electronAPI.resumeThumbnailPreCacheForActivity().catch(() => {});
+      }
       if (window.electronAPI?.startThumbnailPreCache) {
         window.electronAPI.startThumbnailPreCache(currentPhotos).catch(() => {});
       }
@@ -197,15 +206,26 @@ export const App: React.FC = () => {
   // 15-Second Idle Inactivity Detector & Auto-Resume Handler
   useEffect(() => {
     let idleTimer: any = null;
+    // Tracks whether background work is currently paused BECAUSE of
+    // activity, so handleUserActivity only calls stopBackgroundTasksImmediately
+    // once per activity burst (not on every single mousemove) — and so the
+    // very first qualifying event of the whole session pauses too, without
+    // needing to wait for an idle period to have happened first.
+    let isPausedForActivity = false;
 
     const resetIdleTimer = () => {
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
+        isPausedForActivity = false;
         startBackgroundTasks();
       }, 15000);
     };
 
     const handleUserActivity = () => {
+      if (!isPausedForActivity) {
+        isPausedForActivity = true;
+        stopBackgroundTasksImmediately();
+      }
       resetIdleTimer();
     };
 
@@ -214,7 +234,10 @@ export const App: React.FC = () => {
       window.addEventListener(evt, handleUserActivity, { passive: true });
     });
 
-    // Start 15s idle timer
+    // Pause immediately at mount (nothing has proven idle yet) and start the
+    // 15s countdown to the first auto-resume.
+    stopBackgroundTasksImmediately();
+    isPausedForActivity = true;
     resetIdleTimer();
 
     return () => {
@@ -223,7 +246,7 @@ export const App: React.FC = () => {
         window.removeEventListener(evt, handleUserActivity);
       });
     };
-  }, [startBackgroundTasks]);
+  }, [startBackgroundTasks, stopBackgroundTasksImmediately]);
 
   const showToast = (message: string, type: 'info' | 'success' | 'warning' = 'info') => {
     setToastMessage({ message, type });
@@ -824,6 +847,18 @@ export const App: React.FC = () => {
               message: `Recognizing faces: ${currentScanned}/${totalPhotos} (${facePct}%)`,
             },
           }));
+        }
+
+        // This sweep (run right after opening/switching to a library) is
+        // otherwise unaware of the 15s-idle activity gate — faceQueue's own
+        // per-photo loop already respects it, but this one chunks through
+        // possibly thousands of photos independently of that queue. Waiting
+        // here between chunks means an aggressive first-time backlog scan
+        // yields to the user immediately on activity instead of continuing
+        // to hammer the main process with detectFacesBatch calls while
+        // they're trying to interact with the app.
+        while (faceQueue.getStatus().isPaused) {
+          await new Promise((resolve) => setTimeout(resolve, 300));
         }
 
         const { results, people } = await window.electronAPI.detectFacesBatch(chunk);

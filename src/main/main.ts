@@ -1648,6 +1648,29 @@ ipcMain.handle('service:pause-precache', async () => {
   }
 });
 
+// Separate from service:start-precache/pause-precache (the user's own manual
+// Settings toggle) — these back the renderer's 15s-idle auto-pause, which
+// must never clear a pause the user set deliberately, and must never itself
+// be overridden by the user simply moving the mouse. See
+// thumbnailWorkerService.ts's activityPaused doc comment.
+ipcMain.handle('service:activity-pause-precache', async () => {
+  try {
+    thumbnailWorker.pauseForActivity();
+    return { paused: true };
+  } catch (err: any) {
+    return { paused: false, error: err.message };
+  }
+});
+
+ipcMain.handle('service:activity-resume-precache', async () => {
+  try {
+    thumbnailWorker.resumeFromActivity();
+    return { paused: false };
+  } catch (err: any) {
+    return { paused: true, error: err.message };
+  }
+});
+
 ipcMain.handle('help:open-in-browser', async () => {
   try {
     const helpPaths = [

@@ -46,6 +46,12 @@ class ThumbnailWorkerService {
   private confirmedCachedPaths = new Set<string>();
   private isProcessing = false;
   private isPaused = false;
+  // Separate from isPaused (the user's own manual Settings toggle) so the
+  // two never stomp on each other — auto-pausing while the user is
+  // interacting with the app must not clear a pause they set deliberately,
+  // and the reverse: resuming after 15s of inactivity must not override an
+  // explicit manual pause. The loop only runs while BOTH are false.
+  private activityPaused = false;
   private totalQueuedCount = 0;
   private processedCount = 0;
   private currentFileName?: string;
@@ -176,7 +182,7 @@ class ThumbnailWorkerService {
           thumbnailLastFile: this.currentFileName,
           thumbnailCompleted: isFinished || (effectiveTotal > 0 && effectiveCached >= effectiveTotal),
           thumbnailPercent: pct,
-          phase: isFinished ? 'completed' : this.isPaused ? 'paused' : 'thumbnails',
+          phase: isFinished ? 'completed' : (this.isPaused || this.activityPaused) ? 'paused' : 'thumbnails',
         });
       }
     } catch (err) {
@@ -230,7 +236,7 @@ class ThumbnailWorkerService {
     const mem = process.memoryUsage();
     return {
       isRunning: this.isProcessing,
-      paused: this.isPaused,
+      paused: this.isPaused || this.activityPaused,
       current: this.processedCount,
       total: this.totalQueuedCount,
       cpuPercent: this.currentCalculatedCpuPercent,
@@ -323,7 +329,7 @@ class ThumbnailWorkerService {
       this.saveCheckpoint(false);
       this.notifyStatus();
 
-      if (this.limits.enabled && !this.isProcessing && !this.isPaused) {
+      if (this.limits.enabled && !this.isProcessing && !this.isPaused && !this.activityPaused) {
         this.processQueue();
       }
     }
@@ -340,7 +346,22 @@ class ThumbnailWorkerService {
     this.isPaused = false;
     console.log('[ThumbnailWorker] Background pre-caching resumed.');
     this.notifyStatus();
-    if (this.limits.enabled && !this.isProcessing && this.queue.length > 0) {
+    if (this.limits.enabled && !this.isProcessing && !this.activityPaused && this.queue.length > 0) {
+      this.processQueue();
+    }
+  }
+
+  /** Auto-pause while the user is actively using the app — see activityPaused's doc comment. */
+  public pauseForActivity(): void {
+    if (this.activityPaused) return;
+    this.activityPaused = true;
+  }
+
+  /** Auto-resume after the user has been idle for a while — see activityPaused's doc comment. */
+  public resumeFromActivity(): void {
+    if (!this.activityPaused) return;
+    this.activityPaused = false;
+    if (this.limits.enabled && !this.isProcessing && !this.isPaused && this.queue.length > 0) {
       this.processQueue();
     }
   }
@@ -358,7 +379,7 @@ class ThumbnailWorkerService {
     let fastForwardCount = 0;
 
     try {
-      while (this.queue.length > 0 && !this.isPaused && this.limits.enabled) {
+      while (this.queue.length > 0 && !this.isPaused && !this.activityPaused && this.limits.enabled) {
         const photo = this.queue.shift()!;
         this.queuedPaths.delete(photo.filePath.toLowerCase());
 
