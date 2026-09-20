@@ -681,10 +681,25 @@ export function getAllAlbums(db: DatabaseSync = getDb()): Album[] {
   return albumRows.map((row) => rowToAlbum(row, photoIdsByAlbum.get(row.id) || []));
 }
 
-/** Replaces the active library's full album set to match `albums` exactly (upserts + deletes removed ones). */
-export function replaceAllAlbums(albums: Album[], db: DatabaseSync = getDb()): void {
+/**
+ * Replaces the active library's full album set to match `albums` exactly
+ * (upserts + deletes removed ones).
+ *
+ * Safety guard: if the incoming list is empty but the library has albums,
+ * this is far more likely a stale/bogus save (e.g. the renderer's in-memory
+ * albums hadn't been repopulated yet for whichever library this db actually
+ * belongs to — see switchLibrary()'s doc comment) than someone intentionally
+ * deleting every album at once, so it's treated as a no-op. Mirrors
+ * replaceAllPhotos' identical guard.
+ */
+export function replaceAllAlbums(albums: Album[], db: DatabaseSync = getDb()): { skipped: boolean } {
   const incomingIds = new Set(albums.map((a) => a.id));
   const existingIds = (db.prepare('SELECT id FROM albums').all() as any[]).map((r) => r.id as string);
+
+  if (albums.length === 0 && existingIds.length > 0) {
+    return { skipped: true };
+  }
+
   const idsToDelete = existingIds.filter((id) => !incomingIds.has(id));
 
   runInTransaction(() => {
@@ -695,6 +710,8 @@ export function replaceAllAlbums(albums: Album[], db: DatabaseSync = getDb()): v
       upsertAlbum(album, db);
     }
   }, db);
+
+  return { skipped: false };
 }
 
 export function deleteAlbum(albumId: string, db: DatabaseSync = getDb()): void {

@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { Photo, CatalogMeta, TimelineMonthSummary, PlaceSummaryItem } from '../../types';
+import { Photo, CatalogMeta, TimelineMonthSummary, PlaceSummaryItem, Album } from '../../types';
 import { setActiveLibrary, getDbPath, getDbForLibraryPath } from './db';
 import {
   getPhotosPage,
@@ -249,7 +249,7 @@ export async function getCatalogPage(
  */
 export async function switchCatalogLibrary(
   targetDir: string
-): Promise<{ meta: CatalogMeta; firstPage: Photo[] }> {
+): Promise<{ meta: CatalogMeta; firstPage: Photo[]; albums: Album[] }> {
   // A folder whose database file doesn't exist yet has never been indexed —
   // opening it used to just activate a freshly-created, empty catalog and
   // report success, leaving the caller to separately notice 0 photos and
@@ -293,9 +293,16 @@ export async function switchCatalogLibrary(
 
   const meta = await buildMeta(targetDir);
   const firstPageResult = await getCatalogPage(0, PAGE_SIZE, targetDir);
+  // Explicit target-library db, not the ambient getAllAlbums() default —
+  // switchLibrary()'s renderer-side doc comment covers why: without this,
+  // the renderer keeps whatever albums were in memory for the PREVIOUS
+  // library and, on its next save, overwrites (or empties) this library's
+  // real album_photos rows with that stale data.
+  const albums = getAllAlbums(getDbForLibraryPath(targetDir));
 
   return {
     meta,
     firstPage: firstPageResult.photos,
+    albums,
   };
 }

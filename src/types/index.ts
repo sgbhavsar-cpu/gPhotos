@@ -423,7 +423,7 @@ export interface IElectronAPI {
   sendAppReady?: () => void;
   getCatalogMeta: (libraryDir?: string) => Promise<CatalogMeta>;
   getCatalogPage: (params: { pageIndex: number; pageSize?: number; libraryDir?: string }) => Promise<{ photos: Photo[]; totalPages: number; totalPhotos: number }>;
-  switchLibrary: (targetPath: string) => Promise<{ meta: CatalogMeta; firstPage: Photo[] }>;
+  switchLibrary: (targetPath: string) => Promise<{ meta: CatalogMeta; firstPage: Photo[]; albums: Album[] }>;
   getSpriteCoordinate?: (photoPath: string) => Promise<SpriteCoordinate | null>;
   getSpriteCoordinatesBatch?: (photoPaths: string[]) => Promise<Record<string, SpriteCoordinate | null>>;
   getThumbnailPreCacheStatus?: () => Promise<{

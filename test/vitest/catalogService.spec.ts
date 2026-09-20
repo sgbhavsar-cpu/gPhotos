@@ -3,7 +3,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { resetDbForTests, setActiveLibrary } from '../../src/main/services/db';
-import { upsertPhotos, upsertPeople, upsertAlbum } from '../../src/main/services/libraryRepository';
+import { upsertPhotos, upsertPeople, upsertAlbum, getAllAlbums } from '../../src/main/services/libraryRepository';
+import { getDbForLibraryPath } from '../../src/main/services/db';
 import { getCatalogMeta, getCatalogPage, switchCatalogLibrary } from '../../src/main/services/catalogService';
 import { Photo } from '../../src/types';
 
@@ -96,6 +97,34 @@ describe('catalogService (SQLite-backed)', () => {
     // recentLibraries should now list B most recently used, with A still present.
     expect(switchToB.meta.recentLibraries[0]).toBe(libraryB);
     expect(switchToB.meta.recentLibraries).toContain(libraryA);
+  });
+
+  // Regression: the renderer's switchLibrary() used to keep whichever
+  // library's albums happened to already be in memory and, on its very next
+  // (immediate) save, write that stale list into the JUST-switched-to
+  // library — either emptying its real albums (if none had loaded into
+  // memory yet) or overwriting them with the previous library's albums
+  // entirely. switchCatalogLibrary must hand back the TARGET library's own
+  // albums so the renderer never has to reuse a stale in-memory copy.
+  it('switchCatalogLibrary returns the target library\'s own albums, not the previously active library\'s', async () => {
+    setActiveLibrary(libraryA);
+    upsertPhotos([makePhoto('a1', '2026-01-01T00:00:00Z')]);
+    upsertAlbum({ id: 'albumA', title: 'Library A trip', photoIds: ['a1'], createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' });
+
+    setActiveLibrary(libraryB);
+    upsertPhotos([makePhoto('b1', '2026-01-01T00:00:00Z')]);
+    upsertAlbum({ id: 'albumB', title: 'Library B trip', photoIds: ['b1'], createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' });
+
+    const switchToA = await switchCatalogLibrary(libraryA);
+    expect(switchToA.albums.map((a) => a.id)).toEqual(['albumA']);
+
+    const switchToB = await switchCatalogLibrary(libraryB);
+    expect(switchToB.albums.map((a) => a.id)).toEqual(['albumB']);
+
+    // Neither library's own stored albums should have been disturbed by
+    // switching back and forth.
+    expect(getAllAlbums(getDbForLibraryPath(libraryA)).map((a) => a.id)).toEqual(['albumA']);
+    expect(getAllAlbums(getDbForLibraryPath(libraryB)).map((a) => a.id)).toEqual(['albumB']);
   });
 
   it('computes album and place summaries alongside the timeline', async () => {

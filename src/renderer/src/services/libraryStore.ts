@@ -692,7 +692,7 @@ export class LibraryManager {
         await this.flushSaveImmediately();
 
         const tSwitch0 = performance.now();
-        let result: { meta: CatalogMeta; firstPage: Photo[] } | null = null;
+        let result: { meta: CatalogMeta; firstPage: Photo[]; albums?: Album[] } | null = null;
         if (window.electronAPI?.switchLibrary) {
           result = await trackBackendCall(window.electronAPI.switchLibrary(targetPath), 'Switching library...');
         } else if (window.location?.protocol?.startsWith('http')) {
@@ -729,6 +729,14 @@ export class LibraryManager {
 
           this.state.photos = restoredFirstPage;
           this.currentCatalogPage = 0;
+          // Albums are per-library (unlike people, which are a global
+          // registry) — without repopulating this from the just-switched-to
+          // library's own data, the PREVIOUS library's albums stayed in
+          // memory and the immediate notify(true) save below would overwrite
+          // (or empty, if none had loaded yet) this library's real albums
+          // with that stale data. See replaceAllAlbums' matching guard for
+          // the second layer of protection against this.
+          this.state.albums = result.albums || [];
           this.reconcilePeopleAndFaces();
           this.notify(true);
           return true;

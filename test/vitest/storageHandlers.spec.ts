@@ -147,6 +147,49 @@ describe('storage:save / storage:load handlers (end-to-end)', () => {
     expect(p1.isFavorite).toBe(true);
   });
 
+  // Regression: a stale/empty albums array in an otherwise-ordinary library
+  // save (e.g. the renderer hadn't yet repopulated in-memory albums for a
+  // just-switched-to library — see switchLibrary()'s doc comment) used to
+  // silently wipe every real album this library had, mirroring the exact
+  // "albums become empty" bug report. replaceAllAlbums' guard (matching
+  // replaceAllPhotos' identical one) must no-op instead.
+  it('an album save with an empty array never wipes existing albums (matches the photos/people no-wipe contract)', async () => {
+    setActiveLibrary(libraryDir);
+    handleStorageSave(STORAGE_KEY, {
+      photos: [makePhoto('p1')],
+      albums: [{ id: 'album1', title: 'Trip', photoIds: ['p1'], createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' }],
+      selectedFolder: libraryDir,
+    });
+    expect((await handleStorageLoad(STORAGE_KEY)).albums).toHaveLength(1);
+
+    // A subsequent save with a stale/empty albums array must not erase it.
+    handleStorageSave(STORAGE_KEY, { photos: [makePhoto('p1')], albums: [], selectedFolder: libraryDir });
+    const loaded = await handleStorageLoad(STORAGE_KEY);
+    expect(loaded.albums).toHaveLength(1);
+    expect(loaded.albums[0].id).toBe('album1');
+  });
+
+  it('an album save with a genuinely different (non-empty) set still replaces removed albums', async () => {
+    setActiveLibrary(libraryDir);
+    handleStorageSave(STORAGE_KEY, {
+      photos: [makePhoto('p1')],
+      albums: [
+        { id: 'album1', title: 'Trip', photoIds: ['p1'], createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
+        { id: 'album2', title: 'Party', photoIds: ['p1'], createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
+      ],
+      selectedFolder: libraryDir,
+    });
+
+    handleStorageSave(STORAGE_KEY, {
+      photos: [makePhoto('p1')],
+      albums: [{ id: 'album1', title: 'Trip', photoIds: ['p1'], createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' }],
+      selectedFolder: libraryDir,
+    });
+
+    const loaded = await handleStorageLoad(STORAGE_KEY);
+    expect(loaded.albums.map((a: any) => a.id)).toEqual(['album1']);
+  });
+
   it('gphotos_virtual_storages_v1 collapses entries pointing at the same network source, keeping the most recently synced', async () => {
     const VIRTUAL_STORAGES_KEY = 'gphotos_virtual_storages_v1';
     setActiveLibrary(libraryDir);
