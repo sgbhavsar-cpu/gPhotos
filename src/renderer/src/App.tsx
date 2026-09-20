@@ -208,9 +208,11 @@ export const App: React.FC = () => {
     let idleTimer: any = null;
     // Tracks whether background work is currently paused BECAUSE of
     // activity, so handleUserActivity only calls stopBackgroundTasksImmediately
-    // once per activity burst (not on every single mousemove) — and so the
-    // very first qualifying event of the whole session pauses too, without
-    // needing to wait for an idle period to have happened first.
+    // once per activity burst (not on every single mousemove). Starts false
+    // — at mount nothing has happened yet, so whatever background
+    // caching/face-detection other triggers (opening a library, etc.)
+    // already started keeps running freely until the user actually
+    // interacts; only real activity should ever pause it.
     let isPausedForActivity = false;
 
     const resetIdleTimer = () => {
@@ -234,10 +236,8 @@ export const App: React.FC = () => {
       window.addEventListener(evt, handleUserActivity, { passive: true });
     });
 
-    // Pause immediately at mount (nothing has proven idle yet) and start the
-    // 15s countdown to the first auto-resume.
-    stopBackgroundTasksImmediately();
-    isPausedForActivity = true;
+    // Start the 15s countdown; nothing is paused yet at mount (see
+    // isPausedForActivity's doc comment above).
     resetIdleTimer();
 
     return () => {

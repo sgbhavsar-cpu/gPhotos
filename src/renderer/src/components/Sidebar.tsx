@@ -17,9 +17,11 @@ import {
   ArrowRightLeft,
   ChevronDown,
   ChevronRight,
+  PauseCircle,
 } from 'lucide-react';
 import { LibraryState } from '../services/libraryStore';
 import { VirtualStorageConfig, NetworkStorageProgress } from '../../types';
+import { useBackgroundActivityStatus } from '../hooks/useBackgroundActivityStatus';
 
 export type ActiveTab =
   | 'photos'
@@ -65,6 +67,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   const [isLibraryCollapsed, setIsLibraryCollapsed] = useState(false);
   const [isNetworkStorageCollapsed, setIsNetworkStorageCollapsed] = useState(false);
+  const backgroundActivity = useBackgroundActivityStatus(state.isDetectingFaces, state.faceDetectionProgress ?? null);
 
   const navItems = [
     { id: 'photos' as ActiveTab, label: 'Photos', icon: ImageIcon, count: state.totalCount || state.photos.length },
@@ -563,6 +566,26 @@ export const Sidebar: React.FC<SidebarProps> = ({
         >
           {state.selectedFolder ? state.selectedFolder : 'Click to select library...'}
         </div>
+        {backgroundActivity.label && (
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              fontSize: '0.7rem',
+              color: backgroundActivity.isPaused ? 'var(--text-muted)' : 'var(--accent-cyan)',
+              fontWeight: 500,
+            }}
+            title={backgroundActivity.isPaused ? 'Background caching/face detection is paused while you use the app' : undefined}
+          >
+            {backgroundActivity.isPaused ? (
+              <PauseCircle size={11} style={{ flexShrink: 0 }} />
+            ) : (
+              <RefreshCw size={11} className="animate-spin" style={{ animationDuration: '1.1s', flexShrink: 0 }} />
+            )}
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{backgroundActivity.label}</span>
+          </div>
+        )}
       </div>
 
       {/* User Guide & Manual Link */}
