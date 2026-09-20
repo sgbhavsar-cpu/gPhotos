@@ -495,12 +495,31 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
 
     setIsSyncing(true);
     setActiveSyncStorageId(config.id);
-    setProgress({
+    // Seed from what's already cached (checkpoint/DB, cheap — see
+    // getAllStorageDetailsFast's doc comment) rather than resetting to
+    // 0/0 — a Rescan is usually a re-verification pass that will skip
+    // almost every file, and showing 0 while that happens looks exactly
+    // like it's starting over from scratch.
+    let seededProgress: MirrorProgress = {
       current: 0,
       total: 0,
       currentFile: 'Starting...',
       status: 'scanning',
-    });
+    };
+    try {
+      const known = await window.electronAPI?.getAllStorageDetailsFast?.(config.localMirrorRoot);
+      const details = known?.[config.name];
+      if (details && details.totalPhotos > 0) {
+        seededProgress = {
+          current: details.thumbnailCachedCount,
+          total: details.totalPhotos,
+          currentFile: `Checking for changes… (${details.thumbnailCachedCount}/${details.totalPhotos} already cached)`,
+          status: 'scanning',
+          percent: details.percent,
+        };
+      }
+    } catch {}
+    setProgress(seededProgress);
     setSyncSummary(null);
 
     // Inventory gate: only an explicit "Rescan / Refresh" (forceRecount)

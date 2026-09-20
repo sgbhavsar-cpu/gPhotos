@@ -144,4 +144,41 @@ describe('unified sync pipeline: correct database targeting across re-syncs', ()
     const backfilled = JSON.parse(fs.readFileSync(sidecarPath, 'utf-8'));
     expect(typeof backfilled.sourceMtimeMs).toBe('number');
   });
+
+  // Regression: the "already cached, skip" fast path used to compare the
+  // LOCAL sidecar file's own mtime against the remote file's mtime — a
+  // proxy for "has the source changed", not an actual comparison of the
+  // source's current size+mtime against what was persisted the last time it
+  // was synced. A source file edited in place with its mtime deliberately
+  // preserved (common with some backup/restore and sync tools) has an
+  // unchanged mtime but a different size, and the proxy check couldn't tell
+  // the two apart — it would skip re-syncing a genuinely changed file.
+  it('detects a changed source file via size even when its mtime is unchanged, and re-syncs it', async () => {
+    await syncVirtualStorage(storage);
+    const mirrorFolder = path.join(localMirrorRoot, storage.name);
+    const sourcePath = path.join(networkSourcePath, 'IMG_0.jpg');
+    const sidecarPath = path.join(mirrorFolder, 'IMG_0.json');
+
+    const beforeSidecar: VirtualPhotoMetadata = JSON.parse(fs.readFileSync(sidecarPath, 'utf-8'));
+    const originalMtime = fs.statSync(sourcePath).mtime;
+
+    // Overwrite with different (larger) content, then force the mtime back
+    // to its original value — simulating a same-mtime, different-content
+    // edit. Written to a temp path and renamed over the original — sharp
+    // can't reliably overwrite a file it doesn't already have open (Windows).
+    const tmpPath = `${sourcePath}.tmp`;
+    await sharp({ create: { width: 400, height: 400, channels: 3, background: { r: 200, g: 5, b: 5 } } })
+      .jpeg()
+      .toFile(tmpPath);
+    fs.renameSync(tmpPath, sourcePath);
+    fs.utimesSync(sourcePath, originalMtime, originalMtime);
+    expect(fs.statSync(sourcePath).mtime.getTime()).toBe(originalMtime.getTime());
+    expect(fs.statSync(sourcePath).size).not.toBe(beforeSidecar.originalFileSize);
+
+    await syncVirtualStorage(storage);
+
+    const afterSidecar: VirtualPhotoMetadata = JSON.parse(fs.readFileSync(sidecarPath, 'utf-8'));
+    expect(afterSidecar.originalFileSize).toBe(fs.statSync(sourcePath).size);
+    expect(afterSidecar.originalFileSize).not.toBe(beforeSidecar.originalFileSize);
+  });
 });

@@ -585,41 +585,59 @@ async function processOneMirrorFile(
     const stats = fs.statSync(remoteFile);
     const bytesRead = stats.size;
 
-    // Incremental sync check: if both thumbnail and metadata exist and remote was not modified after
+    // Incremental sync check: if both thumbnail and metadata exist and the
+    // remote file's current size+mtime match what was persisted the last
+    // time it was actually synced, skip it. Reads the sidecar first (needed
+    // for the skip return anyway) and compares its own stored
+    // originalFileSize/sourceMtimeMs against the remote's current stat —
+    // not a proxy comparison — so a same-size-different-content edit that
+    // preserves mtime (or vice versa) still gets caught by the other field.
     if (fs.existsSync(localThumbPath) && fs.existsSync(localMetaPath)) {
-      const metaStats = fs.statSync(localMetaPath);
-      if (metaStats.mtime.getTime() >= stats.mtime.getTime()) {
+      // Still parse and return the existing sidecar even though the
+      // thumbnail step itself is skipped — the caller's face-detection
+      // step (see syncVirtualStorage) needs it to know which photo this
+      // is. Without this, any already-thumbnailed file (the overwhelming
+      // common case on every sync after the first) would never even be
+      // considered for face detection, since "skipped" previously meant
+      // "no sidecar returned" — silently starving the whole face pipeline.
+      let existingSidecar: VirtualPhotoMetadata | undefined;
+      try {
+        existingSidecar = JSON.parse(fs.readFileSync(localMetaPath, 'utf-8'));
+      } catch (parseErr) {
+        console.warn(`Failed to parse existing sidecar ${localMetaPath}, face detection will be skipped for this file this pass:`, parseErr);
+      }
+
+      // A sidecar written before originalFileSize/sourceMtimeMs existed has
+      // neither field — fall back to the old local-sidecar-mtime-vs-remote
+      // proxy for exactly that one pass, then self-heal below so every
+      // subsequent pass uses the real size+mtime comparison.
+      const hasPersistedStat = existingSidecar?.sourceMtimeMs != null && existingSidecar?.originalFileSize != null;
+      const sizeAndMtimeMatch = hasPersistedStat
+        && existingSidecar!.originalFileSize === stats.size
+        && existingSidecar!.sourceMtimeMs === stats.mtime.getTime();
+      const legacyProxyMatch = !hasPersistedStat
+        && fs.statSync(localMetaPath).mtime.getTime() >= stats.mtime.getTime();
+
+      if (sizeAndMtimeMatch || legacyProxyMatch) {
         const thumbStats = fs.statSync(localThumbPath);
-        // Still parse and return the existing sidecar even though the
-        // thumbnail step itself is skipped — the caller's face-detection
-        // step (see syncVirtualStorage) needs it to know which photo this
-        // is. Without this, any already-thumbnailed file (the overwhelming
-        // common case on every sync after the first) would never even be
-        // considered for face detection, since "skipped" previously meant
-        // "no sidecar returned" — silently starving the whole face pipeline.
-        let existingSidecar: VirtualPhotoMetadata | undefined;
-        try {
-          existingSidecar = JSON.parse(fs.readFileSync(localMetaPath, 'utf-8'));
-        } catch (parseErr) {
-          console.warn(`Failed to parse existing sidecar ${localMetaPath}, face detection will be skipped for this file this pass:`, parseErr);
-        }
-        // Backfill sourceMtimeMs for a sidecar written before this field
-        // existed (i.e. every file already synced before this fix shipped)
-        // — one-time self-heal using the stat() already done above, no
-        // extra I/O. Without this, detectFacesForPhoto's "file unchanged,
-        // skip re-detection" check can never activate for any
+        // Backfill originalFileSize/sourceMtimeMs for a sidecar written
+        // before those fields existed (i.e. every file already synced
+        // before this fix shipped) — one-time self-heal using the stat()
+        // already done above, no extra I/O. Without this, detectFacesForPhoto's
+        // "file unchanged, skip re-detection" check can never activate for any
         // already-synced photo (originalMtimeMs stays permanently null),
         // so an unlocked-but-already-detected photo gets fully re-detected
         // by EVERY future sync pass forever — including the background
         // daemon's own periodic cycle, which can run within seconds of a
         // user manually detecting faces on that exact photo and silently
         // replace the result with whatever that pass independently found.
-        if (existingSidecar && existingSidecar.sourceMtimeMs == null) {
+        if (existingSidecar && !hasPersistedStat) {
           existingSidecar.sourceMtimeMs = stats.mtime.getTime();
+          existingSidecar.originalFileSize = stats.size;
           try {
             fs.writeFileSync(localMetaPath, JSON.stringify(existingSidecar, null, 2), 'utf-8');
           } catch (writeErr) {
-            console.warn(`Failed to backfill sourceMtimeMs into sidecar ${localMetaPath}:`, writeErr);
+            console.warn(`Failed to backfill originalFileSize/sourceMtimeMs into sidecar ${localMetaPath}:`, writeErr);
           }
         }
         return {

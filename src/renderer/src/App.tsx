@@ -1104,20 +1104,38 @@ export const App: React.FC = () => {
       return;
     }
 
-    // Set live initial progress in network storage list
-    setStorageProgressMap((prev) => ({
-      ...prev,
-      [config!.name]: {
-        storageName: config!.name,
-        phase: 'scanning',
-        thumbnailCurrent: 0,
-        thumbnailTotal: 0,
-        faceCurrent: 0,
-        faceTotal: 0,
-        percent: 0,
-        message: 'Scanning remote directory...',
-      },
-    }));
+    // Seed the progress card from what's already cached (checkpoint/DB —
+    // cheap, see getAllStorageDetailsFast's doc comment) instead of
+    // resetting it to 0/0/0% — a Rescan is usually a no-op re-verification
+    // over an already-mostly-synced storage, and showing 0% while that
+    // happens looks exactly like "it's starting over from scratch" even
+    // when the sync loop below is about to skip almost every file.
+    let seeded: NetworkStorageProgress = {
+      storageName: config.name,
+      phase: 'scanning',
+      thumbnailCurrent: 0,
+      thumbnailTotal: 0,
+      faceCurrent: 0,
+      faceTotal: 0,
+      percent: 0,
+      message: 'Scanning remote directory...',
+    };
+    try {
+      const known = await window.electronAPI.getAllStorageDetailsFast?.(config.localMirrorRoot);
+      const details = known?.[config.name];
+      if (details && details.totalPhotos > 0) {
+        seeded = {
+          ...seeded,
+          thumbnailCurrent: details.thumbnailCachedCount,
+          thumbnailTotal: details.totalPhotos,
+          faceCurrent: details.faceScannedCount,
+          faceTotal: details.totalPhotos,
+          percent: details.percent,
+          message: `Checking for changes… (${details.thumbnailCachedCount}/${details.totalPhotos} already cached)`,
+        };
+      }
+    } catch {}
+    setStorageProgressMap((prev) => ({ ...prev, [config!.name]: seeded }));
 
     try {
       // 1. Thumbnail + face detection + OneDrive reclaim, per photo, in the main process.
