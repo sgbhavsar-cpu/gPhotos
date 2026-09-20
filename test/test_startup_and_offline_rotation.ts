@@ -61,7 +61,7 @@ async function runTests() {
     }
 
     const tStart = performance.now();
-    const photos = scanVirtualMirrorDirectory(mirrorSub);
+    const photos = await scanVirtualMirrorDirectory(mirrorSub);
     const tElapsed = performance.now() - tStart;
 
     console.log(`[Benchmark] Scanned 300 virtual mirror photos with offline remote paths in ${tElapsed.toFixed(2)}ms`);

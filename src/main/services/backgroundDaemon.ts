@@ -333,7 +333,7 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
       // unpinning is idempotent.
       if (reclaimHealth.broken && isOneDrivePath(storage.networkSourcePath)) {
         try {
-          const mirrored = scanVirtualMirrorDirectory(mirrorDir);
+          const mirrored = await scanVirtualMirrorDirectory(mirrorDir);
           const probeSample = mirrored
             .map((p) => p.originalRemotePath)
             .filter((p): p is string => !!p)
@@ -424,7 +424,7 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
       if (result.newlyAdded > 0) {
         storage.lastSynced = new Date().toISOString();
         try {
-          const mirroredPhotos = scanVirtualMirrorDirectory(mirrorDir);
+          const mirroredPhotos = await scanVirtualMirrorDirectory(mirrorDir);
           if (mirroredPhotos && mirroredPhotos.length > 0) {
             thumbnailWorker.enqueuePhotos(mirroredPhotos);
 

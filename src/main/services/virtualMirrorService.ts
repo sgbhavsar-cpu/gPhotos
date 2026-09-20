@@ -834,18 +834,53 @@ export async function syncVirtualStorage(
   };
 }
 
-export function scanVirtualMirrorDirectory(mirrorDirPath: string): Photo[] {
+// How many sidecar JSON files to process before yielding to the event loop —
+// see the doc comment on scanVirtualMirrorDirectory below for why this
+// exists at all. 50 keeps the gap between yields well under what it takes
+// for Windows to mark the window "Not Responding" (~5s), even on a slow
+// disk, while still batching enough work per tick to stay fast overall.
+const MIRROR_SCAN_YIELD_EVERY = 50;
+
+/**
+ * Walks a virtual mirror's sidecar JSON files into Photo records. Runs on
+ * the main process's single thread with node:fs's *synchronous* calls
+ * (readdirSync/readFileSync) — deliberately not converted to fs.promises,
+ * since the cost here isn't that any one file read is slow, it's that a
+ * library with thousands of files used to run this whole recursive walk as
+ * ONE uninterrupted synchronous block with no opportunity for anything else
+ * (an IPC reply, a window redraw, the tray) to happen in between. Confirmed
+ * against real logs: ~55s of continuous blocking for a 3,106-photo library
+ * during the periodic background sync cycle — long past the point Windows
+ * reports the whole app as "Not Responding". Yielding every
+ * MIRROR_SCAN_YIELD_EVERY files (same pattern already used by
+ * getAllPhotosForSummary in catalogService.ts) breaks that up into many
+ * short blocking bursts with real gaps in between, so the process stays
+ * responsive throughout — at the cost of the scan itself taking slightly
+ * longer in wall-clock time, which is the right tradeoff for a background
+ * operation the user isn't directly waiting on.
+ */
+export async function scanVirtualMirrorDirectory(mirrorDirPath: string): Promise<Photo[]> {
+  const startedAt = Date.now();
   const photos: Photo[] = [];
   if (!fs.existsSync(mirrorDirPath)) return photos;
 
-  function scan(current: string) {
+  let sinceYield = 0;
+  const maybeYield = async () => {
+    sinceYield++;
+    if (sinceYield >= MIRROR_SCAN_YIELD_EVERY) {
+      sinceYield = 0;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  };
+
+  async function scan(current: string): Promise<void> {
     try {
       const entries = fs.readdirSync(current, { withFileTypes: true });
       for (const entry of entries) {
         const fullPath = path.join(current, entry.name);
         if (entry.isDirectory()) {
           if (!entry.name.startsWith('.')) {
-            scan(fullPath);
+            await scan(fullPath);
           }
         } else if (entry.isFile() && entry.name.endsWith('.json')) {
           try {
@@ -889,6 +924,7 @@ export function scanVirtualMirrorDirectory(mirrorDirPath: string): Photo[] {
           } catch (jsonErr) {
             console.warn(`Failed to parse sidecar JSON ${fullPath}:`, jsonErr);
           }
+          await maybeYield();
         }
       }
     } catch (err) {
@@ -896,7 +932,11 @@ export function scanVirtualMirrorDirectory(mirrorDirPath: string): Photo[] {
     }
   }
 
-  scan(mirrorDirPath);
+  await scan(mirrorDirPath);
+  logger.debug('VirtualMirror', `scanVirtualMirrorDirectory found ${photos.length} photos`, {
+    mirrorDirPath,
+    durationMs: Date.now() - startedAt,
+  });
   return photos;
 }
 

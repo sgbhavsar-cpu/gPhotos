@@ -6,6 +6,74 @@ import {
   OrganizeProgress
 } from '../types';
 
+// --- IPC call timing instrumentation ---------------------------------------
+// Every electronAPI method below eventually calls ipcRenderer.invoke, so
+// wrapping the one shared method here times ALL of them — including any
+// added later — without touching each individual call site. Two things get
+// logged, both via the existing 'logger:write' channel (fire-and-forget, so
+// this instrumentation itself never adds latency to the thing it's timing):
+//   - a repeating "still waiting" warning for any call not yet resolved
+//     after PENDING_WARN_MS (and every PENDING_WARN_MS after that) — this is
+//     what answers "which specific backend request is the renderer actually
+//     stuck on" when the window stops responding, since the main process's
+//     own hangWatchdog only sees a stall from ITS side, not the renderer's;
+//   - the final duration of every call once it settles, at 'info' level if
+//     slow enough to matter (SLOW_CALL_MS) so it's visible even when debug
+//     logging is off, 'debug' otherwise.
+const PENDING_WARN_MS = 1500;
+const SLOW_CALL_MS = 500;
+let ipcCallSeq = 0;
+const originalInvoke = ipcRenderer.invoke.bind(ipcRenderer);
+(ipcRenderer as unknown as { invoke: (channel: string, ...args: unknown[]) => Promise<unknown> }).invoke = (
+  channel: string,
+  ...args: unknown[]
+) => {
+  const id = ++ipcCallSeq;
+  const startedAt = Date.now();
+  let pendingTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const scheduleWarn = () => {
+    pendingTimer = setTimeout(() => {
+      try {
+        ipcRenderer.send(
+          'logger:write',
+          'warn',
+          'PerfIPC',
+          `Still waiting on "${channel}" after ${Date.now() - startedAt}ms (call #${id})`
+        );
+      } catch {}
+      scheduleWarn();
+    }, PENDING_WARN_MS);
+  };
+  scheduleWarn();
+
+  const settle = (ok: boolean, error?: unknown) => {
+    if (pendingTimer) clearTimeout(pendingTimer);
+    const durationMs = Date.now() - startedAt;
+    const level = durationMs >= SLOW_CALL_MS || !ok ? 'info' : 'debug';
+    try {
+      ipcRenderer.send(
+        'logger:write',
+        level,
+        'PerfIPC',
+        `"${channel}" ${ok ? 'completed' : 'FAILED'} in ${durationMs}ms (call #${id})`,
+        ok ? undefined : { error: String((error as any)?.message || error) }
+      );
+    } catch {}
+  };
+
+  return originalInvoke(channel, ...args).then(
+    (result) => {
+      settle(true);
+      return result;
+    },
+    (err) => {
+      settle(false, err);
+      throw err;
+    }
+  );
+};
+
 const electronAPI: IElectronAPI = {
   selectDirectory: () => ipcRenderer.invoke('dialog:select-directory'),
   scanDirectory: (dirPath: string) => ipcRenderer.invoke('scanner:scan-directory', dirPath),

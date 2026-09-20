@@ -20,6 +20,8 @@ import { MobileMenuDrawer } from './components/MobileMenuDrawer';
 import { libraryStore, LibraryState, getLocalPhotoUrl } from './services/libraryStore';
 import { selectDirectoryOrPrompt } from './services/selectDirectory';
 import { joinMirrorPath } from './services/pathUtils';
+import { logNavigation } from './services/userActionLogger';
+import { logger } from './services/logger';
 import { faceQueue } from './services/faceQueue';
 import { Photo, DetectedFace, VirtualStorageConfig, BackgroundScanProgress, NetworkStorageProgress, DuplicateCluster } from '../types';
 import { AiPhotoFilter } from './services/aiSearchService';
@@ -677,6 +679,8 @@ export const App: React.FC = () => {
     isManualTrigger = false,
     storageName?: string
   ) => {
+    const faceDetectStartedAt = Date.now();
+    logger.debug('UserAction', `start: runFaceDetectionForPhotos (${photosToScan.length} candidate photos${storageName ? `, storage=${storageName}` : ''})`);
     if (photosToScan.length === 0) {
       if (isManualTrigger) showToast('No photos in library to scan.', 'info');
       return;
@@ -873,6 +877,7 @@ export const App: React.FC = () => {
       }
     } finally {
       libraryStore.setDetectingFaces(false, null);
+      logger.debug('UserAction', `end: runFaceDetectionForPhotos (${Date.now() - faceDetectStartedAt}ms)`);
     }
   };
 
@@ -888,6 +893,8 @@ export const App: React.FC = () => {
     );
     if (!dir) return;
 
+    logger.debug('UserAction', `start: handleOpenFolder (${dir})`);
+    const openFolderStartedAt = Date.now();
     libraryStore.setScanning(true);
     setSwitchingLibraryLabel(`Opening ${dir}...`);
     try {
@@ -916,6 +923,7 @@ export const App: React.FC = () => {
     } finally {
       libraryStore.setScanning(false);
       setSwitchingLibraryLabel(null);
+      logger.debug('UserAction', `end: handleOpenFolder (${Date.now() - openFolderStartedAt}ms)`);
     }
   };
 
@@ -1209,6 +1217,7 @@ export const App: React.FC = () => {
   const [tabResetTrigger, setTabResetTrigger] = useState<number>(0);
 
   const handleSelectTab = (tab: ActiveTab) => {
+    logNavigation(tab, activeTab);
     stopBackgroundTasksImmediately();
     responseTracker.clearAll();
     setSelectedPersonIdForView(null);

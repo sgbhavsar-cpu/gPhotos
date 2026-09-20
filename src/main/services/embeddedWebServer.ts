@@ -280,7 +280,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     if (rejectIfPathNotAllowed(res, [mirrorPath], '/api/scan-mirror')) return;
     if (mirrorPath && fs.existsSync(mirrorPath)) {
       try {
-        const photos = scanVirtualMirrorDirectory(mirrorPath);
+        const photos = await scanVirtualMirrorDirectory(mirrorPath);
         if (photos && photos.length > 0) {
           thumbnailWorker.enqueuePhotos(photos);
         }
@@ -338,7 +338,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
         const result = await syncVirtualStorage(config);
         try {
           const mirrorPath = path.join(config.localMirrorRoot, config.name);
-          const photos = scanVirtualMirrorDirectory(mirrorPath);
+          const photos = await scanVirtualMirrorDirectory(mirrorPath);
           if (photos && photos.length > 0) {
             thumbnailWorker.enqueuePhotos(photos);
           }

@@ -76,7 +76,7 @@ async function testVirtualMirror() {
 
   // 6. Test scanning the virtual mirror directory into Photo[]
   console.log('Testing scanVirtualMirrorDirectory on local mirror...');
-  const mirroredPhotos = scanVirtualMirrorDirectory(path.join(localMirrorRoot, 'Home_NAS'));
+  const mirroredPhotos = await scanVirtualMirrorDirectory(path.join(localMirrorRoot, 'Home_NAS'));
   assert.strictEqual(mirroredPhotos.length, 3, 'Should scan all 3 mirrored photos');
   assert(mirroredPhotos[0].isVirtual, 'Scanned photo must have isVirtual=true');
   assert.strictEqual(mirroredPhotos[0].storageName, 'Home_NAS');

@@ -52,7 +52,7 @@ async function run() {
   // 2. Get sample photos from mirror
   let photos = [];
   if (fs.existsSync(MIRROR_DIR)) {
-    photos = scanVirtualMirrorDirectory(MIRROR_DIR);
+    photos = await scanVirtualMirrorDirectory(MIRROR_DIR);
   }
 
   if (photos.length === 0) {

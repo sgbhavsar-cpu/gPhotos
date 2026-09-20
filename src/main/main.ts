@@ -841,7 +841,7 @@ ipcMain.handle('mirror:sync-storage', async (event, config: VirtualStorageConfig
 
     try {
       const storageMirrorRoot = path.join(config.localMirrorRoot, config.name);
-      const mirroredPhotos = scanVirtualMirrorDirectory(storageMirrorRoot);
+      const mirroredPhotos = await scanVirtualMirrorDirectory(storageMirrorRoot);
       if (mirroredPhotos.length > 0) {
         thumbnailWorker.enqueuePhotos(mirroredPhotos);
       }
@@ -856,7 +856,7 @@ ipcMain.handle('mirror:sync-storage', async (event, config: VirtualStorageConfig
 
 ipcMain.handle('mirror:scan-virtual-mirror', async (_event, mirrorDirPath: string) => {
   try {
-    const photos = scanVirtualMirrorDirectory(mirrorDirPath);
+    const photos = await scanVirtualMirrorDirectory(mirrorDirPath);
     if (photos && photos.length > 0) {
       // Defer thumbnail pre-caching so initial startup and gallery paint are 100% fluid
       setTimeout(() => {
@@ -1619,7 +1619,7 @@ ipcMain.handle('service:start-precache', async (_event, photos?: Photo[]) => {
           const subdirs = fs.readdirSync(mirrorRoot, { withFileTypes: true });
           for (const dirent of subdirs) {
             if (dirent.isDirectory() && !dirent.name.startsWith('.')) {
-              const mirrorPhotos = scanVirtualMirrorDirectory(path.join(mirrorRoot, dirent.name));
+              const mirrorPhotos = await scanVirtualMirrorDirectory(path.join(mirrorRoot, dirent.name));
               if (mirrorPhotos && mirrorPhotos.length > 0) {
                 thumbnailWorker.enqueuePhotos(mirrorPhotos);
               }
