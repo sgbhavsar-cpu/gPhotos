@@ -270,15 +270,22 @@ export function clusterFaces(
     }
   }
 
-  const existingPeopleIds = new Set(existingPeople.map((p) => p.id));
-
   return {
+    // A real, user-given name (anything but the auto-assigned "Person N"
+    // placeholder) is always kept, even at 0 faces — a named person the
+    // user cares about should never vanish as a side effect of some
+    // unrelated face losing its assignment elsewhere. A generic placeholder
+    // has no such claim: once it has no faces left, it's just orphaned
+    // scaffolding, whether it was invented moments ago in this same pass or
+    // pre-existed this call. Previously ANY pre-existing person was exempt
+    // from pruning regardless of name, which is exactly what left a stale,
+    // empty "Person N" behind forever whenever its one face got reassigned
+    // (e.g. naming it from within a photo) or unassigned elsewhere. Must
+    // stay in sync with the renderer's copy in clustering.ts.
     people: Array.from(peopleMap.values()).filter((p) => {
       if (p.faceCount > 0) return true;
-      if (existingPeopleIds.has(p.id)) return true;
       const isGenericName = /^Person(\s+\d+)?$/i.test(p.name.trim());
-      if (!isGenericName) return true;
-      return false;
+      return !isGenericName;
     }),
     updatedFaces,
   };

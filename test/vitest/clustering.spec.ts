@@ -4,8 +4,9 @@ import {
   euclideanDistance,
   cosineDistance,
   computeQualityWeightedCentroid,
+  clusterFaces,
 } from '../../src/renderer/src/services/clustering';
-import { DetectedFace } from '../../src/types';
+import { DetectedFace, Person } from '../../src/types';
 
 function makeFace(overrides: Partial<DetectedFace> = {}): DetectedFace {
   return {
@@ -103,6 +104,54 @@ describe('clustering math', () => {
         makeFace({ descriptor: [1, 0] }), // wrong dimension, must be ignored
       ]);
       expect(centroid).toHaveLength(3);
+    });
+  });
+
+  describe('clusterFaces pruning', () => {
+    function makePerson(overrides: Partial<Person> = {}): Person {
+      return {
+        id: 'person_1',
+        name: 'Person 1',
+        faceCount: 1,
+        photoCount: 1,
+        createdAt: new Date().toISOString(),
+        ...overrides,
+      };
+    }
+
+    it('drops a generically-named existing person once it has no faces left', () => {
+      // Reproduces: renaming/reassigning a person's only face (e.g. from
+      // within the lightbox) used to leave the old "Person N" behind
+      // forever at 0 faces, because clusterFaces exempted any pre-existing
+      // person from pruning regardless of name.
+      const staleGenericPerson = makePerson({ id: 'person_7', name: 'Person 7', faceCount: 1 });
+      const newNamedPerson = makePerson({ id: 'person_trupti', name: 'Trupti', faceCount: 0 });
+      // The one face that used to belong to "Person 7" now points at the
+      // newly-named person instead — nothing in `faces` references person_7
+      // any more.
+      const face = makeFace({ id: 'f1', personId: 'person_trupti' });
+
+      const { people } = clusterFaces([face], [staleGenericPerson, newNamedPerson]);
+
+      expect(people.find((p) => p.id === 'person_7')).toBeUndefined();
+      expect(people.find((p) => p.id === 'person_trupti')?.faceCount).toBe(1);
+    });
+
+    it('keeps a real-named existing person even at 0 faces', () => {
+      // A person the user has actually named must never disappear just
+      // because none of their faces are currently assigned (e.g. a
+      // transient recompute, or all their photos were temporarily
+      // excluded) — only generic, never-reviewed placeholders are disposable.
+      const namedPerson = makePerson({ id: 'person_named', name: 'Grandma', faceCount: 1 });
+
+      const { people } = clusterFaces([], [namedPerson]);
+
+      expect(people.find((p) => p.id === 'person_named')).toBeDefined();
+    });
+
+    it('still drops a brand-new generic cluster invented in the same pass with no faces', () => {
+      const { people } = clusterFaces([], []);
+      expect(people).toHaveLength(0);
     });
   });
 });
