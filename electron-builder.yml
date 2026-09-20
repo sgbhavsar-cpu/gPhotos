@@ -11,6 +11,17 @@ files:
 extraResources:
   - from: resources/models-onnx
     to: models-onnx
+# electron-builder's automatic asar-unpack heuristic only unpacks a
+# node_modules package if IT ITSELF contains a native .node binding. sharp's
+# actual image-processing library (libvips) ships as a separate companion
+# package (@img/sharp-libvips-<platform>-<arch>) with no .node file of its
+# own — just a .so/.dylib the sharp binding dlopen()s at runtime — so it was
+# silently left packed inside app.asar, where dlopen can't reach it (this
+# is what broke sharp entirely on the Linux build: "cannot open shared
+# object file"). Unpacking all of @img/** covers sharp on every platform.
+asarUnpack:
+  - "**/node_modules/@img/**"
+  - "**/node_modules/onnxruntime-node/**"
 win:
   icon: public/icon.png
   target:
