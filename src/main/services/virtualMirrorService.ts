@@ -780,23 +780,15 @@ export async function syncVirtualStorage(
     });
   }
 
+  let skippedCount = 0;
+  let lastProgressEmitTime = 0;
+  let lastLoggedSummaryAt = Date.now();
+
   for (let i = startIndex; i < total; i++) {
     const remoteFile = remoteFiles[i];
     const fileName = path.basename(remoteFile);
 
     const percent = Math.round(((i + 1) / Math.max(1, total)) * 100);
-    if (onProgress) {
-      onProgress({
-        storageName: config.name,
-        phase: 'thumbnails',
-        current: i + 1,
-        total,
-        currentFile: fileName,
-        status: 'syncing',
-        percent,
-      });
-    }
-
     const fileStartTime = Date.now();
 
     const result = await processOneMirrorFile(remoteFile, config, storageMirrorRoot);
@@ -806,7 +798,44 @@ export async function syncVirtualStorage(
       totalOriginalSize += result.originalSize;
       totalThumbnailSize += result.thumbnailSize;
       totalSynced++;
-      if (!result.skipped) newlyAdded++;
+      if (!result.skipped) {
+        newlyAdded++;
+      } else {
+        skippedCount++;
+      }
+
+      // The progress counter still has to walk every file to verify it
+      // (there's no way to know a file is unchanged without checking) — but
+      // emitting one IPC/UI update per already-cached file made a fast
+      // verify-only pass look identical to a slow full reprocess, which is
+      // exactly what made this look like "it always starts from zero" even
+      // when the skip check below was working correctly. Skipped files only
+      // update the UI a few times a second; real work (a new/changed photo)
+      // always updates immediately.
+      const now = Date.now();
+      const isLastFile = i === total - 1;
+      if (onProgress && (!result.skipped || isLastFile || now - lastProgressEmitTime >= 200)) {
+        lastProgressEmitTime = now;
+        onProgress({
+          storageName: config.name,
+          phase: 'thumbnails',
+          current: i + 1,
+          total,
+          currentFile: result.skipped ? `Verifying cached photos… (${skippedCount} unchanged so far)` : fileName,
+          status: 'syncing',
+          percent,
+        });
+      }
+
+      // A verify-only pass over a fully-synced storage can walk thousands of
+      // files with nothing else logged at all, which reads as "did this
+      // actually do anything?" just as much as the progress bar did — a
+      // periodic summary makes the skip check's effect visible without
+      // spamming a line per (near-instant) skipped file.
+      if (now - lastLoggedSummaryAt >= 5000 || isLastFile) {
+        lastLoggedSummaryAt = now;
+        logger.info('Sync', `  verifying ${i + 1}/${total} — ${skippedCount} unchanged (skipped), ${newlyAdded} new/changed so far`);
+      }
 
       if (!result.skipped) {
         logger.info('Sync', `Background scan — Photo ${i + 1}/${total}: ${fileName}`);
@@ -814,13 +843,18 @@ export async function syncVirtualStorage(
       }
 
       if (runFaceDetection && result.sidecar) {
-        if (onProgress) {
+        // Same throttling reasoning as the thumbnail-phase update above —
+        // an already-thumbnailed file usually also skips face re-detection
+        // (see detectFacesForPhoto's own unchanged-file check), so this
+        // phase is just as prone to looking like a slow one-by-one redo.
+        if (onProgress && (!result.skipped || i === total - 1 || Date.now() - lastProgressEmitTime >= 200)) {
+          lastProgressEmitTime = Date.now();
           onProgress({
             storageName: config.name,
             phase: 'faces',
             current: i + 1,
             total,
-            currentFile: fileName,
+            currentFile: result.skipped ? `Verifying cached photos… (${skippedCount} unchanged so far)` : fileName,
             status: 'syncing',
             percent,
           });
@@ -891,6 +925,11 @@ export async function syncVirtualStorage(
       : 4;
     await new Promise((r) => setTimeout(r, delayMs));
   }
+
+  logger.info(
+    'Sync',
+    `Rescan complete for ${config.name}: ${total} files checked — ${skippedCount} already up to date (skipped), ${newlyAdded} new or changed.`
+  );
 
   // Final checkpoint mark as completed
   saveStorageCheckpoint({
