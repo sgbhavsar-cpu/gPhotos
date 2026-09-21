@@ -86,7 +86,9 @@ async function runMobileWebServerTests() {
   upsertPhotos(seedPhotos);
   upsertPeople([{ id: 'p_mobile_test', name: 'Test Person', faceCount: 0, photoCount: 0, createdAt: new Date().toISOString() }]);
 
-  const testPort = 5174;
+  // A distinctive high port, not 5173/5174 (Vite's own default/fallback ports),
+  // which other projects' dev servers on this machine can and do occupy.
+  const testPort = 58471;
   console.log(`[Step 1] Starting embedded web server on port ${testPort}...`);
   const status = await startEmbeddedWebServer(testPort);
   console.log(`[Step 1 PASS] Server running: ${status.isRunning} on port ${status.port}`);
