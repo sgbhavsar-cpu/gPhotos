@@ -4,8 +4,8 @@ import os from 'os';
 import path from 'path';
 import sharp from 'sharp';
 import { resetDbForTests, setActiveLibrary, getDb, getDbForLibraryPath } from '../../src/main/services/db';
-import { getPhotoById, upsertPhoto, replaceFacesForPhoto, getAllFaces } from '../../src/main/services/libraryRepository';
-import { detectFacesForPhoto, forceRedetectFacesForPhoto, resolveDbForPhoto } from '../../src/main/services/pipelineOrchestrator';
+import { getPhotoById, upsertPhoto, replaceFacesForPhoto, getAllFaces, upsertPeople } from '../../src/main/services/libraryRepository';
+import { detectFacesForPhoto, forceRedetectFacesForPhoto, resolveDbForPhoto, createFaceClusterCache } from '../../src/main/services/pipelineOrchestrator';
 import { Photo, DetectedFace } from '../../src/types';
 
 // These exercise the real ONNX detection engine against a synthetic
@@ -263,5 +263,42 @@ describe('pipelineOrchestrator face detection step', () => {
     expect(storedInActiveDb).toBeNull();
 
     expect(resolveDbForPhoto(virtualPhoto)).toBe(ownDb);
+  }, 30000);
+
+  // Regression guard for the FaceClusterCache optimization (see
+  // createFaceClusterCache's doc comment): a batch of many photos sharing
+  // one cache must never lose track of faces belonging to OTHER photos
+  // already in the library just because the current call only touches one
+  // photo at a time.
+  it('a shared FaceClusterCache retains other photos\' faces/people after processing an unrelated photo', async () => {
+    const db = getDb();
+    const existingFace: DetectedFace = {
+      id: 'existing_face_1',
+      photoId: 'other_photo',
+      box: { x: 1, y: 1, width: 10, height: 10 },
+      descriptor: new Array(512).fill(0.05),
+      confidence: 0.9,
+      isConfirmed: true,
+      isManual: false,
+      personId: 'person_existing',
+    };
+    replaceFacesForPhoto('other_photo', [existingFace], false, db);
+    upsertPeople([{ id: 'person_existing', name: 'Alice', faceCount: 1, photoCount: 1, createdAt: new Date().toISOString() }]);
+
+    const cache = createFaceClusterCache(db);
+    expect(cache.faces.some((f) => f.id === 'existing_face_1')).toBe(true);
+    expect(cache.people.some((p) => p.id === 'person_existing')).toBe(true);
+
+    // Process a second, unrelated (faceless) photo through the SAME cache.
+    const photo = makeLocalPhoto('cache_test_1', imagePath);
+    const result = await detectFacesForPhoto(photo, imagePath, db, cache);
+    expect(result.ran).toBe(true);
+
+    // The pre-existing face/person must survive in both the cache (so a
+    // THIRD photo in the same batch still sees it without a DB re-read) and
+    // the database itself.
+    expect(cache.faces.some((f) => f.id === 'existing_face_1')).toBe(true);
+    expect(cache.people.some((p) => p.id === 'person_existing')).toBe(true);
+    expect(getAllFaces(db).some((f) => f.id === 'existing_face_1')).toBe(true);
   }, 30000);
 });

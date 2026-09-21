@@ -78,7 +78,8 @@ import {
 import { handleStorageSave, handleStorageLoad } from './services/storageHandlers';
 import { getPhotosByStorageName, getFacesForPhoto, getAllPeople } from './services/libraryRepository';
 import { getDbForLibraryPath } from './services/db';
-import { detectFacesForPhoto, forceRedetectFacesForPhoto, resolveDbForPhoto } from './services/pipelineOrchestrator';
+import type { DatabaseSync } from 'node:sqlite';
+import { detectFacesForPhoto, forceRedetectFacesForPhoto, resolveDbForPhoto, createFaceClusterCache, type FaceClusterCache } from './services/pipelineOrchestrator';
 import { detectFaceInRegion, terminateFaceDetectionWorker } from './services/faceDetectionWorkerClient';
 import { assertPathsAllowed, getDefaultMirrorRoot } from './services/pathSecurity';
 import { browseDirectory } from './services/directoryBrowser';
@@ -968,6 +969,11 @@ ipcMain.handle('mirror:get-photos-by-storage', async (_event, storageName: strin
 // syncVirtualStorage).
 ipcMain.handle('faces:detect-batch', async (_event, photos: Photo[]) => {
   const results: Array<{ photoId: string; ran: boolean; faceCount: number; locked: boolean; skippedReason?: string; faces: any[] }> = [];
+  // Keyed by resolved db rather than shared as one cache — a batch can span
+  // more than one library/storage (each with its own faces table), and a
+  // cache built from one library's faces must never be used to cluster
+  // another's. See createFaceClusterCache's doc comment for why this exists.
+  const cachesByDb = new Map<DatabaseSync, FaceClusterCache>();
   for (const photo of photos) {
     try {
       const sourceFilePath = photo.isVirtual ? (photo.originalRemotePath || photo.filePath) : photo.filePath;
@@ -976,7 +982,12 @@ ipcMain.handle('faces:detect-batch', async (_event, photos: Photo[]) => {
       // I/O and ONNX inference per photo, during which the active library
       // can legitimately change out from under a naive getDb() call.
       const db = resolveDbForPhoto(photo);
-      const result = await detectFacesForPhoto(photo, sourceFilePath, db);
+      let cache = cachesByDb.get(db);
+      if (!cache) {
+        cache = createFaceClusterCache(db);
+        cachesByDb.set(db, cache);
+      }
+      const result = await detectFacesForPhoto(photo, sourceFilePath, db, cache);
       results.push({ photoId: photo.id, ...result, faces: getFacesForPhoto(photo.id, db) });
     } catch (err) {
       logger.error('Pipeline', 'faces:detect-batch item failed', { photoId: photo.id, err: String(err) });

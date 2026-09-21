@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import type { DatabaseSync } from 'node:sqlite';
-import { VirtualStorageConfig, VirtualPhotoMetadata, Photo, DetectedFace } from '../../types';
+import { VirtualStorageConfig, VirtualPhotoMetadata, Photo, DetectedFace, Person } from '../../types';
 import { detectFaces } from './faceDetectionWorkerClient';
 import { clusterFaces } from './faceClustering';
 import { getHeicFullResolutionBufferForDetection } from './heicService';
@@ -37,6 +37,39 @@ export interface FaceStepResult {
   faceCount: number;
   locked: boolean;
   skippedReason?: 'locked' | 'offline' | 'decode-failed' | 'unchanged';
+}
+
+/**
+ * Lets a caller that's about to run detectFacesForPhoto over MANY photos in
+ * one sitting (syncVirtualStorage's per-file loop, the faces:detect-batch
+ * IPC handler) avoid re-fetching and re-clustering the library's ENTIRE
+ * face/people set from scratch for every single photo.
+ *
+ * Without this, a real run measured a single already-slow photo's face
+ * detection climbing to 6+ seconds purely from getAllFaces(db) re-reading
+ * and re-mapping every row in the faces table on every call, then
+ * clusterFaces() re-scanning that same growing set again — for a library
+ * with thousands of already-detected faces, that cost is paid identically
+ * for the 1st and the 20,000th photo in a batch, even though the "existing
+ * faces" set barely changed between them. clusterFaces()'s own output
+ * (updatedFaces/people) is already the complete, authoritative new state —
+ * exactly what the next photo in the same batch needs — so this just keeps
+ * it in memory across calls instead of discarding and re-reading it.
+ *
+ * Scoped to the lifetime of ONE caller-owned batch (one syncVirtualStorage
+ * run, one detect-batch IPC call) — never persisted beyond that, so it
+ * can't ever go stale from unrelated concurrent activity outstaying its
+ * welcome. A caller processing a single one-off photo should simply not
+ * create or pass one; detectFacesForPhoto falls back to its original
+ * always-fresh DB reads.
+ */
+export interface FaceClusterCache {
+  faces: DetectedFace[];
+  people: Person[];
+}
+
+export function createFaceClusterCache(db: DatabaseSync = getDb()): FaceClusterCache {
+  return { faces: getAllFaces(db), people: getAllPeople() };
 }
 
 /** Same id scheme scanVirtualMirrorDirectory() uses, so rows this pipeline writes match what the renderer later reads from the same sidecar. */
@@ -97,7 +130,12 @@ function sidecarToPhoto(sidecar: VirtualPhotoMetadata): Photo {
  * would never see them, showing "0 faces detected" forever. See
  * runFaceDetectionStep below, which resolves this for the sync pipeline.
  */
-export async function detectFacesForPhoto(photo: Photo, sourceFilePath: string, db: DatabaseSync = getDb()): Promise<FaceStepResult> {
+export async function detectFacesForPhoto(
+  photo: Photo,
+  sourceFilePath: string,
+  db: DatabaseSync = getDb(),
+  cache?: FaceClusterCache
+): Promise<FaceStepResult> {
   const photoId = photo.id;
 
   const existing = getPhotoById(photoId, db);
@@ -209,13 +247,22 @@ export async function detectFacesForPhoto(photo: Photo, sourceFilePath: string, 
   // result instead of being replaced). replaceFacesForPhoto below deletes
   // this photo's rows outright, then inserts only what comes out of this
   // clustering pass, so the DB ends up holding exactly the fresh detections.
-  const existingFaces = getAllFaces(db).filter((f) => f.photoId !== photoId);
-  const existingPeople = getAllPeople();
+  const existingFaces = (cache ? cache.faces : getAllFaces(db)).filter((f) => f.photoId !== photoId);
+  const existingPeople = cache ? cache.people : getAllPeople();
   const { people, updatedFaces } = clusterFaces([...existingFaces, ...newFaces], existingPeople);
   const thisPhotoFaces = updatedFaces.filter((f) => f.photoId === photoId);
 
   replaceFacesForPhoto(photoId, thisPhotoFaces, false, db);
   if (people.length > 0) upsertPeople(people);
+
+  // clusterFaces' own output is already the complete, authoritative new
+  // state (every face across the whole set it was given, every person with
+  // freshly-recomputed counts) — exactly what the NEXT photo in this same
+  // batch should see, so just keep it rather than re-reading the DB again.
+  if (cache) {
+    cache.faces = updatedFaces;
+    cache.people = people;
+  }
 
   working.faceScanCompleted = true;
   working.facesLocked = thisPhotoFaces.length === 0; // trivially locked when nothing to confirm
@@ -244,12 +291,13 @@ export async function detectFacesForPhoto(photo: Photo, sourceFilePath: string, 
 export async function runFaceDetectionStep(
   remoteFile: string,
   sidecar: VirtualPhotoMetadata,
-  config: VirtualStorageConfig
+  config: VirtualStorageConfig,
+  cache?: FaceClusterCache
 ): Promise<FaceStepResult> {
   const photo = sidecarToPhoto(sidecar);
   const mirrorFolder = path.join(config.localMirrorRoot, config.name);
   const db = getDbForLibraryPath(mirrorFolder);
-  return detectFacesForPhoto(photo, remoteFile, db);
+  return detectFacesForPhoto(photo, remoteFile, db, cache);
 }
 
 /**
