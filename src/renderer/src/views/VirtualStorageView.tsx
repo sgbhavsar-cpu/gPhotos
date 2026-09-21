@@ -1226,10 +1226,17 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                       ? rawTotal
                       : Math.max(prog?.thumbnailTotal || 0, prog?.faceTotal || 0);
 
-                    // Thumbnail stats
-                    const rawCached = prog?.thumbnailCurrent !== undefined && (prog.phase === 'thumbnails' || prog.phase === 'interrupted' || prog.phase === 'completed')
+                    // Thumbnail stats. StorageDetails' field is
+                    // thumbnailCachedCount — details.cachedThumbnails doesn't
+                    // exist on that type, so this always fell through to the
+                    // stale s.totalItems (whatever was last saved to config,
+                    // not a live count) without ever throwing or warning.
+                    // 'faces' is included in the live-progress condition too:
+                    // by the time a photo's progress event reports phase
+                    // 'faces', its thumbnail step has already resolved.
+                    const rawCached = prog?.thumbnailCurrent !== undefined && (prog.phase === 'thumbnails' || prog.phase === 'faces' || prog.phase === 'interrupted' || prog.phase === 'completed')
                       ? prog.thumbnailCurrent
-                      : (details?.cachedThumbnails !== undefined ? details.cachedThumbnails : (s.totalItems || 0));
+                      : (details?.thumbnailCachedCount !== undefined ? details.thumbnailCachedCount : (s.totalItems || 0));
                     const cachedThumbnails = totalPhotos > 0 ? Math.min(rawCached, totalPhotos) : rawCached;
                     const isThumbActive = prog?.phase === 'thumbnails' || (isSyncing && activeSyncStorageId === s.id);
 

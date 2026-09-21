@@ -837,6 +837,20 @@ export async function syncVirtualStorage(
     ? createFaceClusterCache(getDbForLibraryPath(storageMirrorRoot))
     : undefined;
 
+  // The absolute, library-wide count this run STARTS from — not 0. Without
+  // this, a resumed run (starting partway through the file list) reported
+  // facesCompletedCount as "however many this run itself walked", which for
+  // a run resuming at photo 4311 could show something like "41/23887" after
+  // a few seconds — technically accurate for THIS run alone, but exactly
+  // the kind of number that doesn't match what's shown anywhere else and
+  // means nothing to a user watching it. facesCompletedCount below is
+  // seeded from this and only ever counts genuinely NEW detections on top
+  // of it, so it always reads as "how many of this storage's photos have a
+  // completed face scan right now" — the same number getStorageDetailsFast
+  // and getAllStorageDetailsFast already compute independently, so every
+  // surface showing "faces done" agrees.
+  const facesCompletedBaseline = runFaceDetection ? getFaceStatsForLibrary(storageMirrorRoot).faceScannedCount : 0;
+
   // Distinct from skippedCount/newlyAdded (thumbnail step outcomes) — a
   // thumbnail being skipped says nothing about whether THIS photo's face
   // scan is actually done, and the two were previously conflated into one
@@ -919,7 +933,10 @@ export async function syncVirtualStorage(
           currentFile: currentFileLabel,
           status: 'syncing',
           percent,
-          facesCompletedCount: facesAlreadyDoneCount + facesDetectedThisRunCount,
+          // Baseline (what the library already had before this run started)
+          // plus only genuinely NEW detections — NOT facesAlreadyDoneCount,
+          // which is already included in the baseline and would double-count.
+          facesCompletedCount: facesCompletedBaseline + facesDetectedThisRunCount,
         });
       }
 

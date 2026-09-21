@@ -83,20 +83,25 @@ export function useBackgroundActivityStatus(
     return {
       isActive: true,
       isPaused: false,
-      label: `Detecting faces… ${faceSweepProgress.current}/${faceSweepProgress.total}`,
+      label: `This library: detecting faces… ${faceSweepProgress.current}/${faceSweepProgress.total}`,
     };
   }
 
+  // faceQueue and the thumbnail worker below both operate ACROSS every open/
+  // configured library, not just whichever one is currently on screen — the
+  // "X/Y" here can legitimately be a totally different number than any
+  // single storage's own count in the Network Mirrors screen, which is
+  // confusing without saying so explicitly.
   if (faceQueueStatus.total > 0 && faceQueueStatus.completed < faceQueueStatus.total) {
     return faceQueueStatus.isPaused
       ? { isActive: false, isPaused: true, label: 'Face detection paused — resumes when idle' }
-      : { isActive: true, isPaused: false, label: `Detecting faces… ${faceQueueStatus.completed}/${faceQueueStatus.total}` };
+      : { isActive: true, isPaused: false, label: `Background face scan: ${faceQueueStatus.completed}/${faceQueueStatus.total}` };
   }
 
   if (thumbStatus && thumbStatus.total > thumbStatus.current) {
     return thumbStatus.paused
       ? { isActive: false, isPaused: true, label: 'Caching paused — resumes when idle' }
-      : { isActive: true, isPaused: false, label: `Caching thumbnails… ${thumbStatus.current}/${thumbStatus.total}` };
+      : { isActive: true, isPaused: false, label: `Background cache queue: ${thumbStatus.current}/${thumbStatus.total}` };
   }
 
   return IDLE_STATUS;

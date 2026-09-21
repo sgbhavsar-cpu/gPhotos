@@ -210,4 +210,40 @@ describe('unified sync pipeline: correct database targeting across re-syncs', ()
     expect(details.totalPhotos).toBe(3);
     expect(details.faceScannedCount).toBe(3);
   });
+
+  // Regression: MirrorProgress.facesCompletedCount used to be computed as
+  // "however many photos THIS run itself walked and confirmed" — starting
+  // from 0 every single call. For a run that resumes partway through a
+  // large file list (the normal case after any interruption), that reported
+  // a tiny, meaningless number like "3/23887" instead of the actual
+  // library-wide "how many photos have a completed face scan right now",
+  // which is what every other surface (getStorageDetailsFast, the sidebar,
+  // the completion summary) already shows — the mismatch is exactly what
+  // made the counts look inconsistent and unexplainable across the UI.
+  // facesCompletedCount must always be seeded from the library's real
+  // baseline count and only grow from there, never restart from 0.
+  it('facesCompletedCount reflects the library-wide total, not just what this run itself walked', async () => {
+    await syncVirtualStorage(storage); // 3 photos, all detected — baseline becomes 3
+
+    // Add 2 more new photos to the source before the next (fresh) pass.
+    for (let i = 3; i < 5; i++) {
+      await sharp({ create: { width: 100, height: 100, channels: 3, background: { r: i * 20, g: 10, b: 10 } } })
+        .jpeg()
+        .toFile(path.join(networkSourcePath, `IMG_${i}.jpg`));
+    }
+
+    const seenCounts: number[] = [];
+    await syncVirtualStorage(storage, (progress) => {
+      if (typeof progress.facesCompletedCount === 'number') seenCounts.push(progress.facesCompletedCount);
+    });
+
+    // Never regresses to a small per-run count (e.g. 0, 1, 2) — always at
+    // least the pre-existing baseline of 3, climbing to 5 once the two new
+    // photos are detected too.
+    expect(seenCounts.length).toBeGreaterThan(0);
+    for (const count of seenCounts) {
+      expect(count).toBeGreaterThanOrEqual(3);
+    }
+    expect(seenCounts[seenCounts.length - 1]).toBe(5);
+  });
 });
