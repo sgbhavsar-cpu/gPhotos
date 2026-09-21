@@ -677,8 +677,21 @@ export const App: React.FC = () => {
     // even once it's genuinely 100% done. Only ever overrides *toward*
     // "completed" when the live data unambiguously says so — never invents
     // a worse status than what was already shown.
-    if (window.electronAPI?.getAllStorageDetails) {
-      window.electronAPI.getAllStorageDetails().then((details) => {
+    //
+    // getAllStorageDetailsFast, NOT getAllStorageDetails: this runs
+    // unconditionally at every app mount, across every configured storage —
+    // the plain version's full recursive sidecar-folder walk measured as a
+    // 150+ SECOND startup block on a real multi-storage library (each
+    // storage paying its own thousands-of-files walk, back to back). The
+    // fast path still self-heals a stale "interrupted" flag correctly: its
+    // phase is computed fresh from the checkpoint/DB counts every time
+    // (completed as soon as thumbnailCachedCount/faceScannedCount both
+    // reach totalPhotos), never just copied from the stale flag itself —
+    // it only stops catching drift the live disk scan would (e.g. a
+    // checkpoint whose OWN counts are themselves wrong), which is a much
+    // narrower and rarer case than what this reconciliation exists for.
+    if (window.electronAPI?.getAllStorageDetailsFast) {
+      window.electronAPI.getAllStorageDetailsFast().then((details) => {
         if (!details || typeof details !== 'object') return;
         setStorageProgressMap((prev) => {
           const next = { ...prev };
