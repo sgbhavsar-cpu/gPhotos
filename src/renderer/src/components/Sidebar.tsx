@@ -67,7 +67,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   const [isLibraryCollapsed, setIsLibraryCollapsed] = useState(false);
   const [isNetworkStorageCollapsed, setIsNetworkStorageCollapsed] = useState(false);
-  const backgroundActivity = useBackgroundActivityStatus(state.isDetectingFaces, state.faceDetectionProgress ?? null);
+  const backgroundActivity = useBackgroundActivityStatus(state.isDetectingFaces, state.faceDetectionProgress ?? null, storageProgressMap);
 
   const navItems = [
     { id: 'photos' as ActiveTab, label: 'Photos', icon: ImageIcon, count: state.totalCount || state.photos.length },

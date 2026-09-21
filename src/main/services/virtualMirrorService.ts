@@ -20,7 +20,7 @@ import { libraryStatusService } from './libraryStatusService';
 import { getFaceStatsForLibrary } from './libraryRepository';
 import { getDefaultMirrorRoot } from './pathSecurity';
 import { isPathReachable, isNetworkPath } from './networkReachabilityCache';
-import { runFaceDetectionStep, photoIdForSidecar } from './pipelineOrchestrator';
+import { runFaceDetectionStep, photoIdForSidecar, createFaceClusterCache, type FaceClusterCache, type FaceStepResult } from './pipelineOrchestrator';
 import { logger } from './logger';
 import { getDbForLibraryPath } from './db';
 import { deletePhotos } from './libraryRepository';
@@ -768,6 +768,50 @@ export async function syncVirtualStorage(
     console.log(`[StorageSync] Resuming sync for ${config.name} from photo ${startIndex + 1} of ${total} (Saved progress: ${existingCp.percent}%)`);
   }
 
+  // Prioritize files whose face scan the catalog already shows complete, so
+  // their (fast) re-verification happens first — leaving whatever genuinely
+  // needs real detection clearly isolated as what's actually left, instead
+  // of the two being interleaved in arbitrary filesystem order. That
+  // interleaving is what made a rescan look like it "starts from zero" even
+  // when a real library had, say, 40% of its photos already fully done:
+  // the walk would hit a long unlucky stretch of never-scanned photos and
+  // sit there, with no way to tell from the outside that a large chunk of
+  // "easy" confirmations were still waiting later in the list.
+  //
+  // Only safe to do on a FRESH pass (no valid resume checkpoint, i.e.
+  // startIndex === 0): the checkpoint below tracks progress by ARRAY
+  // POSITION, and completion status changes AS the pass runs — re-sorting
+  // mid-resume could shift a file that's never been visited behind the
+  // resume point, silently skipping it forever. A fresh pass (including the
+  // common case of clicking Rescan again after a previous pass completed)
+  // has no such risk, since it always walks the whole list from the start.
+  if (runFaceDetection && startIndex === 0) {
+    try {
+      const db = getDbForLibraryPath(storageMirrorRoot);
+      const doneRows = db.prepare('SELECT id FROM photos WHERE face_scan_completed = 1').all() as Array<{ id: string }>;
+      const doneIds = new Set(doneRows.map((r) => r.id));
+      if (doneIds.size > 0) {
+        const alreadyDone: string[] = [];
+        const needsWork: string[] = [];
+        for (const remoteFile of remoteFiles) {
+          const fileName = path.basename(remoteFile);
+          const relFromRoot = path.relative(config.networkSourcePath, remoteFile);
+          const localThumbPath = path.join(storageMirrorRoot, path.dirname(relFromRoot), fileName);
+          const photoId = photoIdForSidecar(localThumbPath);
+          (doneIds.has(photoId) ? alreadyDone : needsWork).push(remoteFile);
+        }
+        remoteFiles.length = 0;
+        remoteFiles.push(...alreadyDone, ...needsWork);
+        logger.info(
+          'Sync',
+          `Prioritizing ${alreadyDone.length} already-scanned photo(s) for quick re-verification before ${needsWork.length} still needing face detection.`
+        );
+      }
+    } catch (err) {
+      console.warn(`[StorageSync] Failed to prioritize already-scanned photos for ${config.name}:`, err);
+    }
+  }
+
   if (onProgress) {
     onProgress({
       storageName: config.name,
@@ -784,6 +828,24 @@ export async function syncVirtualStorage(
   let lastProgressEmitTime = 0;
   let lastLoggedSummaryAt = Date.now();
 
+  // Built once for this whole run, not per photo — see createFaceClusterCache's
+  // doc comment for why: without it, a photo late in a large batch pays for
+  // re-reading and re-clustering every face detected so far by THIS SAME run,
+  // on top of every face already in the library, which is what made a single
+  // photo's detection step climb into multiple seconds on a large library.
+  const faceCache: FaceClusterCache | undefined = runFaceDetection
+    ? createFaceClusterCache(getDbForLibraryPath(storageMirrorRoot))
+    : undefined;
+
+  // Distinct from skippedCount/newlyAdded (thumbnail step outcomes) — a
+  // thumbnail being skipped says nothing about whether THIS photo's face
+  // scan is actually done, and the two were previously conflated into one
+  // "unchanged (skipped)" label that claimed nothing was happening even
+  // while real, multi-second face detection was actively running.
+  let facesAlreadyDoneCount = 0;
+  let facesDetectedThisRunCount = 0;
+  let facesDeferredCount = 0; // offline/locked/error — genuinely not attempted
+
   for (let i = startIndex; i < total; i++) {
     const remoteFile = remoteFiles[i];
     const fileName = path.basename(remoteFile);
@@ -793,6 +855,7 @@ export async function syncVirtualStorage(
 
     const result = await processOneMirrorFile(remoteFile, config, storageMirrorRoot);
     let bytesReadForBandwidth = result.bytesRead;
+    let faceResult: FaceStepResult | null = null;
 
     if (result.success) {
       totalOriginalSize += result.originalSize;
@@ -800,79 +863,77 @@ export async function syncVirtualStorage(
       totalSynced++;
       if (!result.skipped) {
         newlyAdded++;
+        logger.info('Sync', `Background scan — Photo ${i + 1}/${total}: ${fileName}`);
+        logger.info('Sync', `  caching thumbnail ..... ${Math.round(result.thumbnailSize / 1024)}kb done`);
       } else {
         skippedCount++;
       }
 
-      // The progress counter still has to walk every file to verify it
-      // (there's no way to know a file is unchanged without checking) — but
-      // emitting one IPC/UI update per already-cached file made a fast
-      // verify-only pass look identical to a slow full reprocess, which is
-      // exactly what made this look like "it always starts from zero" even
-      // when the skip check below was working correctly. Skipped files only
-      // update the UI a few times a second; real work (a new/changed photo)
-      // always updates immediately.
+      if (runFaceDetection && result.sidecar) {
+        try {
+          faceResult = await runFaceDetectionStep(remoteFile, result.sidecar, config, faceCache);
+          if (faceResult.ran) {
+            facesDetectedThisRunCount++;
+            logger.info('Sync', `  detecting faces ..... ${faceResult.faceCount} detected`);
+          } else if (faceResult.skippedReason === 'unchanged' || faceResult.skippedReason === 'locked') {
+            facesAlreadyDoneCount++;
+          } else {
+            // 'offline' or 'decode-failed' — genuinely not attempted, not
+            // the same as "already done" (a later pass still needs to try).
+            facesDeferredCount++;
+            if (!result.skipped) {
+              logger.info('Sync', `  detecting faces ..... skipped (${faceResult.skippedReason})`);
+            }
+          }
+        } catch (faceErr) {
+          console.error(`Face detection step failed for ${remoteFile}:`, faceErr);
+          errors.push(`Face detection failed for ${fileName}: ${String(faceErr)}`);
+        }
+      }
+
+      // The loop still has to walk every file to verify it (there's no way
+      // to know a file is unchanged without checking) — but emitting one
+      // IPC/UI update per already-cached file made a fast verify-only pass
+      // look identical to a slow full reprocess, which is exactly what made
+      // this look like "it always starts from zero". A file only counts as
+      // fully "quiet" (skip the throttle) when NEITHER step did real work;
+      // real work (a new/changed thumbnail OR an actual detection pass)
+      // always updates immediately so the UI reflects it live.
       const now = Date.now();
       const isLastFile = i === total - 1;
-      if (onProgress && (!result.skipped || isLastFile || now - lastProgressEmitTime >= 200)) {
+      const didRealWork = !result.skipped || !!faceResult?.ran;
+      const bothConfirmedDone = result.skipped && (!runFaceDetection || !result.sidecar || (faceResult && !faceResult.ran && faceResult.skippedReason !== 'offline'));
+      const currentFileLabel = faceResult?.ran
+        ? `Detecting faces… (${facesDetectedThisRunCount} scanned this pass)`
+        : bothConfirmedDone
+          ? `Verifying cached photos… (${skippedCount} confirmed unchanged)`
+          : fileName;
+
+      if (onProgress && (didRealWork || isLastFile || now - lastProgressEmitTime >= 200)) {
         lastProgressEmitTime = now;
         onProgress({
           storageName: config.name,
-          phase: 'thumbnails',
+          phase: faceResult ? 'faces' : 'thumbnails',
           current: i + 1,
           total,
-          currentFile: result.skipped ? `Verifying cached photos… (${skippedCount} unchanged so far)` : fileName,
+          currentFile: currentFileLabel,
           status: 'syncing',
           percent,
+          facesCompletedCount: facesAlreadyDoneCount + facesDetectedThisRunCount,
         });
       }
 
       // A verify-only pass over a fully-synced storage can walk thousands of
       // files with nothing else logged at all, which reads as "did this
       // actually do anything?" just as much as the progress bar did — a
-      // periodic summary makes the skip check's effect visible without
-      // spamming a line per (near-instant) skipped file.
+      // periodic summary makes both skip checks' actual effect visible
+      // without spamming a line per (near-instant) skipped file.
       if (now - lastLoggedSummaryAt >= 5000 || isLastFile) {
         lastLoggedSummaryAt = now;
-        logger.info('Sync', `  verifying ${i + 1}/${total} — ${skippedCount} unchanged (skipped), ${newlyAdded} new/changed so far`);
-      }
-
-      if (!result.skipped) {
-        logger.info('Sync', `Background scan — Photo ${i + 1}/${total}: ${fileName}`);
-        logger.info('Sync', `  caching thumbnail ..... ${Math.round(result.thumbnailSize / 1024)}kb done`);
-      }
-
-      if (runFaceDetection && result.sidecar) {
-        // Same throttling reasoning as the thumbnail-phase update above —
-        // an already-thumbnailed file usually also skips face re-detection
-        // (see detectFacesForPhoto's own unchanged-file check), so this
-        // phase is just as prone to looking like a slow one-by-one redo.
-        if (onProgress && (!result.skipped || i === total - 1 || Date.now() - lastProgressEmitTime >= 200)) {
-          lastProgressEmitTime = Date.now();
-          onProgress({
-            storageName: config.name,
-            phase: 'faces',
-            current: i + 1,
-            total,
-            currentFile: result.skipped ? `Verifying cached photos… (${skippedCount} unchanged so far)` : fileName,
-            status: 'syncing',
-            percent,
-          });
-        }
-        try {
-          const faceResult = await runFaceDetectionStep(remoteFile, result.sidecar, config);
-          if (faceResult.ran) {
-            logger.info('Sync', `  detecting faces ..... ${faceResult.faceCount} detected`);
-          } else if (!result.skipped) {
-            // Thumbnail was fresh but the face step itself was skipped
-            // (locked, or storage went unreachable mid-run) — worth a line
-            // since it explains why faces didn't increase for this photo.
-            logger.info('Sync', `  detecting faces ..... skipped (${faceResult.skippedReason})`);
-          }
-        } catch (faceErr) {
-          console.error(`Face detection step failed for ${remoteFile}:`, faceErr);
-          errors.push(`Face detection failed for ${fileName}: ${String(faceErr)}`);
-        }
+        logger.info(
+          'Sync',
+          `  checked ${i + 1}/${total} — thumbnails: ${skippedCount} cached, ${newlyAdded} new/changed; faces: ${facesAlreadyDoneCount} already done, ${facesDetectedThisRunCount} detected this pass, ${facesDeferredCount} deferred`
+        );
       }
     } else {
       const msg = `Error syncing ${remoteFile}: ${result.error}`;
@@ -928,7 +989,7 @@ export async function syncVirtualStorage(
 
   logger.info(
     'Sync',
-    `Rescan complete for ${config.name}: ${total} files checked — ${skippedCount} already up to date (skipped), ${newlyAdded} new or changed.`
+    `Rescan complete for ${config.name}: ${total} files checked — thumbnails: ${skippedCount} already cached, ${newlyAdded} new or changed; faces: ${facesAlreadyDoneCount} already done, ${facesDetectedThisRunCount} detected this pass, ${facesDeferredCount} deferred.`
   );
 
   // Final checkpoint mark as completed

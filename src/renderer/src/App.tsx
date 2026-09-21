@@ -461,18 +461,28 @@ export const App: React.FC = () => {
         // sync pass wrote — for a large library still working through its
         // first pass (thumbnails done, face detection still catching up over
         // many minutes), that stays stale until the whole pass finishes.
-        // getStorageDetails is a live DB + filesystem query with no such lag
-        // (it reflects however many photos have actually finished face
+        // getStorageDetailsFast is a live checkpoint+DB query with no such
+        // lag (it reflects however many photos have actually finished face
         // detection RIGHT NOW), so polling it here keeps the sidebar's
         // "Cached X/Y · Faces X/Y" row correct continuously — updating within
         // this 5s window of each photo actually completing — rather than
         // only once an entire multi-thousand-photo pass finishes, and rather
         // than depending on an active mirror:progress stream from a sync this
         // session happens to be watching live.
-        if (window.electronAPI?.getStorageDetails) {
-          for (const s of saved) {
-            try {
-              const details = await window.electronAPI.getStorageDetails(s.name, s.localMirrorRoot);
+        //
+        // This runs unconditionally, every 5s, for the app's whole lifetime —
+        // regardless of which tab is open — so it must never be the plain
+        // getStorageDetails() (a live recursive sidecar-folder walk per
+        // configured storage): that measured as a genuine multi-second
+        // main-process stall on every single tick, for every user, all the
+        // time, not just while the Network Mirrors screen happened to be
+        // open. One bulk fast call replaces what used to be N slow
+        // one-at-a-time round trips.
+        if (window.electronAPI?.getAllStorageDetailsFast) {
+          try {
+            const allDetails = await window.electronAPI.getAllStorageDetailsFast();
+            for (const s of saved) {
+              const details = allDetails?.[s.name];
               if (!details || details.totalPhotos <= 0) continue;
               setStorageProgressMap((prev) => {
                 const existing = prev[s.name];
@@ -496,8 +506,8 @@ export const App: React.FC = () => {
                   },
                 };
               });
-            } catch {}
-          }
+            }
+          } catch {}
         }
       } catch {}
     };
@@ -564,17 +574,14 @@ export const App: React.FC = () => {
     const unsubscribe = window.electronAPI.onMirrorProgress((progress: any) => {
       const storageName = progress.storageName || 'Network Storage';
       const pct = progress.percent ?? (progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0);
-      // The backend reports both the thumbnail step and the face-detection
-      // step for the SAME file index through the same current/total fields,
-      // distinguished only by `phase` — this used to always be written into
-      // thumbnailCurrent/Total regardless of which phase the event actually
-      // was, so faceCurrent/faceTotal never updated from a live event at all
-      // (stuck at whatever they defaulted to, usually 0/0). Thumbnails are
-      // always done for a file by the time any progress event fires for it
-      // (face detection runs strictly after), so thumbnailCurrent can track
-      // progress.current unconditionally; faceCurrent only advances during
-      // an actual 'faces' phase event, carrying its previous value otherwise.
-      const isFacesPhase = progress.phase === 'faces';
+      // progress.current is the sync loop's WALK POSITION through the file
+      // list — accurate for thumbnails (every walked file has been checked/
+      // cached), but not a count of photos with completed face scans, since
+      // face detection can lag well behind the walk for a large backlog of
+      // never-scanned photos. facesCompletedCount (added alongside the
+      // face-cluster-cache perf fix) is the real, accurate cumulative count
+      // the backend tracks; only fall back to the old walk-position proxy
+      // for a backend/build that predates it.
       setStorageProgressMap((prev) => ({
         ...prev,
         [storageName]: {
@@ -582,7 +589,7 @@ export const App: React.FC = () => {
           phase: (progress.phase as any) || (progress.status === 'completed' ? 'completed' : 'thumbnails'),
           thumbnailCurrent: progress.current,
           thumbnailTotal: progress.total,
-          faceCurrent: isFacesPhase ? progress.current : (prev[storageName]?.faceCurrent || 0),
+          faceCurrent: progress.facesCompletedCount ?? (prev[storageName]?.faceCurrent || 0),
           faceTotal: progress.total,
           percent: pct,
           currentFile: progress.currentFile,
@@ -1158,9 +1165,17 @@ export const App: React.FC = () => {
       // later pass happens to see every file again. The catalog only grows
       // via confirmed processed photos, so it can't regress this way.
       let authoritativeTotal = res.totalSynced;
+      // Also the source of the completed-state thumbnailCurrent/faceCurrent
+      // below — res.totalSynced is how many files this ONE pass touched
+      // (thumbnail-wise), not an actual count of photos with completed face
+      // scans, which can legitimately lag behind after a pass that deferred
+      // some (offline mid-run, etc.). This one ground-truth read, once,
+      // right after a full sync finishes, is a fine cost — unlike polling it
+      // on a timer, which is what getAllStorageDetailsFast exists to avoid.
+      let finalDetails: Awaited<ReturnType<NonNullable<typeof window.electronAPI.getStorageDetails>>> = null;
       try {
-        const details = await window.electronAPI.getStorageDetails?.(config.name, config.localMirrorRoot);
-        if (details && details.totalPhotos > 0) authoritativeTotal = details.totalPhotos;
+        finalDetails = await window.electronAPI.getStorageDetails?.(config.name, config.localMirrorRoot) ?? null;
+        if (finalDetails && finalDetails.totalPhotos > 0) authoritativeTotal = finalDetails.totalPhotos;
       } catch {}
 
       const updatedList = virtualStorages.map((s) =>
@@ -1177,17 +1192,20 @@ export const App: React.FC = () => {
       setVirtualStorages(updatedList);
       await window.electronAPI.saveLibraryData('gphotos_virtual_storages_v1', updatedList);
 
+      const facesFullyDone = !finalDetails || finalDetails.faceScannedCount >= authoritativeTotal;
       setStorageProgressMap((prev) => ({
         ...prev,
         [config!.name]: {
           storageName: config!.name,
           phase: 'completed',
-          thumbnailCurrent: res.totalSynced,
-          thumbnailTotal: res.totalSynced,
-          faceCurrent: res.totalSynced,
-          faceTotal: res.totalSynced,
-          percent: 100,
-          message: '✓ Up to date',
+          thumbnailCurrent: finalDetails?.thumbnailCachedCount ?? res.totalSynced,
+          thumbnailTotal: authoritativeTotal,
+          faceCurrent: finalDetails?.faceScannedCount ?? res.totalSynced,
+          faceTotal: authoritativeTotal,
+          percent: finalDetails?.percent ?? 100,
+          message: facesFullyDone
+            ? '✓ Up to date'
+            : `Thumbnails up to date — ${finalDetails?.faceScannedCount ?? 0}/${authoritativeTotal} faces scanned (some deferred)`,
         },
       }));
       showToast(

@@ -181,4 +181,33 @@ describe('unified sync pipeline: correct database targeting across re-syncs', ()
     expect(afterSidecar.originalFileSize).toBe(fs.statSync(sourcePath).size);
     expect(afterSidecar.originalFileSize).not.toBe(beforeSidecar.originalFileSize);
   });
+
+  // Regression guard for the "prioritize already-scanned photos first"
+  // optimization: on a fresh pass (the prior sync completed, so this isn't
+  // a checkpoint resume), files get reordered — already-done ones first,
+  // so their fast re-verification doesn't get stuck behind a long stretch
+  // of never-scanned photos. The reorder logic must never lose or duplicate
+  // a file, and a genuinely-changed photo mixed into the "already done"
+  // majority must still get correctly re-detected regardless of where the
+  // reorder places it.
+  it('reorders already-scanned photos first on a fresh pass without losing or duplicating any file, even when one has genuinely changed', async () => {
+    await syncVirtualStorage(storage);
+
+    const changedPath = path.join(networkSourcePath, 'IMG_1.jpg');
+    const tmpPath = `${changedPath}.tmp`;
+    await sharp({ create: { width: 300, height: 300, channels: 3, background: { r: 9, g: 9, b: 9 } } })
+      .jpeg()
+      .toFile(tmpPath);
+    fs.renameSync(tmpPath, changedPath);
+
+    // The first pass completed (phase: 'completed'), so this second call is
+    // a fresh pass (startIndex === 0), not a checkpoint resume — exactly
+    // the case the reorder applies to.
+    const result = await syncVirtualStorage(storage);
+    expect(result.success).toBe(true);
+
+    const details = getStorageDetails(storage.name, localMirrorRoot);
+    expect(details.totalPhotos).toBe(3);
+    expect(details.faceScannedCount).toBe(3);
+  });
 });

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { faceQueue, QueueStatus } from '../services/faceQueue';
+import { NetworkStorageProgress } from '../../types';
 
 export interface BackgroundActivitySummary {
   /** Something is actually running right now (not just queued/paused). */
@@ -23,16 +24,20 @@ const IDLE_STATUS: BackgroundActivitySummary = { isActive: false, isPaused: fals
 /**
  * Feeds the sidebar's library-card activity indicator — see App.tsx's 15s
  * idle-detector effect for the pause/resume logic this is just reflecting.
- * Three independent sources feed into one summary, in priority order:
- *   1. The post-library-switch face-detection sweep (runFaceDetectionForPhotos)
- *   2. faceQueue's own idle-driven one-photo-at-a-time queue
- *   3. Thumbnail pre-caching (polled — the main process has no push channel
+ * Four independent sources feed into one summary, in priority order:
+ *   1. An active network/virtual storage sync (syncVirtualStorage) — shown
+ *      first since it's the one the user most likely just triggered
+ *      themselves (Rescan) and is actively watching.
+ *   2. The post-library-switch face-detection sweep (runFaceDetectionForPhotos)
+ *   3. faceQueue's own idle-driven one-photo-at-a-time queue
+ *   4. Thumbnail pre-caching (polled — the main process has no push channel
  *      for this status today, and a 3s poll is more than fine for a status
  *      label no one is watching frame-by-frame).
  */
 export function useBackgroundActivityStatus(
   isDetectingFacesSweep: boolean,
-  faceSweepProgress: { current: number; total: number } | null
+  faceSweepProgress: { current: number; total: number } | null,
+  networkStorageProgress?: Record<string, NetworkStorageProgress>
 ): BackgroundActivitySummary {
   const [faceQueueStatus, setFaceQueueStatus] = useState<QueueStatus>(() => faceQueue.getStatus());
   const [thumbStatus, setThumbStatus] = useState<ThumbnailStatus | null>(null);
@@ -56,6 +61,23 @@ export function useBackgroundActivityStatus(
       clearInterval(interval);
     };
   }, []);
+
+  const activeStorageEntry = networkStorageProgress
+    ? Object.values(networkStorageProgress).find(
+        (p) => p.phase !== 'idle' && p.phase !== 'completed' && p.phase !== 'error' && p.phase !== 'paused'
+      )
+    : undefined;
+  if (activeStorageEntry) {
+    // thumbnailCurrent/faceCurrent are both accurate counts here (not the
+    // sync loop's raw walk position) — see MirrorProgress.facesCompletedCount's
+    // doc comment for why that distinction matters.
+    const label = activeStorageEntry.phase === 'faces'
+      ? `${activeStorageEntry.storageName}: detecting faces… ${activeStorageEntry.faceCurrent}/${activeStorageEntry.faceTotal}`
+      : activeStorageEntry.phase === 'scanning'
+        ? `${activeStorageEntry.storageName}: scanning for changes…`
+        : `${activeStorageEntry.storageName}: caching thumbnails… ${activeStorageEntry.thumbnailCurrent}/${activeStorageEntry.thumbnailTotal}`;
+    return { isActive: true, isPaused: false, label };
+  }
 
   if (isDetectingFacesSweep && faceSweepProgress && faceSweepProgress.total > 0) {
     return {

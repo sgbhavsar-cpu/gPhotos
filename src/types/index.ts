@@ -217,6 +217,15 @@ export interface MirrorProgress {
   status: 'scanning' | 'syncing' | 'completed' | 'error';
   errorMessage?: string;
   percent?: number;
+  // Cumulative count of photos (from the start of THIS run) that now have a
+  // completed face scan, whether that was already true before this run or
+  // just finished this pass — NOT the same as `current`, which is only the
+  // loop's walk position through the full file list. A file the loop has
+  // walked past is not necessarily one whose face scan is done; conflating
+  // the two is what made "Recognizing Faces (2600/23887)" claim 2600 faces
+  // were scanned when only a handful of those 2600 actually needed (or got)
+  // real detection this pass.
+  facesCompletedCount?: number;
 }
 
 export interface NetworkStorageProgress {
@@ -224,6 +233,12 @@ export interface NetworkStorageProgress {
   phase: 'idle' | 'scanning' | 'thumbnails' | 'faces' | 'completed' | 'paused' | 'interrupted' | 'error';
   thumbnailCurrent: number;
   thumbnailTotal: number;
+  // The verification loop's walk position through the file list — accurate
+  // for thumbnails (every walked file has been checked/cached), but NOT a
+  // count of photos with completed face scans. Kept for the progress
+  // bar/percent; use facesCompletedCount (or the polled StorageDetails'
+  // faceScannedCount) for anything claiming to show "how many faces are
+  // actually done".
   faceCurrent: number;
   faceTotal: number;
   percent: number;
