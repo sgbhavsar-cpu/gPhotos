@@ -23,6 +23,8 @@ import {
   rotatePhotoFile,
   rotatePhotoWithOfflineQueue,
   processPendingRotations,
+  writePhotoMetadataWithOfflineQueue,
+  processPendingMetadata,
   generateThumbnailBuffer,
   saveStorageCheckpoint,
   loadStorageCheckpoint,
@@ -1534,6 +1536,43 @@ ipcMain.handle('photo:process-pending-rotations', async () => {
     return await processPendingRotations();
   } catch (err: any) {
     console.error('photo:process-pending-rotations error:', err);
+    return { processed: 0, remaining: 0, error: err.message };
+  }
+});
+
+ipcMain.handle(
+  'photo:write-metadata',
+  async (
+    _event,
+    params: { filePath: string; originalRemotePath?: string; dateIso?: string; latitude?: number; longitude?: number }
+  ) => {
+    try {
+      if (params.dateIso !== undefined && isNaN(new Date(params.dateIso).getTime())) {
+        return { success: false, wroteExif: false, wroteOriginal: false, isQueued: false, error: 'Invalid date' };
+      }
+
+      const res = await writePhotoMetadataWithOfflineQueue({
+        localFilePath: params.filePath,
+        originalRemotePath: params.originalRemotePath,
+        update: {
+          dateIso: params.dateIso,
+          latitude: params.latitude,
+          longitude: params.longitude,
+        },
+      });
+      return res;
+    } catch (err: any) {
+      console.error('photo:write-metadata error:', err);
+      return { success: false, wroteExif: false, wroteOriginal: false, isQueued: false, error: err.message };
+    }
+  }
+);
+
+ipcMain.handle('photo:process-pending-metadata', async () => {
+  try {
+    return await processPendingMetadata();
+  } catch (err: any) {
+    console.error('photo:process-pending-metadata error:', err);
     return { processed: 0, remaining: 0, error: err.message };
   }
 });

@@ -401,6 +401,12 @@ export interface IElectronAPI {
   deleteFilesPermanently: (filePaths: string[]) => Promise<{ success: boolean; deletedCount: number; deletedPaths: string[]; errors: string[] }>;
   rotatePhoto: (filePath: string, rotationDegrees: number, originalRemotePath?: string) => Promise<{ success: boolean; isQueued?: boolean; newPath?: string; message?: string; error?: string; isHeic?: boolean; isHeicRotated?: boolean; heicRotation?: number; rotation?: number }>;
   processPendingRotations?: () => Promise<{ processed: number; remaining: number; error?: string }>;
+  writePhotoMetadata?: (
+    filePath: string,
+    update: { dateIso?: string; latitude?: number; longitude?: number },
+    originalRemotePath?: string
+  ) => Promise<{ success: boolean; wroteExif: boolean; wroteOriginal: boolean; isQueued: boolean; error?: string }>;
+  processPendingMetadata?: () => Promise<{ processed: number; remaining: number; error?: string }>;
   deleteVirtualStorage: (params: { storageName: string; localMirrorRoot?: string; deleteDiskFiles: boolean }) => Promise<{ success: boolean; error?: string }>;
 
   // Background Daemon & Tray Service capabilities

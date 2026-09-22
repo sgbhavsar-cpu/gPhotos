@@ -149,14 +149,15 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         if (selectedFolderPath) {
-          e.stopPropagation();
+          e.stopImmediatePropagation();
           setSelectedFolderPath(null);
           setFolderPhotos([]);
         }
       }
     };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    // capture: true — see PeopleView's matching Escape handler for why.
+    window.addEventListener('keydown', handleKeyDown, { capture: true });
+    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
   }, [selectedFolderPath]);
 
   // Initial roots: Local drives and virtual storage mirror roots

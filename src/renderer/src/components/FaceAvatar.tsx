@@ -29,6 +29,15 @@ interface FaceAvatarProps {
    * cached crop instead of leaving it stale.
    */
   personId?: string;
+  /**
+   * Crops from the full-resolution original (network/OneDrive-backed photos
+   * fall back to the cached thumbnail if the original isn't reachable) —
+   * for a small always-visible avatar this isn't worth the extra fetch, but
+   * for a one-off "which face should represent this person" cover picker,
+   * cropping a small region out of an already-downscaled thumbnail just
+   * upscales compression artifacts into a visibly blurry avatar.
+   */
+  preferOriginal?: boolean;
 }
 
 export const FaceAvatar: React.FC<FaceAvatarProps> = ({
@@ -41,6 +50,7 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
   alt = 'Face Avatar',
   borderRadius = 'var(--radius-full)',
   personId,
+  preferOriginal = false,
 }) => {
   const [croppedDataUrl, setCroppedDataUrl] = useState<string | null>(null);
   const [hasError, setHasError] = useState(false);
@@ -59,7 +69,7 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
 
     // If no bounding box is provided, fallback to standard full image
     if (!box || !box.width || !box.height) {
-      setCroppedDataUrl(getLocalPhotoUrl(photo.filePath));
+      setCroppedDataUrl(getLocalPhotoUrl(photo.filePath, photo.originalRemotePath, preferOriginal));
       return;
     }
 
@@ -68,7 +78,7 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
     const cropLiveFromSource = () => {
       const img = new Image();
       img.crossOrigin = 'anonymous';
-      img.src = getLocalPhotoUrl(photo.filePath);
+      img.src = getLocalPhotoUrl(photo.filePath, photo.originalRemotePath, preferOriginal);
 
       img.onload = () => {
         if (isCancelled) return;
@@ -214,6 +224,7 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
     personId,
     avatarCacheKey,
     usesPersonCache,
+    preferOriginal,
   ]);
 
   if (!photo || hasError) {

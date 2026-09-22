@@ -32,6 +32,7 @@ import { batchThumbnailStore, requestBatchThumbnails } from '../services/asyncIm
 import { createClusterFromSelectedPhotos } from '../services/deduplication';
 import { authFetch } from '../services/webAuthClient';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { BulkEditModal } from '../components/BulkEditModal';
 
 interface GalleryViewProps {
   photos: Photo[];
@@ -81,6 +82,9 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   const [newAlbumTitle, setNewAlbumTitle] = useState('');
   const [albumSuccessToast, setAlbumSuccessToast] = useState<string | null>(null);
 
+  // Bulk date/location edit modal
+  const [showBulkEditModal, setShowBulkEditModal] = useState(false);
+
   // Permanent Deletion Confirmation Modal states
   const [showDeleteConfirmModal, setShowDeleteConfirmModal] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -94,22 +98,29 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
 
-      if (showAlbumDialog) {
-        e.stopPropagation();
+      // stopImmediatePropagation, not stopPropagation — see PeopleView's
+      // matching Escape handler for why (App.tsx's global handler is also
+      // bound to `window` and stopPropagation alone won't stop it firing).
+      if (showBulkEditModal) {
+        e.stopImmediatePropagation();
+        setShowBulkEditModal(false);
+      } else if (showAlbumDialog) {
+        e.stopImmediatePropagation();
         setShowAlbumDialog(false);
       } else if (showDeleteConfirmModal) {
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         setShowDeleteConfirmModal(false);
       } else if (isSelectMode || selectedIds.size > 0) {
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         setIsSelectMode(false);
         setSelectedIds(new Set());
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [showAlbumDialog, showDeleteConfirmModal, isSelectMode, selectedIds]);
+    // capture: true — see PeopleView's matching Escape handler for why.
+    window.addEventListener('keydown', handleKeyDown, { capture: true });
+    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
+  }, [showBulkEditModal, showAlbumDialog, showDeleteConfirmModal, isSelectMode, selectedIds]);
 
   // Stable reference so the gallery's near-bottom/bootstrap load-more effects
   // don't re-fire on every unrelated re-render. Loads several pages ahead
@@ -812,6 +823,17 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
 
         <button
           className="btn btn-secondary"
+          onClick={() => setShowBulkEditModal(true)}
+          disabled={selectedIds.size === 0}
+          style={{ fontSize: '0.78rem', gap: '6px', padding: '6px 10px', flexShrink: 0 }}
+          title="Set date/time or location on all selected photos at once"
+        >
+          <Calendar size={14} color="var(--accent-cyan)" />
+          <span>Edit Date/Location</span>
+        </button>
+
+        <button
+          className="btn btn-secondary"
           onClick={() => setShowDeleteConfirmModal(true)}
           disabled={selectedIds.size === 0}
           style={{
@@ -1053,6 +1075,18 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
               <span>Add to Album</span>
             </button>
 
+            {/* Bulk Edit Date/Location Button */}
+            <button
+              className="btn btn-secondary"
+              onClick={() => setShowBulkEditModal(true)}
+              disabled={selectedIds.size === 0}
+              style={{ fontSize: '0.85rem', gap: '8px', padding: '6px 14px' }}
+              title="Set date/time or location on all selected photos at once"
+            >
+              <Calendar size={16} color="var(--accent-cyan)" />
+              <span>Edit Date/Location ({selectedIds.size})</span>
+            </button>
+
             {/* Permanently Delete Selected Button */}
             <button
               className="btn btn-secondary"
@@ -1212,6 +1246,13 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       )}
 
       {/* Modal: Add to Album */}
+      {showBulkEditModal && (
+        <BulkEditModal
+          photos={photos.filter((p) => selectedIds.has(p.id))}
+          onClose={() => setShowBulkEditModal(false)}
+        />
+      )}
+
       {showAlbumDialog && (
         <div
           style={{

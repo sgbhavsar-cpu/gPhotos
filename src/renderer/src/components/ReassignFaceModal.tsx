@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { X, UserCheck, Plus, AlertCircle, Check } from 'lucide-react';
+import { X, UserCheck, AlertCircle, Check, Search, Sparkles } from 'lucide-react';
 import { DetectedFace, Person, Photo } from '../../types';
 import { FaceAvatar } from './FaceAvatar';
 import { libraryStore } from '../services/libraryStore';
@@ -28,62 +28,79 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
   // label for another instead of actually correcting the identification.
   const isGenericPersonName = (name: string): boolean => /^Person(\s+\d+)?$/i.test(name);
   const availablePeople = personList.filter((p) => p.id !== face.personId && !isGenericPersonName(p.name));
+  const currentPerson = personList.find((p) => p.id === face.personId);
 
-  const [mode, setMode] = useState<'existing' | 'new'>(
-    availablePeople.length > 0 ? 'existing' : 'new'
-  );
-  const [selectedPersonId, setSelectedPersonId] = useState<string>(
-    availablePeople.length > 0 ? availablePeople[0].id : ''
-  );
-  const [newPersonName, setNewPersonName] = useState('');
+  const [searchText, setSearchText] = useState('');
+  const [selectedPersonId, setSelectedPersonId] = useState<string | null>(null);
+  const [mergeEntirePerson, setMergeEntirePerson] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-
-  const [searchFilter, setSearchFilter] = useState('');
   const storePhotos = libraryStore.getState().photos;
 
-  const filteredAvailablePeople = availablePeople.filter((p) =>
-    p.name.toLowerCase().includes(searchFilter.toLowerCase().trim())
+  const filteredPeople = availablePeople.filter((p) =>
+    p.name.toLowerCase().includes(searchText.toLowerCase().trim())
   );
+  const selectedPerson = selectedPersonId ? availablePeople.find((p) => p.id === selectedPersonId) : undefined;
+  const willCreateNew = !selectedPersonId && searchText.trim().length > 0 && filteredPeople.length === 0;
 
-  // Live duplicate-prevention check for "Name as New Person": if someone
-  // with a matching (or very similar) name already exists, surface them
-  // instead of letting the user create a second, separate person by
-  // accident — this is exactly how a stale "Person 7" placeholder used to
-  // end up alongside a freshly-created "Trupti" instead of just renaming
-  // Person 7 in place.
-  const trimmedNewName = newPersonName.trim().toLowerCase();
-  const possibleDuplicatePeople = trimmedNewName
-    ? personList.filter(
-        (p) => !isGenericPersonName(p.name) && p.name.toLowerCase().includes(trimmedNewName)
-      )
-    : [];
+  const canOfferMerge = Boolean(selectedPerson && currentPerson);
 
   // Handle Escape key
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         onClose();
       }
     };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    // capture: true — see PeopleView's matching Escape handler for why.
+    window.addEventListener('keydown', handleKeyDown, { capture: true });
+    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
   }, [onClose]);
+
+  const handleSelectPerson = (p: Person) => {
+    setSelectedPersonId(p.id);
+    setSearchText(p.name);
+    setErrorMessage(null);
+  };
+
+  const handleSearchChange = (value: string) => {
+    setSearchText(value);
+    // Typing again after a click invalidates that selection — either they
+    // pick a (possibly different) match from the refreshed list below, or
+    // keep typing to create a new person from whatever they land on.
+    if (selectedPersonId) setSelectedPersonId(null);
+    setMergeEntirePerson(false);
+    setErrorMessage(null);
+  };
 
   const handleReassign = (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage(null);
 
-    const target = mode === 'existing' ? selectedPersonId : newPersonName.trim();
+    const target = selectedPersonId || searchText.trim();
     if (!target) {
-      setErrorMessage('Please specify or select a person name.');
+      setErrorMessage('Type a name or select a person below.');
       return;
     }
 
-    const result = libraryStore.reassignFaceToPerson(face.id, target);
-    if (!result.success) {
-      setErrorMessage(result.error || 'Failed to reassign face.');
-      return;
+    if (mergeEntirePerson && selectedPersonId && face.personId) {
+      const check = libraryStore.canMergePeople(selectedPersonId, face.personId);
+      if (!check.canMerge) {
+        setErrorMessage(
+          `Can't merge: "${currentPersonName}" and "${selectedPerson?.name}" both appear in photo "${check.conflictPhotoName}" — one photo can't have two faces of the same person.`
+        );
+        return;
+      }
+      if (!libraryStore.mergePeople(selectedPersonId, face.personId)) {
+        setErrorMessage('Merge failed.');
+        return;
+      }
+    } else {
+      const result = libraryStore.reassignFaceToPerson(face.id, target);
+      if (!result.success) {
+        setErrorMessage(result.error || 'Failed to reassign face.');
+        return;
+      }
     }
 
     if (onSuccess) onSuccess();
@@ -111,9 +128,9 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
       <div
         style={{
           width: '96vw',
-          maxWidth: '1400px',
-          height: '92vh',
-          maxHeight: '92vh',
+          maxWidth: '900px',
+          height: '86vh',
+          maxHeight: '86vh',
           backgroundColor: 'var(--bg-surface)',
           border: '1px solid var(--border-subtle)',
           borderRadius: 'var(--radius-lg)',
@@ -166,7 +183,7 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
             padding: '20px',
             display: 'flex',
             flexDirection: 'column',
-            gap: '16px',
+            gap: '14px',
             flex: 1,
             minHeight: 0,
             overflowY: 'auto',
@@ -198,225 +215,170 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
             </div>
           </div>
 
-          {/* Mode Switcher Tabs */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-            <button
-              type="button"
-              className={`btn ${mode === 'existing' ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => {
-                setMode('existing');
-                setErrorMessage(null);
-              }}
-              disabled={availablePeople.length === 0}
-              style={{ fontSize: '0.82rem', padding: '8px' }}
-            >
-              <UserCheck size={15} />
-              <span>Choose Existing Person</span>
-            </button>
-
-            <button
-              type="button"
-              className={`btn ${mode === 'new' ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => {
-                setMode('new');
-                setErrorMessage(null);
-              }}
-              style={{ fontSize: '0.82rem', padding: '8px' }}
-            >
-              <Plus size={15} />
-              <span>Name as New Person</span>
-            </button>
+          {/* Single search box */}
+          <div style={{ position: 'relative' }}>
+            <Search
+              size={15}
+              color="var(--text-muted)"
+              style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)' }}
+            />
+            <input
+              type="text"
+              value={searchText}
+              onChange={(e) => handleSearchChange(e.target.value)}
+              onKeyDown={(e) => e.stopPropagation()}
+              placeholder="Type a name — pick from the list, or keep typing to create a new person"
+              className="input"
+              style={{ width: '100%', fontSize: '0.9rem', paddingLeft: '36px' }}
+              autoFocus
+            />
           </div>
 
-          {/* Form Fields */}
-          {mode === 'existing' ? (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', flex: 1, minHeight: 0 }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <label style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-secondary)' }}>
-                  Select Person from Profile Cards ({filteredAvailablePeople.length}):
-                </label>
-                {availablePeople.length > 4 && (
-                  <input
-                    type="text"
-                    placeholder="Search people..."
-                    value={searchFilter}
-                    onChange={(e) => setSearchFilter(e.target.value)}
-                    onKeyDown={(e) => e.stopPropagation()}
-                    className="input"
-                    style={{ fontSize: '0.75rem', padding: '3px 8px', width: '150px' }}
-                  />
-                )}
-              </div>
+          {willCreateNew ? (
+            <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', padding: '0 2px' }}>
+              No match — this will create a new person named <strong style={{ color: 'var(--text-primary)' }}>"{searchText.trim()}"</strong>.
+            </div>
+          ) : selectedPerson ? (
+            <div style={{ fontSize: '0.8rem', color: 'var(--accent-emerald)', padding: '0 2px', fontWeight: 600 }}>
+              ✓ Will reassign to "{selectedPerson.name}"
+            </div>
+          ) : null}
 
-              {/* Big Profile Photo Cards Grid — fills the full-screen dialog so as many
-                  names as possible are visible at once without needing to search */}
-              <div
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
-                  gap: '10px',
-                  flex: 1,
-                  minHeight: 0,
-                  overflowY: 'auto',
-                  padding: '4px',
-                  alignContent: 'start',
-                }}
-              >
-                {filteredAvailablePeople.length === 0 ? (
-                  <div style={{ padding: '20px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.85rem', gridColumn: '1 / -1' }}>
-                    No matching people found.
-                  </div>
-                ) : (
-                  filteredAvailablePeople.map((p) => {
-                    const isSelected = selectedPersonId === p.id;
-                    const personPhoto =
-                      storePhotos.find((ph) => ph.id === p.coverPhotoId) ||
-                      storePhotos.find((ph) => ph.faces?.some((f) => f.personId === p.id));
-                    const personFace = personPhoto?.faces?.find((f) => f.personId === p.id);
+          {/* People list */}
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
+              gap: '10px',
+              flex: 1,
+              minHeight: 0,
+              overflowY: 'auto',
+              padding: '4px',
+              alignContent: 'start',
+            }}
+          >
+            {filteredPeople.length === 0 ? (
+              !willCreateNew && (
+                <div style={{ padding: '20px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.85rem', gridColumn: '1 / -1' }}>
+                  No people yet — type a name above to create one.
+                </div>
+              )
+            ) : (
+              filteredPeople.map((p) => {
+                const isSelected = selectedPersonId === p.id;
+                const personPhoto =
+                  storePhotos.find((ph) => ph.id === p.coverPhotoId) ||
+                  storePhotos.find((ph) => ph.faces?.some((f) => f.personId === p.id));
+                const personFace = personPhoto?.faces?.find((f) => f.personId === p.id);
 
-                    return (
+                return (
+                  <div
+                    key={p.id}
+                    title={`Select ${p.name}`}
+                    data-testid="reassign-person-card"
+                    onClick={() => handleSelectPerson(p)}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '12px',
+                      padding: '10px 12px',
+                      borderRadius: 'var(--radius-md)',
+                      backgroundColor: isSelected ? 'rgba(59, 130, 246, 0.15)' : 'var(--bg-surface-elevated)',
+                      border: isSelected ? '2px solid var(--accent-primary)' : '1px solid var(--border-subtle)',
+                      cursor: 'pointer',
+                      boxShadow: isSelected ? '0 0 14px rgba(59, 130, 246, 0.4)' : 'none',
+                      transition: 'all 0.15s ease',
+                    }}
+                  >
+                    <div style={{ position: 'relative', width: '52px', height: '52px', flexShrink: 0, borderRadius: '50%', overflow: 'hidden' }}>
+                      {personPhoto ? (
+                        <FaceAvatar photo={personPhoto} face={personFace} box={personFace?.box} size={52} alt={p.name} personId={p.id} />
+                      ) : (
+                        <div
+                          style={{
+                            width: '52px',
+                            height: '52px',
+                            borderRadius: '50%',
+                            backgroundColor: 'rgba(255, 255, 255, 0.08)',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                          }}
+                        >
+                          <UserCheck size={24} color="var(--text-muted)" />
+                        </div>
+                      )}
+                      {isSelected && (
+                        <div
+                          style={{
+                            position: 'absolute',
+                            bottom: '0',
+                            right: '0',
+                            width: '18px',
+                            height: '18px',
+                            borderRadius: '50%',
+                            backgroundColor: 'var(--accent-primary)',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            boxShadow: '0 2px 6px rgba(0,0,0,0.6)',
+                          }}
+                        >
+                          <Check size={11} color="#fff" strokeWidth={3} />
+                        </div>
+                      )}
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
                       <div
-                        key={p.id}
-                        title={`Select ${p.name}`}
-                        data-testid="reassign-person-card"
-                        onClick={() => setSelectedPersonId(p.id)}
                         style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: '12px',
-                          padding: '10px 12px',
-                          borderRadius: 'var(--radius-md)',
-                          backgroundColor: isSelected ? 'rgba(59, 130, 246, 0.15)' : 'var(--bg-surface-elevated)',
-                          border: isSelected ? '2px solid var(--accent-primary)' : '1px solid var(--border-subtle)',
-                          cursor: 'pointer',
-                          boxShadow: isSelected ? '0 0 14px rgba(59, 130, 246, 0.4)' : 'none',
-                          transition: 'all 0.15s ease',
+                          fontSize: '0.88rem',
+                          fontWeight: 700,
+                          color: isSelected ? 'var(--accent-primary)' : 'var(--text-primary)',
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
                         }}
                       >
-                        <div style={{ position: 'relative', width: '64px', height: '64px', flexShrink: 0, borderRadius: '50%', overflow: 'hidden' }}>
-                          {personPhoto ? (
-                            <FaceAvatar photo={personPhoto} face={personFace} box={personFace?.box} size={64} alt={p.name} personId={p.id} />
-                          ) : (
-                            <div
-                              style={{
-                                width: '64px',
-                                height: '64px',
-                                borderRadius: '50%',
-                                backgroundColor: 'rgba(255, 255, 255, 0.08)',
-                                display: 'flex',
-                                alignItems: 'center',
-                                justifyContent: 'center',
-                              }}
-                            >
-                              <UserCheck size={28} color="var(--text-muted)" />
-                            </div>
-                          )}
-                          {isSelected && (
-                            <div
-                              style={{
-                                position: 'absolute',
-                                bottom: '0',
-                                right: '0',
-                                width: '20px',
-                                height: '20px',
-                                borderRadius: '50%',
-                                backgroundColor: 'var(--accent-primary)',
-                                display: 'flex',
-                                alignItems: 'center',
-                                justifyContent: 'center',
-                                boxShadow: '0 2px 6px rgba(0,0,0,0.6)',
-                              }}
-                            >
-                              <Check size={12} color="#fff" strokeWidth={3} />
-                            </div>
-                          )}
-                        </div>
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div
-                            style={{
-                              fontSize: '0.92rem',
-                              fontWeight: 700,
-                              color: isSelected ? 'var(--accent-primary)' : 'var(--text-primary)',
-                              whiteSpace: 'nowrap',
-                              overflow: 'hidden',
-                              textOverflow: 'ellipsis',
-                            }}
-                          >
-                            {p.name}
-                          </div>
-                          <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '2px' }}>
-                            {p.photoCount} {p.photoCount === 1 ? 'photo' : 'photos'}
-                          </div>
-                        </div>
+                        {p.name}
                       </div>
-                    );
-                  })
-                )}
-              </div>
-            </div>
-          ) : (
-            <div>
-              <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, marginBottom: '6px', color: 'var(--text-secondary)' }}>
-                Enter Correct Person's Name:
-              </label>
-              <input
-                type="text"
-                value={newPersonName}
-                onChange={(e) => setNewPersonName(e.target.value)}
-                onKeyDown={(e) => e.stopPropagation()}
-                placeholder="e.g. Monika, Uncle Bob"
-                className="input"
-                style={{ width: '100%', fontSize: '0.9rem' }}
-                autoFocus
-                required
-              />
+                      <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '2px' }}>
+                        {p.photoCount} {p.photoCount === 1 ? 'photo' : 'photos'}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
 
-              {possibleDuplicatePeople.length > 0 ? (
-                <div
-                  style={{
-                    marginTop: '10px',
-                    padding: '10px 12px',
-                    borderRadius: 'var(--radius-md)',
-                    backgroundColor: 'rgba(245, 158, 11, 0.1)',
-                    border: '1px solid rgba(245, 158, 11, 0.35)',
-                  }}
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8rem', fontWeight: 600, color: '#fbbf24' }}>
-                    <AlertCircle size={15} />
-                    <span>
-                      {possibleDuplicatePeople.length === 1 ? 'Someone with this name already exists' : 'People with this name already exist'} — did you mean:
-                    </span>
-                  </div>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: '8px' }}>
-                    {possibleDuplicatePeople.map((p) => (
-                      <button
-                        key={p.id}
-                        type="button"
-                        className="btn btn-secondary"
-                        onClick={() => {
-                          setMode('existing');
-                          setSelectedPersonId(p.id);
-                          setNewPersonName('');
-                          setErrorMessage(null);
-                        }}
-                        style={{ fontSize: '0.8rem', padding: '6px 12px', gap: '6px' }}
-                        title={`Use existing person "${p.name}" instead of creating a new one`}
-                      >
-                        <UserCheck size={14} />
-                        <span>{p.name} ({p.photoCount} {p.photoCount === 1 ? 'photo' : 'photos'})</span>
-                      </button>
-                    ))}
-                  </div>
-                  <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '8px' }}>
-                    Not the same person? Ignore this and keep typing to create a new one.
-                  </div>
-                </div>
-              ) : (
-                <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '6px' }}>
-                  A new virtual album will be created for this person and this face will be assigned as verified.
-                </div>
-              )}
-            </div>
+          {/* Merge-entire-person checkbox */}
+          {canOfferMerge && (
+            <label
+              style={{
+                display: 'flex',
+                alignItems: 'flex-start',
+                gap: '10px',
+                padding: '10px 12px',
+                borderRadius: 'var(--radius-md)',
+                backgroundColor: 'rgba(245, 158, 11, 0.08)',
+                border: '1px solid rgba(245, 158, 11, 0.3)',
+                cursor: 'pointer',
+                fontSize: '0.82rem',
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={mergeEntirePerson}
+                onChange={(e) => setMergeEntirePerson(e.target.checked)}
+                style={{ marginTop: '2px' }}
+              />
+              <span>
+                <strong>Merge this person with selected</strong> — moves ALL of{' '}
+                {currentPerson!.photoCount} photo{currentPerson!.photoCount === 1 ? '' : 's'} currently assigned to{' '}
+                "{currentPersonName}" into "{selectedPerson!.name}", then removes "{currentPersonName}" (it will have 0
+                photos left). Otherwise, only this one face gets reassigned.
+              </span>
+            </label>
           )}
 
           {/* Error message */}
@@ -440,13 +402,13 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
           )}
 
           {/* Action Buttons */}
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '8px' }}>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '4px' }}>
             <button type="button" className="btn btn-secondary" onClick={onClose} style={{ fontSize: '0.85rem' }}>
               Cancel
             </button>
-            <button type="submit" className="btn btn-primary" style={{ fontSize: '0.85rem', padding: '8px 20px' }}>
-              <Check size={16} />
-              <span>Confirm Reassignment</span>
+            <button type="submit" className="btn btn-primary" style={{ fontSize: '0.85rem', padding: '8px 20px' }} disabled={!searchText.trim() && !selectedPersonId}>
+              {mergeEntirePerson ? <Sparkles size={16} /> : <Check size={16} />}
+              <span>{mergeEntirePerson ? 'Merge & Reassign' : 'Confirm Reassignment'}</span>
             </button>
           </div>
         </form>

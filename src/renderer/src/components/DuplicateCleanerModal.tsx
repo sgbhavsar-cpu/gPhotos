@@ -280,6 +280,11 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
       if (!fullscreenPhoto || !activeCluster) return;
 
       if (e.key === 'Escape') {
+        // Without this, App.tsx's global Escape handler also fires (it only
+        // knows about the whole modal being open, not this fullscreen
+        // sub-view) and closes the entire duplicate-cleaner modal instead of
+        // just backing out of the fullscreen preview.
+        e.stopImmediatePropagation();
         setFullscreenPhoto(null);
       } else if (e.key === 'ArrowRight') {
         const idx = activeCluster.photos.findIndex((p) => p.id === fullscreenPhoto.id);
@@ -297,8 +302,9 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    // capture: true — see PeopleView's matching Escape handler for why.
+    window.addEventListener('keydown', handleKeyDown, { capture: true });
+    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
   }, [fullscreenPhoto, activeCluster]);
 
   const activeKeptSet = activeCluster

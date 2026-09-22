@@ -24,6 +24,7 @@ import { runFaceDetectionStep, photoIdForSidecar, createFaceClusterCache, type F
 import { logger } from './logger';
 import { getDbForLibraryPath } from './db';
 import { deletePhotos } from './libraryRepository';
+import { writePhotoMetadata, PhotoMetadataUpdate } from './exifWriter';
 
 // The exact housekeeping filenames written alongside real photo sidecars in
 // a mirror folder (see saveStorageCheckpoint / discoverStoredMirrors) — NOT
@@ -1984,6 +1985,156 @@ export async function processPendingRotations(): Promise<{ processed: number; re
   }
 
   return { processed, remaining: remaining.length };
+}
+
+export interface PendingMetadataItem {
+  id: string;
+  originalRemotePath: string;
+  dateIso?: string;
+  latitude?: number;
+  longitude?: number;
+  timestamp: number;
+}
+
+export function getPendingMetadataPath(): string {
+  try {
+    const electron = require('electron');
+    if (electron.app) {
+      return path.join(electron.app.getPath('userData'), 'pending_metadata.json');
+    }
+  } catch {}
+  const fallback = process.env.APPDATA
+    ? path.join(process.env.APPDATA, 'gPhotos')
+    : path.join(process.cwd(), '.temp');
+  if (!fs.existsSync(fallback)) {
+    try {
+      fs.mkdirSync(fallback, { recursive: true });
+    } catch {}
+  }
+  return path.join(fallback, 'pending_metadata.json');
+}
+
+export function getPendingMetadata(): PendingMetadataItem[] {
+  const p = getPendingMetadataPath();
+  if (!fs.existsSync(p)) return [];
+  try {
+    const raw = fs.readFileSync(p, 'utf-8');
+    return JSON.parse(raw) || [];
+  } catch {
+    return [];
+  }
+}
+
+export function savePendingMetadata(items: PendingMetadataItem[]): void {
+  const p = getPendingMetadataPath();
+  try {
+    fs.writeFileSync(p, JSON.stringify(items, null, 2), 'utf-8');
+  } catch (err) {
+    console.warn('[OfflineMetadataSync] Failed to save pending metadata:', err);
+  }
+}
+
+/**
+ * Queues a date and/or location update for an original file that's
+ * currently unreachable. Merges into any existing pending entry for the
+ * same path so, e.g., editing the date twice while still offline doesn't
+ * leave two stale queue entries — the latest value per field wins.
+ */
+export function enqueuePendingMetadata(originalRemotePath: string, update: PhotoMetadataUpdate): void {
+  const items = getPendingMetadata();
+  const normTarget = originalRemotePath.toLowerCase().replace(/\\/g, '/');
+  const existingIdx = items.findIndex(
+    (i) => i.originalRemotePath.toLowerCase().replace(/\\/g, '/') === normTarget
+  );
+
+  if (existingIdx !== -1) {
+    const existing = items[existingIdx];
+    if (update.dateIso !== undefined) existing.dateIso = update.dateIso;
+    if (update.latitude !== undefined) existing.latitude = update.latitude;
+    if (update.longitude !== undefined) existing.longitude = update.longitude;
+    existing.timestamp = Date.now();
+  } else {
+    items.push({
+      id: Buffer.from(originalRemotePath).toString('base64').replace(/[/+=]/g, '_'),
+      originalRemotePath,
+      dateIso: update.dateIso,
+      latitude: update.latitude,
+      longitude: update.longitude,
+      timestamp: Date.now(),
+    });
+  }
+
+  savePendingMetadata(items);
+}
+
+export async function processPendingMetadata(): Promise<{ processed: number; remaining: number }> {
+  const items = getPendingMetadata();
+  if (items.length === 0) return { processed: 0, remaining: 0 };
+
+  const remaining: PendingMetadataItem[] = [];
+  let processed = 0;
+
+  for (const item of items) {
+    try {
+      if (await isPathReachable(item.originalRemotePath)) {
+        console.log(`[OfflineMetadataSync] Applying pending date/location update to reconnected source: ${item.originalRemotePath}`);
+        const res = writePhotoMetadata(item.originalRemotePath, {
+          dateIso: item.dateIso,
+          latitude: item.latitude,
+          longitude: item.longitude,
+        });
+        if (res.success) {
+          processed++;
+          continue; // successfully processed and drained
+        }
+      }
+    } catch (err) {
+      console.warn(`[OfflineMetadataSync] Error applying metadata to ${item.originalRemotePath}:`, err);
+    }
+    remaining.push(item);
+  }
+
+  if (processed > 0) {
+    savePendingMetadata(remaining);
+  }
+
+  return { processed, remaining: remaining.length };
+}
+
+/**
+ * Writes a date/location update to a photo with offline queue durability:
+ * 1. Immediately writes to the local mirror file (always reachable).
+ * 2. If an original remote path is given and reachable, writes it too.
+ * 3. If the original is unreachable, queues it in pending_metadata.json to
+ *    be applied automatically once the storage reconnects (same pattern as
+ *    rotatePhotoWithOfflineQueue above).
+ */
+export async function writePhotoMetadataWithOfflineQueue(params: {
+  localFilePath: string;
+  originalRemotePath?: string;
+  update: PhotoMetadataUpdate;
+}): Promise<{ success: boolean; wroteExif: boolean; wroteOriginal: boolean; isQueued: boolean; error?: string }> {
+  const { localFilePath, originalRemotePath, update } = params;
+  const localResult = writePhotoMetadata(localFilePath, update);
+
+  let wroteOriginal = false;
+  let isQueued = false;
+
+  if (originalRemotePath && originalRemotePath !== localFilePath) {
+    if (await isPathReachable(originalRemotePath)) {
+      const originalResult = writePhotoMetadata(originalRemotePath, update);
+      wroteOriginal = originalResult.success;
+      if (!originalResult.success) {
+        enqueuePendingMetadata(originalRemotePath, update);
+        isQueued = true;
+      }
+    } else {
+      enqueuePendingMetadata(originalRemotePath, update);
+      isQueued = true;
+    }
+  }
+
+  return { ...localResult, wroteOriginal, isQueued };
 }
 
 /**

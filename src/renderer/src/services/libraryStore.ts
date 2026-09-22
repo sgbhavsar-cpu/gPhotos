@@ -543,6 +543,13 @@ export class LibraryManager {
               this.reconcilePeopleAndFaces();
               this.state.isInitialized = true;
               this.notifyListeners();
+              // Screen 1 is already painted from Page 0 above — everything
+              // past this point is a background top-up. Places/Albums/People
+              // all read the same `photos` array but (unlike Gallery) have no
+              // scroll to lazily trigger more pages, so without this they'd
+              // only ever see whatever page Gallery happened to have loaded.
+              // Not awaited: pages arrive progressively via notifyListeners().
+              this.loadNextCatalogPages(Number.MAX_SAFE_INTEGER);
               return;
             }
           }
@@ -588,6 +595,8 @@ export class LibraryManager {
                   this.reconcilePeopleAndFaces();
                   this.state.isInitialized = true;
                   this.notifyListeners();
+                  // See the matching comment in the Electron fast-path above.
+                  this.loadNextCatalogPages(Number.MAX_SAFE_INTEGER);
                   return;
                 }
               }
@@ -739,6 +748,8 @@ export class LibraryManager {
           this.state.albums = result.albums || [];
           this.reconcilePeopleAndFaces();
           this.notify(true);
+          // See the matching comment in loadPersistedData's fast-path.
+          this.loadNextCatalogPages(Number.MAX_SAFE_INTEGER);
           return true;
         }
       }

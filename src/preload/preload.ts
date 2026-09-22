@@ -125,6 +125,12 @@ const electronAPI: IElectronAPI = {
   rotatePhoto: (filePath: string, rotationDegrees: number, originalRemotePath?: string) =>
     ipcRenderer.invoke('photo:rotate', { filePath, rotationDegrees, originalRemotePath }),
   processPendingRotations: () => ipcRenderer.invoke('photo:process-pending-rotations'),
+  writePhotoMetadata: (
+    filePath: string,
+    update: { dateIso?: string; latitude?: number; longitude?: number },
+    originalRemotePath?: string
+  ) => ipcRenderer.invoke('photo:write-metadata', { filePath, originalRemotePath, ...update }),
+  processPendingMetadata: () => ipcRenderer.invoke('photo:process-pending-metadata'),
   deleteVirtualStorage: (params) => ipcRenderer.invoke('mirror:delete-storage', params),
   getBackgroundServiceStatus: () => ipcRenderer.invoke('service:get-status'),
   setBackgroundServiceSettings: (settings) => ipcRenderer.invoke('service:set-settings', settings),

@@ -45,16 +45,19 @@ const TILE_LAYERS = {
     name: 'OpenStreetMap (Free)',
     url: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
     attribution: '&copy; OpenStreetMap contributors',
+    subdomains: 'abc',
   },
   satellite: {
     name: 'Satellite',
     url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
     attribution: '&copy; Esri, Maxar, Earthstar Geographics',
+    subdomains: 'abc',
   },
   dark: {
     name: 'Dark',
     url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
     attribution: '&copy; OpenStreetMap &copy; CARTO',
+    subdomains: 'abcd',
   },
 };
 
@@ -107,21 +110,25 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
 
+      // stopImmediatePropagation, not stopPropagation — see PeopleView's
+      // matching Escape handler for why (App.tsx's global handler is also
+      // bound to `window` and stopPropagation alone won't stop it firing).
       if (showAssignModal) {
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         setShowAssignModal(false);
         setAssignModalOverridePhotos(null);
       } else if (isEditingClusterLocation) {
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         setIsEditingClusterLocation(false);
       } else if (selectedCluster) {
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         setSelectedCluster(null);
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    // capture: true — see PeopleView's matching Escape handler for why.
+    window.addEventListener('keydown', handleKeyDown, { capture: true });
+    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
   }, [showAssignModal, isEditingClusterLocation, selectedCluster]);
 
   // Unlocated photos
@@ -275,7 +282,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
     const tileConfig = TILE_LAYERS[activeTileType];
     const tileLayer = L.tileLayer(tileConfig.url, {
       maxZoom: 19,
-      subdomains: 'abcd',
+      subdomains: tileConfig.subdomains,
     }).addTo(map);
     currentTileLayerRef.current = tileLayer;
 
@@ -306,7 +313,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
     const tileConfig = TILE_LAYERS[activeTileType];
     const newTileLayer = L.tileLayer(tileConfig.url, {
       maxZoom: 19,
-      subdomains: 'abcd',
+      subdomains: tileConfig.subdomains,
     }).addTo(map);
     currentTileLayerRef.current = newTileLayer;
   }, [activeTileType]);

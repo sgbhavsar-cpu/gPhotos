@@ -38,13 +38,17 @@ import {
   AlertCircle,
   Cloud,
   CloudOff,
-  MoreVertical
+  MoreVertical,
+  BookImage,
+  Star
 } from 'lucide-react';
 import { Photo, Person, DetectedFace, LocationMetadata } from '../../types';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { FaceAvatar } from './FaceAvatar';
 import { ReassignFaceModal } from './ReassignFaceModal';
 import { PersonNameInput } from './PersonNameInput';
+import { LocationPickerModal } from './LocationPickerModal';
+import { SetCoverPhotoModal } from './SetCoverPhotoModal';
 import { evictAndRefreshThumbnail } from '../services/asyncImageLoader';
 import { authFetch } from '../services/webAuthClient';
 import { isOneDriveBackedPath } from '../services/storageValidation';
@@ -109,33 +113,164 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     personId: string;
     currentName: string;
   } | null>(null);
+  const [coverPhotoTarget, setCoverPhotoTarget] = useState<{
+    face: DetectedFace;
+    personId: string;
+    personName: string;
+  } | null>(null);
 
   // Location editing states
   const [isEditingLocation, setIsEditingLocation] = useState(false);
   const [locationInput, setLocationInput] = useState('');
+  const [isSavingLocation, setIsSavingLocation] = useState(false);
+  const [showLocationPicker, setShowLocationPicker] = useState(false);
 
   const handleStartEditLocation = () => {
     setIsEditingLocation(true);
     setLocationInput(photo.location?.label || photo.location?.city || '');
   };
 
-  const handleSaveLocation = () => {
-    const clean = locationInput.trim();
+  const handleConfirmMapLocation = async (lat: number, lng: number, label: string) => {
     const updatedLocation: LocationMetadata = {
-      latitude: photo.location?.latitude ?? 0,
-      longitude: photo.location?.longitude ?? 0,
       ...photo.location,
-      label: clean || undefined,
-      city: clean || undefined,
+      latitude: lat,
+      longitude: lng,
+      label: label || photo.location?.label,
+      city: label || photo.location?.city,
     };
-    const updatedPhoto: Photo = {
-      ...photo,
-      location: clean || (photo.location && (photo.location.latitude !== 0 || photo.location.longitude !== 0))
-        ? updatedLocation
-        : undefined,
-    };
-    libraryStore.updatePhoto(updatedPhoto);
+    libraryStore.updatePhoto({ ...photo, location: updatedLocation });
+    setShowLocationPicker(false);
     setIsEditingLocation(false);
+    await writeLocationToFile(lat, lng);
+  };
+
+  // Date/time editing state
+  const [isEditingDate, setIsEditingDate] = useState(false);
+  const [dateInput, setDateInput] = useState('');
+  const [isSavingDate, setIsSavingDate] = useState(false);
+
+  const toDatetimeLocalValue = (iso: string): string => {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+
+  const handleStartEditDate = () => {
+    setDateInput(toDatetimeLocalValue(photo.dateTaken));
+    setIsEditingDate(true);
+  };
+
+  // Updates the app's own record immediately either way; also tries to
+  // rewrite the actual file's EXIF DateTimeOriginal + mtime (and the
+  // network original's, if reachable) so the date is correct wherever the
+  // file itself is later opened, not just inside this app.
+  const handleSaveDate = async () => {
+    if (!dateInput) {
+      setIsEditingDate(false);
+      return;
+    }
+    const newDate = new Date(dateInput);
+    if (isNaN(newDate.getTime())) {
+      setIsEditingDate(false);
+      return;
+    }
+    const newDateIso = newDate.toISOString();
+
+    setIsSavingDate(true);
+    try {
+      const fileRes = await window.electronAPI?.writePhotoMetadata?.(photo.filePath, { dateIso: newDateIso }, photo.originalRemotePath);
+      libraryStore.updatePhoto({ ...photo, dateTaken: newDateIso });
+      setIsEditingDate(false);
+
+      if (fileRes?.success) {
+        const updatedParts: string[] = [];
+        if (fileRes.wroteExif) updatedParts.push('EXIF');
+        if (fileRes.wroteOriginal) updatedParts.push('original file');
+        setScanStatusMessage(
+          fileRes.isQueued
+            ? '✓ Date updated. Original storage is offline — it will be updated automatically once it reconnects.'
+            : updatedParts.length > 0
+            ? `✓ Date updated (${updatedParts.join(' + ')} too).`
+            : "✓ Date updated. This file format doesn't support embedded date tags, so only the app record changed."
+        );
+      } else {
+        setScanStatusMessage('✓ Date updated in the app, but the file itself could not be updated.');
+      }
+      setTimeout(() => setScanStatusMessage(null), 4500);
+    } catch (err) {
+      console.error('[PhotoLightbox] Failed to write date/EXIF:', err);
+      libraryStore.updatePhoto({ ...photo, dateTaken: newDateIso });
+      setIsEditingDate(false);
+    } finally {
+      setIsSavingDate(false);
+    }
+  };
+
+  // Typing a new place name previously only changed the display label,
+  // leaving the old lat/lng in place — so the map pin silently stayed
+  // wherever the photo used to be. This geocodes the typed name (same free
+  // Nominatim lookup PlacesMapView's "Assign Location" search uses) so the
+  // map position actually follows the name; if nothing matches, the label
+  // still saves but the coordinates are left alone and the user is pointed
+  // at Places to pin it manually instead of silently doing nothing.
+  const handleSaveLocation = async () => {
+    const clean = locationInput.trim();
+    if (!clean) {
+      libraryStore.updatePhoto({ ...photo, location: undefined });
+      setIsEditingLocation(false);
+      return;
+    }
+
+    setIsSavingLocation(true);
+    let geocoded: { lat: number; lon: number } | null = null;
+    try {
+      const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(clean)}&limit=1`);
+      const data = await res.json();
+      if (Array.isArray(data) && data[0]) {
+        geocoded = { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
+      }
+    } catch (err) {
+      console.warn('[PhotoLightbox] Location geocoding failed:', err);
+    } finally {
+      setIsSavingLocation(false);
+    }
+
+    const updatedLocation: LocationMetadata = {
+      ...photo.location,
+      latitude: geocoded ? geocoded.lat : (photo.location?.latitude ?? 0),
+      longitude: geocoded ? geocoded.lon : (photo.location?.longitude ?? 0),
+      label: clean,
+      city: clean,
+    };
+    libraryStore.updatePhoto({ ...photo, location: updatedLocation });
+    setIsEditingLocation(false);
+
+    if (!geocoded) {
+      setScanStatusMessage(`Saved "${clean}" as the label, but couldn't find map coordinates for it — use "Pin on Map" below to set it manually.`);
+      setTimeout(() => setScanStatusMessage(null), 5000);
+    } else {
+      await writeLocationToFile(geocoded.lat, geocoded.lon);
+    }
+  };
+
+  // Writes GPS coordinates to the photo's file (local mirror always, plus
+  // the network original when reachable — queued for when it reconnects
+  // otherwise). Shared by both the geocoded-name save and the map picker.
+  const writeLocationToFile = async (lat: number, lng: number) => {
+    try {
+      const fileRes = await window.electronAPI?.writePhotoMetadata?.(
+        photo.filePath,
+        { latitude: lat, longitude: lng },
+        photo.originalRemotePath
+      );
+      if (fileRes?.isQueued) {
+        setScanStatusMessage('✓ Location updated. Original storage is offline — it will be updated automatically once it reconnects.');
+        setTimeout(() => setScanStatusMessage(null), 5000);
+      }
+    } catch (err) {
+      console.error('[PhotoLightbox] Failed to write location to file:', err);
+    }
   };
 
   const [imgNaturalSize, setImgNaturalSize] = useState<{ width: number; height: number } | null>(null);
@@ -259,6 +394,23 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     setTimeout(() => setAlbumToast(null), 3000);
     setShowAddToAlbumModal(false);
     setNewAlbumTitle('');
+  };
+
+  // Albums this photo already belongs to, plus quick "Add to X" buttons for
+  // the two albums most recently added to (excluding ones it's already in)
+  // — covers the common case of dropping a photo into whatever album you're
+  // actively curating without opening the full picker.
+  const allAlbums = libraryStore.getState().albums || [];
+  const photoAlbums = allAlbums.filter((a) => a.photoIds.includes(photo.id));
+  const quickAddAlbums = allAlbums
+    .filter((a) => !a.photoIds.includes(photo.id))
+    .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+    .slice(0, 2);
+
+  const handleQuickAddToAlbum = (albumId: string, albumTitle: string) => {
+    libraryStore.addPhotosToAlbum(albumId, [photo.id]);
+    setAlbumToast(`✓ Added to "${albumTitle}"!`);
+    setTimeout(() => setAlbumToast(null), 3000);
   };
 
   // In-App Editing states (Rotate, Crop, Save to Source)
@@ -685,9 +837,46 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
       }
 
       if (e.key === 'Escape') {
-        if (isTaggingMode) {
+        // Nested modals here (LocationPickerModal, ReassignFaceModal) mount
+        // AFTER this component and register their own capture-phase Escape
+        // listeners too — but capture-phase listeners on the same window
+        // still fire in ATTACHMENT order, so this outer handler would
+        // otherwise run FIRST and close the whole lightbox out from under
+        // whichever inner dialog the user actually meant to dismiss. Closing
+        // the innermost thing directly here (with stopImmediatePropagation)
+        // makes Escape back out one level at a time, same as everywhere else.
+        if (showLocationPicker) {
+          e.stopImmediatePropagation();
+          setShowLocationPicker(false);
+        } else if (showAddToAlbumModal) {
+          e.stopImmediatePropagation();
+          setShowAddToAlbumModal(false);
+        } else if (reassignFace) {
+          e.stopImmediatePropagation();
+          setReassignFace(null);
+        } else if (coverPhotoTarget) {
+          e.stopImmediatePropagation();
+          setCoverPhotoTarget(null);
+        } else if (renamePersonState) {
+          e.stopImmediatePropagation();
+          setRenamePersonState(null);
+        } else if (isEditingLocation) {
+          e.stopImmediatePropagation();
+          setIsEditingLocation(false);
+        } else if (isEditingDate) {
+          e.stopImmediatePropagation();
+          setIsEditingDate(false);
+        } else if (isTaggingMode) {
+          e.stopImmediatePropagation();
           setIsTaggingMode(false);
           setDrawBox(null);
+        } else if (isEditing) {
+          e.stopImmediatePropagation();
+          setIsEditing(false);
+          setEditRotation(0);
+          setEditFlipH(false);
+          setCropRect(null);
+          setIsCropping(false);
         } else {
           onClose();
         }
@@ -701,9 +890,23 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
         onToggleFavorite(photo.id);
       }
     };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [currentIndex, allPhotos, photo, isTaggingMode]);
+    // capture: true — see PeopleView's matching Escape handler for why.
+    window.addEventListener('keydown', handleKeyDown, { capture: true });
+    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
+  }, [
+    currentIndex,
+    allPhotos,
+    photo,
+    isTaggingMode,
+    showLocationPicker,
+    showAddToAlbumModal,
+    reassignFace,
+    coverPhotoTarget,
+    renamePersonState,
+    isEditingLocation,
+    isEditingDate,
+    isEditing,
+  ]);
 
   const onImageLoad = () => {
     if (imgRef.current) {
@@ -1644,7 +1847,6 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                             onClick={(e) => {
                               e.stopPropagation();
                               setRenamePersonState({ personId: face.personId!, currentName: personName });
-                              setRenameInputName(personName);
                             }}
                             title={`Rename "${personName}" across all photos`}
                             style={{ cursor: 'pointer', display: 'flex', alignItems: 'center' }}
@@ -1896,118 +2098,93 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
             flexDirection: 'column',
             gap: '20px',
           }}>
-            {/* Header & Quick Action Icon Toolbar on Right Side of Photo */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <h2 style={{ fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-primary)', margin: 0 }}>
-                  Photo Details
-                </h2>
-                <button
-                  className="btn btn-ghost btn-icon"
-                  onClick={() => setShowInfo(false)}
-                  title="Close Inspector (I)"
-                  style={{ width: '28px', height: '28px', padding: 0 }}
-                >
-                  <X size={16} />
-                </button>
-              </div>
-
-              {/* Action Toolbar on Right Side */}
-              <div style={{
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                padding: '6px 10px',
-                backgroundColor: 'var(--bg-surface-elevated)',
-                borderRadius: 'var(--radius-md)',
-                border: '1px solid var(--border-subtle)',
-              }}>
-                <button
-                  className={`btn btn-icon ${photo.isFavorite ? 'btn-primary' : 'btn-ghost'}`}
-                  onClick={() => onToggleFavorite(photo.id)}
-                  style={{ width: '32px', height: '32px', padding: 0, color: photo.isFavorite ? 'var(--accent-rose)' : 'inherit' }}
-                  title="Favorite (F)"
-                >
-                  <Heart size={16} fill={photo.isFavorite ? 'currentColor' : 'none'} />
-                </button>
-
-                <button
-                  className="btn btn-ghost btn-icon"
-                  onClick={handleScanFacesInPhoto}
-                  disabled={isScanningSinglePhoto || (photo.isVirtual && isOriginalAvailable === false)}
-                  style={{ width: '32px', height: '32px', padding: 0, color: '#ec4899' }}
-                  title={
-                    photo.isVirtual && isOriginalAvailable === false
-                      ? 'Storage unavailable — reconnect to detect faces'
-                      : 'Scan faces in this photo only'
-                  }
-                >
-                  <Sparkles size={16} className={isScanningSinglePhoto ? 'animate-spin' : ''} />
-                </button>
-
-                <button
-                  className={`btn btn-icon ${isTaggingMode ? 'btn-primary' : 'btn-ghost'}`}
-                  onClick={() => {
-                    setIsTaggingMode(!isTaggingMode);
-                    setDrawBox(null);
-                  }}
-                  style={{ width: '32px', height: '32px', padding: 0, color: 'var(--accent-cyan)' }}
-                  title="Draw & tag face manually"
-                >
-                  <Crop size={16} />
-                </button>
-
-                {photo.faces && photo.faces.length > 0 && (
-                  <button
-                    className={`btn btn-icon ${showFaces ? 'btn-secondary' : 'btn-ghost'}`}
-                    onClick={() => setShowFaces(!showFaces)}
-                    style={{ width: '32px', height: '32px', padding: 0 }}
-                    title="Toggle Face Tag Overlays"
-                  >
-                    {showFaces ? <Eye size={16} /> : <EyeOff size={16} />}
-                  </button>
-                )}
-
-                <button
-                  className="btn btn-ghost btn-icon"
-                  onClick={() => {
-                    const pathToOpen = photo.isVirtual ? photo.originalRemotePath : photo.filePath;
-                    if (pathToOpen && window.electronAPI?.openOriginalFile) {
-                      window.electronAPI.openOriginalFile(pathToOpen);
-                    }
-                  }}
-                  disabled={!isOriginalAvailable}
-                  style={{ width: '32px', height: '32px', padding: 0, color: isOriginalAvailable ? '#10b981' : 'var(--text-muted)' }}
-                  title={isOriginalAvailable ? 'Show Original in Explorer' : 'Original file unavailable'}
-                >
-                  <ExternalLink size={16} />
-                </button>
-              </div>
+            {/* Photo Details panel header — fav/scan/tag/show-faces actions
+                live in the main lightbox header toolbar above; duplicating
+                them here just doubled up the same buttons. */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <h2 style={{ fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-primary)', margin: 0 }}>
+                Photo Details
+              </h2>
+              <button
+                className="btn btn-ghost btn-icon"
+                onClick={() => setShowInfo(false)}
+                title="Close Inspector (I)"
+                style={{ width: '28px', height: '28px', padding: 0 }}
+              >
+                <X size={16} />
+              </button>
             </div>
 
             {/* Date & File info with icon on the right side */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <div>
-                  <div style={{ fontSize: '0.875rem', fontWeight: 600 }}>{formattedDate}</div>
-                  <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                    {photo.width && photo.height ? `${photo.width} × ${photo.height} • ` : ''}
-                    {fileSizeMB} MB
+              {isEditingDate ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                    <input
+                      type="datetime-local"
+                      value={dateInput}
+                      onChange={(e) => setDateInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        e.stopPropagation();
+                        if (e.key === 'Enter') handleSaveDate();
+                        else if (e.key === 'Escape') setIsEditingDate(false);
+                      }}
+                      autoFocus
+                      className="input"
+                      style={{ fontSize: '0.85rem', padding: '6px 10px', flex: 1 }}
+                    />
+                    <button
+                      className="btn btn-primary"
+                      onClick={handleSaveDate}
+                      disabled={isSavingDate}
+                      style={{ width: '32px', height: '32px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                      title="Save date (Enter)"
+                    >
+                      {isSavingDate ? <Sparkles size={16} className="animate-spin" /> : <Check size={16} />}
+                    </button>
+                    <button
+                      className="btn btn-ghost"
+                      onClick={() => setIsEditingDate(false)}
+                      disabled={isSavingDate}
+                      style={{ width: '32px', height: '32px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                      title="Cancel (Esc)"
+                    >
+                      <X size={16} />
+                    </button>
+                  </div>
+                  <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                    {isSavingDate ? 'Updating file...' : 'Also rewrites the file\'s EXIF date + modified time when supported'}
                   </div>
                 </div>
-                <div style={{
-                  width: '32px',
-                  height: '32px',
-                  borderRadius: 'var(--radius-full)',
-                  backgroundColor: 'rgba(255, 255, 255, 0.05)',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  flexShrink: 0,
-                }}>
-                  <Calendar size={16} color="var(--text-secondary)" />
+              ) : (
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <div>
+                    <div style={{ fontSize: '0.875rem', fontWeight: 600 }}>{formattedDate}</div>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                      {photo.width && photo.height ? `${photo.width} × ${photo.height} • ` : ''}
+                      {fileSizeMB} MB
+                    </div>
+                  </div>
+                  <button
+                    onClick={handleStartEditDate}
+                    title="Edit date & time"
+                    style={{
+                      width: '32px',
+                      height: '32px',
+                      borderRadius: 'var(--radius-full)',
+                      backgroundColor: 'rgba(255, 255, 255, 0.05)',
+                      border: 'none',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      flexShrink: 0,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <Calendar size={16} color="var(--text-secondary)" />
+                  </button>
                 </div>
-              </div>
+              )}
 
               {photo.isVirtual && photo.originalRemotePath && (
                 <div style={{
@@ -2152,22 +2329,35 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                     <button
                       className="btn btn-primary"
                       onClick={handleSaveLocation}
+                      disabled={isSavingLocation}
                       style={{ width: '32px', height: '32px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
                       title="Save location (Enter)"
                     >
-                      <Check size={16} />
+                      {isSavingLocation ? <Sparkles size={16} className="animate-spin" /> : <Check size={16} />}
                     </button>
                     <button
                       className="btn btn-ghost"
                       onClick={() => setIsEditingLocation(false)}
+                      disabled={isSavingLocation}
                       style={{ width: '32px', height: '32px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
                       title="Cancel (Esc)"
                     >
                       <X size={16} />
                     </button>
                   </div>
-                  <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
-                    Type custom place name and press Enter to save
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
+                    <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                      {isSavingLocation ? 'Looking up coordinates...' : 'Type a place name and press Enter — its map position updates too'}
+                    </span>
+                    <button
+                      className="btn btn-ghost"
+                      onClick={() => setShowLocationPicker(true)}
+                      style={{ fontSize: '0.72rem', padding: '2px 8px', gap: '4px', height: '22px', flexShrink: 0 }}
+                      title="Set the exact position on a map instead"
+                    >
+                      <MapPin size={11} />
+                      <span>Pin on Map</span>
+                    </button>
                   </div>
                 </div>
               ) : photo.location ? (
@@ -2176,14 +2366,24 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                     <div style={{ fontWeight: 600, fontSize: '0.9rem', color: 'var(--text-primary)' }}>
                       {photo.location.label || (photo.location.latitude ? `${photo.location.latitude.toFixed(4)}, ${photo.location.longitude.toFixed(4)}` : 'Location named')}
                     </div>
-                    <button
-                      className="btn btn-ghost btn-icon"
-                      style={{ width: '28px', height: '28px', padding: 0 }}
-                      onClick={handleStartEditLocation}
-                      title="Rename Location"
-                    >
-                      <Edit2 size={13} color="var(--text-muted)" />
-                    </button>
+                    <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
+                      <button
+                        className="btn btn-ghost btn-icon"
+                        style={{ width: '28px', height: '28px', padding: 0 }}
+                        onClick={() => setShowLocationPicker(true)}
+                        title="Pin exact location on map"
+                      >
+                        <MapPin size={13} color="var(--text-muted)" />
+                      </button>
+                      <button
+                        className="btn btn-ghost btn-icon"
+                        style={{ width: '28px', height: '28px', padding: 0 }}
+                        onClick={handleStartEditLocation}
+                        title="Rename Location"
+                      >
+                        <Edit2 size={13} color="var(--text-muted)" />
+                      </button>
+                    </div>
                   </div>
                   {photo.location.latitude !== 0 && photo.location.longitude !== 0 && (
                     <>
@@ -2207,16 +2407,87 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                   <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
                     No location set.
                   </div>
-                  <button
-                    className="btn btn-ghost"
-                    onClick={handleStartEditLocation}
-                    style={{ fontSize: '0.75rem', padding: '4px 8px', gap: '4px', height: '26px' }}
-                    title="Add custom location name"
-                  >
-                    <Edit2 size={12} />
-                    <span>Add Name</span>
-                  </button>
+                  <div style={{ display: 'flex', gap: '6px' }}>
+                    <button
+                      className="btn btn-ghost"
+                      onClick={() => setShowLocationPicker(true)}
+                      style={{ fontSize: '0.75rem', padding: '4px 8px', gap: '4px', height: '26px' }}
+                      title="Pin location on map"
+                    >
+                      <MapPin size={12} />
+                      <span>Pin on Map</span>
+                    </button>
+                    <button
+                      className="btn btn-ghost"
+                      onClick={handleStartEditLocation}
+                      style={{ fontSize: '0.75rem', padding: '4px 8px', gap: '4px', height: '26px' }}
+                      title="Add custom location name"
+                    >
+                      <Edit2 size={12} />
+                      <span>Add Name</span>
+                    </button>
+                  </div>
                 </div>
+              )}
+            </div>
+
+            <hr style={{ borderColor: 'var(--border-subtle)', margin: 0 }} />
+
+            {/* Albums this photo belongs to + quick-add to recent albums */}
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                <span style={{ fontSize: '0.85rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-muted)' }}>
+                  Albums ({photoAlbums.length})
+                </span>
+                <button
+                  className="btn btn-ghost btn-icon"
+                  onClick={() => setShowAddToAlbumModal(true)}
+                  style={{ width: '26px', height: '26px', padding: 0 }}
+                  title="Add to an album"
+                >
+                  <FolderPlus size={14} />
+                </button>
+              </div>
+
+              {photoAlbums.length > 0 && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: quickAddAlbums.length > 0 ? '10px' : 0 }}>
+                  {photoAlbums.map((a) => (
+                    <span
+                      key={a.id}
+                      style={{
+                        fontSize: '0.75rem',
+                        padding: '3px 10px',
+                        borderRadius: 'var(--radius-full)',
+                        backgroundColor: 'var(--bg-surface-elevated)',
+                        border: '1px solid var(--border-subtle)',
+                        color: 'var(--text-secondary)',
+                      }}
+                    >
+                      {a.title}
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {quickAddAlbums.length > 0 && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                  {quickAddAlbums.map((a) => (
+                    <button
+                      key={a.id}
+                      className="btn btn-secondary"
+                      onClick={() => handleQuickAddToAlbum(a.id, a.title)}
+                      style={{ fontSize: '0.75rem', padding: '4px 10px', gap: '4px' }}
+                      title={`Add to your recently-used album "${a.title}"`}
+                    >
+                      <Plus size={12} />
+                      <span>Add to {a.title}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {photoAlbums.length === 0 && quickAddAlbums.length === 0 && (
+                <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Not in any album yet.</div>
               )}
             </div>
 
@@ -2435,11 +2706,24 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                               onClick={(e) => {
                                 e.stopPropagation();
                                 setRenamePersonState({ personId: face.personId!, currentName: personName });
-                                setRenameInputName(personName);
                               }}
                               title={`Rename "${personName}" across all library photos`}
                             >
                               <Edit2 size={13} />
+                            </button>
+                          )}
+
+                          {face.personId && (
+                            <button
+                              className="btn btn-ghost btn-icon"
+                              style={{ width: '26px', height: '26px', padding: 0, color: 'var(--accent-amber)' }}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setCoverPhotoTarget({ face, personId: face.personId!, personName });
+                              }}
+                              title={`Set this photo as ${personName}'s cover photo`}
+                            >
+                              <Star size={14} />
                             </button>
                           )}
 
@@ -2485,6 +2769,20 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
           currentPersonName={reassignFace.currentPersonName}
           people={people}
           onClose={() => setReassignFace(null)}
+        />
+      )}
+
+      {coverPhotoTarget && (
+        <SetCoverPhotoModal
+          photo={photo}
+          face={coverPhotoTarget.face}
+          personId={coverPhotoTarget.personId}
+          personName={coverPhotoTarget.personName}
+          onClose={() => setCoverPhotoTarget(null)}
+          onSaved={() => {
+            setScanStatusMessage(`✓ Cover photo updated for ${coverPhotoTarget.personName}!`);
+            setTimeout(() => setScanStatusMessage(null), 3500);
+          }}
         />
       )}
 
@@ -2584,6 +2882,17 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
         >
           {albumToast}
         </div>
+      )}
+
+      {/* Modal: Pin location on map */}
+      {showLocationPicker && (
+        <LocationPickerModal
+          initialLat={photo.location?.latitude}
+          initialLng={photo.location?.longitude}
+          initialLabel={photo.location?.label || photo.location?.city}
+          onConfirm={handleConfirmMapLocation}
+          onClose={() => setShowLocationPicker(false)}
+        />
       )}
 
       {/* Modal: Add to Album */}

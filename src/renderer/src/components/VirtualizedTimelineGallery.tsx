@@ -3,6 +3,7 @@ import { Photo } from '../../types';
 import { PhotoCard } from './PhotoCard';
 import { getLocalPhotoUrl, libraryStore } from '../services/libraryStore';
 import { requestBatchThumbnails } from '../services/asyncImageLoader';
+import { TimelineYearScrubber } from './TimelineYearScrubber';
 import {
   Calendar,
   ChevronRight,
@@ -615,20 +616,32 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
 
   const { cols, itemHeight, gap, size } = gridConfig;
 
+  const handleScrubberJump = (top: number) => {
+    if (containerRef.current) {
+      containerRef.current.scrollTop = top;
+    }
+  };
+
+  const scrubberMonths = useMemo(
+    () => virtualMonthData.map((item) => ({ key: item.key, label: item.group.label, year: item.group.year, top: item.top })),
+    [virtualMonthData]
+  );
+
   return (
-    <div
-      ref={containerRef}
-      onScroll={handleScroll}
-      onWheel={handleWheel}
-      style={{
-        flex: 1,
-        overflowY: 'auto',
-        padding: '20px 24px',
-        outline: 'none',
-        position: 'relative',
-      }}
-      tabIndex={0}
-    >
+    <div style={{ flex: 1, minHeight: 0, display: 'flex', overflow: 'hidden' }}>
+      <div
+        ref={containerRef}
+        onScroll={handleScroll}
+        onWheel={handleWheel}
+        style={{
+          flex: 1,
+          overflowY: 'auto',
+          padding: '20px 24px',
+          outline: 'none',
+          position: 'relative',
+        }}
+        tabIndex={0}
+      >
       {virtualMonthData.map((item) => {
         const isVisible = item.bottom >= viewportTop && item.top <= viewportBottom;
 
@@ -822,6 +835,9 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
           </section>
         );
       })}
+      </div>
+
+      <TimelineYearScrubber months={scrubberMonths} scrollTop={scrollTop} onJump={handleScrubberJump} />
     </div>
   );
 };

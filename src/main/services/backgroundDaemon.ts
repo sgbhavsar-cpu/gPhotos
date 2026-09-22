@@ -3,7 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import { spawn, execSync } from 'child_process';
 import { BackgroundServiceStatus, BackgroundServiceSettings, VirtualStorageConfig } from '../../types';
-import { scanVirtualMirrorDirectory, processPendingRotations, syncVirtualStorage, getStorageDetails } from './virtualMirrorService';
+import { scanVirtualMirrorDirectory, processPendingRotations, processPendingMetadata, syncVirtualStorage, getStorageDetails } from './virtualMirrorService';
 import { thumbnailWorker } from './thumbnailWorkerService';
 import { getSetting, setSetting } from './libraryRepository';
 import { setActiveLibrary } from './db';
@@ -178,6 +178,13 @@ export function initBackgroundDaemon(mainWindow?: BrowserWindow | null) {
       await processPendingRotations();
     } catch {}
   }, 30000);
+
+  // Periodic offline date/location sync check (every 30 seconds)
+  setInterval(async () => {
+    try {
+      await processPendingMetadata();
+    } catch {}
+  }, 30000);
 }
 
 function updateTrayMenu(mainWindow?: BrowserWindow | null) {
@@ -287,6 +294,7 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
   try {
     // First drain any pending offline rotations if storage is available
     await processPendingRotations();
+    await processPendingMetadata();
 
     // Self-healing OneDrive reclaim check: evaluate whatever's already
     // pending BEFORE deciding whether reclaim still looks broken — this is

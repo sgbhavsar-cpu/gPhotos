@@ -67,26 +67,36 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
   const [showAddPhotosModal, setShowAddPhotosModal] = useState(false);
   const [photoSearchQuery, setPhotoSearchQuery] = useState('');
   const [selectedPhotoIdsToAdd, setSelectedPhotoIdsToAdd] = useState<Set<string>>(new Set());
+  // Picker filters — Person reuses face-detection data already in the app
+  // ("Filter by AI"); a from-scratch scene/object filter isn't built yet.
+  const [photoFilterPersonId, setPhotoFilterPersonId] = useState('');
+  const [photoFilterLocation, setPhotoFilterLocation] = useState('');
+  const [photoFilterDateFrom, setPhotoFilterDateFrom] = useState('');
+  const [photoFilterDateTo, setPhotoFilterDateTo] = useState('');
 
   // Handle Escape key navigation inside AlbumsView
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
 
+      // stopImmediatePropagation, not stopPropagation — see PeopleView's
+      // matching Escape handler for why (App.tsx's global handler is also
+      // bound to `window` and stopPropagation alone won't stop it firing).
       if (showAddPhotosModal) {
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         setShowAddPhotosModal(false);
       } else if (showCreateModal) {
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         setShowCreateModal(false);
       } else if (selectedAlbumId) {
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         setSelectedAlbumId(null);
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    // capture: true — see PeopleView's matching Escape handler for why.
+    window.addEventListener('keydown', handleKeyDown, { capture: true });
+    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
   }, [showAddPhotosModal, showCreateModal, selectedAlbumId]);
 
   // Form states for Create Album
@@ -130,8 +140,38 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
           p.location?.country?.toLowerCase().includes(q)
       );
     }
+    if (photoFilterPersonId) {
+      candidates = candidates.filter((p) => p.faces?.some((f) => f.personId === photoFilterPersonId));
+    }
+    if (photoFilterLocation) {
+      candidates = candidates.filter((p) => (p.location?.city || p.location?.label) === photoFilterLocation);
+    }
+    if (photoFilterDateFrom) {
+      const from = new Date(photoFilterDateFrom).getTime();
+      candidates = candidates.filter((p) => new Date(p.dateTaken).getTime() >= from);
+    }
+    if (photoFilterDateTo) {
+      // Inclusive of the whole end day, not just midnight.
+      const to = new Date(photoFilterDateTo).getTime() + 24 * 60 * 60 * 1000 - 1;
+      candidates = candidates.filter((p) => new Date(p.dateTaken).getTime() <= to);
+    }
     return candidates;
-  }, [photos, activeAlbum, photoSearchQuery]);
+  }, [photos, activeAlbum, photoSearchQuery, photoFilterPersonId, photoFilterLocation, photoFilterDateFrom, photoFilterDateTo]);
+
+  // Filter dropdown options, derived from the library so they only ever
+  // show choices that actually exist rather than a generic fixed list.
+  const filterablePeople = useMemo(() => {
+    return libraryStore.getState().people.filter((p) => p.photoCount > 0);
+  }, [photos]);
+
+  const filterableLocations = useMemo(() => {
+    const names = new Set<string>();
+    for (const p of photos) {
+      const name = p.location?.city || p.location?.label;
+      if (name) names.add(name);
+    }
+    return Array.from(names).sort();
+  }, [photos]);
 
   const handleCreateAlbum = (e: React.FormEvent) => {
     e.preventDefault();
@@ -329,6 +369,10 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
               onClick={() => {
                 setSelectedPhotoIdsToAdd(new Set());
                 setPhotoSearchQuery('');
+                setPhotoFilterPersonId('');
+                setPhotoFilterLocation('');
+                setPhotoFilterDateFrom('');
+                setPhotoFilterDateTo('');
                 setShowAddPhotosModal(true);
               }}
               style={{
@@ -396,6 +440,10 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                 onClick={() => {
                   setSelectedPhotoIdsToAdd(new Set());
                   setPhotoSearchQuery('');
+                  setPhotoFilterPersonId('');
+                  setPhotoFilterLocation('');
+                  setPhotoFilterDateFrom('');
+                  setPhotoFilterDateTo('');
                   setShowAddPhotosModal(true);
                 }}
                 style={{ gap: '8px', padding: '10px 20px', margin: '0 auto' }}
@@ -664,6 +712,82 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                     Clear
                   </button>
                 </div>
+              </div>
+
+              {/* Picker Filters: person (AI), location, date range */}
+              <div
+                style={{
+                  padding: isMobile ? '10px 16px' : '10px 24px',
+                  backgroundColor: 'var(--bg-surface-elevated)',
+                  borderBottom: '1px solid var(--border-subtle)',
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  alignItems: 'center',
+                  gap: '8px',
+                }}
+              >
+                <select
+                  className="input"
+                  value={photoFilterPersonId}
+                  onChange={(e) => setPhotoFilterPersonId(e.target.value)}
+                  style={{ height: '32px', fontSize: '0.8rem', maxWidth: '180px' }}
+                  title="Filter by recognized person"
+                >
+                  <option value="">Filter by AI: Anyone</option>
+                  {filterablePeople.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} ({p.photoCount})
+                    </option>
+                  ))}
+                </select>
+
+                <select
+                  className="input"
+                  value={photoFilterLocation}
+                  onChange={(e) => setPhotoFilterLocation(e.target.value)}
+                  style={{ height: '32px', fontSize: '0.8rem', maxWidth: '180px' }}
+                  title="Filter by location"
+                >
+                  <option value="">Any Location</option>
+                  {filterableLocations.map((loc) => (
+                    <option key={loc} value={loc}>
+                      {loc}
+                    </option>
+                  ))}
+                </select>
+
+                <input
+                  type="date"
+                  value={photoFilterDateFrom}
+                  onChange={(e) => setPhotoFilterDateFrom(e.target.value)}
+                  className="input"
+                  style={{ height: '32px', fontSize: '0.8rem' }}
+                  title="From date"
+                />
+                <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>to</span>
+                <input
+                  type="date"
+                  value={photoFilterDateTo}
+                  onChange={(e) => setPhotoFilterDateTo(e.target.value)}
+                  className="input"
+                  style={{ height: '32px', fontSize: '0.8rem' }}
+                  title="To date"
+                />
+
+                {(photoFilterPersonId || photoFilterLocation || photoFilterDateFrom || photoFilterDateTo) && (
+                  <button
+                    className="btn btn-ghost"
+                    onClick={() => {
+                      setPhotoFilterPersonId('');
+                      setPhotoFilterLocation('');
+                      setPhotoFilterDateFrom('');
+                      setPhotoFilterDateTo('');
+                    }}
+                    style={{ fontSize: '0.78rem', height: '32px' }}
+                  >
+                    Reset Filters
+                  </button>
+                )}
               </div>
 
               {/* Photos Picker Grid */}

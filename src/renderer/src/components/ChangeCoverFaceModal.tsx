@@ -64,12 +64,13 @@ export const ChangeCoverFaceModal: React.FC<ChangeCoverFaceModalProps> = ({
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         onClose();
       }
     };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    // capture: true — see PeopleView's matching Escape handler for why.
+    window.addEventListener('keydown', handleKeyDown, { capture: true });
+    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
   }, [onClose]);
 
   const handleSelectCover = (photoId: string, faceId: string) => {
@@ -263,6 +264,7 @@ export const ChangeCoverFaceModal: React.FC<ChangeCoverFaceModalProps> = ({
                         size={100}
                         alt={person.name}
                         borderRadius="var(--radius-md)"
+                        preferOriginal
                       />
                     </div>
 

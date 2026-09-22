@@ -81,11 +81,13 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
   const [editingPersonId, setEditingPersonId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState('');
   const [learningNotification, setLearningNotification] = useState<string | null>(null);
+  const [tipDismissed, setTipDismissed] = useState(false);
   const [mergeSelection, setMergeSelection] = useState<string[]>([]);
   const [isMergeMode, setIsMergeMode] = useState(false);
   const [viewMode, setViewMode] = useState<'photos' | 'faces'>('photos');
   const [zoomLevel, setZoomLevel] = useState<GalleryZoomLevel>('medium');
   const [peopleSearchQuery, setPeopleSearchQuery] = useState('');
+  const [showAllPeople, setShowAllPeople] = useState(false);
   const isMobile = useIsMobile();
   // Collapsible "more options" panels so the persistent toolbar never grows
   // past one compact row on mobile — mirrors the pattern established in
@@ -113,31 +115,42 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
 
+      // stopImmediatePropagation (not stopPropagation) is required here:
+      // App.tsx's global Escape handler is also bound directly to `window`,
+      // so stopPropagation (which only blocks bubbling to ancestor elements)
+      // does nothing to stop it — it would otherwise ALSO fire on this same
+      // keypress and pop the tab-navigation history, e.g. sending the user
+      // back to whatever tab they arrived from instead of just backing out
+      // of this one local selection/modal.
       if (reassignTarget) {
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         setReassignTarget(null);
       } else if (personForCoverModal) {
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         setPersonForCoverModal(null);
       } else if (mergeModalPair) {
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         setMergeModalPair(null);
       } else if (editingPersonId) {
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         setEditingPersonId(null);
       } else if (isMergeMode) {
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         setIsMergeMode(false);
         setMergeSelection([]);
       } else if (selectedPersonId) {
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         setSelectedPersonId(null);
         if (onClearSelectedPerson) onClearSelectedPerson();
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    // capture: true so this runs before App.tsx's global Escape handler
+    // (a normal bubble-phase listener on the same window) regardless of
+    // mount order — otherwise stopImmediatePropagation below would be too
+    // late to stop a handler that already ran.
+    window.addEventListener('keydown', handleKeyDown, { capture: true });
+    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
   }, [
     reassignTarget,
     personForCoverModal,
@@ -327,6 +340,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
           size={isMobile ? 44 : 68}
           alt={selectedPerson.name}
           personId={selectedPerson.id}
+          preferOriginal
         />
         <div
           style={{
@@ -642,7 +656,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
             <Sparkles size={16} color="var(--accent-emerald)" />
             <span>{learningNotification}</span>
           </div>
-        ) : (
+        ) : !tipDismissed && (
           <div style={{
             padding: '8px 32px',
             backgroundColor: 'rgba(59, 130, 246, 0.08)',
@@ -654,7 +668,15 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
             gap: '8px',
           }}>
             <Sparkles size={14} color="var(--accent-primary)" />
-            <span>Tip: Confirming photos gives those faces a 2.5x weight multiplier in AI recognition, automatically pulling more matching photos into this album!</span>
+            <span style={{ flex: 1 }}>Tip: Confirming photos gives those faces a 2.5x weight multiplier in AI recognition, automatically pulling more matching photos into this album!</span>
+            <button
+              className="btn btn-ghost btn-icon"
+              onClick={() => setTipDismissed(true)}
+              title="Dismiss tip"
+              style={{ width: '22px', height: '22px', padding: 0, flexShrink: 0 }}
+            >
+              <X size={14} />
+            </button>
           </div>
         )}
 
@@ -859,14 +881,40 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
             onClose={() => setPersonForCoverModal(null)}
           />
         )}
+
+        {/* Merge People Modal — the toolbar's "Merge" button on this
+            person's-photos screen (below) sets mergeModalPair, but that
+            modal was only ever rendered in the grid view's JSX further
+            down, which this early return never reaches — so the dialog
+            silently never appeared. Rendered here too so it actually shows. */}
+        {mergeModalPair && (
+          <MergePeopleModal
+            personA={mergeModalPair.personA}
+            personB={mergeModalPair.personB}
+            allPeople={people}
+            photos={photos}
+            onOpenConflictPhoto={(conflictPhoto) => {
+              setMergeModalPair(null);
+              onSelectPhoto(conflictPhoto);
+            }}
+            onClose={() => setMergeModalPair(null)}
+            onSuccess={() => setMergeModalPair(null)}
+          />
+        )}
       </div>
     );
   }
 
   // ================= 2. All People Grid View =================
+  // Most-photographed first — a name-sorted list buries the people you
+  // actually care about among one-off/misdetected entries.
+  const peopleByPhotoCount = [...people].sort((a, b) => b.photoCount - a.photoCount);
+  const countFilteredPeople = showAllPeople
+    ? peopleByPhotoCount
+    : peopleByPhotoCount.filter((p) => p.photoCount > 2);
   const filteredPeople = peopleSearchQuery.trim()
-    ? people.filter((p) => p.name.toLowerCase().includes(peopleSearchQuery.trim().toLowerCase()))
-    : people;
+    ? countFilteredPeople.filter((p) => p.name.toLowerCase().includes(peopleSearchQuery.trim().toLowerCase()))
+    : countFilteredPeople;
 
   // Shared JSX built once, arranged differently for desktop vs mobile below —
   // same reasoning as GalleryView's titleBlock/filterChips extraction: this
@@ -908,6 +956,17 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
       />
     </div>
   ) : null;
+
+  const showAllPeopleToggle = (
+    <button
+      className={`btn ${showAllPeople ? 'btn-primary' : 'btn-secondary'}`}
+      onClick={() => setShowAllPeople((v) => !v)}
+      style={{ fontSize: '0.8rem' }}
+      title={showAllPeople ? 'Hide people with 2 or fewer photos' : 'Show every recognized person, including low/zero-photo ones'}
+    >
+      <span>{showAllPeople ? 'Show Fewer' : 'Show All'}</span>
+    </button>
+  );
 
   const mergePeopleButton = people.length >= 2 ? (
     <button
@@ -1004,6 +1063,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
               borderTop: '1px solid var(--border-subtle)',
               backgroundColor: 'var(--bg-surface-elevated)',
             }}>
+              {showAllPeopleToggle}
               {mergePeopleButton}
               {confirmMergeButton}
               {detectFacesButton}
@@ -1024,6 +1084,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
           {peopleTitleBlock}
           {peopleSearchInput}
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+            {showAllPeopleToggle}
             {mergePeopleButton}
             {confirmMergeButton}
             {detectFacesButton}
@@ -1200,6 +1261,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                       size={110}
                       alt={person.name}
                       personId={person.id}
+                      preferOriginal
                     />
                     <button
                       className="btn btn-ghost btn-icon"
