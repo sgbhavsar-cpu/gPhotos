@@ -1,8 +1,14 @@
 # gPhotos Desktop — Standalone Windows Application
 
 [![CI](https://github.com/sgbhavsar-cpu/gPhotos/actions/workflows/ci.yml/badge.svg)](https://github.com/sgbhavsar-cpu/gPhotos/actions/workflows/ci.yml)
+[![Downloads](https://img.shields.io/github/downloads/sgbhavsar-cpu/gPhotos/total)](https://github.com/sgbhavsar-cpu/gPhotos/releases/latest)
+[![Latest Release](https://img.shields.io/github/v/release/sgbhavsar-cpu/gPhotos)](https://github.com/sgbhavsar-cpu/gPhotos/releases/latest)
 
 A modern, privacy-first desktop photo library and organization suite built with **Electron, React 18, TypeScript, and Vite**. Designed to run 100% locally and offline on Windows without cloud dependence, subscription fees, or external Python runtimes.
+
+## ⬇️ Download
+
+**[Download the latest Windows installer](https://github.com/sgbhavsar-cpu/gPhotos/releases/latest)** — no build required, no account, no cloud dependency. Grab the `.exe` from the release's Assets.
 
 > **📖 Complete Documentation**: For step-by-step user instructions, architecture notes, and troubleshooting, see the [User Manual](USER_MANUAL.md).
 
