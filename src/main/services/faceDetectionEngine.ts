@@ -2,6 +2,7 @@ import path from 'path';
 import fs from 'fs';
 import sharp from 'sharp';
 import * as ort from 'onnxruntime-node';
+import { workerData } from 'worker_threads';
 import { logger } from './workerSafeLogger';
 import { FACE_DATA_VERSION } from './faceEngineVersion';
 
@@ -86,9 +87,16 @@ export async function loadFaceModels(): Promise<void> {
     logger.debug('FaceDetectionEngine', 'Loading ONNX face models');
     const detPath = resolveModelPath('scrfd_500m.onnx');
     const recPath = resolveModelPath('arcface_mbf.onnx');
+    // Set by faceDetectionWorkerClient.ts's spawnWorker() when this engine is
+    // running inside one of a multi-worker pool (Turbo Mode) — caps each
+    // session to its fair share of cores instead of every worker defaulting
+    // to "use them all" and oversubscribing the machine. undefined (plain
+    // main-thread use, tests) leaves ORT's own default in place.
+    const intraOpNumThreads = typeof (workerData as any)?.intraOpNumThreads === 'number' ? (workerData as any).intraOpNumThreads : undefined;
     const options: ort.InferenceSession.SessionOptions = {
       executionProviders: ['cpu'],
       graphOptimizationLevel: 'all',
+      ...(intraOpNumThreads ? { intraOpNumThreads } : {}),
     };
     [detectionSession, recognitionSession] = await Promise.all([
       ort.InferenceSession.create(detPath, options),

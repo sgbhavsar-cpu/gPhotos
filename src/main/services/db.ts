@@ -240,10 +240,23 @@ function setMetaValue(db: DatabaseSync, key: string, value: string): void {
  * after an engine change — no need to enumerate every library folder on
  * disk up front. A no-op on an empty/new database (nothing to lose).
  */
+// Bumped by every writer of the faces/people tables (see libraryRepository.ts).
+// A long-lived in-memory copy of those tables (pipelineOrchestrator's shared
+// face cluster cache) is only reusable while this hasn't moved since it was
+// built — so it can never serve stale data after an unrelated edit/reset.
+let facesPeopleRevision = 0;
+export function bumpFacesPeopleRevision(): void {
+  facesPeopleRevision++;
+}
+export function getFacesPeopleRevision(): number {
+  return facesPeopleRevision;
+}
+
 function resetFaceDataIfEngineChanged(db: DatabaseSync): void {
   const storedVersion = getMetaValue(db, 'face_data_version');
   if (storedVersion === FACE_DATA_VERSION) return;
 
+  bumpFacesPeopleRevision();
   db.exec('DELETE FROM faces');
   db.exec('DELETE FROM people');
   db.exec('UPDATE photos SET face_scan_completed = 0, faces_locked = 0');
@@ -252,6 +265,10 @@ function resetFaceDataIfEngineChanged(db: DatabaseSync): void {
 
 function applySchema(db: DatabaseSync): void {
   db.exec('PRAGMA journal_mode = WAL');
+  // Without a limit SQLite never shrinks the -wal file: after heavy writes
+  // (face scans, full-library saves) the real databases carried 360-400MB of
+  // dead WAL each. 64MB caps it once a checkpoint fully resets the log.
+  db.exec('PRAGMA journal_size_limit = 67108864');
   db.exec('PRAGMA foreign_keys = ON');
   for (const stmt of SCHEMA_STATEMENTS) {
     db.exec(stmt);

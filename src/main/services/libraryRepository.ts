@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { getDb, getGlobalDb, getDbForLibraryPath, runInTransaction, resolveDbForPhoto } from './db';
+import { getDb, getGlobalDb, getDbForLibraryPath, runInTransaction, resolveDbForPhoto, bumpFacesPeopleRevision } from './db';
 import { Photo, Person, DetectedFace, Album, ExifMetadata, LocationMetadata } from '../../types';
 
 function toBool(v: any): boolean {
@@ -350,6 +350,7 @@ export function replaceAllPhotos(photos: Photo[], dbHint?: DatabaseSync): { upse
 
 export function deletePhotos(ids: string[], db: DatabaseSync = getDb()): void {
   if (ids.length === 0) return;
+  bumpFacesPeopleRevision();
   runInTransaction(() => {
     const deletePhotoStmt = db.prepare('DELETE FROM photos WHERE id = ?');
     const deleteFacesStmt = db.prepare('DELETE FROM faces WHERE photo_id = ?');
@@ -479,6 +480,7 @@ export function attachFacesToPhotos(photos: Photo[], db: DatabaseSync = getDb())
 }
 
 export function replaceFacesForPhoto(photoId: string, faces: DetectedFace[], skipTransaction = false, db: DatabaseSync = getDb()): void {
+  bumpFacesPeopleRevision();
   const doWork = () => {
     db.prepare('DELETE FROM faces WHERE photo_id = ?').run(photoId);
     const stmt = db.prepare(UPSERT_FACE_SQL);
@@ -541,6 +543,7 @@ const UPSERT_PERSON_SQL = `
 // folder they open, not be scoped to just the one active when it was set.
 
 export function upsertPerson(person: Person): void {
+  bumpFacesPeopleRevision();
   getGlobalDb()
     .prepare(UPSERT_PERSON_SQL)
     .run({
@@ -556,6 +559,7 @@ export function upsertPerson(person: Person): void {
 
 export function upsertPeople(people: Person[]): void {
   if (people.length === 0) return;
+  bumpFacesPeopleRevision();
   const db = getGlobalDb();
   runInTransaction(() => {
     const stmt = db.prepare(UPSERT_PERSON_SQL);
@@ -581,16 +585,19 @@ export function getAllPeople(): Person[] {
 
 /** Deletes a person globally and unassigns their faces in the CURRENTLY ACTIVE library only. */
 export function deletePerson(personId: string): void {
+  bumpFacesPeopleRevision();
   getGlobalDb().prepare('DELETE FROM people WHERE id = ?').run(personId);
   getDb().prepare('UPDATE faces SET person_id = NULL, is_confirmed = 0 WHERE person_id = ?').run(personId);
 }
 
 export function renamePerson(personId: string, name: string): void {
+  bumpFacesPeopleRevision();
   getGlobalDb().prepare('UPDATE people SET name = ? WHERE id = ?').run(name, personId);
 }
 
 /** Replaces the global people registry. */
 export function replaceAllPeople(people: Person[]): void {
+  bumpFacesPeopleRevision();
   const db = getGlobalDb();
   runInTransaction(() => {
     db.exec('DELETE FROM people');
@@ -611,6 +618,7 @@ export function replaceAllPeople(people: Person[]): void {
 
 /** Replaces faces in the currently active library only (people live in the global database — see replaceAllPeople). */
 export function replaceAllFaces(faces: DetectedFace[]): void {
+  bumpFacesPeopleRevision();
   const db = getDb();
   runInTransaction(() => {
     db.exec('DELETE FROM faces');

@@ -606,7 +606,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   const cleanDuplicatesButton = onOpenDuplicateCleaner ? (
     <button
       className="btn btn-secondary"
-      onClick={onOpenDuplicateCleaner}
+      onClick={() => onOpenDuplicateCleaner()} // NOT onClick={onOpenDuplicateCleaner}: that passes the click event in as the `cluster` argument
       style={{ padding: '6px 14px', fontSize: '0.82rem', gap: '8px', height: '34px', borderColor: 'rgba(99, 102, 241, 0.4)' }}
       title="Identify duplicate bursts, score best shots, and safely delete inferior copies"
     >

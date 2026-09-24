@@ -155,3 +155,33 @@ describe('clustering math', () => {
     });
   });
 });
+
+describe('peopleNeedingWrite: only rows a scan actually changed are written', () => {
+  const person = (id: string, over: Partial<any> = {}): any => ({ id, name: `P ${id}`, faceCount: 3, photoCount: 2, createdAt: '2026-01-01T00:00:00Z', ...over });
+
+  it('returns nothing when clustering left everyone as it was (the common case per scanned photo)', async () => {
+    const { peopleNeedingWrite } = await import('../../src/main/services/faceClustering');
+    const existing = Array.from({ length: 500 }, (_, i) => person(`p${i}`));
+    expect(peopleNeedingWrite(existing, existing.map((p) => ({ ...p })))).toEqual([]);
+  });
+
+  it('returns only new people and people whose counts/name/cover changed', async () => {
+    const { peopleNeedingWrite } = await import('../../src/main/services/faceClustering');
+    const existing = [person('a'), person('b'), person('c'), person('d')];
+    const updated = [
+      person('a'),                                   // unchanged
+      person('b', { faceCount: 4 }),                 // joined by a new face
+      person('c', { name: 'Renamed' }),              // name changed
+      person('d', { coverFaceId: 'f9' }),            // cover changed
+      person('e'),                                   // brand new
+    ];
+    expect(peopleNeedingWrite(existing, updated).map((p) => p.id)).toEqual(['b', 'c', 'd', 'e']);
+  });
+
+  it('treats null and undefined covers as equal (DB rows vs in-memory objects)', async () => {
+    const { peopleNeedingWrite } = await import('../../src/main/services/faceClustering');
+    const a: any = { ...person('a'), coverFaceId: undefined, coverPhotoId: undefined };
+    const b: any = { ...person('a'), coverFaceId: null, coverPhotoId: null };
+    expect(peopleNeedingWrite([a], [b])).toEqual([]);
+  });
+});

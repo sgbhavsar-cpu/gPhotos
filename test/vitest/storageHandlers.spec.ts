@@ -93,10 +93,10 @@ describe('storage:save / storage:load handlers (end-to-end)', () => {
     expect(await handleStorageLoad(GLOBAL_PEOPLE_KEY)).toHaveLength(0);
   });
 
-  it('stores an unrecognized key (e.g. the face descriptor cache) as an opaque settings blob without loss', async () => {
+  it('stores an unrecognized key as an opaque settings blob without loss', async () => {
     const cacheEntries = [['C:\\Photos\\p1.jpg', { faces: [1, 2, 3] }]];
-    handleStorageSave('gphotos_face_cache_v2', cacheEntries);
-    expect(await handleStorageLoad('gphotos_face_cache_v2')).toEqual(cacheEntries);
+    handleStorageSave('some_other_setting_key', cacheEntries);
+    expect(await handleStorageLoad('some_other_setting_key')).toEqual(cacheEntries);
   });
 
   it('returns null for an empty/never-saved library, matching the old library.json-absent behavior', async () => {
@@ -224,5 +224,69 @@ describe('storage:save / storage:load handlers (end-to-end)', () => {
     expect(loaded).toHaveLength(2);
     const names = loaded.map((s: any) => s.name).sort();
     expect(names).toEqual(['Jainish', 'hemlata']);
+  });
+
+  it('includePhotos:false returns people/albums/settings WITHOUT the photo list (the launch-time message that froze the UI ~10s)', async () => {
+    handleStorageSave(STORAGE_KEY, {
+      photos: [makePhoto('p1'), makePhoto('p2'), makePhoto('p3')],
+      people: [{ id: 'p_alice', name: 'Alice', faceCount: 0, photoCount: 0, createdAt: '2026-01-01T00:00:00Z' }],
+      albums: [],
+      selectedFolder: libraryDir,
+      recentLibraries: [libraryDir],
+    });
+
+    const lean = await handleStorageLoad(STORAGE_KEY, undefined, { includePhotos: false });
+    expect(lean.photos).toEqual([]);
+    expect(lean.people.map((p: any) => p.name)).toEqual(['Alice']);
+    expect(lean.selectedFolder).toBe(libraryDir);
+    expect(lean.recentLibraries).toEqual([libraryDir]);
+    expect(Array.isArray(lean.faces)).toBe(true);
+    expect(Array.isArray(lean.albums)).toBe(true);
+
+    // default (and explicit true) still return the photos, for every other caller (mobile web, slow path)
+    expect((await handleStorageLoad(STORAGE_KEY)).photos).toHaveLength(3);
+    expect((await handleStorageLoad(STORAGE_KEY, undefined, { includePhotos: true })).photos).toHaveLength(3);
+  });
+
+  it('includePhotos:false still reports "nothing stored" as null on an empty library', async () => {
+    expect(await handleStorageLoad(STORAGE_KEY, undefined, { includePhotos: false })).toBeNull();
+  });
+
+  it('includePhotos:false does not return null just because people/albums are empty when photos exist', async () => {
+    handleStorageSave(STORAGE_KEY, { photos: [makePhoto('only')], selectedFolder: libraryDir });
+    const lean = await handleStorageLoad(STORAGE_KEY, undefined, { includePhotos: false });
+    expect(lean).not.toBeNull();
+    expect(lean.photos).toEqual([]);
+  });
+
+  it('compactDescriptors sends descriptors as Float32Array with identical values; default sends plain arrays', async () => {
+    const descriptor = Array.from({ length: 512 }, (_, i) => Math.fround(Math.sin(i) * 0.37)); // float32-exact, like the ONNX model output
+    handleStorageSave(STORAGE_KEY, { photos: [makePhoto('p1')], selectedFolder: libraryDir });
+    const { replaceFacesForPhoto } = await import('../../src/main/services/libraryRepository');
+    replaceFacesForPhoto('p1', [{ id: 'p1_face_0', photoId: 'p1', box: { x: 1, y: 2, width: 3, height: 4 }, descriptor, confidence: 0.9 } as any]);
+
+    const plain = await handleStorageLoad(STORAGE_KEY, undefined, { includePhotos: false });
+    expect(Array.isArray(plain.faces[0].descriptor)).toBe(true);
+
+    const compact = await handleStorageLoad(STORAGE_KEY, undefined, { includePhotos: false, compactDescriptors: true });
+    expect(compact.faces[0].descriptor).toBeInstanceOf(Float32Array);
+    expect(Array.from(compact.faces[0].descriptor as Float32Array)).toEqual(descriptor); // lossless round trip
+    expect(compact.faces[0].box).toEqual({ x: 1, y: 2, width: 3, height: 4 });               // everything else untouched
+  });
+
+  it('the legacy face-cache key is never read back and any write replaces the stored blob with []', async () => {
+    const { setSetting, getSetting } = await import('../../src/main/services/libraryRepository');
+    const KEY = 'gphotos_face_cache_v2';
+    const big = Array.from({ length: 2000 }, (_, i) => [`k${i}`, { faces: [{ id: `f${i}`, descriptor: new Array(512).fill(0.1) }], faceScanCompleted: true }]);
+    setSetting(KEY, big); // simulate the old multi-hundred-MB value
+
+    const t0 = Date.now();
+    expect(await handleStorageLoad(KEY)).toEqual([]);   // not read, not parsed, not sent to the renderer
+    expect(Date.now() - t0).toBeLessThan(200);
+    expect(getSetting(KEY, null)).not.toEqual([]);      // (load alone leaves the blob in place)
+
+    expect(handleStorageSave(KEY, big).success).toBe(true); // any save drops it...
+    expect(getSetting(KEY, null)).toEqual([]);              // ...replacing it with []
+    expect(await handleStorageLoad(KEY)).toEqual([]);
   });
 });

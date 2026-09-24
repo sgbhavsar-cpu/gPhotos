@@ -48,7 +48,7 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
   const [fullscreenPhoto, setFullscreenPhoto] = useState<Photo | null>(null);
 
   useEffect(() => {
-    if (initialCluster) {
+    if (initialCluster && Array.isArray(initialCluster.photos)) {
       setClusters([initialCluster]);
       setKeptPhotoIds({
         [initialCluster.id]: new Set([initialCluster.bestPhotoId]),

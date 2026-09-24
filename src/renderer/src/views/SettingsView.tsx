@@ -290,6 +290,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   };
 
   const handlePauseResumePreCache = async () => {
+    // A cold "Resume" (no library open) re-scans every configured storage
+    // from scratch before it can enqueue anything — for a large OneDrive
+    // library that alone can take tens of seconds. Without this loading
+    // state the button looked completely inert for that whole stretch,
+    // which is exactly what made people click it again (and again) instead
+    // of waiting — each extra click launching another redundant full
+    // rescan (see the matching guard in main.ts's service:start-precache).
+    if (actionLoading === 'precache') return;
+    setActionLoading('precache');
     try {
       if (serviceStatus?.isPreCachingActive) {
         if (window.electronAPI?.pauseThumbnailPreCache) {
@@ -304,6 +313,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       }
     } catch (err) {
       console.error('Failed to toggle pre-cache execution:', err);
+    } finally {
+      setActionLoading(null);
     }
   };
 
@@ -1073,116 +1084,354 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <button
                   className="btn btn-secondary"
                   onClick={handlePauseResumePreCache}
-                  style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.85rem', padding: '8px 16px' }}
+                  disabled={actionLoading === 'precache'}
+                  style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.85rem', padding: '8px 16px', opacity: actionLoading === 'precache' ? 0.6 : 1, cursor: actionLoading === 'precache' ? 'default' : 'pointer' }}
                 >
-                  {serviceStatus?.isPreCachingActive ? <Pause size={15} color="#f59e0b" /> : <Play size={15} color="#10b981" />}
-                  {serviceStatus?.isPreCachingActive ? 'Pause Pre-Caching' : 'Resume Pre-Caching'}
+                  {actionLoading === 'precache' ? (
+                    <RefreshCw size={15} className="animate-spin" />
+                  ) : serviceStatus?.isPreCachingActive ? (
+                    <Pause size={15} color="#f59e0b" />
+                  ) : (
+                    <Play size={15} color="#10b981" />
+                  )}
+                  {actionLoading === 'precache'
+                    ? 'Scanning storages…'
+                    : serviceStatus?.isPreCachingActive
+                      ? 'Pause Pre-Caching'
+                      : 'Resume Pre-Caching'}
                 </button>
               </div>
             )}
           </div>
 
+          {/* Performance Mode Selector: Background (throttled) vs Turbo (exclusive-use overnight) */}
+          <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+            {(['background', 'turbo'] as const).map((mode) => {
+              const active = (serviceStatus?.performanceMode ?? 'background') === mode;
+              const isTurbo = mode === 'turbo';
+              return (
+                <button
+                  key={mode}
+                  onClick={() => handleToggleSetting('performanceMode', mode)}
+                  style={{
+                    flex: '1 1 200px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '10px',
+                    padding: '14px 16px',
+                    borderRadius: 'var(--radius-md)',
+                    cursor: 'pointer',
+                    textAlign: 'left',
+                    backgroundColor: active
+                      ? (isTurbo ? 'rgba(249, 115, 22, 0.12)' : 'rgba(56, 189, 248, 0.12)')
+                      : 'var(--bg-card)',
+                    border: `1px solid ${active ? (isTurbo ? 'rgba(249, 115, 22, 0.5)' : 'rgba(56, 189, 248, 0.5)') : 'var(--border-subtle)'}`,
+                  }}
+                >
+                  {isTurbo ? <Zap size={18} color={active ? '#f97316' : 'var(--text-muted)'} /> : <Cpu size={18} color={active ? 'var(--accent-cyan)' : 'var(--text-muted)'} />}
+                  <div>
+                    <div style={{ fontWeight: 600, fontSize: '0.9rem', color: active ? 'var(--text-primary)' : 'var(--text-muted)' }}>
+                      {isTurbo ? 'Turbo / Overnight Mode' : 'Background Mode'}
+                    </div>
+                    <div style={{ fontSize: '0.76rem', color: 'var(--text-muted)', marginTop: '2px' }}>
+                      {isTurbo ? 'Multiple parallel workers, exclusive use of the PC' : 'Low-priority, stays out of your way'}
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {(serviceStatus?.performanceMode ?? 'background') === 'turbo' && (
+            <p style={{ fontSize: '0.82rem', color: '#f97316', margin: 0, lineHeight: 1.5 }}>
+              Runs thumbnail caching and face detection on multiple CPU cores at once — hours instead of days for a large library. Only use this when you're not using the PC (e.g. overnight); it will make the machine sluggish for anything else.
+            </p>
+          )}
+
+          {/* Idle threshold — applies to both modes: how long the app waits with
+              no click/keypress/scroll/touch before auto-resuming pending work. */}
+          <div style={{
+            backgroundColor: 'var(--bg-card)',
+            border: '1px solid var(--border-subtle)',
+            borderRadius: 'var(--radius-md)',
+            padding: '16px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: '16px',
+            flexWrap: 'wrap',
+          }}>
+            <div style={{ flex: 1, minWidth: isMobile ? 0 : '260px' }}>
+              <label style={{ fontSize: '0.88rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Clock size={16} color="var(--accent-cyan)" />
+                Idle Time Before Auto-Resume
+              </label>
+              <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '6px', lineHeight: 1.4, margin: '6px 0 0 0' }}>
+                How long the app waits with no click, keypress, scroll, or touch before resuming pending caching/face detection. Moving the mouse or the window regaining focus doesn't count as activity and won't reset this.
+              </p>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <input
+                type="number"
+                min={5}
+                max={600}
+                step={1}
+                value={serviceStatus?.idleResumeSeconds ?? 15}
+                onChange={(e) => handleToggleSetting('idleResumeSeconds', Math.max(5, Math.min(600, parseInt(e.target.value, 10) || 15)))}
+                className="input-field"
+                style={{ width: '80px', padding: '8px 10px', fontSize: '0.88rem', textAlign: 'center' }}
+              />
+              <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>seconds</span>
+            </div>
+          </div>
+
           {/* Sliders and Selectors Grid */}
-          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(auto-fit, minmax(280px, 1fr))', gap: '16px' }}>
-            
-            {/* Setting 1: Max CPU Usage Cap */}
-            <div style={{
-              backgroundColor: 'var(--bg-card)',
-              border: '1px solid var(--border-subtle)',
-              borderRadius: 'var(--radius-md)',
-              padding: '16px',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '12px',
-            }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <label style={{ fontSize: '0.88rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <Cpu size={16} color="var(--accent-cyan)" />
-                  Max Background CPU Cap
-                </label>
-                <span style={{
-                  backgroundColor: 'rgba(56, 189, 248, 0.15)',
-                  color: 'var(--accent-cyan)',
-                  padding: '2px 8px',
-                  borderRadius: '12px',
-                  fontSize: '0.82rem',
-                  fontWeight: 700,
-                  fontFamily: 'monospace',
-                }}>
-                  {serviceStatus?.maxCpuPercent ?? 40}% Max
-                </span>
+          {(serviceStatus?.performanceMode ?? 'background') === 'background' ? (
+            <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(auto-fit, minmax(280px, 1fr))', gap: '16px' }}>
+
+              {/* Setting 1: Max CPU Usage Cap */}
+              <div style={{
+                backgroundColor: 'var(--bg-card)',
+                border: '1px solid var(--border-subtle)',
+                borderRadius: 'var(--radius-md)',
+                padding: '16px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '12px',
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label style={{ fontSize: '0.88rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Cpu size={16} color="var(--accent-cyan)" />
+                    Max Background CPU Cap
+                  </label>
+                  <span style={{
+                    backgroundColor: 'rgba(56, 189, 248, 0.15)',
+                    color: 'var(--accent-cyan)',
+                    padding: '2px 8px',
+                    borderRadius: '12px',
+                    fontSize: '0.82rem',
+                    fontWeight: 700,
+                    fontFamily: 'monospace',
+                  }}>
+                    {serviceStatus?.maxCpuPercent ?? 40}% Max
+                  </span>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                  <input
+                    type="range"
+                    min="10"
+                    max="90"
+                    step="5"
+                    value={serviceStatus?.maxCpuPercent ?? 40}
+                    onChange={(e) => handleToggleSetting('maxCpuPercent', parseInt(e.target.value, 10))}
+                    style={{ flex: 1, accentColor: 'var(--accent-cyan)', cursor: 'pointer' }}
+                  />
+                </div>
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                  <span>10% (Ultra Gentle)</span>
+                  <span>40% (Default)</span>
+                  <span>90% (Fast Scan)</span>
+                </div>
+
+                <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.4, margin: 0 }}>
+                  Worker uses duty-cycle throttling to sleep proportional to work time. Guarantees {100 - (serviceStatus?.maxCpuPercent ?? 40)}%+ CPU remains available for smooth desktop responsiveness.
+                </p>
               </div>
 
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+              {/* Setting 2: Max Background RAM Ceiling */}
+              <div style={{
+                backgroundColor: 'var(--bg-card)',
+                border: '1px solid var(--border-subtle)',
+                borderRadius: 'var(--radius-md)',
+                padding: '16px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '12px',
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label style={{ fontSize: '0.88rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Server size={16} color="var(--accent-cyan)" />
+                    Max Background RAM Ceiling
+                  </label>
+                  <span style={{
+                    backgroundColor: 'rgba(56, 189, 248, 0.15)',
+                    color: 'var(--accent-cyan)',
+                    padding: '2px 8px',
+                    borderRadius: '12px',
+                    fontSize: '0.82rem',
+                    fontWeight: 700,
+                    fontFamily: 'monospace',
+                  }}>
+                    {serviceStatus?.maxRamMb ?? 1024} MB
+                  </span>
+                </div>
+
+                <select
+                  className="input-field"
+                  value={serviceStatus?.maxRamMb ?? 1024}
+                  onChange={(e) => handleToggleSetting('maxRamMb', parseInt(e.target.value, 10))}
+                  style={{ width: '100%', padding: '8px 12px', fontSize: '0.88rem' }}
+                >
+                  <option value={512}>512 MB (Economy / Low-spec PCs)</option>
+                  <option value={768}>768 MB</option>
+                  <option value={1024}>1024 MB / 1 GB (Recommended Default)</option>
+                  <option value={1536}>1536 MB / 1.5 GB</option>
+                  <option value={2048}>2048 MB / 2 GB (High-End Workstation)</option>
+                  <option value={4096}>4096 MB / 4 GB (Maximum Throughput)</option>
+                </select>
+
+                <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.4, margin: 0 }}>
+                  Guards process RSS memory and Sharp image cache. If usage exceeds 85% of ceiling, memory buffers are aggressively flushed; if 100% is reached, the worker pauses automatically to prevent paging.
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(auto-fit, minmax(260px, 1fr))', gap: '16px' }}>
+
+              {/* Turbo Setting 1: Parallel Workers */}
+              <div style={{
+                backgroundColor: 'var(--bg-card)',
+                border: '1px solid var(--border-subtle)',
+                borderRadius: 'var(--radius-md)',
+                padding: '16px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '12px',
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label style={{ fontSize: '0.88rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Layers size={16} color="#f97316" />
+                    Parallel Workers
+                  </label>
+                  <span style={{
+                    backgroundColor: 'rgba(249, 115, 22, 0.15)',
+                    color: '#f97316',
+                    padding: '2px 8px',
+                    borderRadius: '12px',
+                    fontSize: '0.82rem',
+                    fontWeight: 700,
+                    fontFamily: 'monospace',
+                  }}>
+                    {serviceStatus?.turboWorkers ?? Math.max(1, (serviceStatus?.logicalCpuCount ?? 4) - 1)}
+                  </span>
+                </div>
+
+                <input
+                  type="range"
+                  min="1"
+                  max={Math.max(1, serviceStatus?.logicalCpuCount ?? 8)}
+                  step="1"
+                  value={serviceStatus?.turboWorkers ?? Math.max(1, (serviceStatus?.logicalCpuCount ?? 4) - 1)}
+                  onChange={(e) => handleToggleSetting('turboWorkers', parseInt(e.target.value, 10))}
+                  style={{ flex: 1, accentColor: '#f97316', cursor: 'pointer' }}
+                />
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                  <span>1</span>
+                  <span>{serviceStatus?.logicalCpuCount ?? '?'} cores detected</span>
+                </div>
+
+                <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.4, margin: 0 }}>
+                  How many photos run thumbnail generation and face detection at once. Each face-detection worker loads its own copy of the AI model, so more workers also use more RAM.
+                </p>
+              </div>
+
+              {/* Turbo Setting 2: Max CPU */}
+              <div style={{
+                backgroundColor: 'var(--bg-card)',
+                border: '1px solid var(--border-subtle)',
+                borderRadius: 'var(--radius-md)',
+                padding: '16px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '12px',
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label style={{ fontSize: '0.88rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Cpu size={16} color="#f97316" />
+                    Max CPU Usage
+                  </label>
+                  <span style={{
+                    backgroundColor: 'rgba(249, 115, 22, 0.15)',
+                    color: '#f97316',
+                    padding: '2px 8px',
+                    borderRadius: '12px',
+                    fontSize: '0.82rem',
+                    fontWeight: 700,
+                    fontFamily: 'monospace',
+                  }}>
+                    {serviceStatus?.turboMaxCpuPercent ?? 100}% Max
+                  </span>
+                </div>
+
                 <input
                   type="range"
                   min="10"
-                  max="90"
+                  max="100"
                   step="5"
-                  value={serviceStatus?.maxCpuPercent ?? 40}
-                  onChange={(e) => handleToggleSetting('maxCpuPercent', parseInt(e.target.value, 10))}
-                  style={{ flex: 1, accentColor: 'var(--accent-cyan)', cursor: 'pointer' }}
+                  value={serviceStatus?.turboMaxCpuPercent ?? 100}
+                  onChange={(e) => handleToggleSetting('turboMaxCpuPercent', parseInt(e.target.value, 10))}
+                  style={{ flex: 1, accentColor: '#f97316', cursor: 'pointer' }}
                 />
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                  <span>10%</span>
+                  <span>100% (Exclusive Use)</span>
+                </div>
+
+                <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.4, margin: 0 }}>
+                  100% leaves almost nothing for other apps — that's fine overnight, but expect the PC to feel unresponsive if you use it while this runs.
+                </p>
               </div>
 
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.72rem', color: 'var(--text-muted)' }}>
-                <span>10% (Ultra Gentle)</span>
-                <span>40% (Default)</span>
-                <span>90% (Fast Scan)</span>
-              </div>
+              {/* Turbo Setting 3: Max RAM */}
+              <div style={{
+                backgroundColor: 'var(--bg-card)',
+                border: '1px solid var(--border-subtle)',
+                borderRadius: 'var(--radius-md)',
+                padding: '16px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '12px',
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label style={{ fontSize: '0.88rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Server size={16} color="#f97316" />
+                    Max RAM Ceiling
+                  </label>
+                  <span style={{
+                    backgroundColor: 'rgba(249, 115, 22, 0.15)',
+                    color: '#f97316',
+                    padding: '2px 8px',
+                    borderRadius: '12px',
+                    fontSize: '0.82rem',
+                    fontWeight: 700,
+                    fontFamily: 'monospace',
+                  }}>
+                    {serviceStatus?.turboMaxRamMb ?? 4096} MB
+                  </span>
+                </div>
 
-              <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.4, margin: 0 }}>
-                Worker uses duty-cycle throttling to sleep proportional to work time. Guarantees {100 - (serviceStatus?.maxCpuPercent ?? 40)}%+ CPU remains available for smooth desktop responsiveness.
-              </p>
+                <select
+                  className="input-field"
+                  value={serviceStatus?.turboMaxRamMb ?? 4096}
+                  onChange={(e) => handleToggleSetting('turboMaxRamMb', parseInt(e.target.value, 10))}
+                  style={{ width: '100%', padding: '8px 12px', fontSize: '0.88rem' }}
+                >
+                  <option value={2048}>2048 MB / 2 GB</option>
+                  <option value={4096}>4096 MB / 4 GB (Recommended)</option>
+                  <option value={6144}>6144 MB / 6 GB</option>
+                  <option value={8192}>8192 MB / 8 GB (High-RAM PCs)</option>
+                </select>
+
+                <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.4, margin: 0 }}>
+                  More parallel workers use more RAM (each loads its own face-detection model). Raise this only on a PC with plenty of free RAM to spare.
+                </p>
+              </div>
             </div>
-
-            {/* Setting 2: Max Background RAM Ceiling */}
-            <div style={{
-              backgroundColor: 'var(--bg-card)',
-              border: '1px solid var(--border-subtle)',
-              borderRadius: 'var(--radius-md)',
-              padding: '16px',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '12px',
-            }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <label style={{ fontSize: '0.88rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <Server size={16} color="var(--accent-cyan)" />
-                  Max Background RAM Ceiling
-                </label>
-                <span style={{
-                  backgroundColor: 'rgba(56, 189, 248, 0.15)',
-                  color: 'var(--accent-cyan)',
-                  padding: '2px 8px',
-                  borderRadius: '12px',
-                  fontSize: '0.82rem',
-                  fontWeight: 700,
-                  fontFamily: 'monospace',
-                }}>
-                  {serviceStatus?.maxRamMb ?? 1024} MB
-                </span>
-              </div>
-
-              <select
-                className="input-field"
-                value={serviceStatus?.maxRamMb ?? 1024}
-                onChange={(e) => handleToggleSetting('maxRamMb', parseInt(e.target.value, 10))}
-                style={{ width: '100%', padding: '8px 12px', fontSize: '0.88rem' }}
-              >
-                <option value={512}>512 MB (Economy / Low-spec PCs)</option>
-                <option value={768}>768 MB</option>
-                <option value={1024}>1024 MB / 1 GB (Recommended Default)</option>
-                <option value={1536}>1536 MB / 1.5 GB</option>
-                <option value={2048}>2048 MB / 2 GB (High-End Workstation)</option>
-                <option value={4096}>4096 MB / 4 GB (Maximum Throughput)</option>
-              </select>
-
-              <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.4, margin: 0 }}>
-                Guards process RSS memory and Sharp image cache. If usage exceeds 85% of ceiling, memory buffers are aggressively flushed; if 100% is reached, the worker pauses automatically to prevent paging.
-              </p>
-            </div>
-          </div>
+          )}
 
           {/* Real-time Hardware Telemetry & Progress Dashboard */}
           <div style={{

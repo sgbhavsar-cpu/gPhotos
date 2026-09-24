@@ -21,6 +21,7 @@ import { getFaceStatsForLibrary } from './libraryRepository';
 import { getDefaultMirrorRoot } from './pathSecurity';
 import { isPathReachable, isNetworkPath } from './networkReachabilityCache';
 import { runFaceDetectionStep, photoIdForSidecar, createFaceClusterCache, type FaceClusterCache, type FaceStepResult } from './pipelineOrchestrator';
+import { getFaceDetectionPoolSize } from './faceDetectionWorkerClient';
 import { logger } from './logger';
 import { getDbForLibraryPath } from './db';
 import { deletePhotos } from './libraryRepository';
@@ -433,17 +434,20 @@ export function getAllStorageDetailsFast(mirrorRoot?: string): Record<string, St
   return result;
 }
 
-const PHYSICAL_SCAN_YIELD_EVERY_FILES = 200;
-
 /**
- * The actual ground-truth sidecar walk (identical logic to getStorageDetails'
- * live scan), as an async generator that yields to the event loop
- * periodically instead of running as one uninterrupted synchronous call —
- * for a mirror with many thousands of synced photos, the plain synchronous
- * version can block the main process for a very long time. Meant to be run
- * ONCE per storage screen load, as a background confirmation pass over
- * whatever getAllStorageDetailsFast already showed instantly from the
- * checkpoint — never on a tight poll (see confirmAllStorageDetailsPhysical).
+ * The ground-truth count of a mirror's synced photos and cached thumbnails,
+ * from DIRECTORY LISTINGS ONLY (no file is opened). A sidecar is
+ * `<baseName>.json` and its thumbnail is the sibling `<originalFileName>`
+ * (see processOneMirrorFile), so "thumbnail cached" == a non-json sibling
+ * with the same base name exists in that folder.
+ *
+ * This used to open and JSON.parse every sidecar and existsSync its
+ * thumbnail: ~6ms per file on a real 24K-photo mirror (each open gets
+ * virus-scanned) = 144s of grinding, on every visit to the Network Mirrors
+ * screen, competing with the face pipeline for the main process. The listing
+ * walk does the same job in well under a second. Runs once per screen load
+ * as a background confirmation over what getAllStorageDetailsFast already
+ * showed from the checkpoint — never on a tight poll.
  */
 export async function scanStorageDetailsPhysical(storageName: string, mirrorRoot?: string): Promise<StorageDetails> {
   const root = mirrorRoot || getDefaultMirrorRoot();
@@ -453,7 +457,6 @@ export async function scanStorageDetailsPhysical(storageName: string, mirrorRoot
   let thumbnailCachedCount = 0;
 
   if (fs.existsSync(mirrorFolder)) {
-    let sinceYield = 0;
     const scan = async (dir: string, depth = 0): Promise<void> => {
       if (depth > 6) return;
       let entries: fs.Dirent[];
@@ -462,29 +465,29 @@ export async function scanStorageDetailsPhysical(storageName: string, mirrorRoot
       } catch {
         return;
       }
+
+      const mediaBases = new Set<string>(); // lower-cased base names of non-json files in this folder
+      const sidecarBases: string[] = [];
+      const subdirs: string[] = [];
       for (const entry of entries) {
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory() && !entry.name.startsWith('.')) {
-          await scan(full, depth + 1);
-        } else if (
-          entry.isFile() &&
-          entry.name.endsWith('.json') &&
-          !isMirrorHousekeepingFile(entry.name)
-        ) {
-          totalPhotos++;
-          try {
-            const meta: VirtualPhotoMetadata = JSON.parse(fs.readFileSync(full, 'utf-8'));
-            if (meta.thumbnailPath && fs.existsSync(meta.thumbnailPath)) {
-              thumbnailCachedCount++;
-            }
-          } catch {}
-          sinceYield++;
-          if (sinceYield >= PHYSICAL_SCAN_YIELD_EVERY_FILES) {
-            sinceYield = 0;
-            await new Promise((resolve) => setImmediate(resolve));
+        if (entry.isDirectory()) {
+          if (!entry.name.startsWith('.')) subdirs.push(path.join(dir, entry.name));
+        } else if (entry.isFile()) {
+          if (entry.name.endsWith('.json')) {
+            if (!isMirrorHousekeepingFile(entry.name)) sidecarBases.push(entry.name.slice(0, -'.json'.length).toLowerCase());
+          } else {
+            mediaBases.add(path.parse(entry.name).name.toLowerCase());
           }
         }
       }
+
+      for (const base of sidecarBases) {
+        totalPhotos++;
+        if (mediaBases.has(base)) thumbnailCachedCount++;
+      }
+
+      await new Promise((resolve) => setImmediate(resolve)); // let the event loop breathe between folders
+      for (const sub of subdirs) await scan(sub, depth + 1);
     };
     await scan(mirrorFolder);
   }
@@ -861,32 +864,67 @@ export async function syncVirtualStorage(
   let facesDetectedThisRunCount = 0;
   let facesDeferredCount = 0; // offline/locked/error — genuinely not attempted
 
-  for (let i = startIndex; i < total; i++) {
-    const remoteFile = remoteFiles[i];
-    const fileName = path.basename(remoteFile);
+  // Files within a batch are dispatched concurrently (Promise.all); the
+  // bookkeeping below (counters, logging, progress, checkpoint) stays
+  // sequential over each batch's results — cheap synchronous work with
+  // nothing to gain from parallelizing it. At concurrency 1 (default,
+  // Background Mode) a "batch" is always exactly one file, so this is
+  // byte-for-byte the original one-at-a-time loop; Turbo Mode raises
+  // concurrency so multiple files' thumbnail+face-detection pipelines run at
+  // once, each face-detection call landing on a different pool worker (see
+  // faceDetectionWorkerClient.ts). Safe to run detectFacesForPhoto concurrently
+  // across different files — see its own doc comment: the only await in it
+  // happens before the cluster-cache read/mutate section, which is fully
+  // synchronous, so JS's run-to-completion semantics make concurrent calls
+  // atomic with respect to that shared faceCache.
+  const concurrency = Math.max(1, getFaceDetectionPoolSize());
 
-    const percent = Math.round(((i + 1) / Math.max(1, total)) * 100);
-    const fileStartTime = Date.now();
+  for (let i = startIndex; i < total; i += concurrency) {
+    const batchStartTime = Date.now();
+    const batchIndices: number[] = [];
+    for (let k = i; k < Math.min(i + concurrency, total); k++) batchIndices.push(k);
 
-    const result = await processOneMirrorFile(remoteFile, config, storageMirrorRoot);
-    let bytesReadForBandwidth = result.bytesRead;
-    let faceResult: FaceStepResult | null = null;
+    const batchOutcomes = await Promise.all(
+      batchIndices.map(async (idx) => {
+        const remoteFile = remoteFiles[idx];
+        const result = await processOneMirrorFile(remoteFile, config, storageMirrorRoot);
+        let faceResult: FaceStepResult | null = null;
+        let faceErr: unknown = null;
+        if (result.success && runFaceDetection && result.sidecar) {
+          try {
+            faceResult = await runFaceDetectionStep(remoteFile, result.sidecar, config, faceCache);
+          } catch (err) {
+            faceErr = err;
+          }
+        }
+        return { idx, remoteFile, result, faceResult, faceErr };
+      })
+    );
 
-    if (result.success) {
-      totalOriginalSize += result.originalSize;
-      totalThumbnailSize += result.thumbnailSize;
-      totalSynced++;
-      if (!result.skipped) {
-        newlyAdded++;
-        logger.info('Sync', `Background scan — Photo ${i + 1}/${total}: ${fileName}`);
-        logger.info('Sync', `  caching thumbnail ..... ${Math.round(result.thumbnailSize / 1024)}kb done`);
-      } else {
-        skippedCount++;
-      }
+    let batchBytesRead = 0;
+    let batchDidRealWork = false;
 
-      if (runFaceDetection && result.sidecar) {
-        try {
-          faceResult = await runFaceDetectionStep(remoteFile, result.sidecar, config, faceCache);
+    for (const { idx: i, remoteFile, result, faceResult, faceErr } of batchOutcomes) {
+      const fileName = path.basename(remoteFile);
+      const percent = Math.round(((i + 1) / Math.max(1, total)) * 100);
+
+      if (result.success) {
+        totalOriginalSize += result.originalSize;
+        totalThumbnailSize += result.thumbnailSize;
+        totalSynced++;
+        batchBytesRead += result.bytesRead;
+        if (!result.skipped) {
+          newlyAdded++;
+          logger.info('Sync', `Background scan — Photo ${i + 1}/${total}: ${fileName}`);
+          logger.info('Sync', `  caching thumbnail ..... ${Math.round(result.thumbnailSize / 1024)}kb done`);
+        } else {
+          skippedCount++;
+        }
+
+        if (faceErr) {
+          console.error(`Face detection step failed for ${remoteFile}:`, faceErr);
+          errors.push(`Face detection failed for ${fileName}: ${String(faceErr)}`);
+        } else if (runFaceDetection && result.sidecar && faceResult) {
           if (faceResult.ran) {
             facesDetectedThisRunCount++;
             logger.info('Sync', `  detecting faces ..... ${faceResult.faceCount} detected`);
@@ -900,106 +938,104 @@ export async function syncVirtualStorage(
               logger.info('Sync', `  detecting faces ..... skipped (${faceResult.skippedReason})`);
             }
           }
-        } catch (faceErr) {
-          console.error(`Face detection step failed for ${remoteFile}:`, faceErr);
-          errors.push(`Face detection failed for ${fileName}: ${String(faceErr)}`);
         }
+
+        // The loop still has to walk every file to verify it (there's no way
+        // to know a file is unchanged without checking) — but emitting one
+        // IPC/UI update per already-cached file made a fast verify-only pass
+        // look identical to a slow full reprocess, which is exactly what made
+        // this look like "it always starts from zero". A file only counts as
+        // fully "quiet" (skip the throttle) when NEITHER step did real work;
+        // real work (a new/changed thumbnail OR an actual detection pass)
+        // always updates immediately so the UI reflects it live.
+        const now = Date.now();
+        const isLastFile = i === total - 1;
+        const didRealWork = !result.skipped || !!faceResult?.ran;
+        if (didRealWork) batchDidRealWork = true;
+        const bothConfirmedDone = result.skipped && (!runFaceDetection || !result.sidecar || (faceResult && !faceResult.ran && faceResult.skippedReason !== 'offline'));
+        const currentFileLabel = faceResult?.ran
+          ? `Detecting faces… (${facesDetectedThisRunCount} scanned this pass)`
+          : bothConfirmedDone
+            ? `Verifying cached photos… (${skippedCount} confirmed unchanged)`
+            : fileName;
+
+        if (onProgress && (didRealWork || isLastFile || now - lastProgressEmitTime >= 200)) {
+          lastProgressEmitTime = now;
+          onProgress({
+            storageName: config.name,
+            phase: faceResult ? 'faces' : 'thumbnails',
+            current: i + 1,
+            total,
+            currentFile: currentFileLabel,
+            status: 'syncing',
+            percent,
+            // Baseline (what the library already had before this run started)
+            // plus only genuinely NEW detections — NOT facesAlreadyDoneCount,
+            // which is already included in the baseline and would double-count.
+            facesCompletedCount: facesCompletedBaseline + facesDetectedThisRunCount,
+          });
+        }
+
+        // A verify-only pass over a fully-synced storage can walk thousands of
+        // files with nothing else logged at all, which reads as "did this
+        // actually do anything?" just as much as the progress bar did — a
+        // periodic summary makes both skip checks' actual effect visible
+        // without spamming a line per (near-instant) skipped file.
+        if (now - lastLoggedSummaryAt >= 5000 || isLastFile) {
+          lastLoggedSummaryAt = now;
+          logger.info(
+            'Sync',
+            `  checked ${i + 1}/${total} — thumbnails: ${skippedCount} cached, ${newlyAdded} new/changed; faces: ${facesAlreadyDoneCount} already done, ${facesDetectedThisRunCount} detected this pass, ${facesDeferredCount} deferred`
+          );
+        }
+      } else {
+        const msg = `Error syncing ${remoteFile}: ${result.error}`;
+        console.error(msg);
+        errors.push(msg);
       }
 
-      // The loop still has to walk every file to verify it (there's no way
-      // to know a file is unchanged without checking) — but emitting one
-      // IPC/UI update per already-cached file made a fast verify-only pass
-      // look identical to a slow full reprocess, which is exactly what made
-      // this look like "it always starts from zero". A file only counts as
-      // fully "quiet" (skip the throttle) when NEITHER step did real work;
-      // real work (a new/changed thumbnail OR an actual detection pass)
-      // always updates immediately so the UI reflects it live.
-      const now = Date.now();
-      const isLastFile = i === total - 1;
-      const didRealWork = !result.skipped || !!faceResult?.ran;
-      const bothConfirmedDone = result.skipped && (!runFaceDetection || !result.sidecar || (faceResult && !faceResult.ran && faceResult.skippedReason !== 'offline'));
-      const currentFileLabel = faceResult?.ran
-        ? `Detecting faces… (${facesDetectedThisRunCount} scanned this pass)`
-        : bothConfirmedDone
-          ? `Verifying cached photos… (${skippedCount} confirmed unchanged)`
-          : fileName;
-
-      if (onProgress && (didRealWork || isLastFile || now - lastProgressEmitTime >= 200)) {
-        lastProgressEmitTime = now;
-        onProgress({
+      // Intermittent checkpoint save every 10 photos or on last photo
+      if ((i + 1) % 10 === 0 || i === total - 1) {
+        saveStorageCheckpoint({
           storageName: config.name,
-          phase: faceResult ? 'faces' : 'thumbnails',
-          current: i + 1,
-          total,
-          currentFile: currentFileLabel,
-          status: 'syncing',
+          networkSourcePath: config.networkSourcePath,
+          localMirrorRoot: config.localMirrorRoot,
+          phase: i === total - 1 ? 'completed' : 'thumbnails',
+          processedCount: i + 1,
+          totalDiscovered: total,
+          lastProcessedIndex: i,
+          lastProcessedFile: fileName,
           percent,
-          // Baseline (what the library already had before this run started)
-          // plus only genuinely NEW detections — NOT facesAlreadyDoneCount,
-          // which is already included in the baseline and would double-count.
-          facesCompletedCount: facesCompletedBaseline + facesDetectedThisRunCount,
+          timestamp: Date.now(),
+          updatedAt: new Date().toISOString(),
         });
       }
-
-      // A verify-only pass over a fully-synced storage can walk thousands of
-      // files with nothing else logged at all, which reads as "did this
-      // actually do anything?" just as much as the progress bar did — a
-      // periodic summary makes both skip checks' actual effect visible
-      // without spamming a line per (near-instant) skipped file.
-      if (now - lastLoggedSummaryAt >= 5000 || isLastFile) {
-        lastLoggedSummaryAt = now;
-        logger.info(
-          'Sync',
-          `  checked ${i + 1}/${total} — thumbnails: ${skippedCount} cached, ${newlyAdded} new/changed; faces: ${facesAlreadyDoneCount} already done, ${facesDetectedThisRunCount} detected this pass, ${facesDeferredCount} deferred`
-        );
-      }
-    } else {
-      const msg = `Error syncing ${remoteFile}: ${result.error}`;
-      console.error(msg);
-      errors.push(msg);
     }
 
-    // Intermittent checkpoint save every 10 photos or on last photo
-    if ((i + 1) % 10 === 0 || i === total - 1) {
-      saveStorageCheckpoint({
-        storageName: config.name,
-        networkSourcePath: config.networkSourcePath,
-        localMirrorRoot: config.localMirrorRoot,
-        phase: i === total - 1 ? 'completed' : 'thumbnails',
-        processedCount: i + 1,
-        totalDiscovered: total,
-        lastProcessedIndex: i,
-        lastProcessedFile: fileName,
-        percent,
-        timestamp: Date.now(),
-        updatedAt: new Date().toISOString(),
-      });
-    }
-
-    // Bandwidth cap: enforce a minimum wall-clock time for this file based on
-    // its size, so a fast local/cached read doesn't burst past the configured
-    // rate. A read that was already slower than the target (a genuinely slow
-    // network) needs no extra sleep — this only pumps the brakes when we're
-    // running faster than the user's configured cap.
-    if (config.bandwidthLimitMbps && config.bandwidthLimitMbps > 0 && bytesReadForBandwidth > 0) {
+    // Bandwidth cap + inter-batch delay — applied once per BATCH using
+    // aggregate bytes/elapsed time, not per file, so concurrent files in the
+    // same batch don't each separately pay the full sleep (which would just
+    // cancel out the concurrency gain). At concurrency 1 this reduces to
+    // exactly the original per-file pacing.
+    if (config.bandwidthLimitMbps && config.bandwidthLimitMbps > 0 && batchBytesRead > 0) {
       const bytesPerSecondLimit = (config.bandwidthLimitMbps * 1_000_000) / 8;
-      const targetMs = (bytesReadForBandwidth / bytesPerSecondLimit) * 1000;
-      const elapsedMs = Date.now() - fileStartTime;
+      const targetMs = (batchBytesRead / bytesPerSecondLimit) * 1000;
+      const elapsedMs = Date.now() - batchStartTime;
       const bandwidthSleepMs = targetMs - elapsedMs;
       if (bandwidthSleepMs > 0) {
         await new Promise((r) => setTimeout(r, bandwidthSleepMs));
       }
     }
 
-    // Configurable delay between photos to prevent bandwidth saturation and
-    // keep desktop 100% responsive — only meaningful when this file actually
-    // did real network I/O (result.skipped means the incremental check found
-    // it already up to date and touched nothing). Without this guard, a
+    // Configurable delay between batches to prevent bandwidth saturation and
+    // keep desktop 100% responsive — only meaningful when this batch actually
+    // did real network I/O (skipped means the incremental check found
+    // everything already up to date and touched nothing). Without this guard, a
     // periodic re-verification pass over an already-fully-synced storage —
     // every file skipped, zero bytes transferred — still paid the full
     // configured delay on every single one, turning a should-be-instant
     // "nothing changed" confirmation into minutes of pure waiting.
-    const delayMs = !result.skipped && config.delayBetweenPhotosSec && config.delayBetweenPhotosSec > 0
+    const delayMs = batchDidRealWork && config.delayBetweenPhotosSec && config.delayBetweenPhotosSec > 0
       ? Math.round(config.delayBetweenPhotosSec * 1000)
       : 4;
     await new Promise((r) => setTimeout(r, delayMs));

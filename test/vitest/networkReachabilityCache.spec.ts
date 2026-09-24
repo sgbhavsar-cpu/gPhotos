@@ -6,6 +6,7 @@ import { resetDbForTests } from '../../src/main/services/db';
 import { setSetting } from '../../src/main/services/libraryRepository';
 import {
   isPathReachable,
+  isPathReachableForServing,
   isKnownOfflineStorage,
   clearOfflineCache,
   clearAllOfflineCache,
@@ -48,6 +49,33 @@ describe('networkReachabilityCache', () => {
     const realFile = path.join(localDir, 'photo.jpg');
     fs.writeFileSync(realFile, 'x');
     expect(await isPathReachable(realFile)).toBe(true);
+  });
+
+  it('does not report an existing folder as unreachable just because the event loop was blocked past the probe timeout', async () => {
+    // Regression: a >1.5s main-process stall at startup made the probe's timeout
+    // timer fire before the (already-finished) fs probe was processed, so every
+    // synced storage looked deleted and was permanently unlinked.
+    const pending = isPathReachable(localDir);
+    const until = Date.now() + 2200; // block the loop longer than PROBE_TIMEOUT_MS (1500ms)
+    while (Date.now() < until) { /* busy-wait: simulates a long synchronous stall */ }
+    expect(await pending).toBe(true);
+  });
+
+  it('isPathReachableForServing: app-owned files skip the timeout race; missing ones are false; foreign paths still use the bounded probe', async () => {
+    const owned = path.join(localDir, 'avatar.jpg');
+    fs.writeFileSync(owned, 'x');
+    // App-owned + present -> true even if the loop is blocked far past PROBE_TIMEOUT_MS
+    const pending = isPathReachableForServing(owned, [localDir]);
+    const until = Date.now() + 2200;
+    while (Date.now() < until) { /* simulate a stall */ }
+    expect(await pending).toBe(true);
+    // App-owned + missing -> false (no timeout involved)
+    expect(await isPathReachableForServing(path.join(localDir, 'nope.jpg'), [localDir])).toBe(false);
+    // Not under an owned root -> falls back to isPathReachable (exists -> true)
+    expect(await isPathReachableForServing(owned, [path.join(tempDir, 'somewhere-else')])).toBe(true);
+    expect(await isPathReachableForServing('', [localDir])).toBe(false);
+    // Nothing gets cached as an offline "storage"
+    expect(isKnownOfflineStorage(path.join(localDir, 'nope.jpg'))).toBe(false);
   });
 
   it('returns false for a local file that does not exist, without caching anything (not a known network root)', async () => {

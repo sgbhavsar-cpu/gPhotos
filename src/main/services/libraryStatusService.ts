@@ -3,6 +3,7 @@ import path from 'path';
 import os from 'os';
 import { app } from 'electron';
 import { LibraryScanStatus } from '../../types';
+import { getDefaultMirrorRoot } from './pathSecurity';
 
 function getUserDataPath(): string {
   try {
@@ -32,7 +33,16 @@ class LibraryStatusService {
 
   private normalizeKey(libraryPath: string): string {
     if (!libraryPath || typeof libraryPath !== 'string') return '';
-    return path.resolve(libraryPath).toLowerCase().replace(/[\\/]+$/, '');
+    // A virtual/network storage is often identified by just its bare folder
+    // name (e.g. "OndrivePhotos"), never a full path — path.resolve() on a
+    // bare name resolves it against process.cwd(), which differs between
+    // the installed app and every different way of launching in dev. That
+    // silently fragmented a single real storage's tracked status across a
+    // different key per cwd ever used, each one stuck at whatever it last
+    // saw. Every virtual storage lives under the one shared, stable mirror
+    // root, so resolve a non-absolute name against THAT instead of cwd.
+    const resolved = path.isAbsolute(libraryPath) ? libraryPath : path.join(getDefaultMirrorRoot(), libraryPath);
+    return path.resolve(resolved).toLowerCase().replace(/[\\/]+$/, '');
   }
 
   private loadAll(): void {
@@ -110,8 +120,34 @@ class LibraryStatusService {
       ...status,
       libraryPath: status.libraryPath,
       libraryName: status.libraryName || existing.libraryName || path.basename(status.libraryPath),
+      // totalPhotos/thumbnailTotalCount/faceTotalCount represent this
+      // library's true full size — never let them shrink. Several callers
+      // save status after processing only a SCOPE of the library (e.g. face
+      // detection on just the first loaded page while later pages are still
+      // fetching), and a naive {...existing, ...status} spread let that
+      // partial scope's smaller count silently overwrite an already-known
+      // larger true total — after which "already 100% done" checks
+      // elsewhere trusted the now-wrong small total as complete, leaving
+      // the rest of the library permanently unaccounted for.
+      totalPhotos: Math.max(existing.totalPhotos || 0, status.totalPhotos ?? 0),
+      thumbnailTotalCount: Math.max(existing.thumbnailTotalCount || 0, status.thumbnailTotalCount ?? 0),
+      faceTotalCount: Math.max(existing.faceTotalCount || 0, status.faceTotalCount ?? 0),
       lastUpdated: new Date().toISOString(),
     };
+
+    // Derive completed/percent from the now-protected totalPhotos rather
+    // than trust the caller's own boolean/percent — a partial-scope caller
+    // computes those using ITS OWN smaller local total (e.g.
+    // `faceCompleted: currentScanned >= totalPhotos` where that totalPhotos
+    // was only the first loaded page), so accepting them as-is could still
+    // mark the library "done" prematurely even with totalPhotos itself now
+    // protected above.
+    if (merged.totalPhotos > 0) {
+      merged.thumbnailCompleted = merged.thumbnailCachedCount >= merged.totalPhotos;
+      merged.thumbnailPercent = Math.min(100, Math.round((merged.thumbnailCachedCount / merged.totalPhotos) * 100));
+      merged.faceCompleted = merged.faceScannedCount >= merged.totalPhotos;
+      merged.facePercent = Math.min(100, Math.round((merged.faceScannedCount / merged.totalPhotos) * 100));
+    }
 
     this.cache[key] = merged;
 

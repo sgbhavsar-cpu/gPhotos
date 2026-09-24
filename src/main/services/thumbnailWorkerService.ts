@@ -5,6 +5,7 @@ import { Photo, ThumbnailWorkerCheckpoint } from '../../types';
 import { getOrGenerateCachedThumbnail } from './thumbnailCacheService';
 import { generateSpriteSheet } from './spriteService';
 import { libraryStatusService } from './libraryStatusService';
+import { getDefaultMirrorRoot } from './pathSecurity';
 
 let sharp: any = null;
 try {
@@ -19,6 +20,7 @@ interface WorkerLimits {
   maxCpuPercent: number; // e.g. 40
   maxRamMb: number; // e.g. 1024
   enabled: boolean;
+  concurrency: number; // photos generated in parallel per batch, e.g. 1 (default) or cpu count (Turbo Mode)
 }
 
 interface WorkerStatus {
@@ -62,6 +64,7 @@ class ThumbnailWorkerService {
     maxCpuPercent: 40,
     maxRamMb: 1024,
     enabled: true,
+    concurrency: 1,
   };
 
   private lastCpuUsage = process.cpuUsage();
@@ -261,15 +264,21 @@ class ThumbnailWorkerService {
 
   public setResourceLimits(limits: Partial<WorkerLimits>): void {
     if (typeof limits.maxCpuPercent === 'number') {
-      this.limits.maxCpuPercent = Math.max(10, Math.min(90, limits.maxCpuPercent));
+      // 100 is a legitimate ceiling for Turbo Mode (exclusive PC use) — the
+      // 8ms sleep floor in processQueue's duty cycle still prevents a true
+      // busy-loop even at 100.
+      this.limits.maxCpuPercent = Math.max(10, Math.min(100, limits.maxCpuPercent));
     }
     if (typeof limits.maxRamMb === 'number') {
-      this.limits.maxRamMb = Math.max(256, Math.min(4096, limits.maxRamMb));
+      this.limits.maxRamMb = Math.max(256, Math.min(8192, limits.maxRamMb));
     }
     if (typeof limits.enabled === 'boolean') {
       this.limits.enabled = limits.enabled;
     }
-    console.log(`[ThumbnailWorker] Limits updated: Max CPU=${this.limits.maxCpuPercent}%, Max RAM=${this.limits.maxRamMb}MB, Enabled=${this.limits.enabled}`);
+    if (typeof limits.concurrency === 'number') {
+      this.limits.concurrency = Math.max(1, Math.min(os.cpus().length || 1, Math.floor(limits.concurrency) || 1));
+    }
+    console.log(`[ThumbnailWorker] Limits updated: Max CPU=${this.limits.maxCpuPercent}%, Max RAM=${this.limits.maxRamMb}MB, Enabled=${this.limits.enabled}, Concurrency=${this.limits.concurrency}`);
     this.notifyStatus();
 
     if (this.limits.enabled && !this.isProcessing && this.queue.length > 0) {
@@ -286,7 +295,19 @@ class ThumbnailWorkerService {
     if (libraryPath) {
       this.currentLibraryPath = libraryPath;
     } else if (photos.length > 0 && photos[0]?.storageName && photos.every(p => p.storageName === photos[0].storageName)) {
-      this.currentLibraryPath = photos[0].storageName;
+      // storageName is always a bare folder name (e.g. "OndrivePhotos"), never
+      // a full path — libraryStatusService's normalizeKey() does
+      // path.resolve() on whatever it's given, so a bare name silently
+      // resolved against process.cwd(), which differs between the installed
+      // app, and every different way of launching in dev. That fragmented a
+      // single real virtual storage's tracked status across several
+      // permanently-disconnected records (one per cwd ever used), each stuck
+      // at whatever it last saw — which is exactly what made "Resume
+      // Pre-Caching" keep reporting stale/wrong totals no matter how many
+      // times it re-ran. Every virtual storage lives under the one shared,
+      // stable mirror root, so join with that instead of resolving the bare
+      // name on its own.
+      this.currentLibraryPath = path.join(getDefaultMirrorRoot(), photos[0].storageName);
     } else {
       this.currentLibraryPath = undefined;
     }
@@ -296,10 +317,34 @@ class ThumbnailWorkerService {
       const existingStatus = libraryStatusService.getLibraryStatus(this.currentLibraryPath);
       if (existingStatus) {
         if (existingStatus.thumbnailCompleted && existingStatus.totalPhotos === photos.length) {
-          this.processedCount = photos.length;
-          this.totalQueuedCount = photos.length;
-          for (const photo of photos) {
-            if (photo?.filePath) this.confirmedCachedPaths.add(photo.filePath.toLowerCase());
+          // Accumulate, don't overwrite — service:start-precache's "resume
+          // all storages" path calls enqueuePhotos once per storage in a
+          // loop, and processedCount/totalQueuedCount are running totals
+          // across that whole loop (see the matching Math.max accumulation
+          // just below for the normal add-to-queue path). Overwriting here
+          // clobbered whatever total earlier, still-pending storages in the
+          // same loop had already contributed — e.g. a small already-cached
+          // storage processed after a huge pending one reset "18368 total"
+          // down to just its own tiny count, making the status badge falsely
+          // read "100% done" while thousands of photos were still queued.
+          //
+          // But only credit it ONCE ever, not once per call: this branch is
+          // a shortcut that skips the normal per-photo queuedPaths/
+          // confirmedCachedPaths bookkeeping below, which is what makes the
+          // normal path naturally idempotent against redundant re-scans of
+          // the same library (already-confirmed photos just don't get
+          // re-added). Without an equivalent guard here, every redundant
+          // rescan of an already-cached library — e.g. several overlapping
+          // "Resume Pre-Caching" clicks re-walking every storage — re-added
+          // that library's full count again and again, inflating the totals
+          // without bound.
+          const alreadyCounted = photos.every((p) => p?.filePath && this.confirmedCachedPaths.has(p.filePath.toLowerCase()));
+          if (!alreadyCounted) {
+            this.processedCount += photos.length;
+            this.totalQueuedCount = Math.max(this.totalQueuedCount, this.processedCount + this.queue.length);
+            for (const photo of photos) {
+              if (photo?.filePath) this.confirmedCachedPaths.add(photo.filePath.toLowerCase());
+            }
           }
           console.log(`[ThumbnailWorker] Library ${this.currentLibraryPath} is already 100% pre-cached (${photos.length} photos). Skipping redundant queueing.`);
           this.notifyStatus();
@@ -371,6 +416,12 @@ class ThumbnailWorkerService {
    * 1. Fast-forward (0ms delay) on already-cached photos!
    * 2. Duty-cycle CPU regulation on new thumbnail generations.
    * 3. RAM backoff protection.
+   *
+   * Photos are pulled off the queue in batches of `limits.concurrency` and
+   * generated in parallel (Promise.all) — with the default concurrency of 1
+   * this degenerates to exactly the old one-at-a-time behavior; Turbo Mode
+   * raises it so sharp/libvips actually uses multiple cores at once instead
+   * of one thumbnail at a time.
    */
   private async processQueue(): Promise<void> {
     if (this.isProcessing) return;
@@ -380,43 +431,52 @@ class ThumbnailWorkerService {
 
     try {
       while (this.queue.length > 0 && !this.isPaused && !this.activityPaused && this.limits.enabled) {
-        const photo = this.queue.shift()!;
-        this.queuedPaths.delete(photo.filePath.toLowerCase());
+        const batchSize = Math.max(1, Math.min(this.limits.concurrency, this.queue.length));
+        const batch = this.queue.splice(0, batchSize);
+        for (const p of batch) this.queuedPaths.delete(p.filePath.toLowerCase());
 
-        // 1. Fast-path cache check: If already cached on disk, FAST FORWARD WITHOUT SLEEP!
         const t0 = Date.now();
-        let isCached = false;
-        try {
-          const res = await getOrGenerateCachedThumbnail(photo.filePath, 250);
-          if (res?.isFromCache) {
-            isCached = true;
-          }
-        } catch {}
+        const outcomes = await Promise.all(
+          batch.map(async (photo) => {
+            try {
+              const res = await getOrGenerateCachedThumbnail(photo.filePath, 250);
+              return { photo, isCached: !!res?.isFromCache };
+            } catch {
+              return { photo, isCached: false };
+            }
+          })
+        );
 
-        if (isCached) {
-          fastForwardCount++;
+        let didRealWork = false;
+        for (const { photo, isCached } of outcomes) {
+          if (isCached) {
+            fastForwardCount++;
+            this.confirmedCachedPaths.add(photo.filePath.toLowerCase());
+            this.processedCount = Math.min(this.totalQueuedCount, this.processedCount + 1);
+
+            // Periodically save and notify every 50 fast-forwarded photos to avoid UI overhead
+            if (fastForwardCount % 50 === 0 || this.queue.length === 0) {
+              this.saveCheckpoint(false);
+              this.notifyStatus();
+            }
+            continue;
+          }
+
+          didRealWork = true;
+          this.currentFileName = photo.fileName || path.basename(photo.filePath);
           this.confirmedCachedPaths.add(photo.filePath.toLowerCase());
           this.processedCount = Math.min(this.totalQueuedCount, this.processedCount + 1);
 
-          // Periodically save and notify every 50 fast-forwarded photos to avoid UI overhead
-          if (fastForwardCount % 50 === 0 || this.queue.length === 0) {
+          if (this.processedCount % 5 === 0) {
             this.saveCheckpoint(false);
             this.notifyStatus();
           }
-          // Do NOT sleep! Continue immediately to next photo to skip already-cached files in milliseconds!
-          continue;
         }
 
-        // New photo generation required:
-        this.currentFileName = photo.fileName || path.basename(photo.filePath);
-        this.confirmedCachedPaths.add(photo.filePath.toLowerCase());
-        this.processedCount = Math.min(this.totalQueuedCount, this.processedCount + 1);
+        // All fast-forwarded (already cached) — skip straight to the next batch, no sleep.
+        if (!didRealWork) continue;
+
         const tWork = Math.max(1, Date.now() - t0);
-
-        if (this.processedCount % 5 === 0) {
-          this.saveCheckpoint(false);
-          this.notifyStatus();
-        }
 
         // 2. RAM Safety Check: if current RAM exceeds limit, pause and back off
         const currentRssMb = Math.round(process.memoryUsage().rss / (1024 * 1024));
@@ -427,7 +487,7 @@ class ThumbnailWorkerService {
         }
 
         // 3. CPU Duty Cycle Throttling on actual work (Cap CPU <= maxCpuPercent)
-        const cpuCap = Math.max(10, Math.min(90, this.limits.maxCpuPercent));
+        const cpuCap = Math.max(10, Math.min(100, this.limits.maxCpuPercent));
         let sleepMs = Math.round(tWork * ((100 - cpuCap) / cpuCap));
         sleepMs = Math.max(8, sleepMs);
 

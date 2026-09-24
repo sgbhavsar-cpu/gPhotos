@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Users,
   Edit2,
@@ -25,6 +25,8 @@ import {
 import { Person, Photo, DetectedFace } from '../../types';
 import { PhotoCard } from '../components/PhotoCard';
 import { FaceAvatar } from '../components/FaceAvatar';
+import { VirtualCardGrid } from '../components/VirtualCardGrid';
+import { prefetchAvatarSprites } from '../services/avatarSpriteLoader';
 import { ChangeCoverFaceModal } from '../components/ChangeCoverFaceModal';
 import { ReassignFaceModal } from '../components/ReassignFaceModal';
 import { MergePeopleModal } from '../components/MergePeopleModal';
@@ -32,6 +34,23 @@ import { PersonNameInput } from '../components/PersonNameInput';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { VirtualizedTimelineGallery, GalleryZoomLevel, ZOOM_LEVELS } from '../components/VirtualizedTimelineGallery';
 import { useIsMobile } from '../hooks/useIsMobile';
+
+// Fixed card height (px) — VirtualCardGrid needs it to position rows without measuring.
+const PEOPLE_CARD_HEIGHT = 246;
+// How many people beyond the mounted window to bake avatar sprite tiles for (2 sheets' worth).
+const AVATAR_PREFETCH_AHEAD = 100;
+
+// photoId -> Photo, built once per photos array. getCoverDetails used to do a
+// linear photos.find() per card per render (5,000 cards x 24K photos).
+const photoIndexCache = new WeakMap<Photo[], Map<string, Photo>>();
+function findPhotoById(photos: Photo[], id: string): Photo | undefined {
+  let index = photoIndexCache.get(photos);
+  if (!index) {
+    index = new Map(photos.map((p) => [p.id, p]));
+    photoIndexCache.set(photos, index);
+  }
+  return index.get(id);
+}
 
 interface PeopleViewProps {
   people: Person[];
@@ -62,6 +81,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
   onClearSelectedPerson,
   resetTrigger,
 }) => {
+  const peopleScrollRef = useRef<HTMLDivElement>(null);
   const [selectedPersonId, setSelectedPersonId] = useState<string | null>(initialSelectedPersonId || null);
   const [removedFaceIds, setRemovedFaceIds] = useState<Set<string>>(new Set());
 
@@ -231,7 +251,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
     let face: DetectedFace | undefined;
 
     if (person.coverPhotoId) {
-      photo = photos.find((p) => p.id === person.coverPhotoId);
+      photo = findPhotoById(photos, person.coverPhotoId);
     }
     if (!photo) {
       photo = photos.find((p) => p.faces?.some((f) => f.personId === person.id));
@@ -1094,7 +1114,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
       )}
 
       {/* People Grid */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: '24px' }}>
+      <div ref={peopleScrollRef} style={{ flex: 1, overflowY: 'auto', padding: '24px' }}>
         {people.length === 0 ? (
           !libraryStore.getState().isInitialized ? (
             <div style={{
@@ -1202,19 +1222,28 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
             </span>
           </div>
         ) : (
-          <div style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))',
-            gap: '20px',
-          }}>
-            {filteredPeople.map((person) => {
+          <VirtualCardGrid
+            items={filteredPeople}
+            getKey={(p) => p.id}
+            scrollRef={peopleScrollRef}
+            rowHeight={PEOPLE_CARD_HEIGHT}
+            minColWidth={180}
+            gap={20}
+            onWindowChange={(start, end) =>
+              prefetchAvatarSprites(
+                filteredPeople
+                  .slice(start, end + AVATAR_PREFETCH_AHEAD)
+                  .filter((p) => p.coverFaceId)
+                  .map((p) => ({ personId: p.id, cacheKey: p.coverFaceId! }))
+              )
+            }
+            renderItem={(person) => {
               const { photo: coverPhoto, face: coverFace } = getCoverDetails(person);
               const isSelectedForMerge = mergeSelection.includes(person.id);
               const isEditingThisPerson = editingPersonId === person.id;
 
               return (
                 <div
-                  key={person.id}
                   onClick={(e) => {
                     if ((e.target as HTMLElement).closest('.person-name-input-container')) {
                       return;
@@ -1240,6 +1269,8 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                     boxShadow: isSelectedForMerge ? 'var(--shadow-glow)' : 'var(--shadow-sm)',
                     transition: 'all var(--transition-fast)',
                     position: 'relative',
+                    height: '100%',
+                    boxSizing: 'border-box',
                   }}
                 >
                   {/* Zoomed Face Avatar with Change Cover Action */}
@@ -1262,6 +1293,8 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                       alt={person.name}
                       personId={person.id}
                       preferOriginal
+                      preferSprite
+                      coverKey={person.coverFaceId}
                     />
                     <button
                       className="btn btn-ghost btn-icon"
@@ -1373,8 +1406,8 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                   </div>
                 </div>
               );
-            })}
-          </div>
+            }}
+          />
         )}
       </div>
 

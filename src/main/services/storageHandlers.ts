@@ -6,6 +6,7 @@ import {
   replaceAllPeople,
   replaceAllAlbums,
   getAllPhotosChunked,
+  getTotalPhotoCount,
   getAllPeople,
   getAllAlbums,
   getAllFacesChunked,
@@ -17,6 +18,11 @@ import { ensureMigratedIfEmpty } from './catalogService';
 export const STORAGE_KEY = 'gphotos_library_v1';
 export const GLOBAL_PEOPLE_KEY = 'gphotos_people_v2';
 const VIRTUAL_STORAGES_KEY = 'gphotos_virtual_storages_v1';
+// Renderer-side face cache from the JSON-storage era. Faces live in SQLite now, so this only
+// ever held a stale copy — but it had grown to ~390MB and was read, JSON-parsed (~3.7s frozen
+// main process) and shipped to the renderer on EVERY launch. Reads return empty without touching
+// the blob; any write replaces the blob with [] so the space is reclaimed.
+export const LEGACY_FACE_CACHE_KEY = 'gphotos_face_cache_v2';
 
 export interface SaveLibraryPayload {
   photos?: any[];
@@ -49,6 +55,10 @@ export interface SaveLibraryPayload {
  * (the caller uses this to kick off thumbnail pre-caching).
  */
 export function handleStorageSave(key: string, data: any): { success: boolean; enqueuePhotos?: any[]; enqueueLibraryPath?: string | null } {
+  if (key === LEGACY_FACE_CACHE_KEY) {
+    setSetting(key, []); // drop whatever was sent (and any old multi-hundred-MB value)
+    return { success: true };
+  }
   if (key === STORAGE_KEY && data) {
     const payload = data as SaveLibraryPayload;
     const libPath: string | null = payload.selectedFolder || payload.currentDirectory || null;
@@ -160,11 +170,44 @@ function dedupeVirtualStorages(storages: any[]): any[] {
  * a mobile browser tab and the desktop window disagree on Albums/People
  * counts for the "same" library open on both.
  */
-export async function handleStorageLoad(key: string, libraryDir?: string | null): Promise<any> {
+export async function handleStorageLoad(
+  key: string,
+  libraryDir?: string | null,
+  options?: { includePhotos?: boolean; compactDescriptors?: boolean }
+): Promise<any> {
+  if (key === LEGACY_FACE_CACHE_KEY) return [];
+
   ensureMigratedIfEmpty();
 
   if (key === STORAGE_KEY) {
     const db = libraryDir ? getDbForLibraryPath(libraryDir) : getDb();
+    // includePhotos:false is for callers that page photos in separately (the
+    // renderer's catalog fast path) and only need people/faces/albums here.
+    // Sending the whole photo list too — every photo WITH its faces, then every
+    // face again — made this a several-hundred-MB message that froze the UI
+    // thread for ~10s (twice) at every launch while it was deserialised.
+    if (options?.includePhotos === false) {
+      const people = getAllPeople();
+      const albums = getAllAlbums(db);
+      if (getTotalPhotoCount(db) === 0 && people.length === 0 && albums.length === 0) return null;
+      let faces = await getAllFacesChunked(db);
+      // compactDescriptors: send each 512-number descriptor as a Float32Array (raw bytes on the
+      // wire) instead of a number[] (V8 serialises the ~15M numbers one by one, ~seconds of
+      // UI-thread time). The renderer converts them straight back; float32 model output
+      // round-trips exactly. Only for callers that opt in — JSON consumers (mobile web) must not.
+      if (options?.compactDescriptors) {
+        faces = faces.map((f) => (f.descriptor && f.descriptor.length ? ({ ...f, descriptor: Float32Array.from(f.descriptor) } as any) : f));
+      }
+      return {
+        photos: [],
+        people,
+        faces,
+        albums,
+        selectedFolder: getSetting<string | null>('selectedFolder', null),
+        recentLibraries: getSetting<string[]>('recentLibraries', []),
+      };
+    }
+
     // Chunked + yielding, not the plain sync getAllPhotos/getAllFaces — a
     // single un-yielding read across a several-thousand-photo library
     // measured as an 80+ second main-process block (see

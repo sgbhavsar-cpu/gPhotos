@@ -95,13 +95,14 @@ async function runTests() {
   assert.strictEqual(saveCount, 0, 'saveLibraryData should NOT be called immediately upon rapid updates');
   console.log('  ✓ 25 rapid photo updates queued without triggering immediate disk write');
 
-  // Wait 600ms for debounce timer to fire. A single debounced save cycle makes
-  // exactly 3 saveLibraryData calls (main library, people registry, face cache) —
-  // the important invariant is that 25 rapid updates collapse into ONE cycle
-  // (3 calls), not 25 separate cycles (75 calls).
+  // Wait 600ms for debounce timer to fire. init() already made the first full
+  // save (people registry + face cache included), so this cycle is incremental:
+  // only the main-library key goes out (the people/face-cache saves are skipped
+  // while unchanged). The invariant is that 25 rapid updates collapse into ONE
+  // cycle (1 call here), not 25 separate cycles (25+ calls).
   await new Promise((r) => setTimeout(r, 650));
-  assert.strictEqual(saveCount, 3, `saveLibraryData should be called exactly 3 times (1 debounced cycle × 3 keys) after debounce (actual: ${saveCount})`);
-  console.log(`  ✓ Debounced save triggered exactly 1 time (3 key writes) for 25 updates`);
+  assert.strictEqual(saveCount, 1, `saveLibraryData should be called exactly once (1 debounced incremental cycle) after debounce (actual: ${saveCount})`);
+  console.log(`  ✓ Debounced save triggered exactly 1 time (1 key write; unchanged people/face cache skipped) for 25 updates`);
   passed++;
 
   // -------------------------------------------------------------

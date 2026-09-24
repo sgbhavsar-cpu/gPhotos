@@ -28,6 +28,20 @@ export interface LibraryState {
   isInitialized?: boolean;
 }
 
+/**
+ * Undo storage:load's compactDescriptors (Float32Array on the wire): everything
+ * else in the app (clustering, JSON saves) expects descriptor to be a plain number[]
+ * — JSON.stringify of a Float32Array would silently write an object, not an array.
+ */
+export function expandCompactDescriptors(faces: any[] | undefined | null): void {
+  if (!faces) return;
+  for (const f of faces) {
+    if (f && f.descriptor && !Array.isArray(f.descriptor) && typeof f.descriptor.length === 'number') {
+      f.descriptor = Array.from(f.descriptor as ArrayLike<number>);
+    }
+  }
+}
+
 export function deduplicatePhotoList(photos: Photo[]): Photo[] {
   const map = new Map<string, Photo>();
   for (const p of photos) {
@@ -163,6 +177,10 @@ export class LibraryManager {
   private isLoadingCatalogPage = false;
   private listeners: Set<() => void> = new Set();
   private saveDebounceTimer: any = null;
+  // id -> signature of each photo as last persisted (or loaded from the DB);
+  // null until the first load/save, which forces one full save.
+  private savedPhotoSigs: Map<string, string> | null = null;
+  private lastSavedPeopleSig: string | null = null;
   private isVerifyingInBackground = false;
 
   public getCachedFaces(photo: { id?: string; filePath?: string; originalRemotePath?: string }): CachedFaceRecord | null {
@@ -442,25 +460,17 @@ export class LibraryManager {
   public async loadGlobalCache() {
     try {
       let globalPeopleData: any = null;
-      let globalFaceData: any = null;
       if (typeof window !== 'undefined' && window.electronAPI) {
         globalPeopleData = await window.electronAPI.loadLibraryData(GLOBAL_PEOPLE_KEY);
-        globalFaceData = await window.electronAPI.loadLibraryData(GLOBAL_FACE_CACHE_KEY);
+        // The old persisted face cache (GLOBAL_FACE_CACHE_KEY) is no longer loaded: SQLite is the
+        // source of truth for faces, and that blob had grown to ~390MB read+parsed at every launch.
+        // globalFaceCache below is now a per-session, in-memory cache only. This one-time write
+        // makes main replace the stale blob with [] (idempotent, 2 bytes).
+        window.electronAPI.saveLibraryData?.(GLOBAL_FACE_CACHE_KEY, [])?.catch?.(() => {});
       } else if (typeof localStorage !== 'undefined') {
         const rawP = localStorage.getItem(GLOBAL_PEOPLE_KEY);
         if (rawP) globalPeopleData = JSON.parse(rawP);
-        const rawF = localStorage.getItem(GLOBAL_FACE_CACHE_KEY);
-        if (rawF) globalFaceData = JSON.parse(rawF);
-      }
-
-      if (Array.isArray(globalFaceData)) {
-        for (const [k, v] of globalFaceData) {
-          if (k && v) this.globalFaceCache.set(k, v);
-        }
-      } else if (globalFaceData && typeof globalFaceData === 'object') {
-        for (const [k, v] of Object.entries(globalFaceData)) {
-          if (k && v) this.globalFaceCache.set(k, v as any);
-        }
+        localStorage.removeItem(GLOBAL_FACE_CACHE_KEY);
       }
 
       if (Array.isArray(globalPeopleData) && globalPeopleData.length > 0) {
@@ -522,6 +532,7 @@ export class LibraryManager {
             if (p0 && p0.photos && p0.photos.length > 0) {
               console.log(`[STARTUP AUDIT] Page 0 (${p0.photos.length} photos) loaded in ${(tPageEnd - tPageStart).toFixed(1)}ms. Total renderer startup time to first screen: ${(tPageEnd - t0).toFixed(1)}ms`);
               this.state.photos = p0.photos;
+              this.stampPersisted(p0.photos, true);
               this.currentCatalogPage = 0;
 
               // Restore persisted people, faces, and albums from central
@@ -529,8 +540,10 @@ export class LibraryManager {
               // it, Albums/People/Faces here could silently come from a
               // different library than the one this session's Photos/Places
               // just loaded from (see catalog-meta/catalog-page calls above).
-              const data = await window.electronAPI.loadLibraryData(STORAGE_KEY, libraryDir);
+              // Photos arrive page by page (above/below); only people/faces/albums are needed here.
+              const data = await window.electronAPI.loadLibraryData(STORAGE_KEY, libraryDir, { includePhotos: false, compactDescriptors: true });
               if (data) {
+                expandCompactDescriptors(data.faces);
                 this.state.people = data.people || [];
                 this.state.faces = data.faces || [];
                 this.state.albums = data.albums || [];
@@ -578,6 +591,7 @@ export class LibraryManager {
                 const pageData = await pageRes.json();
                 if (pageData && pageData.photos && pageData.photos.length > 0) {
                   this.state.photos = pageData.photos;
+                  this.stampPersisted(pageData.photos, true);
                   this.currentCatalogPage = 0;
                   try {
                     const libDirParam = this.state.selectedFolder ? `?libraryDir=${encodeURIComponent(this.state.selectedFolder)}` : '';
@@ -636,6 +650,7 @@ export class LibraryManager {
 
         // Immediately populate state and paint first screen
         this.state.photos = dedupedPhotos;
+        this.stampPersisted(dedupedPhotos, true);
         this.state.totalCount = dedupedPhotos.length;
         this.state.people = data.people || [];
         this.state.faces = data.faces || [];
@@ -737,6 +752,9 @@ export class LibraryManager {
           });
 
           this.state.photos = restoredFirstPage;
+          // Stamp the raw DB rows, not the cache-restored copies, so photos
+          // whose restored faces differ from the DB are still re-saved as before.
+          this.stampPersisted(result.firstPage || [], true);
           this.currentCatalogPage = 0;
           // Albums are per-library (unlike people, which are a global
           // registry) — without repopulating this from the just-switched-to
@@ -809,6 +827,7 @@ export class LibraryManager {
 
       if (newPhotos.length > 0) {
         this.state.photos = deduplicatePhotoList([...this.state.photos, ...newPhotos]);
+        this.stampPersisted(newPhotos);
         this.notifyListeners();
         return true;
       }
@@ -905,37 +924,102 @@ export class LibraryManager {
         !!this.state.catalogMeta &&
         this.state.photos.length < (this.state.catalogMeta.totalPhotos || 0);
 
+      // People + face cache are large and rarely change on a given autosave;
+      // re-sending them every time froze the main process for ~19s (sync
+      // DELETE+reinsert of every person, plus a 20K-entry JSON blob write).
+      // Only send when a cheap content signature differs from the last
+      // successful save. ponytail: signature ignores in-place face edits that
+      // leave counts unchanged; upgrade to a dirty flag if that ever matters.
+      const peopleSig = this.peopleSigOf(this.state.people);
+      const peopleChanged = peopleSig !== this.lastSavedPeopleSig;
+
+      // Photos: send only the ones whose signature changed since the last
+      // successful save, as a merge-only upsert (never deletes). Sending the
+      // whole 24K-photo library (with ~27K face descriptors) on every edit
+      // froze main for 10-26s. Falls back to the full payload (today's
+      // behavior) when there's no baseline yet or a photo left the set —
+      // removals still need replaceAllPhotos to delete the missing rows.
+      const baseline = this.savedPhotoSigs;
+      const currentSigs = new Map<string, string>();
+      for (const p of this.state.photos) currentSigs.set(p.id, this.photoSig(p));
+      let anyRemoved = false;
+      if (baseline) {
+        for (const id of baseline.keys()) {
+          if (!currentSigs.has(id)) { anyRemoved = true; break; }
+        }
+      }
+      const incremental = !!baseline && !anyRemoved;
+      const photosToSend = incremental
+        ? this.state.photos.filter((p) => baseline!.get(p.id) !== currentSigs.get(p.id))
+        : this.state.photos;
+
       const dataToSave = {
-        photos: this.state.photos,
-        isPartialPageSet,
-        people: this.state.people,
-        faces: this.state.faces,
+        photos: photosToSend,
+        isPartialPageSet: incremental ? true : isPartialPageSet,
+        // main only upserts people when non-empty, so [] skips that work
+        people: peopleChanged ? this.state.people : [],
         albums: this.state.albums,
         selectedFolder: this.state.selectedFolder,
         recentLibraries: this.state.recentLibraries,
       };
 
-      const cacheEntries = Array.from(this.globalFaceCache.entries()).slice(-20000);
-
       logger.debug('libraryStore', 'savePersistedData: debounced autosave firing', {
-        isPartialPageSet,
+        isPartialPageSet: dataToSave.isPartialPageSet,
+        incremental,
+        photosSent: photosToSend.length,
         photoCount: this.state.photos.length,
-        totalFacesAcrossPhotos: this.state.photos.reduce((sum, p) => sum + (p.faces?.length || 0), 0),
         peopleCount: this.state.people.length,
       });
 
       if (typeof window !== 'undefined' && window.electronAPI && typeof window.electronAPI.saveLibraryData === 'function') {
         await window.electronAPI.saveLibraryData(STORAGE_KEY, dataToSave);
-        await window.electronAPI.saveLibraryData(GLOBAL_PEOPLE_KEY, this.state.people);
-        await window.electronAPI.saveLibraryData(GLOBAL_FACE_CACHE_KEY, cacheEntries);
+        this.savedPhotoSigs = currentSigs;
+        if (peopleChanged) {
+          await window.electronAPI.saveLibraryData(GLOBAL_PEOPLE_KEY, this.state.people);
+          this.lastSavedPeopleSig = peopleSig;
+        }
       } else if (typeof localStorage !== 'undefined') {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(dataToSave));
+        localStorage.setItem(
+          STORAGE_KEY,
+          JSON.stringify({ ...dataToSave, photos: this.state.photos, people: this.state.people, faces: this.state.faces })
+        );
         localStorage.setItem(GLOBAL_PEOPLE_KEY, JSON.stringify(this.state.people));
-        localStorage.setItem(GLOBAL_FACE_CACHE_KEY, JSON.stringify(cacheEntries));
       }
     } catch (err) {
       console.warn('Failed to save library state:', err);
     }
+  }
+
+  private peopleSigOf(people: Person[]): string {
+    return people.map((p) => `${p.id}:${p.name}:${p.faceCount}:${p.photoCount}:${p.coverFaceId}`).join('|');
+  }
+
+  /** Cheap content signature over every persisted photo field + face identity (not descriptors). */
+  private photoSig(p: Photo): string {
+    let faceSig = '';
+    if (p.faces) {
+      for (const f of p.faces) {
+        faceSig += `${f.id},${f.personId ?? ''},${f.isConfirmed ? 1 : 0},${f.isManual ? 1 : 0},${f.box?.x},${f.box?.y},${f.box?.width},${f.box?.height};`;
+      }
+    }
+    return [
+      p.filePath, p.fileName, p.fileSize, p.fileDate, p.dateTaken, p.year, p.month, p.day,
+      p.width, p.height, p.isFavorite, p.isVirtual, p.originalRemotePath, p.storageName,
+      p.isExcluded, p.faceScanCompleted, p.facesLocked, p.sharpnessScore, p.rotation,
+      p.isHeicRotated, p.heicRotation, p.originalMtimeMs,
+      p.exif ? JSON.stringify(p.exif) : '', p.location ? JSON.stringify(p.location) : '',
+      p.faces ? p.faces.length : -1, faceSig,
+    ].join('|');
+  }
+
+  /**
+   * Records photos that just came FROM the database as already-persisted, so
+   * the next autosave doesn't re-send them. `reset` starts a fresh baseline
+   * (library switch / first load); otherwise it only adds entries.
+   */
+  private stampPersisted(photos: Photo[], reset = false) {
+    if (reset || !this.savedPhotoSigs) this.savedPhotoSigs = new Map();
+    for (const p of photos) this.savedPhotoSigs.set(p.id, this.photoSig(p));
   }
 
   public async persistNow(): Promise<void> {
@@ -1771,17 +1855,28 @@ export class LibraryManager {
     for (const entry of perPhotoFaces) {
       this.state.faces.push(...entry.faces);
     }
+    // Main just persisted this people list too (pipelineOrchestrator's
+    // upsertPeople) — advance the save baseline unless the renderer had its
+    // own unsaved people edit (e.g. a rename), which must still go out.
+    const peopleWereClean = this.lastSavedPeopleSig !== null && this.lastSavedPeopleSig === this.peopleSigOf(this.state.people);
     this.state.people = people;
+    if (peopleWereClean) this.lastSavedPeopleSig = this.peopleSigOf(people);
 
     let matchedInStatePhotos = 0;
     for (const photo of this.state.photos) {
       const entry = facesByPhoto.get(photo.id);
       if (entry) {
         matchedInStatePhotos++;
+        // Main already persisted these faces/flags, so advance the save
+        // baseline too — but only if the photo had no other unsaved edit
+        // (e.g. a just-toggled favorite), which must still go out.
+        const sigs = this.savedPhotoSigs;
+        const wasClean = !!sigs && sigs.get(photo.id) === this.photoSig(photo);
         photo.faces = entry.faces;
         photo.faceScanCompleted = entry.faceScanCompleted;
         photo.facesLocked = entry.facesLocked;
         this.cachePhotoFaces(photo, entry.faces, true);
+        if (wasClean) sigs!.set(photo.id, this.photoSig(photo));
       }
     }
     // If a requested photoId isn't found in this.state.photos at all (e.g.
@@ -1804,7 +1899,10 @@ export class LibraryManager {
       });
     }
 
-    this.notify();
+    // No autosave: the main process already persisted exactly these photos'
+    // faces + people incrementally (pipelineOrchestrator). Re-sending the whole
+    // library here froze the main process for 10-26s per detection (23K photos).
+    this.notifyListeners();
   }
 
   public deletePerson(personId: string): boolean {

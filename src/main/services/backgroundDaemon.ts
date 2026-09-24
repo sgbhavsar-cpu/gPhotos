@@ -1,10 +1,13 @@
 import { app, BrowserWindow, Tray, Menu, nativeImage, shell } from 'electron';
 import path from 'path';
 import fs from 'fs';
-import { spawn, execSync } from 'child_process';
+import { spawn, execSync, execFile } from 'child_process';
+import { createCachedProbe } from './cachedProbe';
 import { BackgroundServiceStatus, BackgroundServiceSettings, VirtualStorageConfig } from '../../types';
 import { scanVirtualMirrorDirectory, processPendingRotations, processPendingMetadata, syncVirtualStorage, getStorageDetails } from './virtualMirrorService';
+import os from 'os';
 import { thumbnailWorker } from './thumbnailWorkerService';
+import { setFaceDetectionPoolSize } from './faceDetectionWorkerClient';
 import { getSetting, setSetting } from './libraryRepository';
 import { setActiveLibrary } from './db';
 import { isPathReachable } from './networkReachabilityCache';
@@ -18,6 +21,8 @@ let isScanningNow = false;
 let activeScanStorage: string | undefined = undefined;
 let isQuitting = false;
 
+const LOGICAL_CPU_COUNT = os.cpus().length || 1;
+
 // Default background service settings with 40% CPU cap and 1GB RAM cap
 let serviceSettings: BackgroundServiceSettings = {
   runAtStartup: false,
@@ -27,20 +32,49 @@ let serviceSettings: BackgroundServiceSettings = {
   maxCpuPercent: 40,
   maxRamMb: 1024,
   enableThumbnailPreCache: true,
+  performanceMode: 'background',
+  turboWorkers: Math.max(1, LOGICAL_CPU_COUNT - 1),
+  turboMaxCpuPercent: 100,
+  turboMaxRamMb: 4096,
+  idleResumeSeconds: 15,
 };
 
 let lastSyncTime: string | undefined = undefined;
+
+/**
+ * Pushes serviceSettings' effective resource limits to the thumbnail worker
+ * and the face-detection worker pool. Turbo Mode ("run overnight with the
+ * whole PC") uses its OWN worker-count/CPU/RAM settings instead of the
+ * Background mode sliders — switching modes never overwrites the other
+ * mode's saved values, so flipping back and forth doesn't lose either.
+ */
+function applyResourceLimits() {
+  if (serviceSettings.performanceMode === 'turbo') {
+    const workers = Math.max(1, Math.min(LOGICAL_CPU_COUNT, serviceSettings.turboWorkers ?? Math.max(1, LOGICAL_CPU_COUNT - 1)));
+    thumbnailWorker.setResourceLimits({
+      maxCpuPercent: serviceSettings.turboMaxCpuPercent ?? 100,
+      maxRamMb: serviceSettings.turboMaxRamMb ?? 4096,
+      enabled: serviceSettings.enableThumbnailPreCache,
+      concurrency: workers,
+    });
+    setFaceDetectionPoolSize(workers);
+  } else {
+    thumbnailWorker.setResourceLimits({
+      maxCpuPercent: serviceSettings.maxCpuPercent,
+      maxRamMb: serviceSettings.maxRamMb,
+      enabled: serviceSettings.enableThumbnailPreCache,
+      concurrency: 1,
+    });
+    setFaceDetectionPoolSize(1);
+  }
+}
 
 function loadSavedSettings() {
   try {
     const saved = getSetting<BackgroundServiceSettings | null>('gphotos_service_settings_v1', null);
     if (saved) {
       serviceSettings = { ...serviceSettings, ...saved };
-      thumbnailWorker.setResourceLimits({
-        maxCpuPercent: serviceSettings.maxCpuPercent,
-        maxRamMb: serviceSettings.maxRamMb,
-        enabled: serviceSettings.enableThumbnailPreCache,
-      });
+      applyResourceLimits();
     }
     const savedLastSync = getSetting<string | null>('gphotos_service_last_sync', null);
     if (savedLastSync) {
@@ -115,8 +149,21 @@ function createTrayIcon(): Electron.NativeImage {
   return nativeImage.createFromBuffer(canvas, { width: size, height: size });
 }
 
+// --smoke-test / GPHOTOS_SMOKE_TEST=1 already isolate userData (settings, DB)
+// via an isolated profile dir — but C:\GPhotos_VirtualMirrors, the local
+// mirror root for every virtual/network storage, is a hardcoded, machine-wide
+// path regardless of userData dir (see discoverStoredMirrors). Without this
+// guard, a smoke-test launch still starts the real periodic sync timer,
+// which auto-discovers and face-detects/syncs against the user's REAL
+// storages — that's exactly what a smoke test must never do.
+const isSmokeTestLaunch = process.argv.includes('--smoke-test') || process.env.GPHOTOS_SMOKE_TEST === '1';
+
 export function initBackgroundDaemon(mainWindow?: BrowserWindow | null) {
   loadSavedSettings();
+  registryInstalledProbe.refresh(); // warm the cache so the first status request already has the answer
+  if (isSmokeTestLaunch) {
+    serviceSettings.isPaused = true; // in-memory only — never persisted, so it can't leak into a real profile
+  }
 
   // Create Tray Icon
   const icon = createTrayIcon();
@@ -523,16 +570,21 @@ function killProcess(pid: number): void {
   } catch {}
 }
 
+// Cached + refreshed in the background: this was an execSync('reg query') on EVERY status
+// request, freezing the whole main process for 1-3s each time (see cachedProbe.ts).
+const registryInstalledProbe = createCachedProbe<boolean>(
+  () =>
+    new Promise((resolve) => {
+      execFile('reg', ['query', REG_KEY, '/v', REG_VALUE], { encoding: 'utf-8', windowsHide: true }, (err, stdout) => {
+        resolve(!err && String(stdout).includes(REG_VALUE));
+      });
+    }),
+  30_000,
+  false
+);
+
 export function isSystemServiceRegistryInstalled(): boolean {
-  try {
-    const out = execSync(`reg query "${REG_KEY}" /v "${REG_VALUE}"`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'ignore'],
-    });
-    return out.includes(REG_VALUE);
-  } catch {
-    return false;
-  }
+  return registryInstalledProbe.get();
 }
 
 function getServicePidFilePath(): string {
@@ -563,6 +615,7 @@ export function installSystemServiceDaemon(): { success: boolean; error?: string
     execSync(`reg add "${REG_KEY}" /v "${REG_VALUE}" /t REG_SZ /d "${cmd.replace(/"/g, '\\"')}" /f`, {
       stdio: ['pipe', 'pipe', 'ignore'],
     });
+    registryInstalledProbe.set(true);
 
     let existingPid = getSystemServicePid();
     if (!existingPid) {
@@ -598,6 +651,7 @@ export function uninstallSystemServiceDaemon(): { success: boolean; error?: stri
         stdio: ['pipe', 'pipe', 'ignore'],
       });
     } catch {}
+    registryInstalledProbe.set(false);
 
     const pid = getSystemServicePid();
     if (pid) {
@@ -641,6 +695,12 @@ export function getBackgroundServiceStatus(): BackgroundServiceStatus {
     maxCpuPercent: serviceSettings.maxCpuPercent ?? 40,
     maxRamMb: serviceSettings.maxRamMb ?? 1024,
     enableThumbnailPreCache: serviceSettings.enableThumbnailPreCache ?? true,
+    performanceMode: serviceSettings.performanceMode ?? 'background',
+    turboWorkers: serviceSettings.turboWorkers ?? Math.max(1, LOGICAL_CPU_COUNT - 1),
+    turboMaxCpuPercent: serviceSettings.turboMaxCpuPercent ?? 100,
+    turboMaxRamMb: serviceSettings.turboMaxRamMb ?? 4096,
+    idleResumeSeconds: serviceSettings.idleResumeSeconds ?? 15,
+    logicalCpuCount: LOGICAL_CPU_COUNT,
     currentCpuPercent: workerStatus.cpuPercent,
     currentRamMb: workerStatus.ramMb,
     thumbnailsPreCachedCount: workerStatus.current,
@@ -655,6 +715,9 @@ export function updateBackgroundServiceSettings(
   mainWindow?: BrowserWindow | null
 ): boolean {
   serviceSettings = { ...serviceSettings, ...settings };
+  if (typeof serviceSettings.idleResumeSeconds === 'number') {
+    serviceSettings.idleResumeSeconds = Math.max(5, Math.min(600, Math.round(serviceSettings.idleResumeSeconds)));
+  }
   if (settings.runAtStartup !== undefined) {
     app.setLoginItemSettings({
       openAtLogin: serviceSettings.runAtStartup,
@@ -662,12 +725,8 @@ export function updateBackgroundServiceSettings(
     });
   }
 
-  // Update resource throttling limits for the background thumbnail worker
-  thumbnailWorker.setResourceLimits({
-    maxCpuPercent: serviceSettings.maxCpuPercent,
-    maxRamMb: serviceSettings.maxRamMb,
-    enabled: serviceSettings.enableThumbnailPreCache,
-  });
+  // Update resource throttling limits for the background thumbnail worker + face detection pool
+  applyResourceLimits();
 
   saveSettings();
   if (mainWindow && !mainWindow.isDestroyed()) {

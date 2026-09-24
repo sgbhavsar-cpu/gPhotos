@@ -302,6 +302,15 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
     });
   }, [monthGroups, zoomLevel, gridConfig]);
 
+  // Must live up here with the other hooks: the 'years'/'months' zoom levels and the
+  // empty-list case return early below, and a hook AFTER those returns is skipped on
+  // those renders — switching to Years crashed the whole app (React error #300,
+  // "Rendered fewer hooks than expected").
+  const scrubberMonths = useMemo(
+    () => virtualMonthData.map((item) => ({ key: item.key, label: item.group.label, year: item.group.year, top: item.top })),
+    [virtualMonthData]
+  );
+
   // Automatically pre-fetch up to 100 thumbnails in 1 single async request for all
   // visible rows. This hook must be called on every render regardless of zoomLevel
   // or an empty photo list (React's Rules of Hooks) — it no-ops internally for the
@@ -621,11 +630,6 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
       containerRef.current.scrollTop = top;
     }
   };
-
-  const scrubberMonths = useMemo(
-    () => virtualMonthData.map((item) => ({ key: item.key, label: item.group.label, year: item.group.year, top: item.top })),
-    [virtualMonthData]
-  );
 
   return (
     <div style={{ flex: 1, minHeight: 0, display: 'flex', overflow: 'hidden' }}>

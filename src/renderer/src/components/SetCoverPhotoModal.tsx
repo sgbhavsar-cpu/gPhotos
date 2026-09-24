@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { X, Check, Star } from 'lucide-react';
 import { DetectedFace, Photo } from '../../types';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
+import { invalidateAvatarSprite } from '../services/avatarSpriteLoader';
 
 interface SetCoverPhotoModalProps {
   photo: Photo;
@@ -191,6 +192,7 @@ export const SetCoverPhotoModal: React.FC<SetCoverPhotoModalProps> = ({
       libraryStore.setPersonCover(personId, photo.id, face.id);
       if (window.electronAPI?.savePersonAvatar) {
         await window.electronAPI.savePersonAvatar(personId, face.id, dataUrl);
+        invalidateAvatarSprite(personId); // grid cards must pick up the new crop, not the cached sprite tile
       }
 
       if (onSaved) onSaved();

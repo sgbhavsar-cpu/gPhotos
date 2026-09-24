@@ -62,6 +62,7 @@ export const App: React.FC = () => {
   const [bgScanProgress, setBgScanProgress] = useState<BackgroundScanProgress | null>(null);
 
   const tabHistoryRef = useRef<ActiveTab[]>(['photos']);
+  const lastPrecacheCountRef = useRef(-1);
 
   useEffect(() => {
     const history = tabHistoryRef.current;
@@ -103,8 +104,13 @@ export const App: React.FC = () => {
       if (window.electronAPI?.resumeThumbnailPreCacheForActivity) {
         window.electronAPI.resumeThumbnailPreCacheForActivity().catch(() => {});
       }
-      if (window.electronAPI?.startThumbnailPreCache) {
-        window.electronAPI.startThumbnailPreCache(currentPhotos).catch(() => {});
+      // Re-armed every idle tick, so only re-send when the photo set changed,
+      // and without faces (unused here) — the full payload was ~26K face
+      // descriptors cloned over IPC every 15s, stalling main for seconds.
+      if (window.electronAPI?.startThumbnailPreCache && lastPrecacheCountRef.current !== currentPhotos.length) {
+        lastPrecacheCountRef.current = currentPhotos.length;
+        const slim = currentPhotos.map((p) => ({ ...p, faces: undefined }));
+        window.electronAPI.startThumbnailPreCache(slim as typeof currentPhotos).catch(() => {});
       }
 
       // 2. Resume / enqueue face detection queue
@@ -203,12 +209,26 @@ export const App: React.FC = () => {
     stopBackgroundTasksImmediately,
   ]);
 
-  // 15-Second Idle Inactivity Detector & Auto-Resume Handler
+  // Idle Inactivity Detector & Auto-Resume Handler — threshold is
+  // configurable (Settings > idleResumeSeconds, default 15s).
   useEffect(() => {
     let idleTimer: any = null;
+    let idleThresholdMs = 15000; // default until the real setting is fetched below
+    let cancelled = false;
+
+    if (window.electronAPI?.getBackgroundServiceStatus) {
+      window.electronAPI.getBackgroundServiceStatus()
+        .then((status) => {
+          if (!cancelled && typeof status?.idleResumeSeconds === 'number' && status.idleResumeSeconds > 0) {
+            idleThresholdMs = status.idleResumeSeconds * 1000;
+          }
+        })
+        .catch(() => {});
+    }
+
     // Tracks whether background work is currently paused BECAUSE of
     // activity, so handleUserActivity only calls stopBackgroundTasksImmediately
-    // once per activity burst (not on every single mousemove). Starts false
+    // once per activity burst (not on every qualifying event). Starts false
     // — at mount nothing has happened yet, so whatever background
     // caching/face-detection other triggers (opening a library, etc.)
     // already started keeps running freely until the user actually
@@ -220,7 +240,16 @@ export const App: React.FC = () => {
       idleTimer = setTimeout(() => {
         isPausedForActivity = false;
         startBackgroundTasks();
-      }, 15000);
+        // Re-arm rather than firing once: startBackgroundTasks() can be a
+        // no-op if it runs before the library's later pages have finished
+        // loading (loadNextCatalogPages is fire-and-forget) — without this,
+        // an app left idle from launch with no further activity to re-trigger
+        // handleUserActivity got exactly one attempt for the whole session
+        // and pending caching/face detection could silently never resume.
+        // enqueuePhotos()/faceQueue.enqueue() both dedupe, so a repeat call
+        // once everything's already queued/caught up is a cheap no-op.
+        resetIdleTimer();
+      }, idleThresholdMs);
     };
 
     const handleUserActivity = () => {
@@ -231,16 +260,22 @@ export const App: React.FC = () => {
       resetIdleTimer();
     };
 
-    const activityEvents = ['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart', 'scroll'];
+    // Deliberately excludes 'mousemove' (and window focus) — the cursor
+    // merely drifting across the window, or the window regaining focus,
+    // isn't the user actually doing anything and shouldn't cancel an
+    // otherwise-idle wait. Only real intent: a click, a keypress, scrolling,
+    // or touch input.
+    const activityEvents = ['mousedown', 'keydown', 'wheel', 'touchstart', 'scroll'];
     activityEvents.forEach((evt) => {
       window.addEventListener(evt, handleUserActivity, { passive: true });
     });
 
-    // Start the 15s countdown; nothing is paused yet at mount (see
+    // Start the countdown; nothing is paused yet at mount (see
     // isPausedForActivity's doc comment above).
     resetIdleTimer();
 
     return () => {
+      cancelled = true;
       if (idleTimer) clearTimeout(idleTimer);
       activityEvents.forEach((evt) => {
         window.removeEventListener(evt, handleUserActivity);
@@ -904,8 +939,7 @@ export const App: React.FC = () => {
             phase: currentScanned >= totalPhotos ? 'completed' : 'faces',
           }).catch(() => {});
         }
-
-        await libraryStore.persistNow();
+        // No persistNow(): detectFacesBatch already persisted this chunk in the main process.
       }
 
       if (totalDetected > 0) {
@@ -1311,7 +1345,9 @@ export const App: React.FC = () => {
   };
 
   const handleOpenDuplicateCleaner = (cluster?: DuplicateCluster | null) => {
-    setDuplicateCleanerCluster(cluster || null);
+    // Only a real cluster counts: a handler wired straight to onClick receives the
+    // click event here, and storing that crashed the whole app in the modal.
+    setDuplicateCleanerCluster(cluster && Array.isArray((cluster as any).photos) ? cluster : null);
     setShowDuplicateCleaner(true);
   };
 

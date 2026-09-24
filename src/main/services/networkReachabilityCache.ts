@@ -17,6 +17,10 @@ const OFFLINE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 // actually prevents that, independent of the offline cache below.
 const PROBE_TIMEOUT_MS = 1500;
 
+// If the probe timer fires this much later than scheduled, the event loop was
+// blocked rather than the target being slow (see the re-arm in isPathReachable).
+const LOOP_BLOCKED_LAG_MS = 500;
+
 interface RootStatus {
   offline: boolean;
   lastCheckedAt: number;
@@ -126,8 +130,26 @@ export async function isPathReachable(filePath: string | undefined | null): Prom
 
   const probePromise = (async () => {
     try {
+      // A timer that fires much later than scheduled means the event loop
+      // itself was blocked (a long sync stall in this process), not that the
+      // path is slow — the probe's completion callback was just queued behind
+      // it and hasn't had its turn yet, while Node runs timers first. Declaring
+      // "unreachable" then made a local folder look deleted, and the renderer
+      // permanently unlinked every storage on a slow startup. So re-arm once
+      // (twice max) to give the probe its turn instead.
       const timeout = new Promise<boolean>((resolve) => {
-        setTimeout(() => resolve(false), PROBE_TIMEOUT_MS);
+        let retriesLeft = 2;
+        let armedAt = Date.now();
+        const fire = () => {
+          const lag = Date.now() - armedAt - PROBE_TIMEOUT_MS;
+          if (lag > LOOP_BLOCKED_LAG_MS && retriesLeft-- > 0) {
+            armedAt = Date.now();
+            setTimeout(fire, PROBE_TIMEOUT_MS);
+          } else {
+            resolve(false);
+          }
+        };
+        setTimeout(fire, PROBE_TIMEOUT_MS);
       });
       const probe = fs.promises.access(filePath, fs.constants.F_OK).then(
         () => true,
@@ -150,6 +172,26 @@ export async function isPathReachable(filePath: string | undefined | null): Prom
 
   inFlightProbes.set(probeKey, probePromise);
   return probePromise;
+}
+
+/**
+ * isPathReachable for the gphoto:// protocol handler. Files the app owns on
+ * local disk (person avatars under userData, thumbnails under the mirror root)
+ * can't hang like an SMB share, so they skip the timeout race: when hundreds
+ * of these are requested at once (opening People), the probes queue behind
+ * libuv's small thread pool, blow the 1.5s budget, and the handler answers
+ * 404 — which Chromium then caches, leaving those images permanently broken.
+ * Everything else (OneDrive/network/unknown paths) keeps the bounded probe.
+ */
+export async function isPathReachableForServing(filePath: string | undefined | null, appOwnedRoots: string[]): Promise<boolean> {
+  if (!filePath) return false;
+  const n = normalize(filePath);
+  const owned = appOwnedRoots.some((r) => {
+    const root = r ? normalize(r) : '';
+    return root && (n === root || n.startsWith(root + '\\') || n.startsWith(root + '/'));
+  });
+  if (!owned) return isPathReachable(filePath);
+  return fs.promises.access(filePath, fs.constants.F_OK).then(() => true, () => false);
 }
 
 /** Test-only: resets all cached state. */

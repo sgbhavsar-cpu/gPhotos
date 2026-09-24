@@ -128,4 +128,42 @@ describe('storage details: fast (checkpoint-only) vs physical (live scan) paths'
     expect(result[storageName].totalPhotos).toBe(3);
     expect(result['photo2'].totalPhotos).toBe(1);
   });
+
+  it('scanStorageDetailsPhysical counts from directory listings: nested folders, missing thumbnails, housekeeping files, case-insensitive names', async () => {
+    const dir = path.join(mirrorRoot, storageName);
+    const nested = path.join(dir, '2026', '09');
+    fs.mkdirSync(nested, { recursive: true });
+    fs.mkdirSync(path.join(dir, '.gphotos_catalog'), { recursive: true });
+
+    writeSidecar(0);                                   // top-level, thumbnail present
+    writeSidecar(1, { thumbnailExists: false });       // sidecar but thumbnail missing -> counted as a photo, not as cached
+    // nested: one with an upper-case extension thumbnail (Windows names are case-insensitive)
+    fs.writeFileSync(path.join(nested, 'A.HEIC'), Buffer.from([1]));
+    fs.writeFileSync(path.join(nested, 'A.json'), '{}');
+    fs.writeFileSync(path.join(nested, 'B.jpg'), Buffer.from([1]));
+    fs.writeFileSync(path.join(nested, 'b.json'), '{}');   // different case than its thumbnail
+    fs.writeFileSync(path.join(nested, 'C.json'), '{}');    // no thumbnail
+    // housekeeping / hidden things must not count
+    fs.writeFileSync(path.join(dir, '_mirror_summary.json'), '{}');
+    fs.writeFileSync(path.join(dir, '_sync_checkpoint.json'), '{}');
+    fs.writeFileSync(path.join(dir, '.gphotos_status.json'), '{}');
+    fs.writeFileSync(path.join(dir, '.gphotos_catalog', 'x.json'), '{}');
+
+    const d = await scanStorageDetailsPhysical(storageName, mirrorRoot);
+    expect(d.totalPhotos).toBe(5);            // IMG_0, IMG_1, A, b, C
+    expect(d.thumbnailCachedCount).toBe(3);   // IMG_0, A (.HEIC), b (B.jpg)
+  });
+
+  it('does not open any sidecar file (that per-file open is what made it take minutes on a real 24K-photo mirror)', async () => {
+    for (let i = 0; i < 25; i++) writeSidecar(i);
+    const realRead = fs.readFileSync;
+    let opened = 0;
+    (fs as any).readFileSync = (...args: any[]) => { if (String(args[0]).endsWith('.json') && String(args[0]).includes(storageName)) opened++; return (realRead as any)(...args); };
+    try {
+      await scanStorageDetailsPhysical(storageName, mirrorRoot);
+    } finally {
+      (fs as any).readFileSync = realRead;
+    }
+    expect(opened).toBe(0);
+  });
 });

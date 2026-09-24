@@ -156,6 +156,7 @@ export function clusterFaces(
   }
 
   let nextPersonIndex = existingPeople.length + 1;
+  const centroidCache = new Map<string, number[]>();
 
   for (let i = 0; i < updatedFaces.length; i++) {
     const face = updatedFaces[i];
@@ -191,7 +192,14 @@ export function clusterFaces(
 
       // Compute distance against quality-weighted centroid
       if (assignedList.length > 0) {
-        const centroid = computeQualityWeightedCentroid(assignedList);
+        // Memoized per person for this call (invalidated when a face joins
+        // them below) — recomputing every person's centroid for every new
+        // face re-normalized the whole library's descriptors each time.
+        let centroid = centroidCache.get(personId);
+        if (!centroid) {
+          centroid = computeQualityWeightedCentroid(assignedList);
+          centroidCache.set(personId, centroid);
+        }
         const centroidDist = euclideanDistance(face.descriptor, centroid);
         if (centroidDist < minDistance) {
           minDistance = centroidDist;
@@ -216,6 +224,7 @@ export function clusterFaces(
     if (bestMatchPersonId) {
       face.personId = bestMatchPersonId;
       personFaces.get(bestMatchPersonId)!.push(face);
+      centroidCache.delete(bestMatchPersonId);
       assignedInThisPhoto.add(bestMatchPersonId);
     } else if (allowNewClusters) {
       // Create new person cluster. Seeded off this face's own (stable,
@@ -290,3 +299,30 @@ export function clusterFaces(
     updatedFaces,
   };
 }
+
+/**
+ * The people from `updated` that differ from what's already stored in
+ * `existing` (new, renamed, re-covered, or with changed counts).
+ *
+ * clusterFaces returns EVERY person with freshly recomputed counts, but one
+ * scanned photo touches only a handful of them — writing all ~5,600 rows per
+ * photo was pure churn (main-thread time, WAL growth to 400MB, and an
+ * invalidated in-memory cache each time). Compare against the list that was
+ * fed into clustering, so this stays exact.
+ */
+export function peopleNeedingWrite(existing: Person[], updated: Person[]): Person[] {
+  const byId = new Map(existing.map((p) => [p.id, p]));
+  return updated.filter((p) => {
+    const e = byId.get(p.id);
+    return (
+      !e ||
+      e.name !== p.name ||
+      (e.coverFaceId ?? null) !== (p.coverFaceId ?? null) ||
+      (e.coverPhotoId ?? null) !== (p.coverPhotoId ?? null) ||
+      (e.faceCount ?? 0) !== (p.faceCount ?? 0) ||
+      (e.photoCount ?? 0) !== (p.photoCount ?? 0) ||
+      e.createdAt !== p.createdAt
+    );
+  });
+}
+

@@ -3,7 +3,7 @@ productName: gPhotos Desktop
 # Windows' file-properties "File version"/"Product version" want all 4
 # segments (major.minor.patch.build); package.json's version stays plain
 # semver (three segments) for npm/electron-builder's own tooling.
-buildVersion: 1.3.0.2
+buildVersion: 2.0.0.0
 directories:
   output: release
   buildResources: build

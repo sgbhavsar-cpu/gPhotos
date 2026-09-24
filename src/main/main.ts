@@ -81,8 +81,8 @@ import { handleStorageSave, handleStorageLoad } from './services/storageHandlers
 import { getPhotosByStorageName, getFacesForPhoto, getAllPeople } from './services/libraryRepository';
 import { getDbForLibraryPath } from './services/db';
 import type { DatabaseSync } from 'node:sqlite';
-import { detectFacesForPhoto, forceRedetectFacesForPhoto, resolveDbForPhoto, createFaceClusterCache, type FaceClusterCache } from './services/pipelineOrchestrator';
-import { detectFaceInRegion, terminateFaceDetectionWorker } from './services/faceDetectionWorkerClient';
+import { detectFacesForPhoto, forceRedetectFacesForPhoto, resolveDbForPhoto, getSharedFaceClusterCache, type FaceClusterCache } from './services/pipelineOrchestrator';
+import { detectFaceInRegion, terminateFaceDetectionWorker, getFaceDetectionPoolSize } from './services/faceDetectionWorkerClient';
 import { assertPathsAllowed, getDefaultMirrorRoot } from './services/pathSecurity';
 import { browseDirectory } from './services/directoryBrowser';
 import {
@@ -92,10 +92,11 @@ import {
 } from './services/spriteService';
 import { thumbnailWorker } from './services/thumbnailWorkerService';
 import { libraryStatusService } from './services/libraryStatusService';
-import { isPathReachable, clearOfflineCache } from './services/networkReachabilityCache';
+import { isPathReachable, isPathReachableForServing, clearOfflineCache } from './services/networkReachabilityCache';
 import { installHangWatchdog, attachRendererHangDetection } from './services/hangWatchdog';
 import { initLogger, applyStoredLogLevelOverride, getLogLevelOverride, setLogLevelOverride, logger } from './services/logger';
 import { getPersonAvatarPath, savePersonAvatar, deletePersonAvatar } from './services/personAvatarService';
+import { getAvatarSprites } from './services/avatarSpriteService';
 import {
   getOneDriveStatus,
   setReclaimEnabled,
@@ -300,6 +301,10 @@ function createWindow() {
       nodeIntegration: false,
       contextIsolation: true,
       webSecurity: true,
+      // The renderer's idle timer + face queue drive background scanning via
+      // setTimeout; a minimized/hidden window otherwise throttles those to
+      // ~1 tick/min, so a scan left running "in the background" crawled.
+      backgroundThrottling: false,
     },
   });
 
@@ -435,11 +440,14 @@ function createWindow() {
       // once a storage is found offline, skips checking it again for a
       // while instead of blocking on the OS's full network timeout on
       // every single photo request.
-      if (preferOriginal && originalPath && (await isPathReachable(originalPath))) {
+      // App-owned local files (avatars, mirror thumbnails) skip the timeout
+      // race — see isPathReachableForServing for why it caused permanent 404s.
+      const appOwnedRoots = [app.getPath('userData'), getDefaultMirrorRoot()];
+      if (preferOriginal && originalPath && (await isPathReachableForServing(originalPath, appOwnedRoots))) {
         targetPath = originalPath;
-      } else if (filePath && (await isPathReachable(filePath))) {
+      } else if (filePath && (await isPathReachableForServing(filePath, appOwnedRoots))) {
         targetPath = filePath;
-      } else if (originalPath && (await isPathReachable(originalPath))) {
+      } else if (originalPath && (await isPathReachableForServing(originalPath, appOwnedRoots))) {
         targetPath = originalPath;
       }
 
@@ -767,9 +775,9 @@ ipcMain.handle('storage:save', async (_event, key: string, data: any) => {
   return savePromiseQueue;
 });
 
-ipcMain.handle('storage:load', async (_event, key: string, libraryDir?: string) => {
+ipcMain.handle('storage:load', async (_event, key: string, libraryDir?: string, options?: { includePhotos?: boolean; compactDescriptors?: boolean }) => {
   try {
-    return await handleStorageLoad(key, libraryDir);
+    return await handleStorageLoad(key, libraryDir, options);
   } catch (err) {
     console.error('Failed to load library data:', err);
     return null;
@@ -976,7 +984,8 @@ ipcMain.handle('faces:detect-batch', async (_event, photos: Photo[]) => {
   // cache built from one library's faces must never be used to cluster
   // another's. See createFaceClusterCache's doc comment for why this exists.
   const cachesByDb = new Map<DatabaseSync, FaceClusterCache>();
-  for (const photo of photos) {
+
+  async function runOne(photo: Photo) {
     try {
       const sourceFilePath = photo.isVirtual ? (photo.originalRemotePath || photo.filePath) : photo.filePath;
       // resolveDbForPhoto, not the ambient active-library pointer — see its
@@ -986,7 +995,7 @@ ipcMain.handle('faces:detect-batch', async (_event, photos: Photo[]) => {
       const db = resolveDbForPhoto(photo);
       let cache = cachesByDb.get(db);
       if (!cache) {
-        cache = createFaceClusterCache(db);
+        cache = getSharedFaceClusterCache(db);
         cachesByDb.set(db, cache);
       }
       const result = await detectFacesForPhoto(photo, sourceFilePath, db, cache);
@@ -996,6 +1005,19 @@ ipcMain.handle('faces:detect-batch', async (_event, photos: Photo[]) => {
       results.push({ photoId: photo.id, ran: false, faceCount: 0, locked: false, skippedReason: 'decode-failed', faces: [] });
     }
   }
+
+  // Dispatched in chunks matching the face-detection worker pool size
+  // (1 outside Turbo Mode — identical to the old strictly-sequential loop;
+  // Turbo Mode raises the pool size so multiple photos' ONNX inference runs
+  // on separate cores at once). Safe to run concurrently: everything after
+  // each photo's single `await` is synchronous (see detectFacesForPhoto),
+  // so the per-db cluster cache is never touched by two photos at once —
+  // JS's run-to-completion semantics make that section atomic.
+  const chunkSize = Math.max(1, getFaceDetectionPoolSize());
+  for (let i = 0; i < photos.length; i += chunkSize) {
+    await Promise.all(photos.slice(i, i + chunkSize).map(runOne));
+  }
+
   return { results, people: getAllPeople() };
 });
 
@@ -1172,6 +1194,16 @@ ipcMain.handle('person:get-avatar-path', async (_event, personId: string, cacheK
   } catch (err) {
     console.error('person:get-avatar-path error:', err);
     return null;
+  }
+});
+
+ipcMain.handle('person:get-avatar-sprites', async (_event, items: Array<{ personId: string; cacheKey: string }>) => {
+  try {
+    // One screenful per call; cap so a bad caller can't queue thousands of sheet builds.
+    return await getAvatarSprites(Array.isArray(items) ? items.slice(0, 200) : []);
+  } catch (err) {
+    console.error('person:get-avatar-sprites error:', err);
+    return {};
   }
 });
 
@@ -1684,27 +1716,49 @@ ipcMain.handle('service:get-precache-status', async () => {
   }
 });
 
+// The "resume all storages" fallback below (no specific photo list given)
+// walks and re-scans every configured virtual storage from scratch — for a
+// large library (tens of thousands of OneDrive photos) that alone can take
+// tens of seconds. The Settings button that calls this gives no loading
+// feedback while its click is in flight, so a user who doesn't see anything
+// happen reasonably clicks it again — and again — each click launching a
+// SEPARATE full re-scan that runs concurrently with the ones still in
+// flight, all mutating the same thumbnailWorker counters. That's what
+// actually made "Resume Pre-Caching" look broken: not one slow call, but
+// several redundant ones piling up (observed: 4 overlapping calls, one
+// taking 104 seconds). This guard makes a second call while one full
+// rescan is still running just await the SAME in-flight scan instead of
+// starting another.
+let inFlightFullRescan: Promise<void> | null = null;
+
 ipcMain.handle('service:start-precache', async (_event, photos?: Photo[]) => {
   try {
     if (photos && photos.length > 0) {
       thumbnailWorker.enqueuePhotos(photos);
     } else {
-      try {
-        const mirrorRoot = getDefaultMirrorRoot();
-        if (fs.existsSync(mirrorRoot)) {
-          const subdirs = fs.readdirSync(mirrorRoot, { withFileTypes: true });
-          for (const dirent of subdirs) {
-            if (dirent.isDirectory() && !dirent.name.startsWith('.')) {
-              const mirrorPhotos = await scanVirtualMirrorDirectory(path.join(mirrorRoot, dirent.name));
-              if (mirrorPhotos && mirrorPhotos.length > 0) {
-                thumbnailWorker.enqueuePhotos(mirrorPhotos);
+      if (!inFlightFullRescan) {
+        inFlightFullRescan = (async () => {
+          try {
+            const mirrorRoot = getDefaultMirrorRoot();
+            if (fs.existsSync(mirrorRoot)) {
+              const subdirs = fs.readdirSync(mirrorRoot, { withFileTypes: true });
+              for (const dirent of subdirs) {
+                if (dirent.isDirectory() && !dirent.name.startsWith('.')) {
+                  const mirrorPhotos = await scanVirtualMirrorDirectory(path.join(mirrorRoot, dirent.name));
+                  if (mirrorPhotos && mirrorPhotos.length > 0) {
+                    thumbnailWorker.enqueuePhotos(mirrorPhotos);
+                  }
+                }
               }
             }
+          } catch (mirrorErr) {
+            console.warn('Auto-enqueuing mirrors for pre-caching failed:', mirrorErr);
+          } finally {
+            inFlightFullRescan = null;
           }
-        }
-      } catch (mirrorErr) {
-        console.warn('Auto-enqueuing mirrors for pre-caching failed:', mirrorErr);
+        })();
       }
+      await inFlightFullRescan;
     }
     thumbnailWorker.resume();
     return { started: true };

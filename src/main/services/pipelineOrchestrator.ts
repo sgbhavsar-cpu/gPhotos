@@ -3,11 +3,11 @@ import path from 'path';
 import type { DatabaseSync } from 'node:sqlite';
 import { VirtualStorageConfig, VirtualPhotoMetadata, Photo, DetectedFace, Person } from '../../types';
 import { detectFaces } from './faceDetectionWorkerClient';
-import { clusterFaces } from './faceClustering';
+import { clusterFaces, peopleNeedingWrite } from './faceClustering';
 import { getHeicFullResolutionBufferForDetection } from './heicService';
 import { isPathReachable } from './networkReachabilityCache';
 import { isOneDrivePath, markFilesForSpaceReclaim, isReclaimEnabled } from './oneDriveService';
-import { getDb, getDbForLibraryPath, resolveDbForPhoto } from './db';
+import { getDb, getDbForLibraryPath, resolveDbForPhoto, getFacesPeopleRevision } from './db';
 
 export { resolveDbForPhoto } from './db';
 import {
@@ -66,10 +66,44 @@ export interface FaceStepResult {
 export interface FaceClusterCache {
   faces: DetectedFace[];
   people: Person[];
+  /** faces/people revision this copy reflects (see db.ts getFacesPeopleRevision); set by createFaceClusterCache. */
+  rev?: number;
 }
 
 export function createFaceClusterCache(db: DatabaseSync = getDb()): FaceClusterCache {
-  return { faces: getAllFaces(db), people: getAllPeople() };
+  const rev = getFacesPeopleRevision(); // read BEFORE loading — a later write must invalidate, never be missed
+  return { faces: getAllFaces(db), people: getAllPeople(), rev };
+}
+
+const sharedFaceClusterCaches = new WeakMap<DatabaseSync, FaceClusterCache>();
+
+/**
+ * Like createFaceClusterCache, but reuses one long-lived copy per database
+ * for as long as NOTHING else has written to the faces/people tables since
+ * it was built (revision check) — a single-photo faces:detect-batch call
+ * (the renderer's face queue) otherwise reloaded all ~28K faces + JSON
+ * descriptors from SQLite per photo (~1.6s of synchronous main-thread time,
+ * several times that under load). Any write elsewhere (rename, reassign,
+ * reset, another storage's scan...) bumps the revision and forces a fresh
+ * load. ponytail: holds ~100+MB of descriptors in memory per library while
+ * scanning; drop the WeakMap entry if that ever matters.
+ */
+export function getSharedFaceClusterCache(db: DatabaseSync): FaceClusterCache {
+  const hit = sharedFaceClusterCaches.get(db);
+  if (hit && hit.rev === getFacesPeopleRevision()) return hit;
+  const fresh = createFaceClusterCache(db);
+  sharedFaceClusterCaches.set(db, fresh);
+  return fresh;
+}
+
+/**
+ * True for errors that mean "this file's bytes can't be decoded" (permanent),
+ * as opposed to environmental failures (worker died, out of memory, timeout)
+ * that a retry could fix.
+ */
+export function isPermanentDecodeError(err: unknown): boolean {
+  const msg = String((err as any)?.message ?? err ?? '');
+  return /tiff2vips|jpeg2vips|heif2vips|webp2vips|png2vips|magick2vips|vipsjpeg|unsupported image format|input (buffer|file) contains unsupported|compression scheme .* not implemented|premature end of (jpeg|input)|corrupt|bad seek|invalid (jpeg|png|tiff|heif)|unable to (read|decode) image/i.test(msg);
 }
 
 /** Same id scheme scanVirtualMirrorDirectory() uses, so rows this pipeline writes match what the renderer later reads from the same sidecar. */
@@ -221,7 +255,25 @@ export async function detectFacesForPhoto(
   }
 
   logger.debug('Pipeline', 'Running face detection', { sourceFilePath, photoId });
-  const { faces: detected, imageWidth, imageHeight } = await detectFaces(detectionBuffer);
+  let detectionResult: Awaited<ReturnType<typeof detectFaces>>;
+  try {
+    detectionResult = await detectFaces(detectionBuffer);
+  } catch (err) {
+    // A file the image decoder can never read (e.g. a ProRAW .dng with an
+    // unsupported TIFF compression) would otherwise throw out of here on
+    // every cycle and stay "pending" forever, so the library never reads as
+    // fully scanned. Same treatment as an unreadable source above: attempted,
+    // nothing detected, not locked (a manual per-photo retry still works).
+    // Anything that isn't clearly a decode problem (worker crash, timeout)
+    // still throws so it's retried.
+    if (!isPermanentDecodeError(err)) throw err;
+    logger.warn('Pipeline', 'Source cannot be decoded — marking scanned with no faces', { sourceFilePath, err: String(err).slice(0, 200) });
+    working.faceScanCompleted = true;
+    working.facesLocked = false;
+    upsertPhoto(working, db);
+    return { ran: true, faceCount: 0, locked: false, skippedReason: 'decode-failed' };
+  }
+  const { faces: detected, imageWidth, imageHeight } = detectionResult;
   const newFaces: DetectedFace[] = detected.map((d, idx) => ({
     id: `${photoId}_face_${idx}`,
     photoId,
@@ -247,13 +299,22 @@ export async function detectFacesForPhoto(
   // result instead of being replaced). replaceFacesForPhoto below deletes
   // this photo's rows outright, then inserts only what comes out of this
   // clustering pass, so the DB ends up holding exactly the fresh detections.
+  // The cache was handed in before this photo's awaited decode/inference; if
+  // anything wrote faces/people meanwhile (e.g. a rename), refresh it in
+  // place so clustering + the upsertPeople below can't clobber that write.
+  if (cache && cache.rev !== undefined && cache.rev !== getFacesPeopleRevision()) {
+    Object.assign(cache, createFaceClusterCache(db));
+  }
   const existingFaces = (cache ? cache.faces : getAllFaces(db)).filter((f) => f.photoId !== photoId);
   const existingPeople = cache ? cache.people : getAllPeople();
   const { people, updatedFaces } = clusterFaces([...existingFaces, ...newFaces], existingPeople);
   const thisPhotoFaces = updatedFaces.filter((f) => f.photoId === photoId);
 
+  const revBeforeOwnWrite = getFacesPeopleRevision();
   replaceFacesForPhoto(photoId, thisPhotoFaces, false, db);
-  if (people.length > 0) upsertPeople(people);
+  // Only the people this photo actually changed — see peopleNeedingWrite.
+  const changedPeople = peopleNeedingWrite(existingPeople, people);
+  if (changedPeople.length > 0) upsertPeople(changedPeople);
 
   // clusterFaces' own output is already the complete, authoritative new
   // state (every face across the whole set it was given, every person with
@@ -262,6 +323,10 @@ export async function detectFacesForPhoto(
   if (cache) {
     cache.faces = updatedFaces;
     cache.people = people;
+    // Our own writes above bumped the revision, but the cache already
+    // reflects them — adopt the new revision, unless something ELSE had
+    // written since the cache was built (then stay stale and reload).
+    if (cache.rev === revBeforeOwnWrite) cache.rev = getFacesPeopleRevision();
   }
 
   working.faceScanCompleted = true;

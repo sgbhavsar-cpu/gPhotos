@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Users } from 'lucide-react';
 import { Photo, DetectedFace } from '../../types';
 import { getLocalPhotoUrl } from '../services/libraryStore';
+import { useAvatarSprite } from '../services/avatarSpriteLoader';
+import { getSpriteUrl } from '../services/asyncImageLoader';
 
 interface FaceAvatarProps {
   photo?: Photo;
@@ -38,6 +40,14 @@ interface FaceAvatarProps {
    * upscales compression artifacts into a visibly blurry avatar.
    */
   preferOriginal?: boolean;
+  /**
+   * Render this person's cover from a pre-baked avatar sprite sheet (one
+   * transfer for ~50 avatars) instead of loading a file per avatar. For the
+   * People grid. `coverKey` is the person's coverFaceId — it lets the tile be
+   * looked up before the cover photo/face objects have loaded.
+   */
+  preferSprite?: boolean;
+  coverKey?: string;
 }
 
 export const FaceAvatar: React.FC<FaceAvatarProps> = ({
@@ -51,17 +61,32 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
   borderRadius = 'var(--radius-full)',
   personId,
   preferOriginal = false,
+  preferSprite = false,
+  coverKey,
 }) => {
   const [croppedDataUrl, setCroppedDataUrl] = useState<string | null>(null);
   const [hasError, setHasError] = useState(false);
+  const [retry, setRetry] = useState(0);
+  useEffect(() => { setRetry(0); }, [croppedDataUrl]);
 
   // Use explicit box if passed, or fall back to face.box
   const box = explicitBox || face?.box;
-  const avatarCacheKey = face?.id || photo?.id || '';
+  // With a coverKey (the person's coverFaceId) the saved avatar and the sprite
+  // lookup share one key. Without it, the crop was saved under whichever face
+  // this card happened to render, which could differ from coverFaceId and
+  // leave that person permanently without a sprite tile.
+  const avatarCacheKey = coverKey || face?.id || photo?.id || '';
   const api = typeof window !== 'undefined' ? window.electronAPI : undefined;
   const usesPersonCache = Boolean(personId && avatarCacheKey && api?.getPersonAvatarPath);
+  const sprite = useAvatarSprite(personId, avatarCacheKey, preferSprite);
 
   useEffect(() => {
+    // Sprite mode: the tile is (or is about to be) the image, so skip the
+    // per-avatar file load. Only when the person has no avatar file yet
+    // ('none') do we crop live from the source photo — which also saves the
+    // avatar so the next sprite lookup finds it.
+    if (sprite.status === 'pending' || sprite.status === 'ready') return;
+
     if (!photo) {
       setCroppedDataUrl(null);
       return;
@@ -74,14 +99,22 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
     }
 
     let isCancelled = false;
+    let finalShown = false;
+    let provisionalShown = false;
 
-    const cropLiveFromSource = () => {
+    // isFinal=false is a quick provisional crop from the local thumbnail; the
+    // final crop (from the original when preferOriginal) replaces it and is
+    // the one persisted as the person's avatar.
+    const cropLiveFromSource = (
+      sourceUrl: string = getLocalPhotoUrl(photo.filePath, photo.originalRemotePath, preferOriginal),
+      isFinal = true
+    ) => {
       const img = new Image();
       img.crossOrigin = 'anonymous';
-      img.src = getLocalPhotoUrl(photo.filePath, photo.originalRemotePath, preferOriginal);
+      img.src = sourceUrl;
 
       img.onload = () => {
-        if (isCancelled) return;
+        if (isCancelled || (!isFinal && finalShown)) return;
         try {
           const canvas = document.createElement('canvas');
         const targetSize = size * 2; // 2x for retina / high-DPI sharpness
@@ -174,10 +207,12 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
         ctx.drawImage(img, cropX, cropY, cropSide, cropSide, 0, 0, targetSize, targetSize);
         const dataUrl = canvas.toDataURL('image/jpeg', 0.88);
         setCroppedDataUrl(dataUrl);
+        if (isFinal) finalShown = true;
+        else provisionalShown = true;
 
         // Persist this crop locally so it's available next time without
         // needing the (possibly network) source photo at all.
-        if (usesPersonCache) {
+        if (isFinal && usesPersonCache) {
           api!.savePersonAvatar!(personId!, avatarCacheKey, dataUrl).catch(() => {});
         }
       } catch (err) {
@@ -187,8 +222,20 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
       };
 
       img.onerror = () => {
-        if (!isCancelled) setHasError(true);
+        // A failed provisional load is harmless; a failed final one only
+        // becomes an error state if nothing was shown in the meantime.
+        if (!isCancelled && isFinal && !provisionalShown) setHasError(true);
       };
+    };
+
+    // Cloud-backed originals (OneDrive) can take many seconds to fetch, which
+    // left cards blank. Show a crop from the local 500px thumbnail right away,
+    // then upgrade to the original when it arrives.
+    const startCrop = () => {
+      if (preferOriginal && photo.originalRemotePath) {
+        cropLiveFromSource(getLocalPhotoUrl(photo.filePath, undefined, false, 500), false);
+      }
+      cropLiveFromSource();
     };
 
     if (usesPersonCache) {
@@ -197,13 +244,13 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
         if (localPath) {
           setCroppedDataUrl(getLocalPhotoUrl(localPath));
         } else {
-          cropLiveFromSource();
+          startCrop();
         }
       }).catch(() => {
-        if (!isCancelled) cropLiveFromSource();
+        if (!isCancelled) startCrop();
       });
     } else {
-      cropLiveFromSource();
+      startCrop();
     }
 
     return () => {
@@ -225,7 +272,39 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
     avatarCacheKey,
     usesPersonCache,
     preferOriginal,
+    sprite.status,
   ]);
+
+  const retrySrc =
+    retry > 0 && croppedDataUrl && !croppedDataUrl.startsWith('data:')
+      ? `${croppedDataUrl}${croppedDataUrl.includes('?') ? '&' : '?'}_r=${retry}`
+      : croppedDataUrl;
+
+  if (sprite.status === 'ready' && sprite.coord) {
+    const c = sprite.coord;
+    return (
+      <div
+        role="img"
+        aria-label={alt}
+        style={{
+          width: `${size}px`,
+          height: `${size}px`,
+          borderRadius,
+          backgroundColor: 'var(--bg-surface-elevated)',
+          backgroundImage: `url(${getSpriteUrl({ spriteId: c.spriteId } as any)})`,
+          backgroundRepeat: 'no-repeat',
+          // sheets are 10 tiles wide; each tile is shown at `size` px
+          backgroundSize: `${10 * size}px ${c.rows * size}px`,
+          backgroundPosition: `-${c.col * size}px -${c.row * size}px`,
+        }}
+      />
+    );
+  }
+
+  if (sprite.status === 'pending') {
+    // Card is already on screen; the picture follows once the batch answers.
+    return <div style={{ width: `${size}px`, height: `${size}px`, borderRadius, backgroundColor: '#1e293b' }} />;
+  }
 
   if (!photo || hasError) {
     return (
@@ -257,8 +336,16 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
     }}>
       {croppedDataUrl ? (
         <img
-          src={croppedDataUrl}
+          src={retrySrc ?? undefined}
           alt={alt}
+          // A transient failure (main process busy while the People screen
+          // opens) is cached by Chromium per URL, so the image would stay
+          // broken forever. Retry with a changed URL, then fall back to the
+          // placeholder icon instead of a broken-image box.
+          onError={() => {
+            if (retry >= 3) { setHasError(true); return; }
+            setTimeout(() => setRetry((r) => r + 1), 1500 * 2 ** retry);
+          }}
           style={{
             width: '100%',
             height: '100%',

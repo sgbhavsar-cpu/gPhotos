@@ -372,7 +372,7 @@ export interface IElectronAPI {
   onOrganizeProgress: (callback: (progress: OrganizeProgress) => void) => () => void;
   readFileAsBase64: (filePath: string) => Promise<string>;
   saveLibraryData: (key: string, data: any) => Promise<boolean>;
-  loadLibraryData: (key: string, libraryDir?: string) => Promise<any>;
+  loadLibraryData: (key: string, libraryDir?: string, options?: { includePhotos?: boolean; compactDescriptors?: boolean }) => Promise<any>;
   syncVirtualStorage: (config: VirtualStorageConfig) => Promise<SyncVirtualStorageResult>;
   scanVirtualMirror: (mirrorDirPath: string) => Promise<Photo[]>;
   discoverMirrors: (rootPath?: string) => Promise<VirtualStorageConfig[]>;
@@ -447,6 +447,7 @@ export interface IElectronAPI {
   switchLibrary: (targetPath: string) => Promise<{ meta: CatalogMeta; firstPage: Photo[]; albums: Album[] }>;
   getSpriteCoordinate?: (photoPath: string) => Promise<SpriteCoordinate | null>;
   getSpriteCoordinatesBatch?: (photoPaths: string[]) => Promise<Record<string, SpriteCoordinate | null>>;
+  getPersonAvatarSprites?: (items: Array<{ personId: string; cacheKey: string }>) => Promise<Record<string, AvatarSpriteCoord | null>>;
   getThumbnailPreCacheStatus?: () => Promise<{
     isRunning: boolean;
     current: number;
@@ -598,6 +599,15 @@ export interface SpriteCoordinate {
   sheetHeight: number;
 }
 
+/** One person's cover avatar inside a baked WebP sprite sheet (10 columns of `tile`px tiles, `rows` rows). */
+export interface AvatarSpriteCoord {
+  spriteId: string;
+  col: number;
+  row: number;
+  rows: number;
+  tile: number;
+}
+
 export interface PairedDeviceInfo {
   id: string;
   label: string;
@@ -631,6 +641,12 @@ export interface BackgroundServiceStatus {
   maxCpuPercent?: number;
   maxRamMb?: number;
   enableThumbnailPreCache?: boolean;
+  performanceMode?: 'background' | 'turbo';
+  turboWorkers?: number;
+  turboMaxCpuPercent?: number;
+  turboMaxRamMb?: number;
+  idleResumeSeconds?: number;
+  logicalCpuCount?: number; // read-only, informational — for sizing the Parallel Workers slider in the UI
   currentCpuPercent?: number;
   currentRamMb?: number;
   thumbnailsPreCachedCount?: number;
@@ -645,9 +661,14 @@ export interface BackgroundServiceSettings {
   isPaused: boolean;
   syncIntervalMinutes: number;
   systemServiceInstalled?: boolean;
-  maxCpuPercent?: number; // Cap background CPU usage (default: 40%)
-  maxRamMb?: number; // Cap background RAM usage in MB (default: 1024 MB / 1 GB)
+  maxCpuPercent?: number; // Background mode: cap background CPU usage (default: 40%)
+  maxRamMb?: number; // Background mode: cap background RAM usage in MB (default: 1024 MB / 1 GB)
   enableThumbnailPreCache?: boolean; // Pre-cache thumbnails in background (default: true)
+  performanceMode?: 'background' | 'turbo'; // 'background': throttled, low-priority (default). 'turbo': overnight/exclusive-use, uses turboWorkers/turboMaxCpuPercent/turboMaxRamMb below instead of the maxCpuPercent/maxRamMb sliders.
+  turboWorkers?: number; // Turbo mode: photos processed in parallel (default: cpu cores - 1)
+  turboMaxCpuPercent?: number; // Turbo mode: CPU cap (default: 100%)
+  turboMaxRamMb?: number; // Turbo mode: RAM ceiling in MB (default: 4096 MB / 4 GB)
+  idleResumeSeconds?: number; // Seconds of no mousedown/keydown/wheel/touchstart/scroll before auto-resuming background caching/face detection (default: 15)
 }
 
 declare global {

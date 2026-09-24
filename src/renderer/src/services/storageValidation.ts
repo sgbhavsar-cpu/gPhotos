@@ -18,6 +18,15 @@ export async function splitStoragesByExistence(
 ): Promise<{ valid: VirtualStorageConfig[]; removed: VirtualStorageConfig[] }> {
   if (list.length === 0) return { valid: [], removed: [] };
 
+  // Pruning is permanent (the name is blacklisted), so a "missing" verdict is
+  // re-checked once before it's believed — a transient false (busy/blocked
+  // main process at startup) must never delete a storage.
+  const checkTwice = async (p: string): Promise<boolean> => {
+    if (await checkFileExists(p).catch(() => true)) return true;
+    await new Promise((r) => setTimeout(r, 2000));
+    return checkFileExists(p).catch(() => true);
+  };
+
   const checks = await Promise.all(
     list.map(async (s) => {
       // A storage that has never completed even one sync (no lastSynced,
@@ -34,7 +43,7 @@ export async function splitStoragesByExistence(
       }
       return {
         storage: s,
-        exists: await checkFileExists(`${s.localMirrorRoot}\\${s.name}`).catch(() => true),
+        exists: await checkTwice(`${s.localMirrorRoot}\\${s.name}`),
       };
     })
   );
