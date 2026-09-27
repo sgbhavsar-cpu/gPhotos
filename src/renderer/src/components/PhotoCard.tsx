@@ -1,9 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Heart, MapPin, Users, Check, EyeOff, Image as ImageIcon, ImageOff, RotateCw } from 'lucide-react';
-import { Photo } from '../../types';
+import { Photo } from '../../../types';
 import { getLocalPhotoUrl, libraryStore } from '../services/libraryStore';
-import { useBatchThumbnail, useSpriteCoordinate, getSpriteUrl, batchThumbnailStore, evictAndRefreshThumbnail } from '../services/asyncImageLoader';
+import { useBatchThumbnail, useSpriteCoordinate, getSpriteUrl, batchThumbnailStore } from '../services/asyncImageLoader';
+import { afterPhotoRotated } from '../services/photoRotation';
 import { authFetch } from '../services/webAuthClient';
+import { notifyError } from '../services/notifications';
 
 interface PhotoCardProps {
   photo: Photo;
@@ -37,11 +39,21 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
   const debounceTimerRef = useRef<any>(null);
   const pendingRotationDeltaRef = useRef<number>(0);
 
-  // Clean up timer on unmount
+  // Always-current photo + flush fn so the unmount cleanup persists a pending
+  // rotation (with the latest photo) instead of silently dropping it when the
+  // card scrolls out of the virtualized window or the tab changes.
+  const photoRef = useRef(photo);
+  photoRef.current = photo;
+  const flushRotationRef = useRef<() => Promise<void>>(async () => {});
+
   useEffect(() => {
     return () => {
       if (debounceTimerRef.current) {
         clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = null;
+      }
+      if (pendingRotationDeltaRef.current !== 0) {
+        void flushRotationRef.current();
       }
     };
   }, []);
@@ -90,7 +102,7 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
   const isRotated = !!photo.isHeicRotated || (photo.heicRotation || photo.rotation || 0) !== 0;
   const isElectron = typeof window !== 'undefined' && !!(window.electronAPI && !(window.electronAPI as any).isBrowserShim);
   const displaySrc = (isRotated ? directUrl : batchSrc) || (isElectron ? directUrl : null);
-  const canUseSprite = !!(spriteCoord && !hasError && !isRotated);
+  const canUseSprite = !!(spriteCoord && !isRotated);
   const hasThumbnail = !!(canUseSprite || displaySrc);
   const isLoading = !hasThumbnail && isBatchLoading;
   const hasError = !hasThumbnail && isBatchError;
@@ -112,55 +124,70 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
       clearTimeout(debounceTimerRef.current);
     }
 
-    debounceTimerRef.current = setTimeout(async () => {
-      const degreesToRotate = pendingRotationDeltaRef.current;
-      if (degreesToRotate === 0) return;
-      pendingRotationDeltaRef.current = 0;
-
-      const localPath = photo.filePath;
-      const remotePath = photo.originalRemotePath;
-      try {
-        let res: any = null;
-        if (window.electronAPI?.rotatePhoto) {
-          res = await window.electronAPI.rotatePhoto(localPath, degreesToRotate, remotePath);
-        } else {
-          const fetchRes = await authFetch('/api/rotate-photo', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              filePath: localPath,
-              originalRemotePath: remotePath,
-              rotationDegrees: degreesToRotate,
-            }),
-          });
-          if (fetchRes.ok) res = await fetchRes.json();
-        }
-
-        // For HEIC photos: update photo in libraryStore so isHeicRotated and rotation flag persist in library.json
-        const isHeic = /\.(heic|heif)$/i.test(localPath) || /\.(heic|heif)$/i.test(remotePath || '');
-        if (res?.isHeic || isHeic || res?.isHeicRotated) {
-          const newRot = res?.heicRotation ?? (((photo.heicRotation || photo.rotation || 0) + degreesToRotate) % 360);
-          libraryStore.updatePhoto({
-            ...photo,
-            isHeicRotated: newRot !== 0,
-            heicRotation: newRot,
-            rotation: newRot,
-          });
-        }
-
-        // Evict and immediately re-request fresh batch thumbnail from backend
-        evictAndRefreshThumbnail(photoPath, remotePath, targetPixelSize);
-        // Reset CSS rotation because thumbnail image pixels on disk are now physically rotated
-        setVisualRotation(0);
-        setCacheBuster(Date.now());
-      } catch (err) {
-        console.error('[PhotoCard] Failed to persist rotated photo to disk:', err);
-      }
+    debounceTimerRef.current = setTimeout(() => {
+      debounceTimerRef.current = null;
+      void persistRotation();
     }, 2000);
   };
 
+  const persistRotation = async () => {
+    const degreesToRotate = pendingRotationDeltaRef.current;
+    if (degreesToRotate === 0) return;
+    pendingRotationDeltaRef.current = 0;
+
+    const currentPhoto = photoRef.current;
+    const localPath = currentPhoto.filePath;
+    const remotePath = currentPhoto.originalRemotePath;
+    try {
+      let res: any = null;
+      if (window.electronAPI?.rotatePhoto) {
+        res = await window.electronAPI.rotatePhoto(localPath, degreesToRotate, remotePath);
+      } else {
+        const fetchRes = await authFetch('/api/rotate-photo', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            filePath: localPath,
+            originalRemotePath: remotePath,
+            rotationDegrees: degreesToRotate,
+          }),
+        });
+        if (fetchRes.ok) res = await fetchRes.json();
+      }
+
+      if (!res || res.success === false) {
+        throw new Error(res?.error || res?.message || 'The photo could not be rotated on disk');
+      }
+
+      // For HEIC photos: update photo in libraryStore so isHeicRotated and rotation flag persist in library.json
+      const isHeic = /\.(heic|heif)$/i.test(localPath) || /\.(heic|heif)$/i.test(remotePath || '');
+      if (res?.isHeic || isHeic || res?.isHeicRotated) {
+        const newRot = res?.heicRotation ?? (((currentPhoto.heicRotation || currentPhoto.rotation || 0) + degreesToRotate) % 360);
+        libraryStore.updatePhoto({
+          ...currentPhoto,
+          isHeicRotated: newRot !== 0,
+          heicRotation: newRot,
+          rotation: newRot,
+        });
+      }
+
+      // New image URLs, rotate the face boxes with the picture, rebuild avatars cut from this photo, and
+      // evict + re-request the batch thumbnail.
+      void afterPhotoRotated(currentPhoto, degreesToRotate, targetPixelSize);
+      // Reset CSS rotation because thumbnail image pixels on disk are now physically rotated
+      setVisualRotation(0);
+      setCacheBuster(Date.now());
+    } catch (err) {
+      // The file was NOT rotated: undo the optimistic preview so the card doesn't lie.
+      setVisualRotation(0);
+      notifyError('Rotate photo', err);
+    }
+  };
+  flushRotationRef.current = persistRotation;
+
   return (
     <div
+      data-photo-id={photo.id}
       onClick={onClick}
       onMouseDown={(e) => onCardMouseDown && onCardMouseDown(photo.id, e)}
       onMouseEnter={(e) => {

@@ -9,7 +9,7 @@
  */
 
 import { useState, useEffect, useRef } from 'react';
-import { SpriteCoordinate } from '../../types';
+import { SpriteCoordinate } from '../../../types';
 import { trackBackendCall } from './responseTracker';
 import { appendAuthToken } from './webAuthClient';
 
@@ -135,7 +135,9 @@ export function useSpriteCoordinate(photoPath: string | undefined | null): Sprit
         }
       };
       spriteCoordListeners.add(listener);
-      return () => spriteCoordListeners.delete(listener);
+      return () => {
+        spriteCoordListeners.delete(listener);
+      };
     })();
 
     return unsubscribe;
@@ -150,6 +152,9 @@ export function useSpriteCoordinate(photoPath: string | undefined | null): Sprit
 
 // Memory store of path -> dataUrl
 export const batchThumbnailStore = new Map<string, string>();
+// Each entry is a ~10-25KB data URL; unbounded, a long scroll through 100k photos held gigabytes
+// and OOM-crashed the renderer. Oldest-inserted entries are evicted (they get re-fetched on demand).
+const MAX_BATCH_THUMBNAILS = 6000;
 const pendingBatchPaths = new Set<string>();
 const batchListeners = new Set<(updatedPaths: Set<string>) => void>();
 
@@ -245,6 +250,10 @@ async function flushBatchQueue(): Promise<void> {
           for (const [filePath, dataUrl] of Object.entries(res.thumbnails)) {
             if (dataUrl) {
               batchThumbnailStore.set(filePath, dataUrl);
+              if (batchThumbnailStore.size > MAX_BATCH_THUMBNAILS) {
+                const oldest = batchThumbnailStore.keys().next().value;
+                if (oldest !== undefined) batchThumbnailStore.delete(oldest);
+              }
               updated.add(filePath);
               fetchedThisFlush++;
             }
@@ -423,7 +432,11 @@ function acquireFetchSlot(signal?: AbortSignal): Promise<void> {
   }
 
   return new Promise<void>((resolve, reject) => {
+    // The SAME function object is queued and looked up on abort. It used to queue a wrapper but
+    // splice by the inner function, so an aborted request stayed queued, later took a slot
+    // nobody would ever release, and after 3 such aborts every photo load hung forever.
     const queueItem = () => {
+      signal?.removeEventListener('abort', onAbort);
       activeFetches++;
       resolve();
     };
@@ -435,11 +448,7 @@ function acquireFetchSlot(signal?: AbortSignal): Promise<void> {
     };
 
     signal?.addEventListener('abort', onAbort, { once: true });
-
-    fetchQueue.push(() => {
-      signal?.removeEventListener('abort', onAbort);
-      queueItem();
-    });
+    fetchQueue.push(queueItem);
   });
 }
 

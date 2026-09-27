@@ -2,6 +2,7 @@ import { setActiveLibrary, getDb, getDbForLibraryPath } from './db';
 import {
   replaceAllPhotos,
   upsertPhotos,
+  deletePhotos,
   upsertPeople,
   replaceAllPeople,
   replaceAllAlbums,
@@ -14,6 +15,7 @@ import {
   setSetting,
 } from './libraryRepository';
 import { ensureMigratedIfEmpty } from './catalogService';
+import { isPathAllowedRemote } from './pathSecurity';
 
 export const STORAGE_KEY = 'gphotos_library_v1';
 export const GLOBAL_PEOPLE_KEY = 'gphotos_people_v2';
@@ -31,6 +33,8 @@ export interface SaveLibraryPayload {
   // its full contents. Sending this array through as a destructive full
   // replace would silently delete every not-yet-loaded photo's row.
   isPartialPageSet?: boolean;
+  // Ids the user deleted. Needed because a partial page set is merge-only (never deletes).
+  removedIds?: string[];
   people?: any[];
   faces?: any[];
   albums?: any[];
@@ -54,7 +58,16 @@ export interface SaveLibraryPayload {
  * Returns the resolved library path a photo enqueue should target, if any
  * (the caller uses this to kick off thumbnail pre-caching).
  */
-export function handleStorageSave(key: string, data: any): { success: boolean; enqueuePhotos?: any[]; enqueueLibraryPath?: string | null } {
+export function handleStorageSave(
+  key: string,
+  data: any,
+  options?: { isRemote?: boolean }
+): { success: boolean; enqueuePhotos?: any[]; enqueueLibraryPath?: string | null } {
+  // isRemote = the save came in over the LAN/mobile HTTP server. A paired
+  // phone must not be able to widen what the server considers a trusted root
+  // (selectedFolder / recentLibraries / virtual-storage paths feed
+  // getAllowedRoots), nor write arbitrary settings keys.
+  const isRemote = !!options?.isRemote;
   if (key === LEGACY_FACE_CACHE_KEY) {
     setSetting(key, []); // drop whatever was sent (and any old multi-hundred-MB value)
     return { success: true };
@@ -62,6 +75,9 @@ export function handleStorageSave(key: string, data: any): { success: boolean; e
   if (key === STORAGE_KEY && data) {
     const payload = data as SaveLibraryPayload;
     const libPath: string | null = payload.selectedFolder || payload.currentDirectory || null;
+    if (isRemote && libPath && !isPathAllowedRemote(libPath)) {
+      throw new Error("Access denied: library path is outside the app's known library/mirror folders.");
+    }
     if (libPath) setActiveLibrary(libPath);
     // Resolved once, explicitly, rather than relying on further ambient
     // getDb() calls below — this whole function is synchronous so there's no
@@ -69,6 +85,10 @@ export function handleStorageSave(key: string, data: any): { success: boolean; e
     // pointer mid-way through, but pinning it here means every operation in
     // this call unambiguously targets the library this save is actually for.
     const db = libPath ? getDbForLibraryPath(libPath) : getDb();
+
+    if (Array.isArray(payload.removedIds) && payload.removedIds.length > 0) {
+      deletePhotos(payload.removedIds.filter((id) => typeof id === 'string'), db);
+    }
 
     let enqueuePhotos: any[] | undefined;
     if (Array.isArray(payload.photos)) {
@@ -94,20 +114,43 @@ export function handleStorageSave(key: string, data: any): { success: boolean; e
       replaceAllAlbums(payload.albums as any, db);
     }
 
-    if (payload.selectedFolder) setSetting('selectedFolder', payload.selectedFolder);
-    if (Array.isArray(payload.recentLibraries)) setSetting('recentLibraries', payload.recentLibraries);
+    if (!isRemote) {
+      if (payload.selectedFolder) setSetting('selectedFolder', payload.selectedFolder);
+      if (Array.isArray(payload.recentLibraries)) setSetting('recentLibraries', payload.recentLibraries);
+    }
 
     return { success: true, enqueuePhotos, enqueueLibraryPath: libPath };
   }
 
   if (key === GLOBAL_PEOPLE_KEY) {
-    replaceAllPeople(Array.isArray(data) ? data : []);
+    // A non-array used to be coerced to [] here, which is a destructive full
+    // sync — a malformed/partial save would silently wipe every person.
+    if (!Array.isArray(data)) {
+      throw new Error(`${GLOBAL_PEOPLE_KEY} save rejected: data must be an array`);
+    }
+    // An explicit array (even empty) is a deliberate sync: Reset & Rescan / deleting the last person.
+    replaceAllPeople(data, { allowEmpty: true });
     return { success: true };
   }
 
   if (key === VIRTUAL_STORAGES_KEY && Array.isArray(data)) {
-    setSetting(key, dedupeVirtualStorages(data));
+    // Remote saves may update existing storages (counts, lastSynced) but can
+    // never introduce a new local/network root: entries whose paths aren't
+    // already trusted are dropped.
+    const entries = isRemote
+      ? data.filter(
+          (s: any) =>
+            s &&
+            (!s.localMirrorRoot || isPathAllowedRemote(s.localMirrorRoot)) &&
+            (!s.networkSourcePath || isPathAllowedRemote(s.networkSourcePath))
+        )
+      : data;
+    setSetting(key, dedupeVirtualStorages(entries));
     return { success: true };
+  }
+
+  if (isRemote && (key === VIRTUAL_STORAGES_KEY || !/^gphotos_[A-Za-z0-9_]+$/.test(key))) {
+    throw new Error(`Setting "${key}" cannot be written over the network`);
   }
 
   setSetting(key, data);

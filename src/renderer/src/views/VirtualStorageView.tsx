@@ -25,13 +25,14 @@ import {
   Image,
   X,
 } from 'lucide-react';
-import { VirtualStorageConfig, MirrorProgress, BackgroundServiceStatus, NetworkStorageProgress, StorageDetails } from '../../types';
+import { VirtualStorageConfig, MirrorProgress, BackgroundServiceStatus, NetworkStorageProgress, StorageDetails } from '../../../types';
 import { DeleteStorageModal } from '../components/DeleteStorageModal';
 import { libraryStore } from '../services/libraryStore';
 import { splitStoragesByExistence } from '../services/storageValidation';
 import { selectDirectoryOrPrompt } from '../services/selectDirectory';
 import { joinMirrorPath } from '../services/pathUtils';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { notify, notifyError } from '../services/notifications';
 
 interface VirtualStorageViewProps {
   onLoadMirroredPhotos: (mirrorRootPath: string) => void;
@@ -54,6 +55,11 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
   const [isLoadingStorages, setIsLoadingStorages] = useState(true);
   const storagesRef = useRef<VirtualStorageConfig[]>([]);
   storagesRef.current = storages;
+  // Set when the persisted storage list could not be READ. In that state an empty in-memory list
+  // means "unknown", not "no storages" — it must never be written back over the real one.
+  const loadFailedRef = useRef(false);
+  const isSyncingRef = useRef(false);
+  const pollBusyRef = useRef(false);
 
   const [storageDetailsMap, setStorageDetailsMap] = useState<Record<string, StorageDetails>>({});
   // Cards would otherwise briefly render with 0/empty stats before the first
@@ -74,7 +80,11 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
   const [localMirrorRoot, setLocalMirrorRoot] = useState('');
   const [delaySec, setDelaySec] = useState<number>(0.5);
   const [bandwidthLimit, setBandwidthLimit] = useState<number>(0);
-  const [isSyncing, setIsSyncing] = useState(false);
+  const [isSyncing, setIsSyncingState] = useState(false);
+  const setIsSyncing = (v: boolean) => {
+    isSyncingRef.current = v;
+    setIsSyncingState(v);
+  };
   const [activeSyncStorageId, setActiveSyncStorageId] = useState<string | null>(null);
   const [progress, setProgress] = useState<MirrorProgress | null>(null);
   const [syncSummary, setSyncSummary] = useState<{
@@ -95,8 +105,13 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
     storagesRef.current = updated;
     setStorages(updated);
     if (onStoragesUpdated) onStoragesUpdated(updated);
+    if (loadFailedRef.current) {
+      notify('error', 'The saved storage list could not be read earlier, so this change was NOT saved (to avoid overwriting it). Reopen this screen and try again.');
+      return updated;
+    }
     if (window.electronAPI) {
-      await window.electronAPI.saveLibraryData(STORAGE_CONFIGS_KEY, updated);
+      const ok = await window.electronAPI.saveLibraryData(STORAGE_CONFIGS_KEY, updated);
+      if (ok === false) notify('error', 'Could not save the storage list to disk. Your changes may be lost when the app restarts.');
     } else if (typeof localStorage !== 'undefined') {
       localStorage.setItem(STORAGE_CONFIGS_KEY, JSON.stringify(updated));
     }
@@ -119,15 +134,21 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
       prev.map((s) => (s.id === config.id ? { ...s, inventoryStatus: 'scanning' } : s))
     );
 
-    const result = await window.electronAPI.scanStorageInventory(config.networkSourcePath);
-
-    const updatedConfig: VirtualStorageConfig = {
-      ...config,
-      inventoryStatus: result.status,
-      inventoryTotalFiles: result.totalFiles,
-      inventoryCompletedAt: result.completedAt,
-      inventoryError: result.error,
-    };
+    let updatedConfig: VirtualStorageConfig;
+    try {
+      const result = await window.electronAPI.scanStorageInventory(config.networkSourcePath);
+      updatedConfig = {
+        ...config,
+        inventoryStatus: result.status,
+        inventoryTotalFiles: result.totalFiles,
+        inventoryCompletedAt: result.completedAt,
+        inventoryError: result.error,
+      };
+    } catch (err: any) {
+      // Offline share / IPC failure: record it as failed (rendered on the card) instead of leaving it 'scanning' forever.
+      updatedConfig = { ...config, inventoryStatus: 'failed', inventoryError: err?.message || String(err) };
+      notifyError(`Count files in "${config.name}"`, err);
+    }
     await saveStorages((prev) => prev.map((s) => (s.id === config.id ? updatedConfig : s)));
     return updatedConfig;
   };
@@ -144,7 +165,13 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
     if (missing.length === 0) return list;
 
     if (window.electronAPI) {
-      const unlinked: string[] = (await window.electronAPI.loadLibraryData(UNLINKED_STORAGES_KEY)) || [];
+      let unlinked: string[];
+      try {
+        unlinked = (await window.electronAPI.loadLibraryData(UNLINKED_STORAGES_KEY)) || [];
+      } catch {
+        // Can't read the ignore list: don't prune now (nothing is lost by waiting for the next pass).
+        return list;
+      }
       const missingNames = missing.map((s) => s.name.toLowerCase());
       const nextUnlinked = Array.from(new Set([...unlinked, ...missingNames]));
       await window.electronAPI.saveLibraryData(UNLINKED_STORAGES_KEY, nextUnlinked);
@@ -170,8 +197,14 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
       setIsLoadingStorages(true);
       try {
         let unlinked: string[] = [];
+        let loadFailed = false;
         if (window.electronAPI) {
-          unlinked = (await window.electronAPI.loadLibraryData(UNLINKED_STORAGES_KEY)) || [];
+          try {
+            unlinked = (await window.electronAPI.loadLibraryData(UNLINKED_STORAGES_KEY)) || [];
+          } catch (err) {
+            loadFailed = true;
+            notifyError('Read the storage settings', err);
+          }
         } else if (typeof localStorage !== 'undefined') {
           const raw = localStorage.getItem(UNLINKED_STORAGES_KEY);
           if (raw) unlinked = JSON.parse(raw);
@@ -180,7 +213,12 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
 
         let saved: VirtualStorageConfig[] | null = null;
         if (window.electronAPI) {
-          saved = await window.electronAPI.loadLibraryData(STORAGE_CONFIGS_KEY);
+          try {
+            saved = await window.electronAPI.loadLibraryData(STORAGE_CONFIGS_KEY);
+          } catch (err) {
+            loadFailed = true;
+            notifyError('Read the storage list', err);
+          }
         }
         if (!saved && typeof localStorage !== 'undefined') {
           const raw = localStorage.getItem(STORAGE_CONFIGS_KEY);
@@ -220,8 +258,9 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
 
         // Prune entries whose local mirror folder no longer exists on disk —
         // e.g. deleted manually outside the app rather than via "Delete
-        // Storage" here.
-        combined = await pruneMissingStorageFolders(combined);
+        // Storage" here. Skipped when the list could not be read (see loadFailedRef).
+        loadFailedRef.current = loadFailed;
+        if (!loadFailed) combined = await pruneMissingStorageFolders(combined);
 
         if (isMounted) {
           storagesRef.current = combined;
@@ -229,14 +268,15 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
           if (onStoragesUpdated) onStoragesUpdated(combined);
         }
         if (window.electronAPI) {
-          await window.electronAPI.saveLibraryData(STORAGE_CONFIGS_KEY, combined);
+          // A failed READ must never be persisted back as an empty list.
+          if (!loadFailed) await window.electronAPI.saveLibraryData(STORAGE_CONFIGS_KEY, combined);
           if (window.electronAPI.getBackgroundServiceStatus) {
             const status = await window.electronAPI.getBackgroundServiceStatus();
             if (isMounted) setServiceStatus(status);
           }
         }
       } catch (err) {
-        console.error('Failed to load virtual storages:', err);
+        notifyError('Load network storages', err);
       } finally {
         if (isMounted) {
           setIsLoadingStorages(false);
@@ -331,15 +371,23 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
     // screen is open, live — not just on next app launch — since the folder
     // is the source of truth for whether the storage still exists at all.
     const checkForRemovedStorages = async () => {
-      if (storagesRef.current.length === 0 || isSyncing) return;
-      const pruned = await pruneMissingStorageFolders(storagesRef.current);
-      if (pruned.length !== storagesRef.current.length) {
-        storagesRef.current = pruned;
-        setStorages(pruned);
-        if (onStoragesUpdated) onStoragesUpdated(pruned);
-        if (window.electronAPI) {
-          await window.electronAPI.saveLibraryData(STORAGE_CONFIGS_KEY, pruned);
+      if (storagesRef.current.length === 0 || isSyncingRef.current || loadFailedRef.current) return;
+      try {
+        const snapshot = storagesRef.current;
+        const kept = new Set((await pruneMissingStorageFolders(snapshot)).map((s) => s.id));
+        const removedIds = new Set(snapshot.filter((s) => !kept.has(s.id)).map((s) => s.id));
+        if (removedIds.size > 0) {
+          // Apply only the removal to the LATEST list: storages may have been added/edited during the await.
+          const pruned = storagesRef.current.filter((s) => !removedIds.has(s.id));
+          storagesRef.current = pruned;
+          setStorages(pruned);
+          if (onStoragesUpdated) onStoragesUpdated(pruned);
+          if (window.electronAPI) {
+            await window.electronAPI.saveLibraryData(STORAGE_CONFIGS_KEY, pruned);
+          }
         }
+      } catch {
+        // Background check; a failed tick is skipped quietly and retried on the next one.
       }
     };
 
@@ -351,7 +399,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
     // it are fine since those come from the always-live getAllStorageDetails
     // call, just not this specific line).
     const refreshStorageTotals = async () => {
-      if (!window.electronAPI?.loadLibraryData || storagesRef.current.length === 0 || isSyncing) return;
+      if (!window.electronAPI?.loadLibraryData || storagesRef.current.length === 0 || isSyncingRef.current || loadFailedRef.current) return;
       try {
         const saved: VirtualStorageConfig[] | null = await window.electronAPI.loadLibraryData(STORAGE_CONFIGS_KEY);
         if (!saved || saved.length === 0) return;
@@ -380,11 +428,15 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
 
     fetchStatus();
     fetchStorageDetails();
-    const intervalId = setInterval(() => {
-      fetchStatus();
-      fetchStorageDetails();
-      checkForRemovedStorages();
-      refreshStorageTotals();
+    const intervalId = setInterval(async () => {
+      // A slow network drive must not stack up overlapping poll rounds.
+      if (pollBusyRef.current) return;
+      pollBusyRef.current = true;
+      try {
+        await Promise.all([fetchStatus(), fetchStorageDetails(), checkForRemovedStorages(), refreshStorageTotals()]);
+      } finally {
+        pollBusyRef.current = false;
+      }
     }, 2000);
     return () => clearInterval(intervalId);
   }, [storages]);
@@ -405,6 +457,8 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
         const updated = await window.electronAPI.getBackgroundServiceStatus();
         setServiceStatus(updated);
       }
+    } catch (err) {
+      notifyError('Pause/resume thumbnail pre-caching', err);
     } finally {
       setIsPreCachingActionBusy(false);
     }
@@ -420,25 +474,35 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
         const updated = await window.electronAPI.getBackgroundServiceStatus();
         setServiceStatus(updated);
       }
+    } catch (err) {
+      notifyError('Start thumbnail caching', err);
     } finally {
       setIsPreCachingActionBusy(false);
     }
   };
 
   const handleSelectNetworkSource = async () => {
-    const dir = await selectDirectoryOrPrompt('Enter the full path to the network/remote source folder (e.g. \\\\NAS\\FamilyPhotos or /mnt/nas/FamilyPhotos):');
-    if (dir) {
-      setNetworkSourcePath(dir);
-      if (!name) {
-        const folderName = dir.split(/[\\/]/).pop() || 'NetworkStorage';
-        setName(folderName);
+    try {
+      const dir = await selectDirectoryOrPrompt('Enter the full path to the network/remote source folder (e.g. \\\\NAS\\FamilyPhotos or /mnt/nas/FamilyPhotos):');
+      if (dir) {
+        setNetworkSourcePath(dir);
+        if (!name) {
+          const folderName = dir.split(/[\\/]/).pop() || 'NetworkStorage';
+          setName(folderName);
+        }
       }
+    } catch (err) {
+      notifyError('Choose network folder', err);
     }
   };
 
   const handleSelectLocalMirror = async () => {
-    const dir = await selectDirectoryOrPrompt('Enter the full path for the local mirror cache root:');
-    if (dir) setLocalMirrorRoot(dir);
+    try {
+      const dir = await selectDirectoryOrPrompt('Enter the full path for the local mirror cache root:');
+      if (dir) setLocalMirrorRoot(dir);
+    } catch (err) {
+      notifyError('Choose mirror folder', err);
+    }
   };
 
   const handleAddStorage = async (e: React.FormEvent) => {
@@ -458,24 +522,34 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
       inventoryStatus: 'not_started',
     };
 
-    await saveStorages((prev) => {
-      const filtered = prev.filter((s) => s.name.toLowerCase() !== newConfig.name.toLowerCase());
-      return [...filtered, newConfig];
-    });
+    try {
+      await saveStorages((prev) => {
+        const filtered = prev.filter((s) => s.name.toLowerCase() !== newConfig.name.toLowerCase());
+        return [...filtered, newConfig];
+      });
 
-    // Remove from unlinked blacklist if previously unlinked
-    if (window.electronAPI) {
-      const unlinked = (await window.electronAPI.loadLibraryData(UNLINKED_STORAGES_KEY)) || [];
-      const updatedUnlinked = unlinked.filter((u: string) => u.toLowerCase() !== newConfig.name.toLowerCase());
-      await window.electronAPI.saveLibraryData(UNLINKED_STORAGES_KEY, updatedUnlinked);
+      // Remove from unlinked blacklist if previously unlinked. If the list can't be READ, leave it
+      // untouched — writing back a guess would erase every other ignored storage.
+      if (window.electronAPI) {
+        try {
+          const unlinked = (await window.electronAPI.loadLibraryData(UNLINKED_STORAGES_KEY)) || [];
+          const updatedUnlinked = unlinked.filter((u: string) => u.toLowerCase() !== newConfig.name.toLowerCase());
+          await window.electronAPI.saveLibraryData(UNLINKED_STORAGES_KEY, updatedUnlinked);
+        } catch (err) {
+          notifyError('Update the ignored-storages list', err);
+        }
+      }
+
+      setName('');
+      setNetworkSourcePath('');
+
+      // Inventory gate: count everything under the source folder and fix that
+      // number before any thumbnail/face processing is allowed to start.
+      newConfig = await ensureInventoryCompleted(newConfig);
+    } catch (err) {
+      notifyError('Add storage', err);
+      return;
     }
-
-    setName('');
-    setNetworkSourcePath('');
-
-    // Inventory gate: count everything under the source folder and fix that
-    // number before any thumbnail/face processing is allowed to start.
-    newConfig = await ensureInventoryCompleted(newConfig);
     if (newConfig.inventoryStatus !== 'completed') {
       setSyncSummary(null);
       return;
@@ -491,7 +565,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
   };
 
   const handleSyncStorage = async (config: VirtualStorageConfig, forceRecount = false) => {
-    if (!window.electronAPI || isSyncing) return;
+    if (!window.electronAPI || isSyncingRef.current) return;
 
     setIsSyncing(true);
     setActiveSyncStorageId(config.id);
@@ -533,19 +607,24 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
     if (forceRecount) {
       config = { ...config, inventoryStatus: 'not_started' };
     }
-    config = await ensureInventoryCompleted(config);
-    if (config.inventoryStatus !== 'completed') {
-      setIsSyncing(false);
-      setActiveSyncStorageId(null);
-      return;
-    }
-
     try {
+      config = await ensureInventoryCompleted(config);
+      if (config.inventoryStatus !== 'completed') {
+        return; // finally below releases the busy state
+      }
+
       // syncVirtualStorage now runs the full unified pipeline itself —
       // thumbnail, then face detection, then OneDrive reclaim if applicable
       // — for plain and OneDrive-backed sources alike (see
       // docs/PIPELINE_REDESIGN_DEV_DOC.md §3.3).
       const result = await window.electronAPI.syncVirtualStorage(config);
+      if (!result.success) {
+        notify(
+          'error',
+          `Sync of "${config.name}" did not complete${result.errors && result.errors.length ? `: ${result.errors[0]}` : '.'}`,
+          result.errors && result.errors.length > 1 ? result.errors.slice(0, 20).join('\n') : undefined
+        );
+      }
       if (result.success) {
         const fullLocalPath = joinMirrorPath(config.localMirrorRoot, config.name);
         setSyncSummary({
@@ -591,7 +670,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
         // no need to force that refresh from here.
       }
     } catch (err) {
-      console.error('Failed to sync virtual storage:', err);
+      notifyError(`Sync "${config.name}"`, err);
     } finally {
       setIsSyncing(false);
       setActiveSyncStorageId(null);
@@ -602,16 +681,8 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
     if (!storageToDelete) return;
     const target = storageToDelete;
 
-    // 1. If deleting disk files, invoke native IPC to trash folder in C:\GPhotos_VirtualMirrors
-    if (deleteDiskFiles && window.electronAPI?.deleteVirtualStorage) {
-      await window.electronAPI.deleteVirtualStorage({
-        storageName: target.name,
-        localMirrorRoot: target.localMirrorRoot,
-        deleteDiskFiles: true,
-      });
-    }
-
-    // 2. Persist to unlinked list so auto-discover mirrors will never resurrect it
+    // Read the ignore list BEFORE touching the disk: if it can't be read this throws (DeleteStorageModal
+    // shows the error) with nothing deleted, instead of saving back a truncated list.
     let unlinked: string[] = [];
     if (window.electronAPI) {
       unlinked = (await window.electronAPI.loadLibraryData(UNLINKED_STORAGES_KEY)) || [];
@@ -619,6 +690,20 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
       const raw = localStorage.getItem(UNLINKED_STORAGES_KEY);
       if (raw) unlinked = JSON.parse(raw);
     }
+    // 1. If deleting disk files, invoke native IPC to trash folder in C:\GPhotos_VirtualMirrors
+    if (deleteDiskFiles && window.electronAPI?.deleteVirtualStorage) {
+      const res = await window.electronAPI.deleteVirtualStorage({
+        storageName: target.name,
+        localMirrorRoot: target.localMirrorRoot,
+        deleteDiskFiles: true,
+      });
+      if (res && res.success === false) {
+        // Keep the storage listed: its files are still on disk.
+        throw new Error(res.error || 'The mirror folder could not be deleted.');
+      }
+    }
+
+    // 2. Persist to unlinked list so auto-discover mirrors will never resurrect it
     if (!unlinked.map((n) => n.toLowerCase()).includes(target.name.toLowerCase())) {
       unlinked.push(target.name);
       if (window.electronAPI) {
@@ -645,24 +730,33 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
   const handleUpdateServiceSetting = async (key: string, val: any) => {
     if (!window.electronAPI?.setBackgroundServiceSettings) return;
     setIsUpdatingService(true);
-    await window.electronAPI.setBackgroundServiceSettings({ [key]: val });
-    const updated = await window.electronAPI.getBackgroundServiceStatus();
-    setServiceStatus(updated);
-    setIsUpdatingService(false);
+    try {
+      await window.electronAPI.setBackgroundServiceSettings({ [key]: val });
+      const updated = await window.electronAPI.getBackgroundServiceStatus();
+      setServiceStatus(updated);
+    } catch (err) {
+      notifyError('Change background service setting', err);
+    } finally {
+      setIsUpdatingService(false);
+    }
   };
 
   const handleTriggerServiceSyncNow = async () => {
     if (!window.electronAPI?.triggerBackgroundServiceSync) return;
-    await window.electronAPI.triggerBackgroundServiceSync();
-    if (window.electronAPI.getBackgroundServiceStatus) {
-      const updated = await window.electronAPI.getBackgroundServiceStatus();
-      setServiceStatus(updated);
+    try {
+      await window.electronAPI.triggerBackgroundServiceSync();
+      if (window.electronAPI.getBackgroundServiceStatus) {
+        const updated = await window.electronAPI.getBackgroundServiceStatus();
+        setServiceStatus(updated);
+      }
+    } catch (err) {
+      notifyError('Start background sync', err);
     }
   };
 
   const handleSyncAllStorages = async () => {
-    if (!window.electronAPI || isSyncing || storagesRef.current.length === 0) return;
-    for (const storage of storagesRef.current) {
+    if (!window.electronAPI || isSyncingRef.current || storagesRef.current.length === 0) return;
+    for (const storage of [...storagesRef.current]) {
       await handleSyncStorage(storage, true);
     }
   };
@@ -1294,6 +1388,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                                 whiteSpace: isMobile ? 'nowrap' : 'normal',
                               }}>
                                 {prog.phase === 'paused' && (prog.message || '⚠ Paused — OneDrive is not freeing up disk space as expected.')}
+                                {prog.phase === 'error' && (prog.message || 'Sync error — see the notice for details, then Rescan to retry.')}
                                 {prog.phase === 'scanning' && 'Scanning remote directory...'}
                                 {prog.phase === 'thumbnails' && `Caching Thumbnails (${prog.thumbnailCurrent}/${prog.thumbnailTotal || '?'})`}
                                 {prog.phase === 'faces' && `Recognizing Faces (${prog.faceCurrent}/${prog.faceTotal || '?'})`}
@@ -1308,7 +1403,12 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                                 style={{ fontSize: '0.72rem', padding: '4px 10px', flexShrink: 0 }}
                                 onClick={async (e) => {
                                   e.stopPropagation();
-                                  await window.electronAPI?.resetOneDriveReclaimHealth?.();
+                                  try {
+                                    await window.electronAPI?.resetOneDriveReclaimHealth?.();
+                                  } catch (err) {
+                                    notifyError('Retry OneDrive check', err);
+                                    return;
+                                  }
                                   handleSyncStorage(s);
                                 }}
                               >

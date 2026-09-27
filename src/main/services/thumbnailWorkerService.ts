@@ -2,8 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { Photo, ThumbnailWorkerCheckpoint } from '../../types';
-import { getOrGenerateCachedThumbnail } from './thumbnailCacheService';
-import { generateSpriteSheet } from './spriteService';
+import { getOrGenerateCachedThumbnail, onThumbnailCacheCleared, getCacheKey } from './thumbnailCacheService';
 import { libraryStatusService } from './libraryStatusService';
 import { getDefaultMirrorRoot } from './pathSecurity';
 
@@ -11,8 +10,10 @@ let sharp: any = null;
 try {
   sharp = require('sharp');
   // Configure Sharp memory cache strictly to avoid memory bloat
+  // files:0 — sharp's file cache keeps source files open, which on Windows
+  // locks the user's photos (rotate/delete fails with EBUSY).
   if (sharp.cache) {
-    sharp.cache({ memory: 64, files: 30, items: 200 });
+    sharp.cache({ memory: 64, files: 0, items: 200 });
   }
 } catch {}
 
@@ -32,7 +33,48 @@ interface WorkerStatus {
   ramMb: number;
   currentFile?: string;
   lastError?: string;
+  /** Photos whose thumbnail could not be generated this session (corrupt/missing/unwritable). */
+  failed: number;
+  /** True while the worker is deliberately slowed because process RSS reached the RAM limit. */
+  ramThrottled: boolean;
 }
+
+// How many queued photos are checked for "already cached?" at once. The check is two cheap
+// stats (IO only, no decode/CPU), so it runs far wider than `limits.concurrency` (1 in
+// Background mode) — a 100k re-walk of an already-cached library would otherwise be serial IO.
+const CACHE_PROBE_WINDOW = 32;
+
+// Mirrors thumbnailCacheService's private getGlobalCacheDir()/cache-file layout. If they ever
+// drift the probe just reports "not cached" and the normal path still does the right thing
+// (a test guards the two staying in sync).
+function getThumbnailCacheDir(): string {
+  try {
+    const { app } = require('electron');
+    if (app && typeof app.getPath === 'function') {
+      return path.join(app.getPath('userData'), 'cache', 'thumbnails');
+    }
+  } catch {}
+  const appData =
+    process.env.APPDATA ||
+    (process.platform === 'darwin'
+      ? path.join(os.homedir(), 'Library/Application Support')
+      : path.join(os.homedir(), '.config'));
+  return path.join(appData, 'gPhotos', 'cache', 'thumbnails');
+}
+
+/** True if a non-empty cached thumbnail already exists for `sourcePath` at `size` (never generates). */
+export async function isThumbnailCached(sourcePath: string, size: number = 250): Promise<boolean> {
+  try {
+    const src = await fs.promises.stat(sourcePath);
+    const cached = path.join(getThumbnailCacheDir(), `${size}`, `${getCacheKey(sourcePath, src.mtimeMs, size)}.jpg`);
+    return (await fs.promises.stat(cached)).size > 0;
+  } catch {
+    return false;
+  }
+}
+
+const FAILED_RETRY_AFTER_MS = 10 * 60 * 1000;
+const FAILED_MAX_ATTEMPTS = 3;
 
 class ThumbnailWorkerService {
   private queue: Photo[] = [];
@@ -46,6 +88,20 @@ class ThumbnailWorkerService {
   // make "Total" grow indefinitely across repeated enqueue calls even
   // though nothing new was actually happening.
   private confirmedCachedPaths = new Set<string>();
+  // Photos whose thumbnail generation failed this session — not retried on
+  // every re-enqueue (a corrupt file would fail identically each time) and
+  // deliberately NOT in confirmedCachedPaths, since they are not cached.
+  // path -> how often generation failed and when. A failure may be transient (share briefly offline,
+  // file locked), so a path is retried after FAILED_RETRY_AFTER_MS, and only given up on after
+  // FAILED_MAX_ATTEMPTS failures.
+  private failedPaths = new Map<string, { attempts: number; lastAt: number }>();
+  private failedCount = 0;
+  private lastError?: string;
+  private ramThrottled = false;
+  private lastRamBackoffAt = 0;
+  // Set once the disk cache is cleared: the persisted "library already 100%
+  // pre-cached" status is then stale, so enqueuePhotos must not trust it.
+  private cacheCleared = false;
   private isProcessing = false;
   private isPaused = false;
   // Separate from isPaused (the user's own manual Settings toggle) so the
@@ -75,9 +131,23 @@ class ThumbnailWorkerService {
   constructor() {
     this.loadCheckpoint();
     // Start periodic resource monitoring (every 2 seconds)
-    setInterval(() => {
-      this.updateResourceMetrics();
+    const metricsTimer = setInterval(() => {
+      try {
+        this.updateResourceMetrics();
+      } catch (err) {
+        console.warn('[ThumbnailWorker] Resource metrics update failed:', err);
+      }
     }, 2000);
+    metricsTimer.unref?.();
+
+    // The disk cache was emptied — forget everything we believed was cached.
+    onThumbnailCacheCleared(() => {
+      this.confirmedCachedPaths.clear();
+      this.failedPaths.clear();
+      this.failedCount = 0;
+      this.processedCount = 0;
+      this.cacheCleared = true;
+    });
   }
 
   private getCheckpointFilePath(): string {
@@ -110,6 +180,11 @@ class ThumbnailWorkerService {
     this.queue = [];
     this.queuedPaths.clear();
     this.confirmedCachedPaths.clear();
+    this.failedPaths.clear();
+    this.failedCount = 0;
+    this.lastError = undefined;
+    this.ramThrottled = false;
+    this.cacheCleared = false;
     this.isProcessing = false;
     this.isPaused = false;
     this.totalQueuedCount = 0;
@@ -223,7 +298,7 @@ class ThumbnailWorkerService {
     if (rssMb > this.limits.maxRamMb * 0.85) {
       if (sharp && typeof sharp.cache === 'function') {
         sharp.cache(false);
-        sharp.cache({ memory: 32, files: 10, items: 100 });
+        sharp.cache({ memory: 32, files: 0, items: 100 });
       }
       if (typeof (global as any).gc === 'function') {
         try {
@@ -245,6 +320,9 @@ class ThumbnailWorkerService {
       cpuPercent: this.currentCalculatedCpuPercent,
       ramMb: Math.round(mem.rss / (1024 * 1024)),
       currentFile: this.isProcessing ? (this.currentFileName || 'Processing...') : undefined,
+      lastError: this.lastError,
+      failed: this.failedCount,
+      ramThrottled: this.ramThrottled,
     };
   }
 
@@ -289,6 +367,13 @@ class ThumbnailWorkerService {
   /**
    * Enqueues photos for background thumbnail pre-caching with library tracking.
    */
+  /** True while a path that failed recently (or too many times) should not be queued again. */
+  private isGivenUpOn(key: string): boolean {
+    const f = this.failedPaths.get(key);
+    if (!f) return false;
+    return f.attempts >= FAILED_MAX_ATTEMPTS || Date.now() - f.lastAt < FAILED_RETRY_AFTER_MS;
+  }
+
   public enqueuePhotos(photos: Photo[], libraryPath?: string): void {
     if (!photos || photos.length === 0) return;
 
@@ -316,7 +401,7 @@ class ThumbnailWorkerService {
     if (this.currentLibraryPath) {
       const existingStatus = libraryStatusService.getLibraryStatus(this.currentLibraryPath);
       if (existingStatus) {
-        if (existingStatus.thumbnailCompleted && existingStatus.totalPhotos === photos.length) {
+        if (!this.cacheCleared && existingStatus.thumbnailCompleted && existingStatus.totalPhotos === photos.length) {
           // Accumulate, don't overwrite — service:start-precache's "resume
           // all storages" path calls enqueuePhotos once per storage in a
           // loop, and processedCount/totalQueuedCount are running totals
@@ -350,7 +435,7 @@ class ThumbnailWorkerService {
           this.notifyStatus();
           return;
         }
-        if (existingStatus.thumbnailCachedCount > 0) {
+        if (!this.cacheCleared && existingStatus.thumbnailCachedCount > 0) {
           this.processedCount = Math.max(this.processedCount, existingStatus.thumbnailCachedCount);
         }
       }
@@ -360,7 +445,7 @@ class ThumbnailWorkerService {
     for (const photo of photos) {
       if (!photo || !photo.filePath) continue;
       const key = photo.filePath.toLowerCase();
-      if (this.confirmedCachedPaths.has(key)) continue;
+      if (this.confirmedCachedPaths.has(key) || this.isGivenUpOn(key)) continue;
       if (!this.queuedPaths.has(key)) {
         this.queuedPaths.add(key);
         this.queue.push(photo);
@@ -428,11 +513,42 @@ class ThumbnailWorkerService {
     this.isProcessing = true;
 
     let fastForwardCount = 0;
+    // Photos probed as NOT cached, waiting for their turn at `concurrency`. They stay in
+    // queuedPaths (so a concurrent enqueuePhotos can't duplicate them) and are put back at the
+    // head of the queue if the loop exits early (pause, disable).
+    const carry: Photo[] = [];
+
+    const recordCached = (photo: Photo) => {
+      fastForwardCount++;
+      this.confirmedCachedPaths.add(photo.filePath.toLowerCase());
+      this.processedCount = Math.min(this.totalQueuedCount, this.processedCount + 1);
+      // Periodically save and notify every 50 fast-forwarded photos to avoid UI overhead
+      if (fastForwardCount % 50 === 0 || (this.queue.length === 0 && carry.length === 0)) {
+        this.saveCheckpoint(false);
+        this.notifyStatus();
+      }
+    };
 
     try {
-      while (this.queue.length > 0 && !this.isPaused && !this.activityPaused && this.limits.enabled) {
-        const batchSize = Math.max(1, Math.min(this.limits.concurrency, this.queue.length));
-        const batch = this.queue.splice(0, batchSize);
+      while ((this.queue.length > 0 || carry.length > 0) && !this.isPaused && !this.activityPaused && this.limits.enabled) {
+        // Wide, IO-only "already cached?" pass over the next window of the queue; cached photos are
+        // fast-forwarded right here, the rest are carried on to the normal `concurrency`-wide path.
+        if (carry.length < this.limits.concurrency && this.queue.length > 0) {
+          const window = this.queue.splice(0, CACHE_PROBE_WINDOW);
+          const cachedFlags = await Promise.all(window.map((p) => isThumbnailCached(p.filePath, 250)));
+          window.forEach((photo, i) => {
+            if (cachedFlags[i]) {
+              this.queuedPaths.delete(photo.filePath.toLowerCase());
+              recordCached(photo);
+            } else {
+              carry.push(photo);
+            }
+          });
+          if (carry.length === 0) continue;
+          if (this.isPaused || this.activityPaused || !this.limits.enabled) continue;
+        }
+
+        const batch = carry.splice(0, Math.max(1, Math.min(this.limits.concurrency, carry.length)));
         for (const p of batch) this.queuedPaths.delete(p.filePath.toLowerCase());
 
         const t0 = Date.now();
@@ -440,25 +556,31 @@ class ThumbnailWorkerService {
           batch.map(async (photo) => {
             try {
               const res = await getOrGenerateCachedThumbnail(photo.filePath, 250);
-              return { photo, isCached: !!res?.isFromCache };
-            } catch {
-              return { photo, isCached: false };
+              // null = generation failed (missing/corrupt/unwritable) — distinct
+              // from a freshly generated thumbnail.
+              return { photo, isCached: !!res?.isFromCache, failed: !res, error: undefined as unknown };
+            } catch (error) {
+              return { photo, isCached: false, failed: true, error };
             }
           })
         );
 
         let didRealWork = false;
-        for (const { photo, isCached } of outcomes) {
-          if (isCached) {
-            fastForwardCount++;
-            this.confirmedCachedPaths.add(photo.filePath.toLowerCase());
-            this.processedCount = Math.min(this.totalQueuedCount, this.processedCount + 1);
-
-            // Periodically save and notify every 50 fast-forwarded photos to avoid UI overhead
-            if (fastForwardCount % 50 === 0 || this.queue.length === 0) {
-              this.saveCheckpoint(false);
-              this.notifyStatus();
+        for (const { photo, isCached, failed, error } of outcomes) {
+          if (failed) {
+            didRealWork = true;
+            const key = photo.filePath.toLowerCase();
+            const prior = this.failedPaths.get(key);
+            this.failedPaths.set(key, { attempts: (prior?.attempts ?? 0) + 1, lastAt: Date.now() });
+            this.failedCount++;
+            this.lastError = `Thumbnail failed: ${photo.fileName || path.basename(photo.filePath)}${error ? ` (${String((error as any)?.message ?? error)})` : ''}`;
+            if (this.failedCount <= 5 || this.failedCount % 100 === 0) {
+              console.warn(`[ThumbnailWorker] ${this.lastError} (${this.failedCount} failed so far)`);
             }
+            continue;
+          }
+          if (isCached) {
+            recordCached(photo);
             continue;
           }
 
@@ -478,12 +600,29 @@ class ThumbnailWorkerService {
 
         const tWork = Math.max(1, Date.now() - t0);
 
-        // 2. RAM Safety Check: if current RAM exceeds limit, pause and back off
+        // 2. RAM Safety Check: if current RAM exceeds limit, back off briefly.
+        // Rate-limited (at most one 3s back-off per 30s) so a main process that
+        // simply sits above the limit (RSS includes everything in the process,
+        // not just this worker) can't throttle pre-caching to a crawl forever;
+        // the state is exposed via status (ramThrottled / lastError) instead.
         const currentRssMb = Math.round(process.memoryUsage().rss / (1024 * 1024));
         if (currentRssMb >= this.limits.maxRamMb) {
-          console.warn(`[ThumbnailWorker] RAM reached ${currentRssMb}MB (limit: ${this.limits.maxRamMb}MB). Backing off for 3 seconds...`);
-          if (sharp?.cache) sharp.cache(false);
-          await new Promise((r) => setTimeout(r, 3000));
+          if (!this.ramThrottled) {
+            this.lastError = `Memory use ${currentRssMb}MB reached the ${this.limits.maxRamMb}MB limit — pre-caching is being slowed`;
+          }
+          this.ramThrottled = true;
+          if (Date.now() - this.lastRamBackoffAt >= 30_000) {
+            this.lastRamBackoffAt = Date.now();
+            console.warn(`[ThumbnailWorker] RAM reached ${currentRssMb}MB (limit: ${this.limits.maxRamMb}MB). Backing off for 3 seconds...`);
+            if (sharp?.cache) {
+              sharp.cache(false);
+              sharp.cache({ memory: 32, files: 0, items: 100 }); // shrink, don't leave the cache disabled
+            }
+            await new Promise((r) => setTimeout(r, 3000));
+          }
+        } else if (this.ramThrottled) {
+          this.ramThrottled = false;
+          if (this.lastError?.startsWith('Memory use')) this.lastError = undefined;
         }
 
         // 3. CPU Duty Cycle Throttling on actual work (Cap CPU <= maxCpuPercent)
@@ -498,6 +637,7 @@ class ThumbnailWorkerService {
         await new Promise((r) => setTimeout(r, sleepMs));
       }
     } finally {
+      if (carry.length > 0) this.queue.unshift(...carry);
       this.isProcessing = false;
       this.currentFileName = undefined;
       const isDone = this.queue.length === 0;

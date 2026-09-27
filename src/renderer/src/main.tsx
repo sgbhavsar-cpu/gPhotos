@@ -4,7 +4,10 @@ import ReactDOM from 'react-dom/client';
 import { App } from './App';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { MobileAuthGate } from './components/MobileAuthGate';
+import { NoticeHost } from './components/NoticeHost';
 import { installUserActionLogger } from './services/userActionLogger';
+import { logger } from './services/logger';
+import { notifyError } from './services/notifications';
 import './index.css';
 
 // Logs every click/navigation + unhandled error to the same file-backed log
@@ -17,10 +20,12 @@ installUserActionLogger();
 if (typeof window !== 'undefined') {
   window.addEventListener('error', (event) => {
     console.error('[Global Unhandled Window Error]:', event.error || event.message, event);
+    notifyError('Unexpected error', event.error || event.message);
   });
 
   window.addEventListener('unhandledrejection', (event) => {
     console.error('[Global Unhandled Promise Rejection]:', event.reason);
+    notifyError('Operation failed', event.reason);
   });
 
   // Register client-side Service Worker for blazing-fast photo thumbnail caching
@@ -35,13 +40,18 @@ if (typeof window !== 'undefined') {
 
 const rootElement = document.getElementById('root');
 if (rootElement) {
-  ReactDOM.createRoot(rootElement).render(
+  ReactDOM.createRoot(rootElement, {
+    // Errors an ErrorBoundary caught never reach window.onerror; log them so they land in main.log.
+    onCaughtError: (err) => logger.error('ErrorBoundary', String((err as Error)?.stack || err)),
+    onUncaughtError: (err) => notifyError('Application error', err),
+  }).render(
     <React.StrictMode>
       <ErrorBoundary fallbackTitle="Application Encountered an Error">
         <MobileAuthGate>
           <App />
         </MobileAuthGate>
       </ErrorBoundary>
+      <NoticeHost />
     </React.StrictMode>
   );
 }

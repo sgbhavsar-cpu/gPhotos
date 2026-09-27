@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { app } from 'electron';
+import { writeFileAtomic } from './jsonFile';
 
 // Person profile photos are cropped client-side from whatever photo/face is
 // currently the person's cover, which may live on a network share or a
@@ -35,12 +36,12 @@ export function getPersonAvatarPath(personId: string, cacheKey: string): string 
 }
 
 /** Removes any previously saved avatar file(s) for this person, regardless of cache key. */
-function clearExistingAvatars(personId: string): void {
+function clearExistingAvatars(personId: string, keepFileName?: string): void {
   const dir = getAvatarDir();
   const prefix = `${sanitizeIdSegment(personId)}__`;
   try {
     for (const entry of fs.readdirSync(dir)) {
-      if (entry.startsWith(prefix)) {
+      if (entry.startsWith(prefix) && entry !== keepFileName) {
         try {
           fs.unlinkSync(path.join(dir, entry));
         } catch {}
@@ -60,9 +61,12 @@ export function savePersonAvatar(
       return { success: false, error: 'Invalid image data URL' };
     }
     const buffer = Buffer.from(match[2], 'base64');
-    clearExistingAvatars(personId);
-    const filePath = path.join(getAvatarDir(), getAvatarFileName(personId, cacheKey));
-    fs.writeFileSync(filePath, buffer);
+    // Write the new avatar first (atomically); only then drop the old ones, so a
+    // failed write (disk full) never leaves the person without an avatar.
+    const fileName = getAvatarFileName(personId, cacheKey);
+    const filePath = path.join(getAvatarDir(), fileName);
+    writeFileAtomic(filePath, buffer);
+    clearExistingAvatars(personId, fileName);
     return { success: true, filePath };
   } catch (err: any) {
     return { success: false, error: err.message };

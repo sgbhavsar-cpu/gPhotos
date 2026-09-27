@@ -163,7 +163,8 @@ If you want to clear all recognized faces and re-index everything from scratch:
 
 ### Person Renaming & Merging:
 - **Instant Inline Renaming**: Click directly on a person's name or click the **Edit (pencil)** icon. Type the new name and press <kbd>Enter</kbd> (or click the green checkmark). *Typing works immediately without requiring DevTools or F12!*
-- **Merge People**: If the same person was split into two cards, click **Merge**, select the matching profiles, and confirm to combine them into a single identity.
+- **Assigning a face to a person** (right-click a face / "Reassign" in the lightbox or People view): type part of a name and press <kbd>Enter</kbd> to assign to the **first matching person** (exact name first, then names starting with what you typed, then names containing it) — or simply **click a person** to assign at once; there is no confirm button. If nobody matches, <kbd>Enter</kbd> creates a new person with that name (a "Create new person" row also appears while you type, in case you want a new one despite a partial match). To move *all* of the current person's photos instead of just this face, tick **Merge the whole person** *before* picking.
+- **Merge People**: If the same person was split into two cards, click **Merge**. When the second person isn't already chosen, search for them exactly as when assigning a face: type part of a name and press <kbd>Enter</kbd> to select the first match (or click a person), pick the final name, then press <kbd>Enter</kbd> once more or click **Confirm & Merge**.
 
 ### Cover Photo Selection & Active Learning:
 - Click the **camera icon** on any person's avatar to pick a specific photo as their profile cover.

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   Image as ImageIcon,
   Users,
@@ -20,7 +20,7 @@ import {
   PauseCircle,
 } from 'lucide-react';
 import { LibraryState } from '../services/libraryStore';
-import { VirtualStorageConfig, NetworkStorageProgress } from '../../types';
+import { VirtualStorageConfig, NetworkStorageProgress } from '../../../types';
 import { useBackgroundActivityStatus } from '../hooks/useBackgroundActivityStatus';
 
 export type ActiveTab =
@@ -69,12 +69,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const [isNetworkStorageCollapsed, setIsNetworkStorageCollapsed] = useState(false);
   const backgroundActivity = useBackgroundActivityStatus(state.isDetectingFaces, state.faceDetectionProgress ?? null, storageProgressMap);
 
+  // One pass per photos-array change instead of a scan on every render (and one per storage).
+  const favoriteCount = useMemo(() => state.photos.reduce((n, p) => n + (p.isFavorite ? 1 : 0), 0), [state.photos]);
+  const storageNamesWithPhotos = useMemo(() => {
+    const names = new Set<string>();
+    for (const p of state.photos) if (p.isVirtual && p.storageName) names.add(p.storageName);
+    return names;
+  }, [state.photos]);
+
   const navItems = [
     { id: 'photos' as ActiveTab, label: 'Photos', icon: ImageIcon, count: state.totalCount || state.photos.length },
     { id: 'albums' as ActiveTab, label: 'Albums', icon: BookImage, count: (state.albums || []).length },
     { id: 'people' as ActiveTab, label: 'People', icon: Users, count: state.people.length },
     { id: 'places' as ActiveTab, label: 'Places', icon: MapPin, count: state.places.length },
-    { id: 'favorites' as ActiveTab, label: 'Favorites', icon: Heart, count: state.photos.filter((p) => p.isFavorite).length },
+    { id: 'favorites' as ActiveTab, label: 'Favorites', icon: Heart, count: favoriteCount },
     { id: 'virtual_storage' as ActiveTab, label: 'Network Mirrors', icon: HardDrive },
     { id: 'folders' as ActiveTab, label: 'Folder Tree', icon: FolderTree },
     { id: 'organize' as ActiveTab, label: 'Organize by Date', icon: FolderSync },
@@ -348,7 +356,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   const isStorageActive =
                     state.selectedFolder &&
                     (state.selectedFolder.toLowerCase().includes(storage.name.toLowerCase()) ||
-                      state.photos.some((p) => p.isVirtual && p.storageName === storage.name));
+                      storageNamesWithPhotos.has(storage.name));
                   const prog = storageProgressMap[storage.name] || storageProgressMap[storage.id];
                   const isProgressActive = prog && prog.phase && prog.phase !== 'idle';
 

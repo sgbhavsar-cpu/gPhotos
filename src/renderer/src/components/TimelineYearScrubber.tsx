@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState, useCallback } from 'react';
+import React, { useMemo, useRef, useState, useCallback, useEffect } from 'react';
 
 export interface ScrubberMonth {
   key: string;
@@ -26,6 +26,9 @@ export const TimelineYearScrubber: React.FC<TimelineYearScrubberProps> = ({ mont
   const trackRef = useRef<HTMLDivElement>(null);
   const [hoverFraction, setHoverFraction] = useState<number | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  // Detaches an in-progress drag's window listeners (also on unmount mid-drag).
+  const dragCleanupRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => dragCleanupRef.current?.(), []);
 
   const yearTicks = useMemo(() => {
     if (months.length === 0) return [];
@@ -82,9 +85,15 @@ export const TimelineYearScrubber: React.FC<TimelineYearScrubberProps> = ({ mont
     const handleUp = () => {
       setIsDragging(false);
       setHoverFraction(null);
+      detach();
+    };
+    const detach = () => {
       window.removeEventListener('mousemove', handleMove);
       window.removeEventListener('mouseup', handleUp);
+      dragCleanupRef.current = null;
     };
+    dragCleanupRef.current?.();
+    dragCleanupRef.current = detach;
     window.addEventListener('mousemove', handleMove);
     window.addEventListener('mouseup', handleUp);
   };

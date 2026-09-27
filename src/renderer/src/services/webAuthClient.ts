@@ -85,16 +85,13 @@ export async function pairWithPin(pin: string): Promise<{ success: boolean; erro
   }
 }
 
+/** Throws when the server can't be reached/answered: "unknown" must not be treated as "no PIN required". */
 export async function checkAuthRequired(): Promise<boolean> {
   if (!isBrowserMode()) return false;
-  try {
-    const res = await fetch('/api/auth/status');
-    if (!res.ok) return false;
-    const data = await res.json();
-    return !!data.pinRequired;
-  } catch {
-    return false;
-  }
+  const res = await fetch('/api/auth/status');
+  if (!res.ok) throw new Error(`Server returned HTTP ${res.status}`);
+  const data = await res.json();
+  return !!data.pinRequired;
 }
 
 /** Verifies the currently stored token (if any) is still accepted by the server. */

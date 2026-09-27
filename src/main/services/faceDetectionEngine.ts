@@ -124,8 +124,14 @@ export interface DecodedImage {
   height: number;
 }
 
+// Full-res decode is required (recognition aligns against source pixels, and box/landmark
+// coordinates are reported in the original frame), so it can't be downscaled before decode
+// without changing descriptors. Cap the input instead: 200MP -> at most ~600MB of raw RGB.
+// (sharp's own default is 268MP / ~800MB.)
+export const FACE_MAX_INPUT_PIXELS = 200_000_000;
+
 export async function decodeToRawRgb(imageBuffer: Buffer): Promise<DecodedImage> {
-  const { data, info } = await sharp(imageBuffer)
+  const { data, info } = await sharp(imageBuffer, { limitInputPixels: FACE_MAX_INPUT_PIXELS })
     .rotate() // apply EXIF orientation so detection matches what the user sees
     .removeAlpha()
     .toColorspace('srgb')
@@ -144,8 +150,10 @@ interface LetterboxResult {
 async function letterboxForDetection(image: DecodedImage): Promise<LetterboxResult> {
   const { width, height } = image;
   const scale = Math.min(DETECTION_INPUT_SIZE / width, DETECTION_INPUT_SIZE / height);
-  const resizedWidth = Math.round(width * scale);
-  const resizedHeight = Math.round(height * scale);
+  // Clamp to >=1px: an extreme aspect ratio (e.g. a 20000x1 strip) would round a
+  // side to 0, which sharp rejects — and that error is retried forever.
+  const resizedWidth = Math.max(1, Math.round(width * scale));
+  const resizedHeight = Math.max(1, Math.round(height * scale));
 
   const resized = await sharp(image.data, { raw: { width, height, channels: 3 } })
     .resize(resizedWidth, resizedHeight, { fit: 'fill' })
@@ -482,4 +490,104 @@ export async function detectFaceInRegion(
     imageWidth: image.width,
     imageHeight: image.height,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Orientation probe — detector only (no ArcFace, no alignment): decode ONCE at
+// small size, rotate the raw RGB 0/90/180/270 and score how strongly SCRFD sees
+// upright faces in each. SCRFD is not rotation-invariant, so the orientation
+// with the strongest face signal is (very likely) the upright one.
+// ---------------------------------------------------------------------------
+
+export type Rotation = 0 | 90 | 180 | 270;
+export interface OrientationProbe {
+  width: number; // dimensions of the (EXIF-normalised, downscaled) image as probed at 0 degrees
+  height: number;
+  // Keyed by the clockwise rotation applied to the image as displayed.
+  scores: Record<Rotation, { count: number; score: number }>;
+}
+
+const PROBE_MAX_SIDE = 640;
+const PROBE_ROTATIONS: Rotation[] = [0, 90, 180, 270];
+
+/** Rotates a raw 3-channel RGB image clockwise by 0/90/180/270 degrees. */
+export function rotateRgbClockwise(image: DecodedImage, degrees: Rotation): DecodedImage {
+  if (degrees === 0) return image;
+  const { data, width: w, height: h } = image;
+  const swap = degrees !== 180;
+  const out = Buffer.allocUnsafe(data.length);
+  const ow = swap ? h : w;
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      let dx: number;
+      let dy: number;
+      if (degrees === 90) { dx = h - 1 - y; dy = x; }
+      else if (degrees === 180) { dx = w - 1 - x; dy = h - 1 - y; }
+      else { dx = y; dy = w - 1 - x; }
+      const s = (y * w + x) * 3;
+      const d = (dy * ow + dx) * 3;
+      out[d] = data[s];
+      out[d + 1] = data[s + 1];
+      out[d + 2] = data[s + 2];
+    }
+  }
+  return { data: out, width: swap ? h : w, height: swap ? w : h };
+}
+
+/** Detector-only pass: SCRFD boxes (>= DET_SCORE_THRESHOLD, after NMS) in the image's own pixel space. */
+async function detectBoxesOnly(image: DecodedImage): Promise<Array<{ score: number; area: number }>> {
+  const { tensorData, scale } = await letterboxForDetection(image);
+  const inputTensor = new ort.Tensor('float32', tensorData, [1, 3, DETECTION_INPUT_SIZE, DETECTION_INPUT_SIZE]);
+  const outputs = await detectionSession!.run({ [detectionSession!.inputNames[0]]: inputTensor });
+  return nonMaxSuppression(decodeScrfdOutputs(outputs, detectionSession!.outputNames)).map((c) => ({
+    score: c.score,
+    area: ((c.box[2] - c.box[0]) / scale) * ((c.box[3] - c.box[1]) / scale),
+  }));
+}
+
+export interface OrientationDetection { score: number; area: number } // area = box area / image area (0..1)
+
+/** Per-rotation detections behind probeOrientation — exported for calibration/tests. */
+export async function probeOrientationDetail(imageBuffer: Buffer): Promise<{ width: number; height: number; detections: Record<Rotation, OrientationDetection[]> }> {
+  await loadFaceModels();
+  if (!detectionSession) throw new Error('Face models failed to load');
+
+  const { data, info } = await sharp(imageBuffer, { limitInputPixels: FACE_MAX_INPUT_PIXELS })
+    .rotate() // EXIF orientation, so 0 degrees == what the user sees
+    .resize(PROBE_MAX_SIDE, PROBE_MAX_SIDE, { fit: 'inside', withoutEnlargement: true })
+    .removeAlpha()
+    .toColorspace('srgb')
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const base: DecodedImage = { data, width: info.width, height: info.height };
+
+  const detections = {} as Record<Rotation, OrientationDetection[]>;
+  for (const r of PROBE_ROTATIONS) {
+    const rotated = rotateRgbClockwise(base, r);
+    const imageArea = rotated.width * rotated.height;
+    detections[r] = (await detectBoxesOnly(rotated)).map((d) => ({ score: d.score, area: d.area / imageArea }));
+  }
+  return { width: base.width, height: base.height, detections };
+}
+
+/** Detector confidence -> orientation evidence. SCRFD fires weakly (~0.5-0.6) on sideways/upside-down faces but strongly (0.75+) on upright ones, so weak hits are squashed (0..1 per face). */
+// Measured on public-domain portraits/groups (0.5 = detector floor): correct orientation gives 0.75-0.91,
+// wrong orientations 0.50-0.73. ((c-0.5)/0.4)^2 keeps ~0.8+ faces near/above 0.5 and crushes <=0.6 hits to <0.06.
+export function orientationEvidence(d: OrientationDetection): number {
+  const t = Math.min(1, Math.max(0, (d.score - DET_SCORE_THRESHOLD) / 0.4));
+  return t * t;
+}
+
+/**
+ * Scores each of the four clockwise rotations of an image by the face-detector
+ * signal it produces. `count` = faces found, `score` = summed evidence.
+ * Cheap: one downscaled decode + four 640px detector runs, no recognition.
+ */
+export async function probeOrientation(imageBuffer: Buffer): Promise<OrientationProbe> {
+  const { width, height, detections } = await probeOrientationDetail(imageBuffer);
+  const scores = {} as OrientationProbe['scores'];
+  for (const r of PROBE_ROTATIONS) {
+    scores[r] = { count: detections[r].length, score: detections[r].reduce((sum, d) => sum + orientationEvidence(d), 0) };
+  }
+  return { width, height, scores };
 }

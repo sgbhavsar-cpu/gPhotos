@@ -1,5 +1,15 @@
-import { Photo } from '../../types';
+import { Photo } from '../../../types';
 import { libraryStore } from './libraryStore';
+import { notifyError } from './notifications';
+
+/**
+ * Whether a detectFacesBatch result is a real outcome to adopt (faces found, none found, or
+ * skipped because the photo is verified/unchanged). `ran:false` with 'offline'/'decode-failed'
+ * means nothing was scanned: stamping faceScanCompleted on those made the photo never rescan.
+ */
+export function isFaceResultFinal(r: { ran: boolean; skippedReason?: string }): boolean {
+  return r.ran || r.skippedReason === 'locked' || r.skippedReason === 'unchanged';
+}
 
 // Detection, clustering and persistence all happen in the main process now
 // (see src/main/services/faceDetectionEngine.ts + pipelineOrchestrator.ts) —
@@ -26,6 +36,11 @@ class FaceQueueService {
   private completedInSession = 0;
   private listeners: Set<QueueStatusListener> = new Set();
   private queuedPhotoIds: Set<string> = new Set();
+  private failureStreak = 0;
+  // Undecodable photos are never stamped faceScanCompleted, so the idle handler would re-enqueue
+  // them forever: retry a couple of times, then leave them alone for this session.
+  private decodeFailures = new Map<string, number>();
+  private static readonly MAX_DECODE_ATTEMPTS = 2;
 
   public subscribe(listener: QueueStatusListener): () => void {
     this.listeners.add(listener);
@@ -58,6 +73,7 @@ class FaceQueueService {
   public enqueue(photos: Photo[], priority: 'high' | 'normal' | 'low' = 'normal') {
     let added = 0;
     for (const photo of photos) {
+      if ((this.decodeFailures.get(photo.id) ?? 0) >= FaceQueueService.MAX_DECODE_ATTEMPTS) continue;
       if (this.queuedPhotoIds.has(photo.id)) {
         if (priority === 'high') {
           // Promote existing item to head of queue
@@ -113,6 +129,7 @@ class FaceQueueService {
   public clear() {
     this.queue = [];
     this.queuedPhotoIds.clear();
+    this.decodeFailures.clear();
     this.totalInSession = 0;
     this.completedInSession = 0;
     this.isRunning = false;
@@ -141,16 +158,21 @@ class FaceQueueService {
       if (window.electronAPI?.detectFacesBatch) {
         const { results, people } = await window.electronAPI.detectFacesBatch([photo]);
         const [result] = results;
-        if (result) {
+        if (result && isFaceResultFinal(result)) {
           libraryStore.applyServerDetectedFaces(
             [{ photoId: result.photoId, faces: result.faces, faceScanCompleted: true, facesLocked: result.locked }],
             people
           );
+        } else if (result && result.skippedReason === 'decode-failed') {
+          this.decodeFailures.set(photo.id, (this.decodeFailures.get(photo.id) ?? 0) + 1);
         }
       }
       this.completedInSession++;
+      this.failureStreak = 0;
     } catch (err) {
       console.warn(`Error processing face queue for ${photo.fileName}:`, err);
+      // One bad photo is noise; a run of failures means detection itself is broken — say so once (notices dedupe).
+      if (++this.failureStreak >= 3) notifyError('Background face detection is failing', err);
     } finally {
       this.queuedPhotoIds.delete(photo.id);
       this.processingPhotoId = null;

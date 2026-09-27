@@ -1,8 +1,11 @@
-import { Photo, Person, DetectedFace, PlaceAlbum, Album, CatalogMeta } from '../../types';
+import { Photo, Person, DetectedFace, PlaceAlbum, Album, CatalogMeta } from '../../../types';
 import { groupPhotosByPlace } from './placesService';
 import { logger } from './logger';
 import { trackBackendCall } from './responseTracker';
 import { appendAuthToken, authFetch } from './webAuthClient';
+import { notifyError } from './notifications';
+import { normalizeDegrees, resolveFaceFrame, rotateBox } from './faceGeometry';
+import { getImageVersion } from './imageVersion';
 import {
   clusterFaces,
   euclideanDistance,
@@ -90,6 +93,69 @@ const STORAGE_KEY = 'gphotos_library_v1';
 const GLOBAL_PEOPLE_KEY = 'gphotos_people_v2';
 const GLOBAL_FACE_CACHE_KEY = 'gphotos_face_cache_v2';
 
+// Every Nth save re-signs every photo ignoring the per-object cache: the safety net for an in-place
+// edit of NESTED photo data (exif/location contents, a face's fields) that the cheap guard can't see.
+export const FULL_RESIGN_EVERY = 20;
+// Catalog pages arriving in one run are announced to React at most this often (and once at the end).
+const PAGE_NOTIFY_INTERVAL_MS = 250;
+
+/**
+ * Per-Photo-object save signature cache. `sig` is the (expensive) content signature; the other fields
+ * snapshot what it was computed from, so an unchanged object costs ~25 comparisons instead of a
+ * JSON.stringify of exif/location + string building. A replaced object never hits (new identity), and
+ * a top-level in-place edit (photo.isFavorite = true) or face-array reassign/push fails the guard.
+ */
+interface SigEntry {
+  sig: string;
+  fc: boolean; // faces already copied into globalFaceCache for this snapshot
+  filePath: unknown; fileName: unknown; fileSize: unknown; fileDate: unknown; dateTaken: unknown;
+  year: unknown; month: unknown; day: unknown; width: unknown; height: unknown;
+  isFavorite: unknown; isVirtual: unknown; originalRemotePath: unknown; storageName: unknown;
+  isExcluded: unknown; faceScanCompleted: unknown; facesLocked: unknown; sharpnessScore: unknown;
+  rotation: unknown; isHeicRotated: unknown; heicRotation: unknown; originalMtimeMs: unknown;
+  exif: unknown; location: unknown; faces: unknown; nFaces: number;
+}
+
+function computePhotoSig(p: Photo): string {
+  let faceSig = '';
+  if (p.faces) {
+    for (const f of p.faces) {
+      faceSig += `${f.id},${f.personId ?? ''},${f.isConfirmed ? 1 : 0},${f.isManual ? 1 : 0},${f.box?.x},${f.box?.y},${f.box?.width},${f.box?.height};`;
+    }
+  }
+  return [
+    p.filePath, p.fileName, p.fileSize, p.fileDate, p.dateTaken, p.year, p.month, p.day,
+    p.width, p.height, p.isFavorite, p.isVirtual, p.originalRemotePath, p.storageName,
+    p.isExcluded, p.faceScanCompleted, p.facesLocked, p.sharpnessScore, p.rotation,
+    p.isHeicRotated, p.heicRotation, p.originalMtimeMs,
+    p.exif ? JSON.stringify(p.exif) : '', p.location ? JSON.stringify(p.location) : '',
+    p.faces ? p.faces.length : -1, faceSig,
+  ].join('|');
+}
+
+function makeSigEntry(p: Photo): SigEntry {
+  return {
+    sig: computePhotoSig(p), fc: false,
+    filePath: p.filePath, fileName: p.fileName, fileSize: p.fileSize, fileDate: p.fileDate, dateTaken: p.dateTaken,
+    year: p.year, month: p.month, day: p.day, width: p.width, height: p.height,
+    isFavorite: p.isFavorite, isVirtual: p.isVirtual, originalRemotePath: p.originalRemotePath, storageName: p.storageName,
+    isExcluded: p.isExcluded, faceScanCompleted: p.faceScanCompleted, facesLocked: p.facesLocked, sharpnessScore: p.sharpnessScore,
+    rotation: p.rotation, isHeicRotated: p.isHeicRotated, heicRotation: p.heicRotation, originalMtimeMs: p.originalMtimeMs,
+    exif: p.exif, location: p.location, faces: p.faces, nFaces: p.faces ? p.faces.length : -1,
+  };
+}
+
+function sigEntryMatches(e: SigEntry, p: Photo): boolean {
+  return e.filePath === p.filePath && e.fileName === p.fileName && e.fileSize === p.fileSize
+    && e.fileDate === p.fileDate && e.dateTaken === p.dateTaken && e.year === p.year && e.month === p.month
+    && e.day === p.day && e.width === p.width && e.height === p.height && e.isFavorite === p.isFavorite
+    && e.isVirtual === p.isVirtual && e.originalRemotePath === p.originalRemotePath && e.storageName === p.storageName
+    && e.isExcluded === p.isExcluded && e.faceScanCompleted === p.faceScanCompleted && e.facesLocked === p.facesLocked
+    && e.sharpnessScore === p.sharpnessScore && e.rotation === p.rotation && e.isHeicRotated === p.isHeicRotated
+    && e.heicRotation === p.heicRotation && e.originalMtimeMs === p.originalMtimeMs && e.exif === p.exif
+    && e.location === p.location && e.faces === p.faces && e.nFaces === (p.faces ? p.faces.length : -1);
+}
+
 export interface CachedFaceRecord {
   faces: DetectedFace[];
   faceScanCompleted: boolean;
@@ -106,6 +172,9 @@ export function getLocalPhotoUrl(
   preferOriginal: boolean = false,
   size: number = 250
 ): string {
+  // Cache key that changes when the photo's pixels changed on disk (see imageVersion.ts).
+  const ver = getImageVersion(filePath);
+  const vq = ver > 0 ? `&v=${ver}` : '';
   if (typeof window !== 'undefined') {
     const isElectron = !!(window.electronAPI && !(window.electronAPI as any).isBrowserShim);
 
@@ -120,7 +189,7 @@ export function getLocalPhotoUrl(
       } else if (size > 0) {
         url += `&size=${size}`;
       }
-      return appendAuthToken(url);
+      return appendAuthToken(url + vq);
     }
 
     // If running in native Electron
@@ -134,7 +203,7 @@ export function getLocalPhotoUrl(
       } else if (size > 0) {
         url += `&size=${size}`;
       }
-      return url;
+      return url + vq;
     }
 
     // Generic web fallback
@@ -148,7 +217,7 @@ export function getLocalPhotoUrl(
       } else if (size > 0) {
         url += `&size=${size}`;
       }
-      return appendAuthToken(url);
+      return appendAuthToken(url + vq);
     }
   }
   return filePath;
@@ -182,6 +251,47 @@ export class LibraryManager {
   private savedPhotoSigs: Map<string, string> | null = null;
   private lastSavedPeopleSig: string | null = null;
   private isVerifyingInBackground = false;
+  // Set when loading the persisted library failed (IPC rejected): the in-memory
+  // state is then NOT the user's library, so saving it would overwrite the real
+  // one. Saves stay blocked until a load / switch / open succeeds.
+  private loadError: unknown = null;
+  // Set when the global people registry failed to load (state.people is then NOT the stored
+  // registry). Unlike loadError it is cleared only by a later successful people load, never by
+  // setPhotos/switchLibrary, so the people key is never sent (main would wipe every person).
+  private peopleLoadFailed = false;
+  private loadInFlight: Promise<void> | null = null;
+  // Saves run strictly one after another so the baseline signatures a save
+  // advances are never computed against a half-finished previous save.
+  private saveChain: Promise<void> = Promise.resolve();
+  private saveFailures = 0;
+  // Bumped on every library switch/replace; async page loads started under an
+  // older epoch must not append their photos to the new library.
+  private libraryEpoch = 0;
+  // Ids removed via removePhotos that the database has not confirmed deleting yet.
+  private pendingRemovedIds: Set<string> = new Set();
+  // Per-Photo-object signature cache (see SigEntry). A new WeakMap drops every entry at once.
+  private sigEntries = new WeakMap<Photo, SigEntry>();
+  // Set by operations that edit face contents in place, and on blur/unload: the next scan re-signs
+  // every photo. Otherwise it happens every FULL_RESIGN_EVERY-th save.
+  private forceFullResign = false;
+  private savesSinceFullResign = 0;
+  // Catalog-page notification coalescing while a loadNextCatalogPages run is active.
+  private pageRunDepth = 0;
+  private pageNotifyPending = false;
+  private pageNotifyTimer: any = null;
+  private lastPageNotifyAt = 0;
+
+  /** Forget the cached signature of a photo whose nested data (a face's fields) was edited in place. */
+  private touch(photo: Photo | undefined | null) {
+    if (photo) this.sigEntries.delete(photo);
+  }
+
+  /** clusterFaces edits face objects in place, and those objects are shared with photo.faces. */
+  private cluster(...args: Parameters<typeof clusterFaces>): ReturnType<typeof clusterFaces> {
+    const result = clusterFaces(...args);
+    this.forceFullResign = true;
+    return result;
+  }
 
   public getCachedFaces(photo: { id?: string; filePath?: string; originalRemotePath?: string }): CachedFaceRecord | null {
     const keys = [
@@ -221,10 +331,19 @@ export class LibraryManager {
   constructor() {
     if (typeof window !== 'undefined') {
       window.addEventListener('beforeunload', () => {
+        this.forceFullResign = true;
         this.flushSaveImmediately();
       });
+      // Safety net for a missed in-place edit: when the window loses focus, audit every photo once
+      // (off the interaction path) and save if the audit finds anything the cheap scan missed.
+      window.addEventListener('blur', () => {
+        if (!this.savedPhotoSigs || this.loadError) return;
+        this.forceFullResign = true;
+        if (this.scanPhotos().dirty) this.flushSaveImmediately();
+      });
     }
-    this.loadPersistedData();
+    // No load here: App.tsx's mount effect always calls loadPersistedData(), and
+    // a second load raced it (and in browser mode ran before the PIN gate, so it 401'd).
   }
 
   public subscribe(listener: () => void): () => void {
@@ -251,14 +370,14 @@ export class LibraryManager {
     }
   }
 
-  private scheduleDebouncedSave() {
+  private scheduleDebouncedSave(delayMs = 500) {
     if (this.saveDebounceTimer) {
       clearTimeout(this.saveDebounceTimer);
     }
     this.saveDebounceTimer = setTimeout(() => {
       this.saveDebounceTimer = null;
       this.savePersistedData();
-    }, 500);
+    }, delayMs);
   }
 
   public async flushSaveImmediately() {
@@ -304,9 +423,10 @@ export class LibraryManager {
           if (!face || !face.id) continue;
           const existing = allFacesMap.get(face.id);
           if (existing) {
-            if (!existing.personId && face.personId) existing.personId = face.personId;
+            // `existing` may be the very face object a photo holds: edited in place, so re-sign everything.
+            if (!existing.personId && face.personId) { existing.personId = face.personId; this.forceFullResign = true; }
             if (!existing.descriptor && face.descriptor) existing.descriptor = face.descriptor;
-            if (face.isConfirmed) existing.isConfirmed = true;
+            if (face.isConfirmed && !existing.isConfirmed) { existing.isConfirmed = true; this.forceFullResign = true; }
           } else {
             allFacesMap.set(face.id, { ...face, photoId: photo.id });
           }
@@ -375,7 +495,7 @@ export class LibraryManager {
     if (peopleMap.size === 0 && allFaces.length > 0) {
       const facesWithDesc = allFaces.filter((f) => f.descriptor && f.descriptor.length > 0);
       if (facesWithDesc.length > 0) {
-        const { people, updatedFaces } = clusterFaces(allFaces, [], DEFAULT_MATCH_THRESHOLD, true);
+        const { people, updatedFaces } = this.cluster(allFaces, [], DEFAULT_MATCH_THRESHOLD, true);
         for (const p of people) {
           const registered = this.globalPeopleRegistry.get(p.id);
           if (registered && !/^Person(\s+\d+)?$/i.test(registered.name)) {
@@ -389,7 +509,7 @@ export class LibraryManager {
       }
     } else if (unassignedFaces.length > 0 && peopleMap.size > 0) {
       // If we have some unassigned faces, cluster them matching to existing people or create new clusters
-      const { people, updatedFaces } = clusterFaces(allFaces, Array.from(peopleMap.values()), DEFAULT_MATCH_THRESHOLD, true);
+      const { people, updatedFaces } = this.cluster(allFaces, Array.from(peopleMap.values()), DEFAULT_MATCH_THRESHOLD, true);
       for (const p of people) {
         const registered = this.globalPeopleRegistry.get(p.id);
         if (registered && !/^Person(\s+\d+)?$/i.test(registered.name)) {
@@ -472,6 +592,7 @@ export class LibraryManager {
         if (rawP) globalPeopleData = JSON.parse(rawP);
         localStorage.removeItem(GLOBAL_FACE_CACHE_KEY);
       }
+      this.peopleLoadFailed = false; // the registry was read (possibly empty) — saving people is safe again
 
       if (Array.isArray(globalPeopleData) && globalPeopleData.length > 0) {
         const existingMap = new Map(this.state.people.map((p) => [p.id, p]));
@@ -491,7 +612,15 @@ export class LibraryManager {
       }
     } catch (err) {
       console.warn('Failed to load global people / face cache:', err);
+      // Saving with an unloaded people registry would overwrite the stored one.
+      this.peopleLoadFailed = true;
+      this.reportLoadFailure(err);
     }
+  }
+
+  private reportLoadFailure(err: unknown) {
+    this.loadError = err;
+    notifyError('Could not load your library (changes will not be saved until it loads — restart the app)', err);
   }
 
   /**
@@ -500,7 +629,19 @@ export class LibraryManager {
    * 2. Immediately paints Screen 1 with Page 0 (first 100 photos, ~40 KB)
    * 3. Seamlessly restores and reconciles people, faces, and albums from central storage
    */
-  public async loadPersistedData() {
+  public loadPersistedData(): Promise<void> {
+    // Concurrent callers (StrictMode's double effect, a remount) share one load.
+    if (!this.loadInFlight) {
+      this.loadInFlight = this.doLoadPersistedData().finally(() => {
+        this.loadInFlight = null;
+      });
+    }
+    return this.loadInFlight;
+  }
+
+  private async doLoadPersistedData() {
+    this.libraryEpoch++;
+    this.loadError = null;
     try {
       await this.loadGlobalCache();
       // 1. FAST-PATH (500K Scalable Catalog): Load pre-calculated metadata in ~1ms
@@ -685,6 +826,7 @@ export class LibraryManager {
             }
           } catch (autoLoadErr) {
             console.warn('Auto-loading photos for selected folder failed:', autoLoadErr);
+            notifyError('Could not reload photos for the selected folder', autoLoadErr);
           }
         }
 
@@ -700,6 +842,8 @@ export class LibraryManager {
       }
     } catch (err) {
       console.warn('Failed to load library state:', err);
+      // Not "an empty library": remember the failure so it is shown and nothing is saved over the real data.
+      this.reportLoadFailure(err);
     } finally {
       this.state.isInitialized = true;
       this.notifyListeners();
@@ -756,6 +900,9 @@ export class LibraryManager {
           // whose restored faces differ from the DB are still re-saved as before.
           this.stampPersisted(result.firstPage || [], true);
           this.currentCatalogPage = 0;
+          this.libraryEpoch++;
+          this.loadError = null;
+          this.pendingRemovedIds.clear();
           // Albums are per-library (unlike people, which are a global
           // registry) — without repopulating this from the just-switched-to
           // library's own data, the PREVIOUS library's albums stayed in
@@ -773,6 +920,8 @@ export class LibraryManager {
       }
     } catch (err) {
       console.warn('[LibraryStore] switchLibrary failed:', err);
+      // Callers fall back to a full rescan on `false`; say why instead of doing it silently.
+      notifyError('Could not switch library', err);
     }
     return false;
   }
@@ -785,10 +934,44 @@ export class LibraryManager {
    * already in flight.
    */
   public async loadNextCatalogPages(count: number = 3): Promise<void> {
-    for (let i = 0; i < count; i++) {
-      const loadedMore = await this.loadNextCatalogPage();
-      if (!loadedMore) break;
+    // Inside a run the per-page notifications are coalesced (each one regroups/re-renders the whole
+    // app: 5000 pages at 500K photos); the run always ends with a final notification.
+    this.pageRunDepth++;
+    try {
+      for (let i = 0; i < count; i++) {
+        const loadedMore = await this.loadNextCatalogPage();
+        if (!loadedMore) break;
+      }
+    } finally {
+      this.pageRunDepth--;
+      if (this.pageRunDepth === 0) this.flushPageNotify();
     }
+  }
+
+  /** Notify now if this run hasn't for PAGE_NOTIFY_INTERVAL_MS, otherwise once when the interval is up. */
+  private notifyPageLoaded() {
+    if (this.pageRunDepth === 0) {
+      this.notifyListeners();
+      return;
+    }
+    const wait = this.lastPageNotifyAt + PAGE_NOTIFY_INTERVAL_MS - Date.now();
+    if (wait <= 0) {
+      this.flushPageNotify(true);
+    } else {
+      this.pageNotifyPending = true;
+      if (!this.pageNotifyTimer) this.pageNotifyTimer = setTimeout(() => this.flushPageNotify(), wait);
+    }
+  }
+
+  private flushPageNotify(force = false) {
+    if (this.pageNotifyTimer) {
+      clearTimeout(this.pageNotifyTimer);
+      this.pageNotifyTimer = null;
+    }
+    if (!force && !this.pageNotifyPending) return;
+    this.pageNotifyPending = false;
+    this.lastPageNotifyAt = Date.now();
+    this.notifyListeners();
   }
 
   /**
@@ -802,7 +985,10 @@ export class LibraryManager {
 
     this.isLoadingCatalogPage = true;
     try {
-      this.currentCatalogPage += 1;
+      // The page index only advances once the page has actually been appended —
+      // bumping it up-front skipped 100 photos for good after any failed fetch.
+      const pageIndex = this.currentCatalogPage + 1;
+      const epoch = this.libraryEpoch;
       let newPhotos: Photo[] = [];
       // Always pass the currently active library explicitly — omitting it
       // relies on the main process still having the right library active
@@ -812,32 +998,70 @@ export class LibraryManager {
 
       if (window.electronAPI?.getCatalogPage) {
         const res = await trackBackendCall(
-          window.electronAPI.getCatalogPage({ pageIndex: this.currentCatalogPage, libraryDir }),
+          window.electronAPI.getCatalogPage({ pageIndex, libraryDir }),
           'Loading photos...'
         );
         if (res && res.photos) newPhotos = res.photos;
       } else if (window.location?.protocol?.startsWith('http')) {
         const libraryDirParam = libraryDir ? `&libraryDir=${encodeURIComponent(libraryDir)}` : '';
-        const res = await authFetch(`/api/catalog-page?page=${this.currentCatalogPage}&size=100${libraryDirParam}`);
+        const res = await authFetch(`/api/catalog-page?page=${pageIndex}&size=100${libraryDirParam}`);
         if (res.ok) {
           const data = await res.json();
           if (data && data.photos) newPhotos = data.photos;
         }
       }
 
+      // The library was switched/reloaded while this page was in flight: its photos
+      // belong to the old library. Drop them; returning true lets the caller's loop
+      // carry on loading the NEW library's pages (its own loop bailed on isLoadingCatalogPage).
+      if (epoch !== this.libraryEpoch) return true;
+
       if (newPhotos.length > 0) {
-        this.state.photos = deduplicatePhotoList([...this.state.photos, ...newPhotos]);
+        this.currentCatalogPage = pageIndex;
+        this.appendCatalogPage(newPhotos);
         this.stampPersisted(newPhotos);
-        this.notifyListeners();
+        this.notifyPageLoaded();
         return true;
       }
       return false;
     } catch (err) {
       console.warn('[LibraryStore] Failed loading next catalog page:', err);
+      notifyError('Could not load more photos', err);
       return false;
     } finally {
       this.isLoadingCatalogPage = false;
     }
+  }
+
+  private photoKeyCache: { arr: Photo[]; keys: Set<string> } | null = null;
+
+  /**
+   * Appends a catalog page without re-deduplicating the whole library (that was
+   * O(N) per 100-photo page, O(N^2) overall). Only falls back to the full
+   * deduplicatePhotoList when the page actually collides with what's loaded.
+   */
+  private appendCatalogPage(newPhotos: Photo[]) {
+    const keyOf = (p: Photo) => (p.originalRemotePath || p.filePath || '').toLowerCase().replace(/\\/g, '/');
+    const cache = this.photoKeyCache;
+    const keys = cache && cache.arr === this.state.photos ? cache.keys : new Set(this.state.photos.map(keyOf));
+    const batch = new Set<string>();
+    let collides = false;
+    for (const p of newPhotos) {
+      const k = keyOf(p);
+      if (!k || keys.has(k) || batch.has(k)) {
+        collides = true;
+        break;
+      }
+      batch.add(k);
+    }
+    if (collides) {
+      this.state.photos = deduplicatePhotoList([...this.state.photos, ...newPhotos]);
+      this.photoKeyCache = null;
+      return;
+    }
+    batch.forEach((k) => keys.add(k));
+    this.state.photos = this.state.photos.concat(newPhotos);
+    this.photoKeyCache = { arr: this.state.photos, keys };
   }
 
   /**
@@ -897,15 +1121,19 @@ export class LibraryManager {
     }
   }
 
-  private async savePersistedData() {
-    try {
-      // Always update globalFaceCache from current photos
-      for (const p of this.state.photos) {
-        if (p.faceScanCompleted || (p.faces && p.faces.length > 0)) {
-          this.cachePhotoFaces(p, p.faces || [], p.faceScanCompleted);
-        }
-      }
+  private savePersistedData(): Promise<void> {
+    // doSave never rejects (it reports its own failures), so the chain can't wedge.
+    this.saveChain = this.saveChain.then(() => this.doSave());
+    return this.saveChain;
+  }
 
+  private async doSave() {
+    if (this.loadError) {
+      // Memory is not the user's library (load failed): saving would overwrite the real one.
+      notifyError('Changes are not being saved because your library failed to load', this.loadError);
+      return;
+    }
+    try {
       // Safety guard: if photos contain faces but people is empty, reconcile first
       if (this.state.people.length === 0 && this.state.photos.some((p) => p.faces && p.faces.length > 0)) {
         this.reconcilePeopleAndFaces();
@@ -931,7 +1159,11 @@ export class LibraryManager {
       // successful save. ponytail: signature ignores in-place face edits that
       // leave counts unchanged; upgrade to a dirty flag if that ever matters.
       const peopleSig = this.peopleSigOf(this.state.people);
-      const peopleChanged = peopleSig !== this.lastSavedPeopleSig;
+      // While the registry failed to load, state.people is not the real registry: never send it.
+      const peopleChanged = !this.peopleLoadFailed && peopleSig !== this.lastSavedPeopleSig;
+      if (this.peopleLoadFailed) {
+        notifyError('People are not being saved because the people registry failed to load — restart the app', this.loadError ?? 'people registry load failed');
+      }
 
       // Photos: send only the ones whose signature changed since the last
       // successful save, as a merge-only upsert (never deletes). Sending the
@@ -939,19 +1171,16 @@ export class LibraryManager {
       // froze main for 10-26s. Falls back to the full payload (today's
       // behavior) when there's no baseline yet or a photo left the set —
       // removals still need replaceAllPhotos to delete the missing rows.
+      // One pass over the photos: per-object cached signature (no string building for an unchanged
+      // object), compared straight against the baseline, so no 100k-entry signature map per save.
       const baseline = this.savedPhotoSigs;
-      const currentSigs = new Map<string, string>();
-      for (const p of this.state.photos) currentSigs.set(p.id, this.photoSig(p));
-      let anyRemoved = false;
-      if (baseline) {
-        for (const id of baseline.keys()) {
-          if (!currentSigs.has(id)) { anyRemoved = true; break; }
-        }
-      }
-      const incremental = !!baseline && !anyRemoved;
-      const photosToSend = incremental
-        ? this.state.photos.filter((p) => baseline!.get(p.id) !== currentSigs.get(p.id))
-        : this.state.photos;
+      const scan = this.scanPhotos();
+      // A photo that left the set normally needs replaceAllPhotos to delete its row — except one the user
+      // removed via removePhotos: its id travels in removedIds, so it can stay an incremental merge.
+      const incremental = !!baseline && scan.removed.every((id) => this.pendingRemovedIds.has(id));
+      const photosToSend = incremental ? scan.changed : this.state.photos;
+      // Full-payload case: the new baseline is every current photo's signature (as of now, pre-await).
+      const fullBaseline = incremental ? null : new Map(this.state.photos.map((p) => [p.id, this.photoSig(p)] as [string, string]));
 
       const dataToSave = {
         photos: photosToSend,
@@ -961,7 +1190,10 @@ export class LibraryManager {
         albums: this.state.albums,
         selectedFolder: this.state.selectedFolder,
         recentLibraries: this.state.recentLibraries,
+        // Photos the user deleted: lets main delete their rows even when only a partial page set is loaded.
+        removedIds: this.pendingRemovedIds.size > 0 ? Array.from(this.pendingRemovedIds) : undefined,
       };
+      const sentRemovedIds = dataToSave.removedIds;
 
       logger.debug('libraryStore', 'savePersistedData: debounced autosave firing', {
         isPartialPageSet: dataToSave.isPartialPageSet,
@@ -972,10 +1204,24 @@ export class LibraryManager {
       });
 
       if (typeof window !== 'undefined' && window.electronAPI && typeof window.electronAPI.saveLibraryData === 'function') {
-        await window.electronAPI.saveLibraryData(STORAGE_KEY, dataToSave);
-        this.savedPhotoSigs = currentSigs;
+        // main resolves false (it doesn't throw) when the write failed — treat that as a failure,
+        // and only advance the "already saved" baseline once the write really happened.
+        if ((await window.electronAPI.saveLibraryData(STORAGE_KEY, dataToSave)) === false) {
+          throw new Error('The library database rejected the save');
+        }
+        if (this.savedPhotoSigs === baseline) {
+          if (fullBaseline) {
+            this.savedPhotoSigs = fullBaseline;
+          } else if (baseline) {
+            scan.changed.forEach((p, i) => baseline.set(p.id, scan.changedSigs[i]));
+            scan.removed.forEach((id) => baseline.delete(id));
+          }
+        }
+        sentRemovedIds?.forEach((id) => this.pendingRemovedIds.delete(id));
         if (peopleChanged) {
-          await window.electronAPI.saveLibraryData(GLOBAL_PEOPLE_KEY, this.state.people);
+          if ((await window.electronAPI.saveLibraryData(GLOBAL_PEOPLE_KEY, this.state.people)) === false) {
+            throw new Error('The people database rejected the save');
+          }
           this.lastSavedPeopleSig = peopleSig;
         }
       } else if (typeof localStorage !== 'undefined') {
@@ -983,10 +1229,17 @@ export class LibraryManager {
           STORAGE_KEY,
           JSON.stringify({ ...dataToSave, photos: this.state.photos, people: this.state.people, faces: this.state.faces })
         );
-        localStorage.setItem(GLOBAL_PEOPLE_KEY, JSON.stringify(this.state.people));
+        if (!this.peopleLoadFailed) localStorage.setItem(GLOBAL_PEOPLE_KEY, JSON.stringify(this.state.people));
       }
+      this.saveFailures = 0;
     } catch (err) {
       console.warn('Failed to save library state:', err);
+      notifyError('Could not save your library', err);
+      // Nothing was marked saved, so the next attempt re-sends the same changes.
+      if (this.saveFailures < 5 && !this.saveDebounceTimer) {
+        this.scheduleDebouncedSave(Math.min(30000, 2000 * 2 ** this.saveFailures));
+      }
+      this.saveFailures++;
     }
   }
 
@@ -994,22 +1247,56 @@ export class LibraryManager {
     return people.map((p) => `${p.id}:${p.name}:${p.faceCount}:${p.photoCount}:${p.coverFaceId}`).join('|');
   }
 
-  /** Cheap content signature over every persisted photo field + face identity (not descriptors). */
+  /** Cached entry for this Photo object; `verify` re-derives the signature from its content instead of trusting the guard. */
+  private sigEntry(p: Photo, verify = false): SigEntry {
+    let e = this.sigEntries.get(p);
+    if (e !== undefined && sigEntryMatches(e, p) && (!verify || computePhotoSig(p) === e.sig)) return e;
+    e = makeSigEntry(p);
+    this.sigEntries.set(p, e);
+    return e;
+  }
+
+  /** Content signature over every persisted photo field + face identity (not descriptors); cached per Photo object. */
   private photoSig(p: Photo): string {
-    let faceSig = '';
-    if (p.faces) {
-      for (const f of p.faces) {
-        faceSig += `${f.id},${f.personId ?? ''},${f.isConfirmed ? 1 : 0},${f.isManual ? 1 : 0},${f.box?.x},${f.box?.y},${f.box?.width},${f.box?.height};`;
+    return this.sigEntry(p).sig;
+  }
+
+  /**
+   * One pass over state.photos for a save (or the blur audit): which photos differ from the saved baseline,
+   * and which baseline ids are gone. Also mirrors faces into the session face cache once per new/changed object.
+   * Every FULL_RESIGN_EVERY-th scan, after a face edit that bypasses the cache, and on blur/unload it
+   * re-signs everything, so an in-place edit the cheap guard missed still reaches the database.
+   */
+  private scanPhotos(): { changed: Photo[]; changedSigs: string[]; removed: string[]; dirty: boolean } {
+    const verify = this.forceFullResign || ++this.savesSinceFullResign >= FULL_RESIGN_EVERY;
+    if (verify) {
+      this.forceFullResign = false;
+      this.savesSinceFullResign = 0;
+    }
+    const baseline = this.savedPhotoSigs;
+    const changed: Photo[] = [];
+    const changedSigs: string[] = [];
+    const removed: string[] = [];
+    const seen = new Set<string>();
+    for (const p of this.state.photos) {
+      const e = this.sigEntry(p, verify);
+      if (!e.fc) {
+        e.fc = true;
+        if (p.faceScanCompleted || (p.faces && p.faces.length > 0)) this.cachePhotoFaces(p, p.faces || [], p.faceScanCompleted);
+      }
+      if (baseline) {
+        const b = baseline.get(p.id);
+        if (b !== undefined) seen.add(p.id);
+        if (b !== e.sig) {
+          changed.push(p);
+          changedSigs.push(e.sig);
+        }
       }
     }
-    return [
-      p.filePath, p.fileName, p.fileSize, p.fileDate, p.dateTaken, p.year, p.month, p.day,
-      p.width, p.height, p.isFavorite, p.isVirtual, p.originalRemotePath, p.storageName,
-      p.isExcluded, p.faceScanCompleted, p.facesLocked, p.sharpnessScore, p.rotation,
-      p.isHeicRotated, p.heicRotation, p.originalMtimeMs,
-      p.exif ? JSON.stringify(p.exif) : '', p.location ? JSON.stringify(p.location) : '',
-      p.faces ? p.faces.length : -1, faceSig,
-    ].join('|');
+    if (baseline && seen.size < baseline.size) {
+      for (const id of baseline.keys()) if (!seen.has(id)) removed.push(id);
+    }
+    return { changed, changedSigs, removed, dirty: !!baseline && (changed.length > 0 || removed.length > 0) };
   }
 
   /**
@@ -1083,6 +1370,10 @@ export class LibraryManager {
 
     const finalDeduped = deduplicatePhotoList(preserved);
     this.state.photos = finalDeduped;
+    // The photo set was replaced wholesale (open/scan): an earlier load failure no longer
+    // makes this state untrustworthy, and page loads still in flight belong to the old set.
+    this.libraryEpoch++;
+    this.loadError = null;
     this.state.totalCount = finalDeduped.length;
 
     if (folderPath) {
@@ -1102,11 +1393,22 @@ export class LibraryManager {
   }
 
   public addPhotos(newPhotos: Photo[]) {
-    const combined = [...this.state.photos, ...newPhotos];
-    const deduped = deduplicatePhotoList(combined).sort(
-      (a, b) => new Date(b.dateTaken).getTime() - new Date(a.dateTaken).getTime()
-    );
+    // Only the new photos are checked against the loaded set (full dedupe only on a collision),
+    // and each date is parsed once instead of twice per sort comparison.
+    this.appendCatalogPage(newPhotos);
+    const times = new Map<Photo, number>();
+    const timeOf = (p: Photo) => {
+      let t = times.get(p);
+      if (t === undefined) {
+        t = new Date(p.dateTaken).getTime();
+        if (!Number.isFinite(t)) t = 0;
+        times.set(p, t);
+      }
+      return t;
+    };
+    const deduped = this.state.photos.slice().sort((a, b) => timeOf(b) - timeOf(a));
     this.state.photos = deduped;
+    this.photoKeyCache = null;
     this.state.places = groupPhotosByPlace(deduped);
     this.reconcilePeopleAndFaces();
     this.notify();
@@ -1136,9 +1438,14 @@ export class LibraryManager {
   }
 
   public toggleFavorite(photoId: string) {
-    const photo = this.state.photos.find((p) => p.id === photoId);
-    if (photo) {
-      photo.isFavorite = !photo.isFavorite;
+    // Replaces the Photo object and the array instead of flipping the flag in place: PhotoCard is
+    // memoized on prev.photo.isFavorite vs next.photo.isFavorite (the same object once mutated, so the
+    // heart never updated) and GalleryView's useMemo([photos]) keeps serving the old list.
+    const idx = this.state.photos.findIndex((p) => p.id === photoId);
+    if (idx >= 0) {
+      const photos = this.state.photos.slice();
+      photos[idx] = { ...photos[idx], isFavorite: !photos[idx].isFavorite };
+      this.state.photos = photos;
       this.notify();
     }
   }
@@ -1146,13 +1453,14 @@ export class LibraryManager {
   public excludePhotos(photoIds: string[], exclude = true) {
     const idSet = new Set(photoIds);
     let changed = false;
-    for (const photo of this.state.photos) {
-      if (idSet.has(photo.id)) {
-        photo.isExcluded = exclude;
-        changed = true;
-      }
-    }
+    // New objects + new array for the touched photos (see toggleFavorite for why not in place).
+    const photos = this.state.photos.map((photo) => {
+      if (!idSet.has(photo.id)) return photo;
+      changed = true;
+      return { ...photo, isExcluded: exclude };
+    });
     if (changed) {
+      this.state.photos = photos;
       this.state.places = groupPhotosByPlace(this.state.photos.filter((p) => !p.isExcluded));
       this.notify();
     }
@@ -1161,6 +1469,7 @@ export class LibraryManager {
   public updatePhotoQuietly(updatedPhoto: Photo) {
     const idx = this.state.photos.findIndex((p) => p.id === updatedPhoto.id || p.filePath === updatedPhoto.filePath);
     if (idx >= 0) {
+      this.photoIndexCache = null; // object at idx is replaced in place
       this.state.photos[idx] = { ...this.state.photos[idx], ...updatedPhoto };
     }
   }
@@ -1169,10 +1478,14 @@ export class LibraryManager {
     const idx = this.state.photos.findIndex((p) => p.id === updatedPhoto.id || p.filePath === updatedPhoto.filePath);
     let locationChanged = recalculatePlaces;
     if (idx >= 0) {
+      this.photoIndexCache = null; // object at idx is replaced in place
       if (updatedPhoto.location && JSON.stringify(updatedPhoto.location) !== JSON.stringify(this.state.photos[idx].location)) {
         locationChanged = true;
       }
-      this.state.photos[idx] = { ...this.state.photos[idx], ...updatedPhoto };
+      // New array too, so memoized views keyed on the photos array (GalleryView) see the change.
+      const photos = this.state.photos.slice();
+      photos[idx] = { ...photos[idx], ...updatedPhoto };
+      this.state.photos = photos;
     }
     if (locationChanged) {
       this.state.places = groupPhotosByPlace(this.state.photos.filter((p) => !p.isExcluded));
@@ -1180,7 +1493,8 @@ export class LibraryManager {
     this.notify();
   }
 
-  public updatePhotos(updatedList: Photo[], recalculatePlaces = false) {
+  /** Merges each entry over the current photo with the same id — partial patches are fine (and preferred). */
+  public updatePhotos(updatedList: Array<Partial<Photo> & { id: string }>, recalculatePlaces = false) {
     const map = new Map(updatedList.map((p) => [p.id, p]));
     let locationChanged = recalculatePlaces;
     this.state.photos = this.state.photos.map((p) => {
@@ -1201,7 +1515,18 @@ export class LibraryManager {
 
   public removePhotos(photoIds: string[]) {
     const idSet = new Set(photoIds);
+    const countBefore = this.state.photos.length;
     this.state.photos = this.state.photos.filter((p) => !idSet.has(p.id));
+    // Without this, photos.length < catalogMeta.totalPhotos forever after a delete, so every
+    // later save was sent as a merge-only "partial page set" and the deleted rows stayed in the DB.
+    const removedLoaded = countBefore - this.state.photos.length;
+    if (this.state.catalogMeta && removedLoaded > 0) {
+      this.state.catalogMeta = {
+        ...this.state.catalogMeta,
+        totalPhotos: Math.max(0, (this.state.catalogMeta.totalPhotos || 0) - removedLoaded),
+      };
+    }
+    photoIds.forEach((id) => this.pendingRemovedIds.add(id));
     this.state.totalCount = Math.max(0, (this.state.totalCount || this.state.photos.length) - photoIds.length);
     this.state.faces = this.state.faces.filter((f) => !idSet.has(f.photoId));
     this.state.places = groupPhotosByPlace(this.state.photos.filter((p) => !p.isExcluded));
@@ -1412,7 +1737,7 @@ export class LibraryManager {
     }
 
     if (newlyAssignedCount > 0) {
-      const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
+      const { people, updatedFaces } = this.cluster(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
       this.state.people = people;
       this.state.faces = updatedFaces;
       this.notify();
@@ -1456,7 +1781,7 @@ export class LibraryManager {
     }
 
     // Re-cluster / recalculate
-    const { people, updatedFaces } = clusterFaces(
+    const { people, updatedFaces } = this.cluster(
       this.state.faces,
       this.state.people.filter((p) => p.id !== sourcePersonId)
     );
@@ -1547,7 +1872,7 @@ export class LibraryManager {
     }
 
     // Re-cluster and recalculate face and photo counts
-    const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people);
+    const { people, updatedFaces } = this.cluster(this.state.faces, this.state.people);
     this.state.people = people;
     this.state.faces = updatedFaces;
     this.recomputeFacesLockedForPhoto(face.photoId);
@@ -1603,7 +1928,7 @@ export class LibraryManager {
 
     if (unassigned) {
       // Re-calculate people without creating unwanted new clusters for unassigned faces
-      const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
+      const { people, updatedFaces } = this.cluster(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
       this.state.people = people;
       this.state.faces = updatedFaces;
       if (affectedPhotoId) {
@@ -1636,6 +1961,7 @@ export class LibraryManager {
         const photoFace = photo.faces?.find((f) => f.id === faceId);
         if (photoFace) {
           photoFace.isConfirmed = true;
+          this.touch(photo); // nested edit: the cached signature no longer matches
         }
       }
       this.recomputeFacesLockedForPhoto(face.photoId);
@@ -1650,6 +1976,141 @@ export class LibraryManager {
     return propagation;
   }
 
+  /**
+   * A photo was physically rotated `degrees` clockwise (its local thumbnail now, its original when reachable).
+   * Face boxes are stored in pixel coordinates of the OLD orientation, so without this every face overlay and
+   * every person avatar cropped from the photo would point at the wrong region. Rotates each face's box and
+   * its reference frame with the picture and swaps the photo's width/height for quarter turns.
+   *
+   * Returns how many faces were moved, how many could not be (no known frame), and the people whose avatar is
+   * cut from this photo so the caller can regenerate it.
+   */
+  public applyPhotoRotation(photoId: string, degrees: number): { rotatedFaces: number; skippedFaces: number; avatarPersonIds: string[] } {
+    const turn = normalizeDegrees(degrees);
+    const none = { rotatedFaces: 0, skippedFaces: 0, avatarPersonIds: [] as string[] };
+    if (turn === 0) return none;
+    const photo = this.state.photos.find((p) => p.id === photoId);
+    if (!photo) return none;
+
+    // Face objects are shared between photo.faces and state.faces, but not always (a photo loaded from disk
+    // may hold its own copies). Rotate every distinct object once, matched by id.
+    const targets = new Map<string, DetectedFace[]>();
+    const add = (f: DetectedFace) => {
+      const list = targets.get(f.id) || [];
+      if (!list.includes(f)) list.push(f);
+      targets.set(f.id, list);
+    };
+    (photo.faces || []).forEach(add);
+    this.state.faces.filter((f) => f.photoId === photoId).forEach(add);
+
+    let rotatedFaces = 0;
+    let skippedFaces = 0;
+    const rotatedIds = new Set<string>();
+    for (const [id, copies] of targets) {
+      const frame = resolveFaceFrame(copies[0], photo);
+      if (!frame) {
+        skippedFaces++;
+        continue;
+      }
+      const moved = rotateBox(copies[0].box, frame.w, frame.h, turn);
+      for (const f of copies) {
+        f.box = moved.box;
+        f.imageWidth = moved.frameW;
+        f.imageHeight = moved.frameH;
+      }
+      rotatedIds.add(id);
+      rotatedFaces++;
+    }
+
+    const swap = turn === 90 || turn === 270;
+    const idx = this.state.photos.indexOf(photo);
+    if (idx >= 0) {
+      this.photoIndexCache = null;
+      const photos = this.state.photos.slice();
+      photos[idx] = swap && photo.width && photo.height ? { ...photo, width: photo.height, height: photo.width } : { ...photo };
+      this.state.photos = photos; // new object + array: face edits are nested, so this also forgets the cached signature
+    }
+    this.forceFullResign = true;
+    this.notify();
+
+    const avatarPersonIds = this.state.people
+      .filter((p) =>
+        (p.coverFaceId && rotatedIds.has(p.coverFaceId)) ||
+        (!p.coverFaceId && (p.coverPhotoId === photoId || (photo.faces || []).some((f) => f.personId === p.id)))
+      )
+      .map((p) => p.id);
+
+    return { rotatedFaces, skippedFaces, avatarPersonIds };
+  }
+
+  /**
+   * Photos were physically moved to another folder (photoRelocation.ts): their ids, paths and the ids of their
+   * faces all changed. The main process already updated the database; this brings the in-memory library in line so
+   * albums, people covers and face lists keep pointing at the same photos, and queues the old ids for deletion in
+   * whichever database might still hold them.
+   */
+  public applyPhotoRelocations(
+    moves: Array<{ oldId: string; newId: string; newFilePath: string; newOriginalRemotePath?: string; newFileName?: string }>
+  ): number {
+    const byOld = new Map(moves.filter((m) => m.oldId && m.newId && m.oldId !== m.newId).map((m) => [m.oldId, m] as const));
+    if (byOld.size === 0) return 0;
+
+    // Face ids embed the photo id (`<photoId>_face_<n>`): rewrite them once, on the shared face objects.
+    const faceIdMap = new Map<string, string>();
+    const remapFace = (f: DetectedFace) => {
+      const move = byOld.get(f.photoId);
+      if (!move) return;
+      const oldFaceId = f.id;
+      f.photoId = move.newId;
+      if (oldFaceId.startsWith(move.oldId)) f.id = move.newId + oldFaceId.slice(move.oldId.length);
+      if (f.id !== oldFaceId) faceIdMap.set(oldFaceId, f.id);
+    };
+    this.state.faces.forEach(remapFace);
+    for (const p of this.state.photos) if (byOld.has(p.id)) (p.faces || []).forEach(remapFace);
+
+    this.photoIndexCache = null;
+    this.state.photos = this.state.photos.map((p) => {
+      const move = byOld.get(p.id);
+      if (!move) return p;
+      return {
+        ...p,
+        id: move.newId,
+        filePath: move.newFilePath,
+        fileName: move.newFileName ?? p.fileName,
+        originalRemotePath: move.newOriginalRemotePath ?? p.originalRemotePath,
+        thumbnailPath: p.thumbnailPath ? move.newFilePath : p.thumbnailPath,
+      };
+    });
+
+    this.state.people = this.state.people.map((person) => {
+      const coverMove = person.coverPhotoId ? byOld.get(person.coverPhotoId) : undefined;
+      const newCoverFace = person.coverFaceId ? faceIdMap.get(person.coverFaceId) : undefined;
+      if (!coverMove && !newCoverFace) return person;
+      return {
+        ...person,
+        coverPhotoId: coverMove ? coverMove.newId : person.coverPhotoId,
+        coverFaceId: newCoverFace ?? person.coverFaceId,
+      };
+    });
+
+    this.state.albums = this.state.albums.map((album) => {
+      const touched = album.photoIds.some((id) => byOld.has(id)) || (album.coverPhotoId && byOld.has(album.coverPhotoId));
+      if (!touched) return album;
+      return {
+        ...album,
+        photoIds: album.photoIds.map((id) => byOld.get(id)?.newId ?? id),
+        coverPhotoId: album.coverPhotoId ? byOld.get(album.coverPhotoId)?.newId ?? album.coverPhotoId : album.coverPhotoId,
+        updatedAt: new Date().toISOString(),
+      };
+    });
+
+    this.state.places = groupPhotosByPlace(this.state.photos.filter((p) => !p.isExcluded));
+    byOld.forEach((_m, oldId) => this.pendingRemovedIds.add(oldId));
+    this.forceFullResign = true;
+    this.notify(true);
+    return byOld.size;
+  }
+
   public deleteFaceDetection(faceId: string) {
     const removedFace = this.state.faces.find((f) => f.id === faceId);
     this.state.faces = this.state.faces.filter((f) => f.id !== faceId);
@@ -1658,7 +2119,7 @@ export class LibraryManager {
         photo.faces = photo.faces.filter((f) => f.id !== faceId);
       }
     }
-    const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people);
+    const { people, updatedFaces } = this.cluster(this.state.faces, this.state.people);
     this.state.people = people;
     this.state.faces = updatedFaces;
     if (removedFace) {
@@ -1698,7 +2159,7 @@ export class LibraryManager {
           p.faces = p.faces.filter((f) => !idsToRemove.has(f.id));
         }
       }
-      const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people);
+      const { people, updatedFaces } = this.cluster(this.state.faces, this.state.people);
       this.state.people = people;
       this.state.faces = updatedFaces;
     }
@@ -1755,7 +2216,7 @@ export class LibraryManager {
           p.faces = p.faces.filter((f) => !idsToRemove.has(f.id));
         }
       }
-      const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people);
+      const { people, updatedFaces } = this.cluster(this.state.faces, this.state.people);
       this.state.people = people;
       this.state.faces = updatedFaces;
     }
@@ -1794,7 +2255,7 @@ export class LibraryManager {
         }
         return p;
       });
-      const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
+      const { people, updatedFaces } = this.cluster(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
       this.state.people = people;
       this.state.faces = updatedFaces;
       this.notify(true);
@@ -1811,7 +2272,7 @@ export class LibraryManager {
     }
     const mergedFaces = Array.from(faceMap.values());
 
-    const { people, updatedFaces } = clusterFaces(mergedFaces, this.state.people);
+    const { people, updatedFaces } = this.cluster(mergedFaces, this.state.people);
     this.state.faces = updatedFaces;
     this.state.people = people;
 
@@ -1848,10 +2309,20 @@ export class LibraryManager {
     people: Person[]
   ) {
     const facesByPhoto = new Map(perPhotoFaces.map((p) => [p.photoId, p]));
+    // id -> Photo lookup: this runs once per chunk of ~8 photos, so scanning every photo
+    // each time was O(N^2/8) over a full-library scan.
+    const photoIndex = this.getPhotoIndex();
 
     // Drop this library's cached copy of each touched photo's faces — the
-    // authoritative per-photo list below replaces them.
-    this.state.faces = this.state.faces.filter((f) => !facesByPhoto.has(f.photoId));
+    // authoritative per-photo list below replaces them. Skippable when none of these
+    // photos carried faces yet (the usual first-scan case): nothing to drop.
+    const mayHaveStaleFaces = perPhotoFaces.some((e) => {
+      const p = photoIndex.get(e.photoId);
+      return !p || p.faceScanCompleted || (p.faces && p.faces.length > 0);
+    });
+    if (mayHaveStaleFaces) {
+      this.state.faces = this.state.faces.filter((f) => !facesByPhoto.has(f.photoId));
+    }
     for (const entry of perPhotoFaces) {
       this.state.faces.push(...entry.faces);
     }
@@ -1863,9 +2334,9 @@ export class LibraryManager {
     if (peopleWereClean) this.lastSavedPeopleSig = this.peopleSigOf(people);
 
     let matchedInStatePhotos = 0;
-    for (const photo of this.state.photos) {
-      const entry = facesByPhoto.get(photo.id);
-      if (entry) {
+    for (const entry of perPhotoFaces) {
+      const photo = photoIndex.get(entry.photoId);
+      if (photo) {
         matchedInStatePhotos++;
         // Main already persisted these faces/flags, so advance the save
         // baseline too — but only if the photo had no other unsaved edit
@@ -1932,7 +2403,7 @@ export class LibraryManager {
     const remainingPeople = this.state.people.filter((p) => p.id !== personId);
 
     // 3. Recalculate people and faces without creating new clusters for unassigned faces
-    const { people, updatedFaces } = clusterFaces(this.state.faces, remainingPeople, DEFAULT_MATCH_THRESHOLD, false);
+    const { people, updatedFaces } = this.cluster(this.state.faces, remainingPeople, DEFAULT_MATCH_THRESHOLD, false);
     this.state.people = people;
     this.state.faces = updatedFaces;
     this.notify();
@@ -2088,7 +2559,7 @@ export class LibraryManager {
 
     this.state.faces = this.state.faces.filter((f) => f.photoId !== photoId).concat(finalFaces);
 
-    const { people, updatedFaces } = clusterFaces(this.state.faces, this.state.people);
+    const { people, updatedFaces } = this.cluster(this.state.faces, this.state.people);
     this.state.people = people;
     this.state.faces = updatedFaces;
     photo.faces = updatedFaces.filter((f) => f.photoId === photoId);
@@ -2102,6 +2573,19 @@ export class LibraryManager {
     this.notify();
 
     return photo;
+  }
+
+  private photoIndexCache: { arr: Photo[]; len: number; map: Map<string, Photo> } | null = null;
+
+  /** id -> Photo for the current photos array; rebuilt when the array (or its length) changes. */
+  private getPhotoIndex(): Map<string, Photo> {
+    const arr = this.state.photos;
+    const c = this.photoIndexCache;
+    if (c && c.arr === arr && c.len === arr.length) return c.map;
+    const map = new Map<string, Photo>();
+    for (const p of arr) map.set(p.id, p);
+    this.photoIndexCache = { arr, len: arr.length, map };
+    return map;
   }
 
   public setScanning(isScanning: boolean) {

@@ -1,10 +1,15 @@
 import React, { Component, ErrorInfo, ReactNode } from 'react';
 import { AlertTriangle, RefreshCw, Home, Copy, Check } from 'lucide-react';
+import { logger } from '../services/logger';
 
 interface Props {
   children: ReactNode;
   fallbackTitle?: string;
   onReset?: () => void;
+  /** When this value changes (e.g. the active tab) a crashed boundary clears itself. */
+  resetKey?: unknown;
+  /** Fill the parent instead of the whole window. */
+  compact?: boolean;
 }
 
 interface State {
@@ -28,7 +33,19 @@ export class ErrorBoundary extends Component<Props, State> {
 
   public componentDidCatch(error: Error, errorInfo: ErrorInfo) {
     console.error('[ErrorBoundary caught error]:', error, errorInfo);
+    try {
+      logger.error('ErrorBoundary', error?.message || String(error), {
+        stack: error?.stack,
+        componentStack: errorInfo?.componentStack,
+      });
+    } catch {}
     this.setState({ errorInfo });
+  }
+
+  public componentDidUpdate(prev: Props) {
+    if (this.state.hasError && prev.resetKey !== this.props.resetKey) {
+      this.handleReset();
+    }
   }
 
   private handleReload = () => {
@@ -46,7 +63,10 @@ export class ErrorBoundary extends Component<Props, State> {
     const details = `Error: ${this.state.error?.message || 'Unknown error'}\n\nStack:\n${
       this.state.error?.stack || ''
     }\n\nComponent Stack:\n${this.state.errorInfo?.componentStack || ''}`;
-    navigator.clipboard.writeText(details);
+    try {
+      // navigator.clipboard is undefined on insecure (plain-http LAN) origins.
+      navigator.clipboard?.writeText(details).catch(() => {});
+    } catch {}
     this.setState({ copied: true });
     setTimeout(() => this.setState({ copied: false }), 2000);
   };
@@ -59,7 +79,8 @@ export class ErrorBoundary extends Component<Props, State> {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            minHeight: '100vh',
+            minHeight: this.props.compact ? '100%' : '100vh',
+            height: this.props.compact ? '100%' : undefined,
             width: '100%',
             backgroundColor: '#090d16',
             color: '#f8fafc',
@@ -102,7 +123,7 @@ export class ErrorBoundary extends Component<Props, State> {
                   {this.props.fallbackTitle || 'Something went wrong'}
                 </h2>
                 <p style={{ fontSize: '0.85rem', color: '#94a3b8', margin: '4px 0 0' }}>
-                  An unexpected error was caught. Your photo files and library database are safe.
+                  An unexpected error was caught. Your photo files are untouched; changes made just before this error may not have been saved.
                 </p>
               </div>
             </div>

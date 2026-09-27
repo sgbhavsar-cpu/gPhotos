@@ -1,9 +1,9 @@
+// sharp + fs share libuv's default 4 threads; long resizes would otherwise starve UI file IO.
+process.env.UV_THREADPOOL_SIZE ||= '16';
 import { app, BrowserWindow, ipcMain, dialog, protocol, net, shell, Menu } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import { pathToFileURL } from 'url';
-import exifr from 'exifr';
 import { parsePhotoMetadata } from './services/exifParser';
 import {
   scanDirectoryRecursive,
@@ -20,7 +20,6 @@ import {
   editPhotoFile,
   trashFiles,
   deleteFilesPermanently,
-  rotatePhotoFile,
   rotatePhotoWithOfflineQueue,
   processPendingRotations,
   writePhotoMetadataWithOfflineQueue,
@@ -29,14 +28,14 @@ import {
   saveStorageCheckpoint,
   loadStorageCheckpoint,
   getAllStorageCheckpoints,
-  getStorageDetails,
-  getAllStorageDetails,
+  scanStorageDetailsPhysical,
+  isStorageSyncInProgress,
   getAllStorageDetailsFast,
   confirmAllStorageDetailsPhysical,
   syncOnePhoto,
   scanStorageInventory
 } from './services/virtualMirrorService';
-import { Photo, OrganizeOptions, VirtualStorageConfig, EditPhotoOptions, BackgroundServiceSettings } from '../types';
+import { Photo, OrganizeOptions, VirtualStorageConfig, EditPhotoOptions, BackgroundServiceSettings, OrientationInput, OrientationResult, RelocationPhotoInput } from '../types';
 import {
   initBackgroundDaemon,
   getBackgroundServiceStatus,
@@ -49,7 +48,6 @@ import {
 } from './services/backgroundDaemon';
 import { exportLibraryBackupZip } from './services/zipBackupService';
 import {
-  getHeicJpegBuffer,
   getOrGenerateHeicThumbnail500,
   getHeicHighQualityJpegBuffer,
   prepareHeicHqTemp,
@@ -69,21 +67,23 @@ import {
   listDevices,
   revokeDevice,
   revokeAllDevices,
+  flushWebAuthConfig,
 } from './services/webAuthService';
-import { getOrGenerateCachedThumbnail, clearThumbnailCache, refreshThumbnailsFromSource } from './services/thumbnailCacheService';
+import { getOrGenerateCachedThumbnail, refreshThumbnailsFromSource } from './services/thumbnailCacheService';
 import {
   getCatalogMeta,
   getCatalogPage,
   switchCatalogLibrary,
-  ensureMigratedIfEmpty,
 } from './services/catalogService';
 import { handleStorageSave, handleStorageLoad } from './services/storageHandlers';
-import { getPhotosByStorageName, getFacesForPhoto, getAllPeople } from './services/libraryRepository';
+import { getPhotosByStorageName, getFacesForPhoto, getAllPeople, getSetting } from './services/libraryRepository';
 import { getDbForLibraryPath } from './services/db';
 import type { DatabaseSync } from 'node:sqlite';
 import { detectFacesForPhoto, forceRedetectFacesForPhoto, resolveDbForPhoto, getSharedFaceClusterCache, type FaceClusterCache } from './services/pipelineOrchestrator';
 import { detectFaceInRegion, terminateFaceDetectionWorker, getFaceDetectionPoolSize } from './services/faceDetectionWorkerClient';
-import { assertPathsAllowed, getDefaultMirrorRoot } from './services/pathSecurity';
+import { assertPathsAllowed, isPathAllowed, getDefaultMirrorRoot } from './services/pathSecurity';
+import { detectUprightRotations } from './services/orientationService';
+import { planRelocation, relocatePhotos } from './services/photoRelocation';
 import { browseDirectory } from './services/directoryBrowser';
 import {
   getSpriteCoordinate,
@@ -106,28 +106,9 @@ import {
   resetReclaimHealth,
 } from './services/oneDriveService';
 
-initLogger();
-installHangWatchdog();
-
-app.name = 'gPhotos';
-app.setName('gPhotos');
-if (process.platform === 'win32') {
-  app.setAppUserModelId('gPhotos');
-}
-
-const startupStartTime = Date.now();
-console.log(`[STARTUP AUDIT] T+0ms: Main process initialized.`);
-
-// Global Exception and Promise Rejection Handlers to eliminate unhandled errors
-process.on('uncaughtException', (error) => {
-  console.error('[CRITICAL MAIN PROCESS EXCEPTION]:', error);
-});
-
-process.on('unhandledRejection', (reason) => {
-  console.error('[CRITICAL MAIN PROCESS UNHANDLED REJECTION]:', reason);
-});
-
-// Single Instance Lock: Ensure only one copy of application runs in production, while allowing isolated smoke tests
+// Smoke-test userData redirect and the single-instance check must run BEFORE the logger
+// starts: initLogger rotates main.log, which would otherwise touch the real (or the
+// already-running instance's) log files.
 const isSmokeTest = process.argv.includes('--smoke-test') || process.env.GPHOTOS_SMOKE_TEST === '1';
 if (isSmokeTest) {
   try {
@@ -141,7 +122,63 @@ const gotSingleInstanceLock = isSmokeTest ? true : app.requestSingleInstanceLock
 if (!gotSingleInstanceLock) {
   console.log('Another instance of gPhotos is already running. Quitting duplicate instance.');
   app.quit();
-} else if (!isSmokeTest) {
+} else {
+  initLogger();
+  installHangWatchdog();
+}
+
+app.name = 'gPhotos';
+app.setName('gPhotos');
+if (process.platform === 'win32') {
+  app.setAppUserModelId('gPhotos');
+}
+
+const startupStartTime = Date.now();
+console.log(`[STARTUP AUDIT] T+0ms: Main process initialized.`);
+
+// Global Exception and Promise Rejection Handlers to eliminate unhandled errors
+// Errors are written to main.log (a packaged app has no console) and the user
+// is told at most once a minute, so a failing timer can't spam dialogs.
+let lastErrorDialogAt = 0;
+function reportUnexpectedError(kind: string, err: unknown) {
+  const detail = String((err as any)?.stack || err);
+  console.error(`[CRITICAL MAIN PROCESS ${kind}]:`, err);
+  try {
+    logger.error('Fatal', kind, { err: detail });
+  } catch {}
+  const now = Date.now();
+  if (app.isReady() && now - lastErrorDialogAt > 60_000) {
+    lastErrorDialogAt = now;
+    dialog
+      .showMessageBox({
+        type: 'error',
+        title: 'gPhotos - Unexpected Error',
+        message: `An unexpected error occurred (${kind}). If problems continue, restart gPhotos.`,
+        detail: detail.slice(0, 600),
+        buttons: ['OK'],
+      })
+      .catch(() => {});
+  }
+}
+process.on('uncaughtException', (error) => reportUnexpectedError('EXCEPTION', error));
+process.on('unhandledRejection', (reason) => reportUnexpectedError('UNHANDLED REJECTION', reason));
+
+// A storage name becomes a directory under the mirror root. Reject anything that
+// resolves to the root itself (".") or escapes it, so recursive create/delete
+// stays inside one storage folder.
+function assertValidStorageName(root: string, name: unknown): string {
+  if (typeof name !== 'string' || !name.trim() || /[\\/]/.test(name)) {
+    throw new Error(`Invalid storage name: "${String(name)}"`);
+  }
+  const rel = path.relative(root, path.join(root, name));
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error(`Invalid storage name: "${name}"`);
+  }
+  return name;
+}
+
+// Single Instance Lock: Ensure only one copy of application runs in production, while allowing isolated smoke tests
+if (gotSingleInstanceLock && !isSmokeTest) {
   app.on('second-instance', () => {
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
@@ -257,33 +294,23 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
-function getStoragePath(): string {
-  const userDir = app.getPath('userData');
-  if (!fs.existsSync(userDir)) {
-    fs.mkdirSync(userDir, { recursive: true });
-  }
-  const defaultPath = path.join(userDir, 'library.json');
-
-  // Cross-compatibility between dev environment (gphotos-desktop) and packaged exe (gPhotos):
-  if (!fs.existsSync(defaultPath)) {
-    try {
-      const appData = app.getPath('appData');
-      const isAppGPhotos = path.basename(userDir).toLowerCase() === 'gphotos';
-      const altDir = isAppGPhotos
-        ? path.join(appData, 'gphotos-desktop')
-        : path.join(appData, 'gPhotos');
-      const altPath = path.join(altDir, 'library.json');
-      if (fs.existsSync(altPath)) {
-        fs.copyFileSync(altPath, defaultPath);
-        console.log(`[Storage] Migrated library data from ${altPath} to ${defaultPath}`);
-      }
-    } catch (migErr) {
-      console.warn('[Storage] Fallback migration check failed:', migErr);
-    }
-  }
-
-  return defaultPath;
-}
+const IMAGE_MIME: Record<string, string> = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.bmp': 'image/bmp',
+  '.heic': 'image/jpeg',
+  '.heif': 'image/jpeg',
+  '.tif': 'image/tiff',
+  '.tiff': 'image/tiff',
+  '.avif': 'image/avif',
+  '.dng': 'image/jpeg',
+  '.raw': 'image/jpeg',
+  '.cr2': 'image/jpeg',
+  '.nef': 'image/jpeg',
+};
 
 function createWindow() {
   isAppReadyFired = false;
@@ -380,7 +407,8 @@ function createWindow() {
   });
 
   // Handle local photo and AI model protocol
-  protocol.handle('gphoto', async (request) => {
+  // createWindow can run again (macOS activate, second-instance); protocol.handle throws on re-register.
+  if (!protocol.isProtocolHandled('gphoto')) protocol.handle('gphoto', async (request) => {
     try {
       const url = new URL(request.url);
 
@@ -430,7 +458,8 @@ function createWindow() {
         url.searchParams.get('preferOriginal') === '1' ||
         url.searchParams.get('preferOriginal') === 'true';
       const sizeParam = url.searchParams.get('size');
-      const requestedSize = sizeParam ? parseInt(sizeParam, 10) : 0;
+      // Clamped: every distinct size creates its own cache tier on disk.
+      const requestedSize = sizeParam ? Math.min(Math.max(parseInt(sizeParam, 10) || 0, 0), 2048) : 0;
       const quality = url.searchParams.get('quality');
 
       let targetPath: string | null = null;
@@ -453,6 +482,9 @@ function createWindow() {
 
       if (targetPath) {
         const ext = path.extname(targetPath).toLowerCase();
+        // Only image files are ever served: this scheme has bypassCSP + CORS *, so it
+        // must not be usable to read arbitrary files (keys, library.json, ...).
+        if (!IMAGE_MIME[ext]) return new Response('Unsupported file type', { status: 403 });
 
         // 1. Raw original full resolution requested
         if (preferOriginal) {
@@ -469,19 +501,10 @@ function createWindow() {
             }
           }
 
-          const mimeMap: Record<string, string> = {
-            '.jpg': 'image/jpeg',
-            '.jpeg': 'image/jpeg',
-            '.png': 'image/png',
-            '.webp': 'image/webp',
-            '.gif': 'image/gif',
-            '.bmp': 'image/bmp',
-          };
-          const contentType = mimeMap[ext] || 'image/jpeg';
           const buffer = await fs.promises.readFile(targetPath);
           return new Response(buffer, {
             headers: {
-              'Content-Type': contentType,
+              'Content-Type': IMAGE_MIME[ext],
               'Access-Control-Allow-Origin': '*',
               'Cache-Control': 'public, max-age=31536000, immutable',
             },
@@ -509,18 +532,10 @@ function createWindow() {
         }
 
         // 3. Fallback direct file read
-        const mimeMap: Record<string, string> = {
-          '.jpg': 'image/jpeg',
-          '.jpeg': 'image/jpeg',
-          '.png': 'image/png',
-          '.webp': 'image/webp',
-          '.gif': 'image/gif',
-          '.bmp': 'image/bmp',
-        };
         const buffer = await fs.promises.readFile(targetPath);
         return new Response(buffer as any, {
           headers: {
-            'Content-Type': mimeMap[ext] || 'image/jpeg',
+            'Content-Type': IMAGE_MIME[ext],
             'Access-Control-Allow-Origin': '*',
             'Cache-Control': 'public, max-age=31536000, immutable',
           },
@@ -534,10 +549,20 @@ function createWindow() {
     }
   });
 
+  // If the UI can't load (missing dist, dev server down) the always-on-top splash
+  // would stay forever with no window behind it: tell the user and get out of the way.
+  const onLoadFailure = (err: unknown) => {
+    reportUnexpectedError('UI LOAD FAILURE', err);
+    if (splashWindow && !splashWindow.isDestroyed()) splashWindow.close();
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.show();
+  };
+  mainWindow.webContents.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
+    if (isMainFrame && code !== -3) onLoadFailure(new Error(`${desc} (${code}) loading ${url}`));
+  });
   if (process.env.VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
+    mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL).catch(onLoadFailure);
   } else {
-    mainWindow.loadFile(path.join(__dirname, '../../dist/index.html'));
+    mainWindow.loadFile(path.join(__dirname, '../../dist/index.html')).catch(onLoadFailure);
   }
 
   mainWindow.on('closed', () => {
@@ -549,15 +574,17 @@ function createWindow() {
 }
 
 app.on('before-quit', () => {
-  markAsQuitting();
-  stopEmbeddedWebServer();
-  try {
-    thumbnailWorker.flushCheckpoint();
-  } catch {}
-  terminateFaceDetectionWorker();
+  for (const step of [markAsQuitting, stopEmbeddedWebServer, flushWebAuthConfig, () => thumbnailWorker.flushCheckpoint(), terminateFaceDetectionWorker]) {
+    try {
+      step();
+    } catch (err) {
+      console.warn('[Quit] shutdown step failed:', err);
+    }
+  }
 });
 
 app.whenReady().then(() => {
+  if (!gotSingleInstanceLock) return;
   applyStoredLogLevelOverride();
 
   // Start embedded mobile web server automatically on launch
@@ -584,7 +611,7 @@ app.whenReady().then(() => {
       }
     });
   }
-});
+}).catch((err) => reportUnexpectedError('STARTUP FAILURE', err));
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
@@ -604,9 +631,10 @@ ipcMain.on('app:ready', () => {
 // fire-and-forget so a debug log call from the renderer never adds IPC
 // round-trip latency to whatever action triggered it.
 ipcMain.on('logger:write', (_event, level: 'debug' | 'info' | 'warn' | 'error', scope: string, message: string, meta?: Record<string, unknown>) => {
-  if (typeof logger[level] === 'function') {
+  if (level !== 'debug' && level !== 'info' && level !== 'warn' && level !== 'error') return;
+  try {
     logger[level](scope, message, meta);
-  }
+  } catch {}
 });
 
 ipcMain.handle('logger:get-level-override', async () => {
@@ -742,18 +770,6 @@ ipcMain.handle('organizer:execute', async (event, options: OrganizeOptions) => {
   }
 });
 
-ipcMain.handle('file:read-base64', async (_event, filePath: string) => {
-  try {
-    const data = fs.readFileSync(filePath);
-    const ext = path.extname(filePath).slice(1).toLowerCase();
-    const mime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
-    return `data:${mime};base64,${data.toString('base64')}`;
-  } catch (err: any) {
-    console.error(`Failed to read file ${filePath}:`, err);
-    return '';
-  }
-});
-
 // Serialized save queue to guarantee atomic sequential writes without race conditions
 let savePromiseQueue: Promise<boolean> = Promise.resolve(true);
 
@@ -767,6 +783,7 @@ ipcMain.handle('storage:save', async (_event, key: string, data: any) => {
       return result.success;
     } catch (err) {
       console.error('Failed to save library data:', err);
+      logger.error('Storage', `Failed to save "${key}"`, { err: String((err as any)?.stack || err) });
       return false;
     }
   };
@@ -779,8 +796,11 @@ ipcMain.handle('storage:load', async (_event, key: string, libraryDir?: string, 
   try {
     return await handleStorageLoad(key, libraryDir, options);
   } catch (err) {
+    // Rethrown (not null): a failed load must not look like an empty library, or the
+    // renderer would save that emptiness over the real data.
     console.error('Failed to load library data:', err);
-    return null;
+    logger.error('Storage', `Failed to load "${key}"`, { err: String((err as any)?.stack || err) });
+    throw err;
   }
 });
 
@@ -790,7 +810,8 @@ ipcMain.handle('catalog:get-meta', async (_event, customDir?: string) => {
     return await getCatalogMeta(customDir);
   } catch (err) {
     console.error('catalog:get-meta error:', err);
-    return null;
+    logger.error('Catalog', 'get-meta failed', { err: String((err as any)?.stack || err) });
+    throw err;
   }
 });
 
@@ -801,7 +822,8 @@ ipcMain.handle(
       return await getCatalogPage(params.pageIndex, params.pageSize, params.libraryDir);
     } catch (err) {
       console.error('catalog:get-page error:', err);
-      return { photos: [], totalPages: 0, totalPhotos: 0 };
+      logger.error('Catalog', 'get-page failed', { err: String((err as any)?.stack || err) });
+      throw err;
     }
   }
 );
@@ -815,6 +837,7 @@ ipcMain.handle('catalog:switch-library', async (_event, targetPath: string) => {
     return res;
   } catch (err) {
     console.error('catalog:switch-library error:', err);
+    logger.error('Catalog', 'switch-library failed', { err: String((err as any)?.stack || err) });
     return null;
   }
 });
@@ -914,7 +937,7 @@ ipcMain.handle('mirror:get-storage-checkpoints', async (_event, mirrorRoot?: str
 
 ipcMain.handle('mirror:get-storage-details', async (_event, storageName: string, mirrorRoot?: string) => {
   try {
-    return getStorageDetails(storageName, mirrorRoot);
+    return await scanStorageDetailsPhysical(storageName, mirrorRoot); // async listing walk: never blocks the main thread
   } catch (err) {
     console.error('mirror:get-storage-details error:', err);
     return null;
@@ -923,7 +946,7 @@ ipcMain.handle('mirror:get-storage-details', async (_event, storageName: string,
 
 ipcMain.handle('mirror:get-all-storage-details', async (_event, mirrorRoot?: string) => {
   try {
-    return getAllStorageDetails(mirrorRoot);
+    return await confirmAllStorageDetailsPhysical(mirrorRoot);
   } catch (err) {
     console.error('mirror:get-all-storage-details error:', err);
     return {};
@@ -977,6 +1000,72 @@ ipcMain.handle('mirror:get-photos-by-storage', async (_event, storageName: strin
 // pipeline, which calls pipelineOrchestrator.ts's detectFacesForPhoto
 // directly per photo instead of round-tripping one at a time over IPC (see
 // syncVirtualStorage).
+// Moving photos to another folder of their own library / storage (photoRelocation.ts). The renderer asks for a plan
+// first (which folder they live in, which can move), lets the user pick a destination inside it, then moves.
+ipcMain.handle('photos:plan-relocation', async (_event, photos: RelocationPhotoInput[]) => {
+  try {
+    if (!Array.isArray(photos)) throw new Error('photos must be a list');
+    return await planRelocation(photos);
+  } catch (err: any) {
+    console.error('photos:plan-relocation error:', err);
+    logger.error('Relocation', 'plan failed', { err: String(err?.stack || err) });
+    throw err;
+  }
+});
+
+ipcMain.handle('photos:relocate', async (event, params: { photos: RelocationPhotoInput[]; targetDir: string }) => {
+  try {
+    if (!params || !Array.isArray(params.photos) || typeof params.targetDir !== 'string') throw new Error('invalid request');
+    // A sync running at the same moment would act on the old folder layout and undo or duplicate the move.
+    const storages = getSetting<VirtualStorageConfig[]>('gphotos_virtual_storages_v1', []);
+    const busy = storages.find(
+      (s) => s.localMirrorRoot && params.photos.some((p) => p.isVirtual && p.storageName === s.name) && isStorageSyncInProgress(s.localMirrorRoot, s.name)
+    );
+    if (busy) {
+      return { results: [], root: null, error: `A sync of "${busy.name}" is running right now. Wait for it to finish, then try again.` };
+    }
+    const outcome = await relocatePhotos({
+      photos: params.photos,
+      targetDir: params.targetDir,
+      onProgress: (done, total) => {
+        try {
+          if (!event.sender.isDestroyed()) event.sender.send('photos:relocate-progress', { done, total });
+        } catch {}
+      },
+    });
+    const moved = outcome.results.filter((r) => r.status === 'moved').length;
+    logger.info('Relocation', `Moved ${moved} of ${outcome.results.length} photo(s)`, { targetDir: params.targetDir, error: outcome.error });
+    return outcome;
+  } catch (err: any) {
+    console.error('photos:relocate error:', err);
+    logger.error('Relocation', 'relocate failed', { err: String(err?.stack || err) });
+    throw err;
+  }
+});
+
+// Automatic "make it upright": which way must each photo turn so the people in it are upright (faces at all four
+// orientations). Read-only: nothing is rotated here — the renderer applies rotations through photo:rotate.
+ipcMain.handle('photos:detect-orientation', async (event, photos: OrientationInput[]) => {
+  try {
+    if (!Array.isArray(photos)) throw new Error('photos must be a list');
+    const usable = photos.filter((p) => p && typeof p.id === 'string' && typeof p.filePath === 'string');
+    const allowed = usable.filter((p) => isPathAllowed(p.filePath));
+    const denied: OrientationResult[] = usable
+      .filter((p) => !isPathAllowed(p.filePath))
+      .map((p) => ({ id: p.id, status: 'failed', rotation: 0, confidence: 0, faces: 0, reason: 'outside the known library folders' }));
+    const results = await detectUprightRotations(allowed, (done, total) => {
+      try {
+        if (!event.sender.isDestroyed()) event.sender.send('photos:orientation-progress', { done, total });
+      } catch {}
+    });
+    return [...results, ...denied];
+  } catch (err: any) {
+    console.error('photos:detect-orientation error:', err);
+    logger.error('Orientation', 'detect-orientation failed', { err: String(err?.stack || err) });
+    throw err;
+  }
+});
+
 ipcMain.handle('faces:detect-batch', async (_event, photos: Photo[]) => {
   const results: Array<{ photoId: string; ran: boolean; faceCount: number; locked: boolean; skippedReason?: string; faces: any[] }> = [];
   // Keyed by resolved db rather than shared as one cache — a batch can span
@@ -1250,11 +1339,17 @@ ipcMain.handle('file:check-exists', async (_event, filePath: string) => {
 const activeScanJobs = new Map<string, boolean>();
 
 ipcMain.handle('mirror:start-bg-scan', async (event, sourcePath: string, mirrorRoot?: string, storageName?: string) => {
-  const jobId = `job_${Date.now()}`;
-  activeScanJobs.set(jobId, true);
-
+  const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
   const finalMirrorRoot = mirrorRoot || getDefaultMirrorRoot();
-  const name = storageName || path.basename(sourcePath) || 'Storage';
+  const name = assertValidStorageName(finalMirrorRoot, storageName || path.basename(sourcePath) || 'Storage');
+  activeScanJobs.set(jobId, true);
+  // The renderer can be reloaded/closed mid-scan; sending to a destroyed
+  // webContents throws and used to abort the whole scan.
+  const sendProgress = (payload: Record<string, unknown>) => {
+    try {
+      if (!event.sender.isDestroyed()) event.sender.send('mirror:bg-scan-progress', payload);
+    } catch {}
+  };
   const targetMirrorDir = path.join(finalMirrorRoot, name);
 
   if (!fs.existsSync(targetMirrorDir)) {
@@ -1422,7 +1517,7 @@ ipcMain.handle('mirror:start-bg-scan', async (event, sourcePath: string, mirrorR
           try {
             thumbnailWorker.enqueuePhotos(batch);
           } catch {}
-          event.sender.send('mirror:bg-scan-progress', {
+          sendProgress({
             jobId,
             sourcePath,
             storageName: name,
@@ -1456,7 +1551,7 @@ ipcMain.handle('mirror:start-bg-scan', async (event, sourcePath: string, mirrorR
         updatedAt: new Date().toISOString(),
       });
 
-      event.sender.send('mirror:bg-scan-progress', {
+      sendProgress({
         jobId,
         sourcePath,
         storageName: name,
@@ -1470,7 +1565,7 @@ ipcMain.handle('mirror:start-bg-scan', async (event, sourcePath: string, mirrorR
       });
     } catch (err: any) {
       console.error('Background scan error:', err);
-      event.sender.send('mirror:bg-scan-progress', {
+      sendProgress({
         jobId,
         sourcePath,
         currentFile: '',
@@ -1516,6 +1611,7 @@ ipcMain.handle('storage:generate-thumb-on-the-fly', async (_event, sourceFilePat
 
 ipcMain.handle('photo:edit', async (_event, options: EditPhotoOptions) => {
   try {
+    assertPathsAllowed([options?.filePath, options?.originalPath].filter(Boolean), 'photo:edit');
     return await editPhotoFile(options);
   } catch (err: any) {
     console.error('photo:edit error:', err);
@@ -1550,6 +1646,7 @@ ipcMain.handle(
     params: { filePath: string; rotationDegrees: number; originalRemotePath?: string }
   ) => {
     try {
+      assertPathsAllowed([params?.filePath, params?.originalRemotePath].filter(Boolean), 'photo:rotate');
       const res = await rotatePhotoWithOfflineQueue({
         localFilePath: params.filePath,
         originalRemotePath: params.originalRemotePath,
@@ -1579,9 +1676,11 @@ ipcMain.handle(
     params: { filePath: string; originalRemotePath?: string; dateIso?: string; latitude?: number; longitude?: number }
   ) => {
     try {
-      if (params.dateIso !== undefined && isNaN(new Date(params.dateIso).getTime())) {
-        return { success: false, wroteExif: false, wroteOriginal: false, isQueued: false, error: 'Invalid date' };
-      }
+      assertPathsAllowed([params?.filePath, params?.originalRemotePath].filter(Boolean), 'photo:write-metadata');
+      const fail = (error: string) => ({ success: false, wroteExif: false, wroteOriginal: false, isQueued: false, error });
+      if (params.dateIso !== undefined && isNaN(new Date(params.dateIso).getTime())) return fail('Invalid date');
+      const validCoord = (v: unknown, max: number) => v === undefined || (typeof v === 'number' && Number.isFinite(v) && Math.abs(v) <= max);
+      if (!validCoord(params.latitude, 90) || !validCoord(params.longitude, 180)) return fail('Invalid coordinates');
 
       const res = await writePhotoMetadataWithOfflineQueue({
         localFilePath: params.filePath,
@@ -1624,25 +1723,17 @@ ipcMain.handle(
 ipcMain.handle('mirror:delete-storage', async (_event, params: { storageName: string; localMirrorRoot?: string; deleteDiskFiles: boolean }) => {
   try {
     const { storageName, localMirrorRoot, deleteDiskFiles } = params;
-    // A storageName containing path separators or ".." could otherwise walk
-    // the joined path outside the mirror root entirely before the recursive
-    // delete below runs.
-    if (!storageName || /[\\/]|\.\./.test(storageName)) {
-      throw new Error(`Invalid storage name: "${storageName}"`);
-    }
     const finalRoot = localMirrorRoot || getDefaultMirrorRoot();
+    assertValidStorageName(finalRoot, storageName);
     const mirrorDir = path.join(finalRoot, storageName);
     if (deleteDiskFiles) {
       assertPathsAllowed([mirrorDir], 'mirror:delete-storage');
     }
 
     if (deleteDiskFiles && fs.existsSync(mirrorDir)) {
-      try {
-        await shell.trashItem(mirrorDir);
-      } catch (trashErr) {
-        console.warn(`shell.trashItem failed on ${mirrorDir}, falling back to fs.rmSync:`, trashErr);
-        fs.rmSync(mirrorDir, { recursive: true, force: true });
-      }
+      // No permanent-delete fallback: if the Recycle Bin refuses, the user is
+      // told instead of the storage's catalog DB being silently destroyed.
+      await shell.trashItem(mirrorDir);
     }
     return { success: true };
   } catch (err: any) {
@@ -1939,16 +2030,18 @@ ipcMain.handle('heic:cleanup-hq', async (_event, photoId: string) => {
 ipcMain.handle('thumbnails:get-batch', async (_event, params: { items: Array<{ path: string; originalPath?: string }>; size?: number }) => {
   try {
     const { items, size } = params || {};
-    const targetSize = typeof size === 'number' && size > 0 ? size : 250;
+    const targetSize = typeof size === 'number' && size > 0 ? Math.min(size, 2048) : 250;
     const requestedItems = Array.isArray(items) ? items.slice(0, 100) : [];
     const thumbnails: Record<string, string> = {};
 
     await Promise.all(
       requestedItems.map(async (item) => {
         if (!item || !item.path) return;
-        const targetPath = (item.path && fs.existsSync(item.path))
+        // Async + cached reachability (not existsSync): an offline NAS must not stall the main thread per item.
+        const appOwnedRoots = [app.getPath('userData'), getDefaultMirrorRoot()];
+        const targetPath = (await isPathReachableForServing(item.path, appOwnedRoots))
           ? item.path
-          : (item.originalPath && fs.existsSync(item.originalPath) ? item.originalPath : null);
+          : (item.originalPath && (await isPathReachableForServing(item.originalPath, appOwnedRoots)) ? item.originalPath : null);
 
         if (!targetPath) return;
 

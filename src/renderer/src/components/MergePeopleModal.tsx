@@ -1,8 +1,10 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { X, Merge, AlertCircle, Check, Users, ExternalLink } from 'lucide-react';
-import { Person, Photo } from '../../types';
+import { Person, Photo } from '../../../types';
 import { FaceAvatar } from './FaceAvatar';
+import { PersonPicker } from './PersonPicker';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
+import { notifyError } from '../services/notifications';
 
 interface MergePeopleModalProps {
   personA: Person;
@@ -28,9 +30,9 @@ export const MergePeopleModal: React.FC<MergePeopleModalProps> = ({
     [allPeople, personA]
   );
 
-  const [selectedPersonBId, setSelectedPersonBId] = useState<string>(
-    initialPersonB?.id || (candidatePeople.length > 0 ? candidatePeople[0].id : '')
-  );
+  // No arbitrary default: when the caller didn't fix the second person, the user picks one (search or click),
+  // so a merge can never be confirmed against whoever happens to be first in the list.
+  const [selectedPersonBId, setSelectedPersonBId] = useState<string>(initialPersonB?.id || '');
 
   const personB = useMemo(
     () => candidatePeople.find((p) => p.id === selectedPersonBId),
@@ -58,8 +60,12 @@ export const MergePeopleModal: React.FC<MergePeopleModalProps> = ({
     return { photo, face, box: face?.box };
   };
 
-  const coverA = getCoverPhotoAndBox(personA);
-  const coverB = personB ? getCoverPhotoAndBox(personB) : { photo: undefined, face: undefined, box: undefined };
+  // Each lookup scans every photo; memoize so typing a custom name doesn't rescan the library per keystroke.
+  const coverA = useMemo(() => getCoverPhotoAndBox(personA), [photos, personA]);
+  const coverB = useMemo(
+    () => (personB ? getCoverPhotoAndBox(personB) : { photo: undefined, face: undefined, box: undefined }),
+    [photos, personB]
+  );
 
   // Handle Escape key
   useEffect(() => {
@@ -76,6 +82,10 @@ export const MergePeopleModal: React.FC<MergePeopleModalProps> = ({
 
   const handleMerge = (e: React.FormEvent) => {
     e.preventDefault();
+    submitMerge();
+  };
+
+  const submitMerge = () => {
     if (!personB) return;
 
     if (!mergeCheck.canMerge) {
@@ -95,7 +105,14 @@ export const MergePeopleModal: React.FC<MergePeopleModalProps> = ({
       finalName = customName.trim();
     }
 
-    const success = libraryStore.mergePeople(personA.id, personB.id, finalName);
+    let success = false;
+    try {
+      success = libraryStore.mergePeople(personA.id, personB.id, finalName);
+    } catch (err) {
+      setErrorMessage('Merge operation failed — see the error notice.');
+      notifyError('Merge people', err);
+      return;
+    }
     if (!success) {
       setErrorMessage('Merge operation could not be completed.');
       return;
@@ -180,18 +197,23 @@ export const MergePeopleModal: React.FC<MergePeopleModalProps> = ({
               <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, marginBottom: '6px', color: 'var(--text-secondary)' }}>
                 Select Person to Merge With {personA.name}:
               </label>
-              <select
-                value={selectedPersonBId}
-                onChange={(e) => setSelectedPersonBId(e.target.value)}
-                className="input"
-                style={{ width: '100%', fontSize: '0.9rem' }}
-              >
-                {candidatePeople.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name} ({p.photoCount} {p.photoCount === 1 ? 'photo' : 'photos'})
-                  </option>
-                ))}
-              </select>
+              <PersonPicker
+                people={candidatePeople}
+                photos={photos}
+                selectedId={selectedPersonBId || null}
+                onPick={(p) => {
+                  setSelectedPersonBId(p.id);
+                  setErrorMessage(null);
+                }}
+                // Enter picks the first match; Enter again on the already-picked person merges.
+                onEnterOnSelected={() => {
+                  if (mergeCheck.canMerge) submitMerge();
+                }}
+                placeholder="Type a name and press Enter — or click a person"
+                listMaxHeight={230}
+                columnMinWidth={200}
+                autoFocus
+              />
             </div>
           )}
 

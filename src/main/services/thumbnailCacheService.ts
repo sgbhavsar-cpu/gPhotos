@@ -9,12 +9,15 @@ import {
   purgeHeicCache,
   rotateHeic500Thumbnail,
 } from './heicService';
-import { getHeicSavedRotation, saveHeicSavedRotation } from './heicRotationStore';
+import { getSavedRotationForContent, addSavedRotation } from './heicRotationStore';
 import { isPathReachable } from './networkReachabilityCache';
 
 let sharp: any = null;
 try {
   sharp = require('sharp');
+  // files:0 — path-based sharp() otherwise keeps source files open in its file
+  // cache, and on Windows that locks user photos (rotate/delete fails with EBUSY).
+  if (typeof sharp.cache === 'function') sharp.cache({ memory: 64, files: 0, items: 200 });
 } catch (err) {
   console.warn('[ThumbnailCache] Sharp library not available, using nativeImage fallback.');
 }
@@ -43,6 +46,27 @@ function getGlobalCacheDir(): string {
 
 export function getCacheKey(filePath: string, mtimeMs: number, size: number): string {
   return crypto.createHash('sha1').update(`${filePath}:${mtimeMs}:${size}`).digest('hex');
+}
+
+// Listeners notified after clearThumbnailCache() empties the disk cache, so
+// in-memory "already cached" bookkeeping elsewhere (thumbnailWorkerService)
+// can be invalidated without a circular import.
+const cacheClearedListeners = new Set<() => void>();
+export function onThumbnailCacheCleared(listener: () => void): () => void {
+  cacheClearedListeners.add(listener);
+  return () => cacheClearedListeners.delete(listener);
+}
+
+/** Writes via tmp + rename so a crash/concurrent reader never sees a truncated cache file. */
+async function writeFileAtomic(target: string, data: Buffer): Promise<void> {
+  const tmp = `${target}.${process.pid}.${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}.tmp`;
+  try {
+    await fs.promises.writeFile(tmp, data);
+    await fs.promises.rename(tmp, target);
+  } catch (err) {
+    fs.promises.unlink(tmp).catch(() => {});
+    throw err;
+  }
 }
 
 export interface ThumbnailResult {
@@ -106,13 +130,16 @@ export async function getOrGenerateCachedThumbnail(
   // Fast-path: Check disk cache asynchronously without waiting in concurrency queue!
   try {
     const cacheStat = await fs.promises.stat(cachedFilePath);
-    const etag = `"${cacheStat.mtimeMs.toString(36)}-${cacheStat.size.toString(36)}"`;
-    return {
-      filePath: cachedFilePath,
-      mime: 'image/jpeg',
-      etag,
-      isFromCache: true,
-    };
+    if (cacheStat.size > 0) {
+      const etag = `"${cacheStat.mtimeMs.toString(36)}-${cacheStat.size.toString(36)}"`;
+      return {
+        filePath: cachedFilePath,
+        mime: 'image/jpeg',
+        etag,
+        isFromCache: true,
+      };
+    }
+    // Zero-byte file (interrupted write) — treat as a miss and regenerate.
   } catch {
     // Cache miss, proceed to generate
   }
@@ -131,13 +158,15 @@ export async function getOrGenerateCachedThumbnail(
       // Re-check cache in case another worker just finished it
       try {
         const cacheStat = await fs.promises.stat(cachedFilePath);
-        const etag = `"${cacheStat.mtimeMs.toString(36)}-${cacheStat.size.toString(36)}"`;
-        return {
-          filePath: cachedFilePath,
-          mime: 'image/jpeg',
-          etag,
-          isFromCache: true,
-        };
+        if (cacheStat.size > 0) {
+          const etag = `"${cacheStat.mtimeMs.toString(36)}-${cacheStat.size.toString(36)}"`;
+          return {
+            filePath: cachedFilePath,
+            mime: 'image/jpeg',
+            etag,
+            isFromCache: true,
+          };
+        }
       } catch {}
 
       await fs.promises.mkdir(cacheDir, { recursive: true });
@@ -148,7 +177,19 @@ export async function getOrGenerateCachedThumbnail(
 
       // A. For HEIC images
       if (isHeic) {
-        const extraRot = getHeicSavedRotation(sourcePath);
+        // Only a real HEIC container needs the saved rotation applied; a JPEG named .heic already has it baked in.
+        let head: Buffer = Buffer.alloc(0);
+        try {
+          const fh = await fs.promises.open(sourcePath, 'r');
+          try {
+            const buf = Buffer.alloc(12);
+            const { bytesRead } = await fh.read(buf, 0, 12, 0);
+            head = buf.subarray(0, bytesRead);
+          } finally {
+            await fh.close();
+          }
+        } catch {}
+        const extraRot = getSavedRotationForContent(sourcePath, head);
         if (sharp) {
           try {
             let sharpPipeline = sharp(sourcePath).rotate();
@@ -212,7 +253,7 @@ export async function getOrGenerateCachedThumbnail(
       }
 
       // Asynchronously persist to disk cache
-      await fs.promises.writeFile(cachedFilePath, thumbBuffer);
+      await writeFileAtomic(cachedFilePath, thumbBuffer);
       const etag = `"${stat.mtimeMs.toString(36)}-${thumbBuffer.length.toString(36)}"`;
 
       return {
@@ -267,6 +308,9 @@ export async function clearThumbnailCache(): Promise<{ freedBytes: number; fileC
   }
 
   await prune(root);
+  for (const listener of cacheClearedListeners) {
+    try { listener(); } catch {}
+  }
   return { freedBytes, fileCount };
 }
 
@@ -397,10 +441,10 @@ export async function rotateCachedHeicThumbnail(
   const root = getGlobalCacheDir();
   const knownSizes = [150, 200, 250, 300, 500, 1600];
 
-  for (const target of pathsToRotate) {
-    // 1. Record delta rotation in persistent store
-    totalRotation = saveHeicSavedRotation(target, degrees);
+  // 1. Record the delta once per path (see addSavedRotation: per-path saves double-counted the original).
+  totalRotation = addSavedRotation(Array.from(pathsToRotate), degrees).get(sourcePath) ?? 0;
 
+  for (const target of pathsToRotate) {
     // 2. Rotate all existing cached thumbnail files in cache/thumbnails/{size}/{cacheKey}.jpg
     let stat: fs.Stats | null = null;
     try {
@@ -420,7 +464,7 @@ export async function rotateCachedHeicThumbnail(
                 .rotate(degrees)
                 .jpeg({ quality: size > 500 ? 86 : 82, mozjpeg: true })
                 .toBuffer();
-              await fs.promises.writeFile(cachedFilePath, rotated);
+              await writeFileAtomic(cachedFilePath, rotated);
             }
           } catch (err) {
             console.warn(`[ThumbnailCache] Failed to rotate existing cached thumbnail ${cachedFilePath}:`, err);

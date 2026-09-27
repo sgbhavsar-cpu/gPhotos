@@ -1,4 +1,4 @@
-import { Photo, DuplicateCluster } from '../../types';
+import { Photo, DuplicateCluster } from '../../../types';
 
 /**
  * Calculates a sharpness and quality score for a photo.
@@ -103,8 +103,17 @@ export function identifyDuplicateClusters(
     }
   }
 
+  // Parse each date once. An unparseable dateTaken (NaN) used to defeat the time-window `break` below
+  // (NaN > windowMs is false) and made the scan O(n^2); such photos are simply not comparable, so skip them.
+  const timeOf = new Map<Photo, number>();
   const eligiblePhotos = Array.from(uniquePhotosMap.values())
-    .sort((a, b) => new Date(a.dateTaken).getTime() - new Date(b.dateTaken).getTime());
+    .filter((p) => {
+      const t = new Date(p.dateTaken).getTime();
+      if (!Number.isFinite(t)) return false;
+      timeOf.set(p, t);
+      return true;
+    })
+    .sort((a, b) => timeOf.get(a)! - timeOf.get(b)!);
 
   const clusters: DuplicateCluster[] = [];
   const visitedIds = new Set<string>();
@@ -114,7 +123,7 @@ export function identifyDuplicateClusters(
     if (visitedIds.has(p1.id)) continue;
 
     const group: Photo[] = [p1];
-    const t1 = new Date(p1.dateTaken).getTime();
+    const t1 = timeOf.get(p1)!;
     const p1Key = getPhotoCanonicalKey(p1);
     const p1People = new Set((p1.faces || []).map((f) => f.personId).filter(Boolean));
 
@@ -128,7 +137,7 @@ export function identifyDuplicateClusters(
         continue;
       }
 
-      const t2 = new Date(p2.dateTaken).getTime();
+      const t2 = timeOf.get(p2)!;
       const timeDiff = Math.abs(t2 - t1);
 
       // Must be taken within the time window

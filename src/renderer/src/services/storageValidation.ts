@@ -1,4 +1,18 @@
-import { VirtualStorageConfig } from '../../types';
+import { VirtualStorageConfig } from '../../../types';
+
+/**
+ * True only when a path is confirmed missing: it must read as missing twice, 2s apart, and a failed
+ * check counts as "exists". A single transient false (network share still waking, busy main process)
+ * must never be believed — callers act on this by pruning/persisting.
+ */
+export async function isPathConfirmedMissing(
+  checkFileExists: (path: string) => Promise<boolean>,
+  p: string
+): Promise<boolean> {
+  if (await checkFileExists(p).catch(() => true)) return false;
+  await new Promise((r) => setTimeout(r, 2000));
+  return !(await checkFileExists(p).catch(() => true));
+}
 
 /**
  * Checks each configured storage's local mirror folder against disk and
@@ -21,11 +35,7 @@ export async function splitStoragesByExistence(
   // Pruning is permanent (the name is blacklisted), so a "missing" verdict is
   // re-checked once before it's believed — a transient false (busy/blocked
   // main process at startup) must never delete a storage.
-  const checkTwice = async (p: string): Promise<boolean> => {
-    if (await checkFileExists(p).catch(() => true)) return true;
-    await new Promise((r) => setTimeout(r, 2000));
-    return checkFileExists(p).catch(() => true);
-  };
+  const checkTwice = async (p: string): Promise<boolean> => !(await isPathConfirmedMissing(checkFileExists, p));
 
   const checks = await Promise.all(
     list.map(async (s) => {

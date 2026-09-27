@@ -91,6 +91,8 @@ export interface Photo {
   // fileSize) on each rescan so an unchanged file can skip re-reading
   // entirely instead of being re-hydrated/re-detected every pass.
   originalMtimeMs?: number;
+  // Path of the cached thumbnail file (set by the mirror/thumbnail pipeline).
+  thumbnailPath?: string;
 }
 
 export interface FolderTreeNode {
@@ -109,6 +111,10 @@ export interface BackgroundScanProgress {
   totalDiscovered: number;
   isComplete: boolean;
   newlyAddedPhotos?: Photo[];
+  newPhotos?: Photo[];
+  storageName?: string;
+  mirrorRoot?: string;
+  percent?: number;
   error?: string;
 }
 
@@ -181,6 +187,12 @@ export interface SyncVirtualStorageResult {
   newlyAdded: number;
   totalSizeSaved: number;
   errors: string[];
+  // Non-fatal problems (e.g. a stale mirror file that could not be cleaned up). The photos were
+  // mirrored fine, so `success` is not affected.
+  warnings?: string[];
+  // True when the run was stopped early because the source storage became unreachable mid-sync.
+  // Nothing was pruned; the next pass starts fresh and re-verifies cheaply.
+  sourceUnavailable?: boolean;
 }
 
 export interface VirtualPhotoMetadata {
@@ -356,6 +368,59 @@ export interface Album {
   eventDate?: string;
 }
 
+// ---- Moving photos to another folder (photoRelocation.ts in the main process) ----
+export interface RelocationPhotoInput {
+  id: string;
+  filePath: string;
+  fileName: string;
+  originalRemotePath?: string;
+  isVirtual?: boolean;
+  storageName?: string;
+}
+export interface RelocationRoot {
+  kind: 'storage' | 'library';
+  label: string;
+  /** The folder the user may pick inside (a storage's network source folder, or the library folder). */
+  path: string;
+}
+export interface RelocationPlan {
+  root: RelocationRoot | null;
+  movableIds: string[];
+  skipped: Array<{ id: string; fileName: string; reason: string }>;
+}
+export interface RelocationItemResult {
+  oldId: string;
+  status: 'moved' | 'skipped' | 'failed';
+  reason?: string;
+  newId?: string;
+  newFilePath?: string;
+  newOriginalRemotePath?: string;
+  newFileName?: string;
+}
+export interface RelocationOutcome {
+  results: RelocationItemResult[];
+  root: RelocationRoot | null;
+  error?: string;
+}
+
+// ---- Automatic "make it upright" (orientationService.ts in the main process) ----
+export interface OrientationInput {
+  id: string;
+  filePath: string;
+  fileName?: string;
+  originalRemotePath?: string;
+  isVirtual?: boolean;
+}
+export interface OrientationResult {
+  id: string;
+  status: 'upright' | 'rotate' | 'unknown' | 'failed';
+  /** Degrees CLOCKWISE to apply to the photo as displayed so faces are upright. */
+  rotation: 0 | 90 | 180 | 270;
+  confidence: number;
+  faces: number;
+  reason?: string;
+}
+
 export interface IElectronAPI {
   // Set by browserShim.ts when running over HTTP (mobile/LAN browser)
   // instead of via real Electron IPC — some capabilities (a native folder
@@ -370,7 +435,12 @@ export interface IElectronAPI {
   analyzeDryRun: (options: OrganizeOptions) => Promise<DryRunSummary>;
   executeOrganize: (options: OrganizeOptions) => Promise<{ success: boolean; movedCount: number; errors: string[] }>;
   onOrganizeProgress: (callback: (progress: OrganizeProgress) => void) => () => void;
-  readFileAsBase64: (filePath: string) => Promise<string>;
+  readFileAsBase64?: (filePath: string) => Promise<string>;
+  planPhotoRelocation?: (photos: RelocationPhotoInput[]) => Promise<RelocationPlan>;
+  relocatePhotos?: (params: { photos: RelocationPhotoInput[]; targetDir: string }) => Promise<RelocationOutcome>;
+  onPhotoRelocationProgress?: (callback: (progress: { done: number; total: number }) => void) => () => void;
+  detectPhotoOrientation?: (photos: OrientationInput[]) => Promise<OrientationResult[]>;
+  onOrientationProgress?: (callback: (progress: { done: number; total: number }) => void) => () => void;
   saveLibraryData: (key: string, data: any) => Promise<boolean>;
   loadLibraryData: (key: string, libraryDir?: string, options?: { includePhotos?: boolean; compactDescriptors?: boolean }) => Promise<any>;
   syncVirtualStorage: (config: VirtualStorageConfig) => Promise<SyncVirtualStorageResult>;

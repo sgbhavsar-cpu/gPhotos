@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useDeferredValue } from 'react';
 import {
   Users,
   Edit2,
@@ -22,7 +22,7 @@ import {
   Search,
   MoreVertical
 } from 'lucide-react';
-import { Person, Photo, DetectedFace } from '../../types';
+import { Person, Photo, DetectedFace } from '../../../types';
 import { PhotoCard } from '../components/PhotoCard';
 import { FaceAvatar } from '../components/FaceAvatar';
 import { VirtualCardGrid } from '../components/VirtualCardGrid';
@@ -34,6 +34,7 @@ import { PersonNameInput } from '../components/PersonNameInput';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { VirtualizedTimelineGallery, GalleryZoomLevel, ZOOM_LEVELS } from '../components/VirtualizedTimelineGallery';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { notify, notifyError } from '../services/notifications';
 
 // Fixed card height (px) — VirtualCardGrid needs it to position rows without measuring.
 const PEOPLE_CARD_HEIGHT = 246;
@@ -42,14 +43,27 @@ const AVATAR_PREFETCH_AHEAD = 100;
 
 // photoId -> Photo, built once per photos array. getCoverDetails used to do a
 // linear photos.find() per card per render (5,000 cards x 24K photos).
-const photoIndexCache = new WeakMap<Photo[], Map<string, Photo>>();
-function findPhotoById(photos: Photo[], id: string): Photo | undefined {
+const photoIndexCache = new WeakMap<Photo[], { byId: Map<string, Photo>; firstByPerson: Map<string, Photo> }>();
+function getPhotoIndex(photos: Photo[]) {
   let index = photoIndexCache.get(photos);
   if (!index) {
-    index = new Map(photos.map((p) => [p.id, p]));
+    const byId = new Map<string, Photo>();
+    const firstByPerson = new Map<string, Photo>();
+    for (const p of photos) {
+      byId.set(p.id, p);
+      if (p.faces) {
+        for (const f of p.faces) {
+          if (f.personId && !firstByPerson.has(f.personId)) firstByPerson.set(f.personId, p);
+        }
+      }
+    }
+    index = { byId, firstByPerson };
     photoIndexCache.set(photos, index);
   }
-  return index.get(id);
+  return index;
+}
+function findPhotoById(photos: Photo[], id: string): Photo | undefined {
+  return getPhotoIndex(photos).byId.get(id);
 }
 
 interface PeopleViewProps {
@@ -184,17 +198,29 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
   // If a person is selected, show their virtual album
   const selectedPerson = people.find((p) => p.id === selectedPersonId);
 
-  // Find all photos and corresponding face objects for this person (filtering out immediately removed faces)
-  const personPhotoItems = selectedPerson
-    ? photos
-        .map((photo) => {
-          const face = photo.faces?.find((f) => f.personId === selectedPerson.id);
-          return { photo, face };
-        })
-        .filter((item): item is { photo: Photo; face: DetectedFace } =>
-          item.face !== undefined && !removedFaceIds.has(item.face.id)
-        )
-    : [];
+  // Find all photos and corresponding face objects for this person (filtering out immediately removed faces).
+  // Memoized: it scans every photo, and this component re-renders on each banner/rename keystroke.
+  const personPhotoItems = useMemo(() => {
+    if (!selectedPerson) return [] as Array<{ photo: Photo; face: DetectedFace }>;
+    const out: Array<{ photo: Photo; face: DetectedFace }> = [];
+    for (const photo of photos) {
+      const face = photo.faces?.find((f) => f.personId === selectedPerson.id);
+      if (face && !removedFaceIds.has(face.id)) out.push({ photo, face });
+    }
+    return out;
+  }, [photos, selectedPerson?.id, removedFaceIds]);
+  // Stable array identity so VirtualizedTimelineGallery's grouping memo isn't invalidated every render.
+  const personPhotos = useMemo(() => personPhotoItems.map((item) => item.photo), [personPhotoItems]);
+
+  // Most-photographed first — a name-sorted list buries the people you
+  // actually care about among one-off/misdetected entries.
+  const deferredSearchQuery = useDeferredValue(peopleSearchQuery);
+  const filteredPeople = useMemo(() => {
+    const sorted = [...people].sort((a, b) => b.photoCount - a.photoCount);
+    const byCount = showAllPeople ? sorted : sorted.filter((p) => p.photoCount > 2);
+    const q = deferredSearchQuery.trim().toLowerCase();
+    return q ? byCount.filter((p) => p.name.toLowerCase().includes(q)) : byCount;
+  }, [people, showAllPeople, deferredSearchQuery]);
 
   const handleStartRename = (person: Person, e?: React.MouseEvent) => {
     if (e) {
@@ -207,16 +233,25 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
   const handleSaveRename = (personId: string, newName: string) => {
     const clean = newName.trim();
     if (clean) {
-      if (onUpdatePersonName) onUpdatePersonName(personId, clean);
-      const res = libraryStore.updatePersonName(personId, clean);
-      if (res && !res.success && res.error) {
-        alert(res.error);
+      // Call the store exactly once (the onUpdatePersonName prop wraps the same store call): a second
+      // call after a merge finds the source person gone and used to report a bogus "Person not found".
+      let res: ReturnType<typeof libraryStore.updatePersonName> | undefined;
+      try {
+        res = libraryStore.updatePersonName(personId, clean);
+      } catch (err) {
+        notifyError('Rename person', err);
+        return;
+      }
+      if (res && !res.success) {
+        notify('error', res.error || 'Could not rename this person.');
         return;
       }
       if (res && res.merged) {
+        notify('info', `Merged into existing person "${res.targetPersonName || clean}".`);
         if (selectedPersonId === personId) {
-          const target = people.find((p) => p.name.toLowerCase() === clean.toLowerCase());
+          const target = people.find((p) => p.id !== personId && p.name.toLowerCase() === clean.toLowerCase());
           if (target) setSelectedPersonId(target.id);
+          else setSelectedPersonId(null);
         }
       }
     }
@@ -254,7 +289,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
       photo = findPhotoById(photos, person.coverPhotoId);
     }
     if (!photo) {
-      photo = photos.find((p) => p.faces?.some((f) => f.personId === person.id));
+      photo = getPhotoIndex(photos).firstByPerson.get(person.id);
     }
 
     if (photo && photo.faces) {
@@ -310,11 +345,15 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
     );
     if (!confirmed) return;
 
-    if (selectedPersonId === personId) {
-      setSelectedPersonId(null);
+    try {
+      if (selectedPersonId === personId) {
+        setSelectedPersonId(null);
+      }
+      await libraryStore.deletePerson(personId);
+      Promise.resolve(window.electronAPI?.deletePersonAvatar?.(personId)).catch(() => {});
+    } catch (err) {
+      notifyError(`Delete ${personName}`, err);
     }
-    await libraryStore.deletePerson(personId);
-    window.electronAPI?.deletePersonAvatar?.(personId).catch(() => {});
   };
 
   // ================= 1. Person Virtual Album Detail View =================
@@ -452,7 +491,13 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
       <button
         className="btn btn-ghost btn-icon"
         onClick={() => {
-          const updated = libraryStore.autoSelectBestFaceCover(selectedPerson.id);
+          let updated: ReturnType<typeof libraryStore.autoSelectBestFaceCover> | null = null;
+          try {
+            updated = libraryStore.autoSelectBestFaceCover(selectedPerson.id);
+          } catch (err) {
+            notifyError('AI best face', err);
+            return;
+          }
           if (updated) {
             setLearningNotification(
               `✓ AI auto-selected the clearest, smiling, high-resolution face for ${selectedPerson.name}!`
@@ -470,7 +515,13 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
       <button
         className="btn btn-ghost btn-icon"
         onClick={() => {
-          const res = libraryStore.propagateLearnedFaces(selectedPerson.id);
+          let res: ReturnType<typeof libraryStore.propagateLearnedFaces>;
+          try {
+            res = libraryStore.propagateLearnedFaces(selectedPerson.id);
+          } catch (err) {
+            notifyError('Find more photos', err);
+            return;
+          }
           if (res.newlyAssignedCount > 0) {
             setLearningNotification(
               `✓ Added ${res.newlyAssignedCount} newly discovered photo${res.newlyAssignedCount > 1 ? 's' : ''} to ${selectedPerson.name}'s album using quality-weighted centroid!`
@@ -703,7 +754,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
         {/* Photos View: Virtualized Timeline Gallery with 6 Zoom Levels (Years, Months, XS, S, M, L) */}
         {viewMode === 'photos' ? (
           <VirtualizedTimelineGallery
-            photos={personPhotoItems.map((item) => item.photo)}
+            photos={personPhotos}
             zoomLevel={zoomLevel}
             onZoomChange={setZoomLevel}
             onSelectPhoto={onSelectPhoto}
@@ -926,16 +977,6 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
   }
 
   // ================= 2. All People Grid View =================
-  // Most-photographed first — a name-sorted list buries the people you
-  // actually care about among one-off/misdetected entries.
-  const peopleByPhotoCount = [...people].sort((a, b) => b.photoCount - a.photoCount);
-  const countFilteredPeople = showAllPeople
-    ? peopleByPhotoCount
-    : peopleByPhotoCount.filter((p) => p.photoCount > 2);
-  const filteredPeople = peopleSearchQuery.trim()
-    ? countFilteredPeople.filter((p) => p.name.toLowerCase().includes(peopleSearchQuery.trim().toLowerCase()))
-    : countFilteredPeople;
-
   // Shared JSX built once, arranged differently for desktop vs mobile below —
   // same reasoning as GalleryView's titleBlock/filterChips extraction: this
   // header used to let Merge/Detect Faces/Reset & Rescan overflow off the

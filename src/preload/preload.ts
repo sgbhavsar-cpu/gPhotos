@@ -89,7 +89,6 @@ const electronAPI: IElectronAPI = {
       ipcRenderer.removeListener('organizer:progress', subscription);
     };
   },
-  readFileAsBase64: (filePath: string) => ipcRenderer.invoke('file:read-base64', filePath),
   saveLibraryData: (key: string, data: any) => ipcRenderer.invoke('storage:save', key, data),
   loadLibraryData: (key: string, libraryDir?: string, options?: { includePhotos?: boolean; compactDescriptors?: boolean }) => ipcRenderer.invoke('storage:load', key, libraryDir, options),
   syncVirtualStorage: (config) => ipcRenderer.invoke('mirror:sync-storage', config),
@@ -198,6 +197,23 @@ const electronAPI: IElectronAPI = {
   listSourceFiles: (sourcePath: string) => ipcRenderer.invoke('mirror:list-source-files', sourcePath),
   logFromRenderer: (level, scope: string, message: string, meta?: Record<string, unknown>) =>
     ipcRenderer.send('logger:write', level, scope, message, meta),
+  planPhotoRelocation: (photos) => ipcRenderer.invoke('photos:plan-relocation', photos),
+  relocatePhotos: (params) => ipcRenderer.invoke('photos:relocate', params),
+  onPhotoRelocationProgress: (callback) => {
+    const subscription = (_event: any, progress: { done: number; total: number }) => callback(progress);
+    ipcRenderer.on('photos:relocate-progress', subscription);
+    return () => {
+      ipcRenderer.removeListener('photos:relocate-progress', subscription);
+    };
+  },
+  detectPhotoOrientation: (photos) => ipcRenderer.invoke('photos:detect-orientation', photos),
+  onOrientationProgress: (callback) => {
+    const subscription = (_event: any, progress: { done: number; total: number }) => callback(progress);
+    ipcRenderer.on('photos:orientation-progress', subscription);
+    return () => {
+      ipcRenderer.removeListener('photos:orientation-progress', subscription);
+    };
+  },
   getLogLevelOverride: () => ipcRenderer.invoke('logger:get-level-override'),
   setLogLevelOverride: (overrideDebug: boolean) => ipcRenderer.invoke('logger:set-level-override', overrideDebug),
 };

@@ -3,7 +3,7 @@ import path from 'path';
 import type { DatabaseSync } from 'node:sqlite';
 import { VirtualStorageConfig, VirtualPhotoMetadata, Photo, DetectedFace, Person } from '../../types';
 import { detectFaces } from './faceDetectionWorkerClient';
-import { clusterFaces, peopleNeedingWrite } from './faceClustering';
+import { clusterFaces, peopleNeedingWrite, FaceClusterSession } from './faceClustering';
 import { getHeicFullResolutionBufferForDetection } from './heicService';
 import { isPathReachable } from './networkReachabilityCache';
 import { isOneDrivePath, markFilesForSpaceReclaim, isReclaimEnabled } from './oneDriveService';
@@ -78,6 +78,14 @@ export function createFaceClusterCache(db: DatabaseSync = getDb()): FaceClusterC
 const sharedFaceClusterCaches = new WeakMap<DatabaseSync, FaceClusterCache>();
 
 /**
+ * Per-cache clustering state (see FaceClusterSession): after the first full
+ * clusterFaces pass over a cache, later photos only cluster their OWN new
+ * faces against it instead of re-clustering the whole library each time. Only
+ * trusted while cache.faces/cache.people are still exactly what it last produced.
+ */
+const clusterSessions = new WeakMap<FaceClusterCache, FaceClusterSession>();
+
+/**
  * Like createFaceClusterCache, but reuses one long-lived copy per database
  * for as long as NOTHING else has written to the faces/people tables since
  * it was built (revision check) — a single-photo faces:detect-batch call
@@ -104,6 +112,20 @@ export function getSharedFaceClusterCache(db: DatabaseSync): FaceClusterCache {
 export function isPermanentDecodeError(err: unknown): boolean {
   const msg = String((err as any)?.message ?? err ?? '');
   return /tiff2vips|jpeg2vips|heif2vips|webp2vips|png2vips|magick2vips|vipsjpeg|unsupported image format|input (buffer|file) contains unsupported|compression scheme .* not implemented|premature end of (jpeg|input)|corrupt|bad seek|invalid (jpeg|png|tiff|heif)|unable to (read|decode) image/i.test(msg);
+}
+
+// How many times a file may fail in an ambiguous (maybe-transient) way before
+// it's treated as permanently undecodable. Counted per process, keyed by
+// path+mtime+size, so a changed file starts fresh.
+const MAX_TRANSIENT_ATTEMPTS = 2;
+const transientFailureCounts = new Map<string, number>();
+const PERMANENT_READ_CODES = new Set(['EACCES', 'EPERM', 'EISDIR', 'EIO', 'EINVAL', 'ENAMETOOLONG', 'EFBIG']);
+
+function noteRepeatFailure(key: string): number {
+  if (transientFailureCounts.size > 5000) transientFailureCounts.clear();
+  const n = (transientFailureCounts.get(key) ?? 0) + 1;
+  transientFailureCounts.set(key, n);
+  return n;
 }
 
 /** Same id scheme scanVirtualMirrorDirectory() uses, so rows this pipeline writes match what the renderer later reads from the same sidecar. */
@@ -232,22 +254,44 @@ export async function detectFacesForPhoto(
   }
 
   let detectionBuffer: Buffer | null = null;
+  let readError: unknown = null;
+  const isHeic = /\.(heic|heif)$/i.test(sourceFilePath);
+  const failureKey = `${sourceFilePath}|${working.originalMtimeMs ?? ''}|${working.fileSize ?? ''}`;
   try {
     // Async read: for a OneDrive/network source this can block on hydration
     // for seconds — fs.promises.readFile offloads that wait to libuv's
     // thread pool instead of the single Electron main-process JS thread, so
     // every other IPC handler (renderer requests, menu actions) stays
     // responsive while it waits.
-    detectionBuffer = /\.(heic|heif)$/i.test(sourceFilePath)
+    detectionBuffer = isHeic
       ? await getHeicFullResolutionBufferForDetection(sourceFilePath)
       : await fs.promises.readFile(sourceFilePath);
   } catch (err) {
+    readError = err;
     logger.warn('Pipeline', 'Failed to read source for face detection', { sourceFilePath, err: String(err) });
   }
 
   if (!detectionBuffer) {
-    // Attempted (so this doesn't retry forever), but nothing detected — not
-    // locked, so an explicit per-photo "Detect Faces" retry can still fix it.
+    // A thrown read error (offline, EBUSY, OneDrive hydration failure...) is
+    // environmental: do NOT mark the photo scanned, or the unchanged-skip
+    // above would never retry it. A HEIC decode that returned null is
+    // ambiguous (corrupt file vs. out-of-memory), so allow one retry and only
+    // then treat it as a permanent decode failure. A non-locked, not-completed
+    // photo is picked up again by the next scan / an explicit "Detect Faces".
+    // A file that is simply gone (ENOENT/ENOTDIR) is not transient: it falls through to the
+    // "attempted, nothing detected" path below like any other undecodable source.
+    const code = (readError as { code?: string } | null)?.code ?? '';
+    const gone = code === 'ENOENT' || code === 'ENOTDIR';
+    // Errors that will not fix themselves (permissions, a directory, a bad sector) get the same
+    // bounded retries as an ambiguous decode; only environmental ones (EBUSY, network drop,
+    // OneDrive hydration...) are retried indefinitely.
+    const stillWorthRetrying = readError
+      ? !gone && (!PERMANENT_READ_CODES.has(code) || noteRepeatFailure(failureKey) < MAX_TRANSIENT_ATTEMPTS)
+      : noteRepeatFailure(failureKey) < MAX_TRANSIENT_ATTEMPTS;
+    if (stillWorthRetrying) {
+      upsertPhoto(working, db);
+      return { ran: false, faceCount: 0, locked: false, skippedReason: 'decode-failed' };
+    }
     working.faceScanCompleted = true;
     working.facesLocked = false;
     upsertPhoto(working, db);
@@ -266,7 +310,15 @@ export async function detectFacesForPhoto(
     // nothing detected, not locked (a manual per-photo retry still works).
     // Anything that isn't clearly a decode problem (worker crash, timeout)
     // still throws so it's retried.
-    if (!isPermanentDecodeError(err)) throw err;
+    // A worker crash/wedge is environmental too — but if the SAME file keeps
+    // taking the worker down, it is effectively undecodable: stop after a
+    // couple of attempts instead of crashing a worker every cycle forever.
+    if (!isPermanentDecodeError(err)) {
+      // Only a failure this photo plausibly CAUSED counts (see FaceWorkerError.attributable);
+      // photos that merely shared a crashed worker are simply retried later.
+      const culprit = (err as any)?.name === 'FaceWorkerError' && (err as any).attributable === true;
+      if (!culprit || noteRepeatFailure(failureKey) < MAX_TRANSIENT_ATTEMPTS) throw err;
+    }
     logger.warn('Pipeline', 'Source cannot be decoded — marking scanned with no faces', { sourceFilePath, err: String(err).slice(0, 200) });
     working.faceScanCompleted = true;
     working.facesLocked = false;
@@ -305,15 +357,28 @@ export async function detectFacesForPhoto(
   if (cache && cache.rev !== undefined && cache.rev !== getFacesPeopleRevision()) {
     Object.assign(cache, createFaceClusterCache(db));
   }
-  const existingFaces = (cache ? cache.faces : getAllFaces(db)).filter((f) => f.photoId !== photoId);
-  const existingPeople = cache ? cache.people : getAllPeople();
-  const { people, updatedFaces } = clusterFaces([...existingFaces, ...newFaces], existingPeople);
-  const thisPhotoFaces = updatedFaces.filter((f) => f.photoId === photoId);
+  let people: Person[];
+  let updatedFaces: DetectedFace[];
+  let changedPeople: Person[];
+  const session = cache ? clusterSessions.get(cache) : undefined;
+  // Fast path: the cache is exactly what the last pass produced, so only this
+  // photo's faces need clustering (same result as re-clustering everything).
+  const fast = cache && session?.matches(cache.faces, cache.people) ? session.clusterPhoto(photoId, newFaces) : null;
+  if (fast) {
+    ({ people, faces: updatedFaces, changedPeople } = fast);
+  } else {
+    const existingFaces = (cache ? cache.faces : getAllFaces(db)).filter((f) => f.photoId !== photoId);
+    const existingPeople = cache ? cache.people : getAllPeople();
+    ({ people, updatedFaces } = clusterFaces([...existingFaces, ...newFaces], existingPeople));
+    // Only the people this photo actually changed — see peopleNeedingWrite.
+    changedPeople = peopleNeedingWrite(existingPeople, people);
+    if (cache) clusterSessions.set(cache, new FaceClusterSession(updatedFaces, people));
+  }
+  // clusterFaces' output is settled (everything assigned), so these are exactly this photo's fresh faces.
+  const thisPhotoFaces = newFaces;
 
   const revBeforeOwnWrite = getFacesPeopleRevision();
   replaceFacesForPhoto(photoId, thisPhotoFaces, false, db);
-  // Only the people this photo actually changed — see peopleNeedingWrite.
-  const changedPeople = peopleNeedingWrite(existingPeople, people);
   if (changedPeople.length > 0) upsertPeople(changedPeople);
 
   // clusterFaces' own output is already the complete, authoritative new

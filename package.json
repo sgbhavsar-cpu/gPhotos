@@ -1,11 +1,12 @@
 {
   "name": "gphotos-desktop",
   "productName": "gPhotos",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "gPhotos Desktop - Standalone Photo Manager with Face Recognition and Places Map",
   "main": "dist-electron/main/main.js",
   "scripts": {
     "dev": "vite",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.electron.json",
     "test:imports": "node test/verify_imports_and_runtime.js",
     "test:render": "npx tsx test/test_rendered_app_startup.ts",
     "test:smoke": "node test/smoke_test_app_ready.js",
@@ -13,7 +14,7 @@
     "test:dedup-heic": "cross-env ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron.exe node_modules/tsx/dist/cli.mjs test/test_selected_dedup_and_heic_rotate.ts",
     "test:mobile-auth": "cross-env ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron.exe node_modules/tsx/dist/cli.mjs test/test_mobile_web_server.ts",
     "test:vitest": "cross-env ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron.exe node_modules/vitest/vitest.mjs run",
-    "test": "npm run test:imports && npm run test:render && npm run test:smoke && npm run test:workflow && npm run test:dedup-heic && npm run test:mobile-auth && npm run test:vitest",
+    "test": "npm run typecheck && npm run test:imports && npm run test:render && npm run test:smoke && npm run test:workflow && npm run test:dedup-heic && npm run test:mobile-auth && npm run test:vitest",
     "build:ui": "vite build",
     "copy:splash": "node -e \"const fs=require('fs'); fs.mkdirSync('dist-electron/main', {recursive:true}); fs.copyFileSync('src/main/splash.html', 'dist-electron/main/splash.html');\"",
     "build:electron": "tsc -p tsconfig.electron.json && npm run copy:splash",

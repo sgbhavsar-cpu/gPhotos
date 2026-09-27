@@ -31,9 +31,10 @@ import {
   Activity,
   Cloud
 } from 'lucide-react';
-import { BackgroundServiceStatus, BackgroundServiceSettings, WebServerStatus, PairedDeviceInfo } from '../../types';
+import { BackgroundServiceStatus, BackgroundServiceSettings, WebServerStatus, PairedDeviceInfo } from '../../../types';
 import { aiSearchService, AiSearchConfig, AiProvider } from '../services/aiSearchService';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { notify, notifyError } from '../services/notifications';
 
 interface SettingsViewProps {
   onOpenHelp?: () => void;
@@ -81,14 +82,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const handleToggleDebugLogging = async (enabled: boolean) => {
     setDebugLoggingEnabled(enabled);
-    await window.electronAPI?.setLogLevelOverride?.(enabled);
+    try {
+      await window.electronAPI?.setLogLevelOverride?.(enabled);
+    } catch (err) {
+      setDebugLoggingEnabled(!enabled);
+      notifyError('Change debug logging', err);
+    }
   };
 
+  // Background poll: a failed tick is skipped quietly (the next one retries).
   const refreshOneDriveHealth = async () => {
-    if (window.electronAPI?.getOneDriveReclaimHealth) {
-      const health = await window.electronAPI.getOneDriveReclaimHealth();
-      if (health) setOneDriveHealth(health);
-    }
+    try {
+      if (window.electronAPI?.getOneDriveReclaimHealth) {
+        const health = await window.electronAPI.getOneDriveReclaimHealth();
+        if (health) setOneDriveHealth(health);
+      }
+    } catch {}
   };
 
   useEffect(() => {
@@ -99,16 +108,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           setWebServerPortInput(String(status.port || 5173));
           setWebServerEnabled(status.enabled);
         }
-      });
+      }).catch((err) => notifyError('Load mobile server status', err));
     }
     refreshAccessPinAndDevices();
     if (window.electronAPI?.getLogLevelOverride) {
-      window.electronAPI.getLogLevelOverride().then((enabled) => setDebugLoggingEnabled(!!enabled));
+      window.electronAPI.getLogLevelOverride().then((enabled) => setDebugLoggingEnabled(!!enabled)).catch(() => {});
     }
     if (window.electronAPI?.getOneDriveStatus) {
       window.electronAPI.getOneDriveStatus().then((status) => {
         if (status) setOneDriveStatus(status);
-      });
+      }).catch(() => {});
     }
     refreshOneDriveHealth();
     const healthInterval = setInterval(refreshOneDriveHealth, 10000);
@@ -116,63 +125,93 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   }, []);
 
   const handleToggleOneDriveReclaim = async (enabled: boolean) => {
+    const previous = oneDriveStatus?.reclaimEnabled;
     setOneDriveStatus((prev) => (prev ? { ...prev, reclaimEnabled: enabled } : prev));
-    await window.electronAPI?.setOneDriveReclaimEnabled?.(enabled);
+    try {
+      await window.electronAPI?.setOneDriveReclaimEnabled?.(enabled);
+    } catch (err) {
+      setOneDriveStatus((prev) => (prev && previous !== undefined ? { ...prev, reclaimEnabled: previous } : prev));
+      notifyError('Change OneDrive space reclaim', err);
+    }
   };
 
   const handleResetOneDriveHealth = async () => {
     setIsResettingOneDriveHealth(true);
-    await window.electronAPI?.resetOneDriveReclaimHealth?.();
-    await refreshOneDriveHealth();
-    setIsResettingOneDriveHealth(false);
+    try {
+      await window.electronAPI?.resetOneDriveReclaimHealth?.();
+      await refreshOneDriveHealth();
+    } catch (err) {
+      notifyError('Retry OneDrive check', err);
+    } finally {
+      setIsResettingOneDriveHealth(false);
+    }
   };
 
   const refreshAccessPinAndDevices = async () => {
-    if (window.electronAPI?.getWebServerPin) {
-      const res = await window.electronAPI.getWebServerPin();
-      setAccessPin(res?.pin || null);
-    }
-    if (window.electronAPI?.listPairedDevices) {
-      const list = await window.electronAPI.listPairedDevices();
-      setPairedDevices(list || []);
+    try {
+      if (window.electronAPI?.getWebServerPin) {
+        const res = await window.electronAPI.getWebServerPin();
+        setAccessPin(res?.pin || null);
+      }
+      if (window.electronAPI?.listPairedDevices) {
+        const list = await window.electronAPI.listPairedDevices();
+        setPairedDevices(list || []);
+      }
+    } catch (err) {
+      notifyError('Load mobile access PIN / devices', err);
     }
   };
 
   const handleRegeneratePin = async () => {
     if (!window.electronAPI?.regenerateWebServerPin) return;
     setAuthActionLoading(true);
-    const res = await window.electronAPI.regenerateWebServerPin();
-    setAuthActionLoading(false);
-    if (res?.pin) {
-      setAccessPin(res.pin);
-      setPinRevealed(true);
-      setAuthFeedback('New PIN generated. Existing paired devices remain connected.');
-      setTimeout(() => setAuthFeedback(null), 4000);
+    try {
+      const res = await window.electronAPI.regenerateWebServerPin();
+      if (res?.pin) {
+        setAccessPin(res.pin);
+        setPinRevealed(true);
+        setAuthFeedback('New PIN generated. Existing paired devices remain connected.');
+        setTimeout(() => setAuthFeedback(null), 4000);
+      }
+    } catch (err) {
+      notifyError('Regenerate PIN', err);
+    } finally {
+      setAuthActionLoading(false);
     }
   };
 
   const handleRevokeDevice = async (deviceId: string) => {
     if (!window.electronAPI?.revokePairedDevice) return;
     setAuthActionLoading(true);
-    await window.electronAPI.revokePairedDevice(deviceId);
-    await refreshAccessPinAndDevices();
-    setAuthActionLoading(false);
+    try {
+      await window.electronAPI.revokePairedDevice(deviceId);
+      await refreshAccessPinAndDevices();
+    } catch (err) {
+      notifyError('Revoke device', err);
+    } finally {
+      setAuthActionLoading(false);
+    }
   };
 
   const handleRevokeAllDevices = async () => {
     if (!window.electronAPI?.revokeAllPairedDevices) return;
     setAuthActionLoading(true);
-    await window.electronAPI.revokeAllPairedDevices();
-    await refreshAccessPinAndDevices();
-    setAuthActionLoading(false);
-    setAuthFeedback('All paired devices were signed out.');
-    setTimeout(() => setAuthFeedback(null), 4000);
+    try {
+      await window.electronAPI.revokeAllPairedDevices();
+      await refreshAccessPinAndDevices();
+      setAuthFeedback('All paired devices were signed out.');
+      setTimeout(() => setAuthFeedback(null), 4000);
+    } catch (err) {
+      notifyError('Revoke all devices', err);
+    } finally {
+      setAuthActionLoading(false);
+    }
   };
 
   const handleSaveWebServerSettings = async () => {
     const portNum = parseInt(webServerPortInput, 10);
     if (isNaN(portNum) || portNum < 1024 || portNum > 65535) {
-      alert('Please enter a valid port number between 1024 and 65535.');
+      notify('warning', 'Please enter a valid port number between 1024 and 65535.');
       return;
     }
     setIsUpdatingWebServer(true);
@@ -191,16 +230,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         );
       }
     } catch (err: any) {
-      alert('Failed to update web server settings: ' + err.message);
+      notifyError('Update mobile web server settings', err);
     } finally {
       setIsUpdatingWebServer(false);
     }
   };
 
-  const handleCopyMobileUrl = (url: string) => {
-    navigator.clipboard.writeText(url);
-    setCopiedUrl(true);
-    setTimeout(() => setCopiedUrl(false), 2000);
+  const handleCopyMobileUrl = async (url: string) => {
+    try {
+      // navigator.clipboard is undefined on plain-http origins and can reject when denied.
+      if (!navigator.clipboard) throw new Error('Clipboard access is not available here — select the link and copy it manually.');
+      await navigator.clipboard.writeText(url);
+      setCopiedUrl(true);
+      setTimeout(() => setCopiedUrl(false), 2000);
+    } catch (err) {
+      notifyError('Copy link', err);
+    }
   };
 
   // Backup in .zip format state
@@ -216,7 +261,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const handleCreateZipBackup = async () => {
     if (!window.electronAPI?.createLibraryBackupZip) {
-      alert('Backup creation is available in the Electron desktop app.');
+      notify('info', 'Backup creation is available in the Electron desktop app.');
       return;
     }
     setIsBackingUp(true);
@@ -231,10 +276,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         setBackupResult(res);
         setBackupFeedback(`✓ Library backup successfully exported to: ${res.filePath} (${((res.fileSize || 0) / 1024).toFixed(1)} KB)`);
       } else {
-        alert('Failed to create backup: ' + (res.error || 'Unknown error'));
+        notifyError('Create backup', res.error || 'Unknown error');
       }
     } catch (err: any) {
-      alert('Backup error: ' + err.message);
+      notifyError('Create backup', err);
     } finally {
       setIsBackingUp(false);
     }
@@ -279,13 +324,48 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     return () => clearInterval(interval);
   }, [serviceStatus?.isPreCachingActive]);
 
+  // Range sliders / number input: keep a local draft while dragging or typing and only write the
+  // setting on release/blur — otherwise every tick is an IPC round trip whose (stale) poll result
+  // fights the control, and typing "30" turns into 5 then 50.
+  const [draft, setDraft] = useState<Record<string, number>>({});
+  const [idleDraft, setIdleDraft] = useState<string | null>(null);
+  const commitDraft = async (key: keyof BackgroundServiceSettings) => {
+    const v = draft[key as string];
+    if (v === undefined) return;
+    await handleToggleSetting(key, v);
+    setDraft((d) => {
+      const n = { ...d };
+      delete n[key as string];
+      return n;
+    });
+  };
+  // Commit props for a range slider. Pointer capture keeps the release event on the slider even when
+  // the pointer ends outside it (mouseup/touchend were missed then, leaving the draft stuck); blur
+  // and keyboard release cover the remaining ways a change ends.
+  const sliderCommit = (key: keyof BackgroundServiceSettings) => ({
+    onPointerDown: (e: React.PointerEvent<HTMLInputElement>) => {
+      try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
+    },
+    onPointerUp: () => commitDraft(key),
+    onPointerCancel: () => commitDraft(key),
+    onBlur: () => commitDraft(key),
+    onKeyUp: () => commitDraft(key),
+  });
+  const commitIdle = async () => {
+    if (idleDraft === null) return;
+    const n = Math.max(5, Math.min(600, parseInt(idleDraft, 10) || 15));
+    setIdleDraft(null);
+    await handleToggleSetting('idleResumeSeconds', n);
+  };
+
   const handleToggleSetting = async (key: keyof BackgroundServiceSettings, value: any) => {
     if (!window.electronAPI?.setBackgroundServiceSettings) return;
     try {
       await window.electronAPI.setBackgroundServiceSettings({ [key]: value });
       await fetchStatus();
     } catch (err) {
-      console.error(`Failed to update setting ${key}:`, err);
+      notifyError(`Change setting "${String(key)}"`, err);
+      fetchStatus(); // snap the controls back to what is really stored
     }
   };
 
@@ -312,7 +392,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         }
       }
     } catch (err) {
-      console.error('Failed to toggle pre-cache execution:', err);
+      notifyError('Pause/resume thumbnail pre-caching', err);
     } finally {
       setActionLoading(null);
     }
@@ -326,12 +406,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       if (res.success) {
         setSyncFeedback('Autonomous system service registered and started successfully!');
       } else {
-        alert('Failed to install service: ' + (res.error || 'Unknown error'));
+        notifyError('Install service', res.error || 'Unknown error');
       }
       await fetchStatus();
       await fetchLogs();
     } catch (err: any) {
-      alert('Error: ' + err.message);
+      notifyError('Install service', err);
     } finally {
       setActionLoading(null);
       setTimeout(() => setSyncFeedback(null), 5000);
@@ -349,12 +429,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       if (res.success) {
         setSyncFeedback('System service uninstalled. App background thread is now handling sync.');
       } else {
-        alert('Failed to uninstall service: ' + (res.error || 'Unknown error'));
+        notifyError('Uninstall service', res.error || 'Unknown error');
       }
       await fetchStatus();
       await fetchLogs();
     } catch (err: any) {
-      alert('Error: ' + err.message);
+      notifyError('Uninstall service', err);
     } finally {
       setActionLoading(null);
       setTimeout(() => setSyncFeedback(null), 5000);
@@ -370,7 +450,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       await fetchStatus();
       setTimeout(fetchLogs, 1500);
     } catch (err: any) {
-      alert('Sync trigger failed: ' + err.message);
+      notifyError('Start background sync', err);
     } finally {
       setActionLoading(null);
       setTimeout(() => setSyncFeedback(null), 4000);
@@ -1176,8 +1256,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 min={5}
                 max={600}
                 step={1}
-                value={serviceStatus?.idleResumeSeconds ?? 15}
-                onChange={(e) => handleToggleSetting('idleResumeSeconds', Math.max(5, Math.min(600, parseInt(e.target.value, 10) || 15)))}
+                value={idleDraft ?? String(serviceStatus?.idleResumeSeconds ?? 15)}
+                onChange={(e) => setIdleDraft(e.target.value)}
+                onBlur={commitIdle}
+                onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
                 className="input-field"
                 style={{ width: '80px', padding: '8px 10px', fontSize: '0.88rem', textAlign: 'center' }}
               />
@@ -1213,7 +1295,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     fontWeight: 700,
                     fontFamily: 'monospace',
                   }}>
-                    {serviceStatus?.maxCpuPercent ?? 40}% Max
+                    {draft.maxCpuPercent ?? serviceStatus?.maxCpuPercent ?? 40}% Max
                   </span>
                 </div>
 
@@ -1223,8 +1305,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     min="10"
                     max="90"
                     step="5"
-                    value={serviceStatus?.maxCpuPercent ?? 40}
-                    onChange={(e) => handleToggleSetting('maxCpuPercent', parseInt(e.target.value, 10))}
+                    value={draft.maxCpuPercent ?? serviceStatus?.maxCpuPercent ?? 40}
+                    onChange={(e) => setDraft((d) => ({ ...d, maxCpuPercent: parseInt(e.target.value, 10) }))}
+                    {...sliderCommit('maxCpuPercent')}
                     style={{ flex: 1, accentColor: 'var(--accent-cyan)', cursor: 'pointer' }}
                   />
                 </div>
@@ -1314,7 +1397,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     fontWeight: 700,
                     fontFamily: 'monospace',
                   }}>
-                    {serviceStatus?.turboWorkers ?? Math.max(1, (serviceStatus?.logicalCpuCount ?? 4) - 1)}
+                    {draft.turboWorkers ?? serviceStatus?.turboWorkers ?? Math.max(1, (serviceStatus?.logicalCpuCount ?? 4) - 1)}
                   </span>
                 </div>
 
@@ -1323,8 +1406,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   min="1"
                   max={Math.max(1, serviceStatus?.logicalCpuCount ?? 8)}
                   step="1"
-                  value={serviceStatus?.turboWorkers ?? Math.max(1, (serviceStatus?.logicalCpuCount ?? 4) - 1)}
-                  onChange={(e) => handleToggleSetting('turboWorkers', parseInt(e.target.value, 10))}
+                  value={draft.turboWorkers ?? serviceStatus?.turboWorkers ?? Math.max(1, (serviceStatus?.logicalCpuCount ?? 4) - 1)}
+                  onChange={(e) => setDraft((d) => ({ ...d, turboWorkers: parseInt(e.target.value, 10) }))}
+                  {...sliderCommit('turboWorkers')}
                   style={{ flex: 1, accentColor: '#f97316', cursor: 'pointer' }}
                 />
 
@@ -1362,7 +1446,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     fontWeight: 700,
                     fontFamily: 'monospace',
                   }}>
-                    {serviceStatus?.turboMaxCpuPercent ?? 100}% Max
+                    {draft.turboMaxCpuPercent ?? serviceStatus?.turboMaxCpuPercent ?? 100}% Max
                   </span>
                 </div>
 
@@ -1371,8 +1455,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   min="10"
                   max="100"
                   step="5"
-                  value={serviceStatus?.turboMaxCpuPercent ?? 100}
-                  onChange={(e) => handleToggleSetting('turboMaxCpuPercent', parseInt(e.target.value, 10))}
+                  value={draft.turboMaxCpuPercent ?? serviceStatus?.turboMaxCpuPercent ?? 100}
+                  onChange={(e) => setDraft((d) => ({ ...d, turboMaxCpuPercent: parseInt(e.target.value, 10) }))}
+                  {...sliderCommit('turboMaxCpuPercent')}
                   style={{ flex: 1, accentColor: '#f97316', cursor: 'pointer' }}
                 />
 
@@ -1732,7 +1817,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <button
               className="btn btn-primary"
               onClick={() => {
-                aiSearchService.saveConfig(aiConfig);
+                try {
+                  aiSearchService.saveConfig(aiConfig);
+                } catch (err) {
+                  notifyError('Save AI settings', err);
+                  return;
+                }
                 setAiFeedback('✓ AI Configuration saved successfully! Settings are active for AI Chatbot.');
                 setTimeout(() => setAiFeedback(null), 4000);
               }}
@@ -1815,7 +1905,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               {backupResult?.filePath && window.electronAPI?.openItemInFolder && (
                 <button
                   className="btn btn-secondary"
-                  onClick={() => window.electronAPI!.openItemInFolder(backupResult.filePath!)}
+                  onClick={async () => { try { await window.electronAPI!.openItemInFolder(backupResult.filePath!); } catch (err) { notifyError('Show backup in Explorer', err); } }}
                   style={{ fontSize: '0.78rem', padding: '4px 10px', height: 'auto' }}
                 >
                   Show in Explorer

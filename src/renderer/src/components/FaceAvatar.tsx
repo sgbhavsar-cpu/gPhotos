@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Users } from 'lucide-react';
-import { Photo, DetectedFace } from '../../types';
+import { Photo, DetectedFace } from '../../../types';
 import { getLocalPhotoUrl } from '../services/libraryStore';
 import { useAvatarSprite } from '../services/avatarSpriteLoader';
 import { getSpriteUrl } from '../services/asyncImageLoader';
@@ -68,6 +68,10 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
   const [hasError, setHasError] = useState(false);
   const [retry, setRetry] = useState(0);
   useEffect(() => { setRetry(0); }, [croppedDataUrl]);
+  // A failure belongs to one photo/face; don't leave the placeholder stuck when the source changes.
+  useEffect(() => { setHasError(false); }, [photo?.filePath, face?.id, personId, coverKey]);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (retryTimerRef.current) clearTimeout(retryTimerRef.current); }, []);
 
   // Use explicit box if passed, or fall back to face.box
   const box = explicitBox || face?.box;
@@ -101,6 +105,8 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
     let isCancelled = false;
     let finalShown = false;
     let provisionalShown = false;
+    // In-flight source images, so cleanup can abort loads (full-res originals are expensive).
+    const loadingImgs: HTMLImageElement[] = [];
 
     // isFinal=false is a quick provisional crop from the local thumbnail; the
     // final crop (from the original when preferOriginal) replaces it and is
@@ -110,6 +116,7 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
       isFinal = true
     ) => {
       const img = new Image();
+      loadingImgs.push(img);
       img.crossOrigin = 'anonymous';
       img.src = sourceUrl;
 
@@ -255,6 +262,11 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
 
     return () => {
       isCancelled = true;
+      for (const im of loadingImgs) {
+        im.onload = null;
+        im.onerror = null;
+        im.src = '';
+      }
     };
   }, [
     photo?.filePath,
@@ -344,7 +356,8 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
           // placeholder icon instead of a broken-image box.
           onError={() => {
             if (retry >= 3) { setHasError(true); return; }
-            setTimeout(() => setRetry((r) => r + 1), 1500 * 2 ** retry);
+            if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+            retryTimerRef.current = setTimeout(() => setRetry((r) => r + 1), 1500 * 2 ** retry);
           }}
           style={{
             width: '100%',

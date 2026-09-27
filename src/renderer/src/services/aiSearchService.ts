@@ -1,4 +1,5 @@
-import { Photo, Person } from '../../types';
+import { Photo, Person } from '../../../types';
+import { notify } from './notifications';
 
 export type AiProvider = 'gemini' | 'openai' | 'local';
 
@@ -38,6 +39,21 @@ export interface AiSearchResult {
 }
 
 const STORAGE_KEY = 'gphotos_ai_search_config_v1';
+
+// LLM output is untrusted: a non-array / non-string field used to throw deep inside applyFilter.
+const asStringArray = (v: unknown): string[] | undefined =>
+  Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : typeof v === 'string' && v ? [v] : undefined;
+const asString = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() ? v : undefined);
+// The model may answer { "year": "2024" }: coerce, and keep only finite numbers (else the filter matches nothing).
+const asFiniteNumber = (v: unknown): number | undefined => {
+  const n = typeof v === 'string' && !v.trim() ? NaN : Number(v);
+  return Number.isFinite(n) ? n : undefined;
+};
+const asDateRange = (v: unknown): AiPhotoFilter['dateRange'] => {
+  if (!v || typeof v !== 'object') return undefined;
+  const r = v as Record<string, unknown>;
+  return { start: asString(r.start), end: asString(r.end), year: asFiniteNumber(r.year), month: asFiniteNumber(r.month) };
+};
 
 class AiSearchService {
   private config: AiSearchConfig = {
@@ -107,12 +123,14 @@ class AiSearchService {
         filter = await this.queryGemini(cleanQuery, people, photos);
       } catch (err) {
         console.warn('Gemini query failed, falling back to smart local NLP:', err);
+        notify('warning', `Gemini search failed (${(err as Error)?.message || err}) — showing basic local search results instead.`);
       }
     } else if (this.config.provider === 'openai' && this.config.openaiApiKey.trim()) {
       try {
         filter = await this.queryOpenAI(cleanQuery, people, photos);
       } catch (err) {
         console.warn('OpenAI query failed, falling back to smart local NLP:', err);
+        notify('warning', `OpenAI search failed (${(err as Error)?.message || err}) — showing basic local search results instead.`);
       }
     }
 
@@ -327,11 +345,11 @@ Do NOT return markdown fences or other text, ONLY the raw JSON object.`;
     return {
       queryText: query,
       explanation: parsed.explanation || `Filtered photos for: "${query}"`,
-      peopleMustInclude: parsed.peopleMustInclude,
-      alonePersonName: parsed.alonePersonName || undefined,
-      childhoodPersonName: parsed.childhoodPersonName || undefined,
-      locationQuery: parsed.locationQuery || undefined,
-      dateRange: parsed.dateRange || undefined,
+      peopleMustInclude: asStringArray(parsed.peopleMustInclude),
+      alonePersonName: asString(parsed.alonePersonName),
+      childhoodPersonName: asString(parsed.childhoodPersonName),
+      locationQuery: asString(parsed.locationQuery),
+      dateRange: asDateRange(parsed.dateRange),
     };
   }
 
@@ -400,11 +418,11 @@ Return ONLY JSON:
     return {
       queryText: query,
       explanation: parsed.explanation || `Filtered photos for: "${query}"`,
-      peopleMustInclude: parsed.peopleMustInclude,
-      alonePersonName: parsed.alonePersonName || undefined,
-      childhoodPersonName: parsed.childhoodPersonName || undefined,
-      locationQuery: parsed.locationQuery || undefined,
-      dateRange: parsed.dateRange || undefined,
+      peopleMustInclude: asStringArray(parsed.peopleMustInclude),
+      alonePersonName: asString(parsed.alonePersonName),
+      childhoodPersonName: asString(parsed.childhoodPersonName),
+      locationQuery: asString(parsed.locationQuery),
+      dateRange: asDateRange(parsed.dateRange),
     };
   }
 
@@ -479,8 +497,8 @@ Return ONLY JSON:
     }
 
     // 5. Date / Year filter
-    if (filter.dateRange?.year) {
-      const yr = filter.dateRange.year;
+    const yr = asFiniteNumber(filter.dateRange?.year);
+    if (yr) {
       result = result.filter((p) => new Date(p.dateTaken).getFullYear() === yr);
     }
 

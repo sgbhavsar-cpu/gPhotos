@@ -1,9 +1,9 @@
 import fs from 'fs';
 import { Photo, CatalogMeta, TimelineMonthSummary, PlaceSummaryItem, Album } from '../../types';
-import { setActiveLibrary, getDbPath, getDbForLibraryPath } from './db';
+import type { DatabaseSync } from 'node:sqlite';
+import { setActiveLibrary, getDbPath, getDbForLibraryPath, getDb } from './db';
 import {
   getPhotosPage,
-  getAllPhotosForSummary,
   getTotalPhotoCount,
   getAllPeople,
   getAllAlbums,
@@ -56,6 +56,23 @@ export function computeTimelineSummary(photos: SummaryPhoto[]): TimelineMonthSum
   });
 }
 
+function placeKeyAndName(loc: NonNullable<SummaryPhoto['location']>): { placeKey: string; albumName: string } {
+  if (loc.city && loc.country) {
+    return { placeKey: `${loc.city}_${loc.country}`.toLowerCase(), albumName: `${loc.city}, ${loc.country}` };
+  }
+  if (loc.city) {
+    return { placeKey: loc.city.toLowerCase(), albumName: loc.city };
+  }
+  const gridLat = loc.latitude.toFixed(1);
+  const gridLng = loc.longitude.toFixed(1);
+  return {
+    placeKey: `geo_${gridLat}_${gridLng}`,
+    albumName: loc.country
+      ? `${loc.country} (${loc.latitude.toFixed(2)}°, ${loc.longitude.toFixed(2)}°)`
+      : `Location (${loc.latitude.toFixed(2)}°, ${loc.longitude.toFixed(2)}°)`,
+  };
+}
+
 /**
  * Pre-computes place summaries so startup never needs to run spatial map clustering.
  */
@@ -65,23 +82,7 @@ export function computePlacesSummary(photos: SummaryPhoto[]): PlaceSummaryItem[]
 
   for (const p of geoPhotos) {
     const loc = p.location!;
-    let placeKey = '';
-    let albumName = '';
-
-    if (loc.city && loc.country) {
-      placeKey = `${loc.city}_${loc.country}`.toLowerCase();
-      albumName = `${loc.city}, ${loc.country}`;
-    } else if (loc.city) {
-      placeKey = loc.city.toLowerCase();
-      albumName = loc.city;
-    } else {
-      const gridLat = loc.latitude.toFixed(1);
-      const gridLng = loc.longitude.toFixed(1);
-      placeKey = `geo_${gridLat}_${gridLng}`;
-      albumName = loc.country
-        ? `${loc.country} (${loc.latitude.toFixed(2)}°, ${loc.longitude.toFixed(2)}°)`
-        : `Location (${loc.latitude.toFixed(2)}°, ${loc.longitude.toFixed(2)}°)`;
-    }
+    const { placeKey, albumName } = placeKeyAndName(loc);
 
     if (!map.has(placeKey)) {
       map.set(placeKey, {
@@ -103,13 +104,141 @@ export function computePlacesSummary(photos: SummaryPhoto[]): PlaceSummaryItem[]
   return Array.from(map.values()).sort((a, b) => b.photoCount - a.photoCount);
 }
 
+// Rows whose (local-time) year/month can be read straight off the ISO string, so SQL can GROUP BY
+// it exactly like `new Date(str)` + getFullYear()/getMonth() would: either a tz-less date-time (JS
+// treats it as local wall time, so its own Y-M is the answer; day 01-28 so DST gaps can't cross a
+// month) or a UTC ('Z') one on days 02-27 (any UTC->local shift is under a day, so the month can't
+// change whatever the machine's timezone/historical DST rules). Everything else (boundary days,
+// offsets, date-only, odd/invalid strings, empty) goes through the original JS logic.
+const FAST_MONTH_SQL = `(
+  d GLOB '[12][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]*'
+  AND substr(d, 6, 2) BETWEEN '01' AND '12'
+  AND substr(d, 12, 2) < '24'
+  AND (
+    ((substr(d, 20) = '' OR substr(d, 20) GLOB '.[0-9][0-9][0-9]') AND substr(d, 9, 2) BETWEEN '01' AND '28')
+    OR ((substr(d, 20) = 'Z' OR substr(d, 20) GLOB '.[0-9][0-9][0-9]Z') AND substr(d, 9, 2) BETWEEN '02' AND '27')
+  )
+)`;
+
+// Only the covering-index columns (date_taken, id) go through the window, so it streams from
+// idx_photos_date_taken_id without touching table rows; anything else is joined back per selected row.
+const DATE_RANK_CTE = `WITH r AS (
+  SELECT id, date_taken AS d, ROW_NUMBER() OVER (ORDER BY date_taken DESC, id DESC) - 1 AS rn
+  FROM photos
+)`;
+
+/**
+ * Same result as computeTimelineSummary(<all photos in date_taken DESC, id DESC order>), but the bulk
+ * of the counting happens in SQLite (GROUP BY year-month with MIN(row number) as firstPhotoIndex) and
+ * only the unusual date strings are pushed through the original JS logic — no photo list is loaded.
+ */
+export function computeTimelineSummarySql(db: DatabaseSync = getDb()): TimelineMonthSummary[] {
+  const monthNames = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'
+  ];
+  const map = new Map<string, TimelineMonthSummary>();
+
+  const fast = db
+    .prepare(`${DATE_RANK_CTE} SELECT substr(d, 1, 7) AS ym, COUNT(*) AS c, MIN(rn) AS fi FROM r WHERE ${FAST_MONTH_SQL} GROUP BY ym`)
+    .all() as Array<{ ym: string; c: number; fi: number }>;
+  for (const row of fast) {
+    const year = Number(row.ym.slice(0, 4));
+    const month = Number(row.ym.slice(5, 7));
+    map.set(row.ym, { year, month, label: `${monthNames[month - 1]} ${year}`, count: row.c, firstPhotoIndex: row.fi });
+  }
+
+  const rest = db
+    .prepare(`${DATE_RANK_CTE} SELECT rn, d, (SELECT file_date FROM photos WHERE id = r.id) AS f FROM r WHERE NOT ${FAST_MONTH_SQL} ORDER BY rn`)
+    .all() as Array<{ rn: number; d: string; f: string | null }>;
+  if (rest.length > 0) {
+    const slow = computeTimelineSummary(rest.map((x) => ({ id: '', filePath: '', dateTaken: x.d, fileDate: x.f || '' })));
+    for (const e of slow) {
+      const key = `${e.year}-${String(e.month).padStart(2, '0')}`;
+      const rn = rest[e.firstPhotoIndex].rn;
+      const cur = map.get(key);
+      if (cur) {
+        cur.count += e.count;
+        cur.firstPhotoIndex = Math.min(cur.firstPhotoIndex, rn);
+      } else {
+        map.set(key, { ...e, firstPhotoIndex: rn });
+      }
+    }
+  }
+
+  return Array.from(map.values()).sort((a, b) => (a.year !== b.year ? b.year - a.year : b.month - a.month));
+}
+
+/**
+ * Same result as computePlacesSummary(<all photos in date_taken DESC, id DESC order>). SQLite groups the
+ * geotagged photos by (city, country) — or by exact coordinates when there is no city — keeping the
+ * first photo of each group; only one row per group is then parsed in JS to derive the place key/name
+ * (JS toLowerCase/toFixed semantics), and groups sharing a key are merged in first-photo order.
+ */
+export function computePlacesSummarySql(db: DatabaseSync = getDb()): PlaceSummaryItem[] {
+  const groups = db
+    .prepare(
+      // MAX(date_taken || char(1) || id) is the (date_taken, id) tuple max as one scalar (char(1) sorts
+      // below every real character, so a shorter date_taken still orders before its extensions), i.e.
+      // the FIRST photo of each group in the library's DESC order; SQLite then takes the bare
+      // columns (id, file_path, lj) from that very row. No window/sort needed.
+      `WITH g AS (
+         SELECT id, file_path, date_taken, location_json AS lj,
+           CASE WHEN json_valid(location_json) THEN json_extract(location_json, '$.city') END AS city,
+           CASE WHEN json_valid(location_json) THEN json_extract(location_json, '$.country') END AS country,
+           CASE WHEN json_valid(location_json) THEN json_extract(location_json, '$.latitude') END AS lat,
+           CASE WHEN json_valid(location_json) THEN json_extract(location_json, '$.longitude') END AS lng
+         FROM photos WHERE location_json IS NOT NULL
+       )
+       SELECT id, file_path, lj, COUNT(*) AS c, MAX(date_taken || char(1) || id) AS k
+       FROM g
+       WHERE lat IS NOT NULL AND lat <> 0 AND lat <> '' AND lng IS NOT NULL AND lng <> 0 AND lng <> ''
+       GROUP BY city, country,
+                CASE WHEN city IS NULL OR city = '' THEN lat END,
+                CASE WHEN city IS NULL OR city = '' THEN lng END
+       ORDER BY k DESC`
+    )
+    .all() as Array<{ id: string; file_path: string; lj: string; c: number }>;
+
+  const map = new Map<string, PlaceSummaryItem>();
+  for (const g of groups) {
+    const loc = JSON.parse(g.lj) as NonNullable<SummaryPhoto['location']>;
+    const { placeKey, albumName } = placeKeyAndName(loc);
+    const cur = map.get(placeKey);
+    if (cur) {
+      cur.photoCount += g.c;
+    } else {
+      map.set(placeKey, {
+        id: `place_${placeKey}`,
+        name: albumName,
+        city: loc.city,
+        country: loc.country,
+        latitude: loc.latitude,
+        longitude: loc.longitude,
+        photoCount: g.c,
+        coverPhotoId: g.id,
+        coverFilePath: g.file_path,
+      });
+    }
+  }
+  return Array.from(map.values()).sort((a, b) => b.photoCount - a.photoCount);
+}
+
 async function buildMeta(customDir?: string | null): Promise<CatalogMeta> {
-  const photos = await getAllPhotosForSummary();
+  const db = getDb();
   const people = getAllPeople();
   const albums = getAllAlbums();
 
-  const timelineSummary = computeTimelineSummary(photos);
-  const placesSummary = computePlacesSummary(photos);
+  // Aggregated in SQLite — never materialises the photo list (see computeTimelineSummarySql).
+  const totalPhotos = getTotalPhotoCount(db);
+  const timelineSummary = computeTimelineSummarySql(db);
+  const placesSummary = computePlacesSummarySql(db);
+  const edgeSql = (dir: 'ASC' | 'DESC') =>
+    db.prepare(`SELECT date_taken, file_date FROM photos ORDER BY date_taken ${dir}, id ${dir} LIMIT 1`).get() as
+      | { date_taken: string; file_date: string | null }
+      | undefined;
+  const latest = totalPhotos > 0 ? edgeSql('DESC') : undefined;
+  const earliest = totalPhotos > 0 ? edgeSql('ASC') : undefined;
 
   const albumsSummary = albums.map((a) => ({
     id: a.id,
@@ -124,7 +253,6 @@ async function buildMeta(customDir?: string | null): Promise<CatalogMeta> {
     count: p.faceCount ?? 0,
   }));
 
-  const totalPhotos = photos.length;
   const totalPages = Math.max(1, Math.ceil(totalPhotos / PAGE_SIZE));
   const recentLibraries = getSetting<string[]>('recentLibraries', []);
   const selectedFolder = getSetting<string | null>('selectedFolder', customDir || null);
@@ -135,8 +263,8 @@ async function buildMeta(customDir?: string | null): Promise<CatalogMeta> {
     totalAlbums: albumsSummary.length,
     totalPeople: peopleSummary.length,
     totalPlaces: placesSummary.length,
-    earliestDate: totalPhotos > 0 ? photos[totalPhotos - 1].dateTaken || photos[totalPhotos - 1].fileDate : undefined,
-    latestDate: totalPhotos > 0 ? photos[0].dateTaken || photos[0].fileDate : undefined,
+    earliestDate: earliest ? earliest.date_taken || earliest.file_date || '' : undefined,
+    latestDate: latest ? latest.date_taken || latest.file_date || '' : undefined,
     timelineSummary,
     placesSummary,
     albumsSummary,
@@ -215,6 +343,11 @@ export async function getCatalogPage(
   pageSize = PAGE_SIZE,
   customDir?: string
 ): Promise<{ photos: Photo[]; totalPages: number; totalPhotos: number }> {
+  // IPC-supplied values: clamp so a negative/NaN/huge pageSize can't become
+  // SQLite's LIMIT -1 (= whole library, synchronously) or a bind error.
+  pageSize = Number.isFinite(pageSize) ? Math.min(500, Math.max(1, Math.floor(pageSize))) : PAGE_SIZE;
+  pageIndex = Number.isFinite(pageIndex) ? Math.max(0, Math.floor(pageIndex)) : 0;
+
   setActiveLibrary(customDir || null);
   ensureMigratedIfEmpty();
 
@@ -228,7 +361,11 @@ export async function getCatalogPage(
       if (/\.(heic|heif)$/i.test(target)) {
         try {
           const { getHeicSavedRotation } = require('./heicRotationStore');
-          const rot = getHeicSavedRotation(target);
+          // Local mirror file first (cheap local sidecar/store lookup); the
+          // remote original is looked up in the in-memory store ONLY — its
+          // sidecar path would be a sync stat on a possibly-offline share.
+          const rot = (p.originalRemotePath && p.filePath && p.filePath !== target ? getHeicSavedRotation(p.filePath) : 0)
+            || getHeicSavedRotation(target, { skipSidecar: !!p.originalRemotePath });
           if (rot !== 0) {
             p.isHeicRotated = true;
             p.heicRotation = rot;

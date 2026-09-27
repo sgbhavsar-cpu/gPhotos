@@ -17,10 +17,17 @@ import {
   Square,
   MoreVertical,
 } from 'lucide-react';
-import { Photo, PlaceAlbum } from '../../types';
+import { Photo, PlaceAlbum } from '../../../types';
 import { PhotoCard } from '../components/PhotoCard';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { notify, notifyError } from '../services/notifications';
+import { VirtualCardGrid } from '../components/VirtualCardGrid';
+import { VirtualHorizontalList } from '../components/VirtualHorizontalList';
+
+// Place names come from EXIF / geocoding / the user and end up inside Leaflet divIcon HTML.
+const escapeHtml = (v: unknown): string =>
+  String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
 
 interface PlacesMapViewProps {
   photos: Photo[];
@@ -68,7 +75,14 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
   onToggleFavorite,
   resetTrigger,
 }) => {
+  // App passes a fresh inline callback every render; read it through a ref so markers/clusters
+  // aren't recomputed (O(photos)) on every parent re-render.
+  const onSelectPhotoRef = useRef(onSelectPhoto);
+  onSelectPhotoRef.current = onSelectPhoto;
   const mapContainerRef = useRef<HTMLDivElement>(null);
+  // Scroll containers of the two windowed photo lists (cluster tray, Assign modal grid).
+  const clusterTrayRef = useRef<HTMLDivElement>(null);
+  const assignGridScrollRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
   const currentTileLayerRef = useRef<L.TileLayer | null>(null);
   const markersLayerRef = useRef<L.LayerGroup | null>(null);
@@ -149,13 +163,16 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
   const photosForAssignModal = assignModalOverridePhotos ?? unlocatedPhotos;
   const isLocationOverrideMode = assignModalOverridePhotos !== null;
 
-  // Initialize all target photos as selected when opening assign modal
+  // Initialize all target photos as selected when opening the assign modal. Deliberately NOT
+  // re-run when `unlocatedPhotos` changes identity (any store update), or the user's
+  // deselections would be wiped while the dialog is open.
+  const photosForAssignModalRef = useRef(photosForAssignModal);
+  photosForAssignModalRef.current = photosForAssignModal;
   useEffect(() => {
     if (showAssignModal) {
-      setSelectedUnlocatedIds(new Set(photosForAssignModal.map((p) => p.id)));
+      setSelectedUnlocatedIds(new Set(photosForAssignModalRef.current.map((p) => p.id)));
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showAssignModal, assignModalOverridePhotos, unlocatedPhotos]);
+  }, [showAssignModal, assignModalOverridePhotos]);
 
   // All valid geotagged photos
   const geoPhotos = useMemo(() => {
@@ -175,42 +192,63 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
     (map: L.Map, clusterPixelThreshold = 55): PhotoCluster[] => {
       if (geoPhotos.length === 0) return [];
 
-      const clusters: {
+      type Bucket = {
         photos: Photo[];
         screenPt: L.Point;
         sumLat: number;
         sumLng: number;
-      }[] = [];
+        cell: string;
+      };
+      const clusters: Bucket[] = [];
+      // Grid hash (cell = threshold px): a point can only be within threshold of clusters in its
+      // own or the 8 neighbouring cells, so this is ~O(photos) instead of O(photos x clusters).
+      const grid = new Map<string, Bucket[]>();
+      const cellSize = clusterPixelThreshold;
+      const cellOf = (pt: L.Point) => `${Math.floor(pt.x / cellSize)},${Math.floor(pt.y / cellSize)}`;
 
       for (const photo of geoPhotos) {
         const lat = photo.location!.latitude;
         const lng = photo.location!.longitude;
         const pt = map.latLngToLayerPoint([lat, lng]);
+        const cx = Math.floor(pt.x / cellSize);
+        const cy = Math.floor(pt.y / cellSize);
 
-        let matched = false;
-        for (const cluster of clusters) {
-          const dist = pt.distanceTo(cluster.screenPt);
-          if (dist <= clusterPixelThreshold) {
-            cluster.photos.push(photo);
-            cluster.sumLat += lat;
-            cluster.sumLng += lng;
-            // Update center point smoothly
-            cluster.screenPt = L.point(
-              (cluster.screenPt.x + pt.x) / 2,
-              (cluster.screenPt.y + pt.y) / 2
-            );
-            matched = true;
-            break;
+        let target: Bucket | null = null;
+        for (let dx = -1; dx <= 1 && !target; dx++) {
+          for (let dy = -1; dy <= 1 && !target; dy++) {
+            const list = grid.get(`${cx + dx},${cy + dy}`);
+            if (!list) continue;
+            for (const cluster of list) {
+              if (pt.distanceTo(cluster.screenPt) <= clusterPixelThreshold) {
+                target = cluster;
+                break;
+              }
+            }
           }
         }
 
-        if (!matched) {
-          clusters.push({
-            photos: [photo],
-            screenPt: pt,
-            sumLat: lat,
-            sumLng: lng,
-          });
+        if (target) {
+          target.photos.push(photo);
+          target.sumLat += lat;
+          target.sumLng += lng;
+          // Update center point smoothly
+          target.screenPt = L.point((target.screenPt.x + pt.x) / 2, (target.screenPt.y + pt.y) / 2);
+          const newCell = cellOf(target.screenPt);
+          if (newCell !== target.cell) {
+            const oldList = grid.get(target.cell);
+            if (oldList) oldList.splice(oldList.indexOf(target), 1);
+            const nl = grid.get(newCell) || [];
+            nl.push(target);
+            grid.set(newCell, nl);
+            target.cell = newCell;
+          }
+        } else {
+          const cell = cellOf(pt);
+          const b: Bucket = { photos: [photo], screenPt: pt, sumLat: lat, sumLng: lng, cell };
+          clusters.push(b);
+          const list = grid.get(cell) || [];
+          list.push(b);
+          grid.set(cell, list);
         }
       }
 
@@ -338,13 +376,14 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
         false
       );
 
+      const safeTitle = escapeHtml(cluster.title);
       const html = `
-        <div class="pin-bubble" title="${cluster.title} (${cluster.subtitle})">
-          <img src="${thumbUrl}" class="pin-thumbnail" alt="${cluster.title}" />
+        <div class="pin-bubble" title="${safeTitle} (${escapeHtml(cluster.subtitle)})">
+          <img src="${escapeHtml(thumbUrl)}" class="pin-thumbnail" alt="${safeTitle}" />
           ${isMulti ? `<div class="pin-badge">${cluster.photos.length}</div>` : ''}
           <div class="pin-pointer"></div>
           <div class="pin-title-pill">
-            <span class="pin-title-text">${cluster.title}</span>
+            <span class="pin-title-text">${safeTitle}</span>
             <span class="pin-count-badge">${cluster.photos.length}</span>
           </div>
         </div>
@@ -366,7 +405,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
         L.DomEvent.stopPropagation(e);
         if (cluster.photos.length === 1) {
           // iPhone style: Single photo tap directly launches Lightbox!
-          onSelectPhoto(cluster.photos[0]);
+          onSelectPhotoRef.current(cluster.photos[0]);
         } else {
           // Multi-photo cluster: smoothly zoom in and show photos in bottom tray
           setSelectedCluster(cluster);
@@ -380,7 +419,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
 
       marker.addTo(markersLayer);
     });
-  }, [geoPhotos, computeClusters, onSelectPhoto]);
+  }, [geoPhotos, computeClusters]);
 
   const handleSaveClusterLocationName = () => {
     const clean = clusterLocationInput.trim();
@@ -395,7 +434,12 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
         city: clean,
       },
     }));
-    libraryStore.updatePhotos(updatedPhotos);
+    try {
+      libraryStore.updatePhotos(updatedPhotos);
+    } catch (err) {
+      notifyError('Rename location', err);
+      return;
+    }
     setSelectedCluster({
       ...selectedCluster,
       title: clean,
@@ -413,20 +457,22 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
     setIsSearchingPlaces(true);
     try {
       const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=5`);
+      if (!res.ok) throw new Error(`Place search returned HTTP ${res.status}`);
       const data = await res.json();
       if (Array.isArray(data)) {
-        const results = data.map((item: any) => ({
-          name: item.display_name.split(',').slice(0, 3).join(','),
-          lat: parseFloat(item.lat),
-          lon: parseFloat(item.lon),
-        }));
+        const results = data
+          .map((item: any) => ({
+            name: String(item.display_name || '').split(',').slice(0, 3).join(','),
+            lat: parseFloat(item.lat),
+            lon: parseFloat(item.lon),
+          }))
+          .filter((r) => r.name && Number.isFinite(r.lat) && Number.isFinite(r.lon));
         setAssignSearchResults(results);
-        if (results.length > 0) {
-          setChosenLocation(results[0]);
-        }
+        setChosenLocation(results.length > 0 ? results[0] : null);
+        if (results.length === 0) notify('info', `No places found for "${query}".`);
       }
     } catch (err) {
-      console.warn('Place search error:', err);
+      notifyError('Place search failed (offline?)', err);
     } finally {
       setIsSearchingPlaces(false);
     }
@@ -444,7 +490,12 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
         city: chosenLocation.name.split(',')[0].trim(),
       },
     }));
-    libraryStore.updatePhotos(updated);
+    try {
+      libraryStore.updatePhotos(updated);
+    } catch (err) {
+      notifyError('Assign location', err);
+      return;
+    }
     setShowAssignModal(false);
     setAssignModalOverridePhotos(null);
     setChosenLocation(null);
@@ -502,17 +553,21 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
     }
   };
 
+  // The map container must stay mounted (Leaflet binds to that DOM node once), so the
+  // loading state is an overlay rather than an early return.
   const isInitialized = libraryStore.getState().isInitialized;
-  if (!isInitialized && photos.length === 0) {
-    return (
+  const showLoading = !isInitialized && photos.length === 0;
+  const loadingOverlay = showLoading ? (
       <div
         style={{
-          flex: 1,
+          position: 'absolute',
+          inset: 0,
+          zIndex: 60,
+          backgroundColor: 'var(--bg-app)',
           display: 'flex',
           flexDirection: 'column',
           alignItems: 'center',
           justifyContent: 'center',
-          height: '100%',
           gap: '14px',
           color: 'var(--text-muted)',
         }}
@@ -530,8 +585,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
         />
         <span style={{ fontSize: '0.95rem' }}>Loading map and geotagged places...</span>
       </div>
-    );
-  }
+  ) : null;
 
   // Shared JSX built once and arranged differently for desktop vs mobile
   // below — mobile collapses the tile selector / Fit All / Assign Location
@@ -767,6 +821,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
             zIndex: 10,
           }}
         />
+        {loadingOverlay}
 
         {/* Floating Bottom Drawer for Selected Cluster (Apple Photos iOS Style) */}
         {selectedCluster && (
@@ -926,17 +981,22 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
 
             {/* Horizontal Scroll of Cluster Photos */}
             <div
+              ref={clusterTrayRef}
               style={{
                 padding: '14px 18px',
-                display: 'flex',
-                gap: '12px',
                 overflowX: 'auto',
                 overflowY: 'hidden',
               }}
             >
-              {selectedCluster.photos.map((photo) => (
+              <VirtualHorizontalList
+                key={selectedCluster.id}
+                items={selectedCluster.photos}
+                getKey={(photo) => photo.id}
+                scrollRef={clusterTrayRef}
+                itemWidth={150}
+                gap={12}
+                renderItem={(photo) => (
                 <div
-                  key={photo.id}
                   onClick={() => onSelectPhoto(photo)}
                   style={{
                     minWidth: '150px',
@@ -1004,7 +1064,8 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                     </div>
                   </div>
                 </div>
-              ))}
+                )}
+              />
             </div>
           </div>
         )}
@@ -1212,20 +1273,24 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                   </div>
 
                   <div
+                    ref={assignGridScrollRef}
                     style={{
-                      display: 'grid',
-                      gridTemplateColumns: 'repeat(auto-fill, minmax(100px, 1fr))',
-                      gap: '8px',
                       maxHeight: '180px',
                       overflowY: 'auto',
                       padding: '4px',
                     }}
                   >
-                    {photosForAssignModal.map((p) => {
+                    <VirtualCardGrid
+                      items={photosForAssignModal}
+                      getKey={(p) => p.id}
+                      scrollRef={assignGridScrollRef}
+                      rowHeight={80}
+                      minColWidth={100}
+                      gap={8}
+                      renderItem={(p) => {
                       const isSel = selectedUnlocatedIds.has(p.id);
                       return (
                         <div
-                          key={p.id}
                           onClick={() => {
                             setSelectedUnlocatedIds((prev) => {
                               const next = new Set(prev);
@@ -1236,7 +1301,8 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                           }}
                           style={{
                             position: 'relative',
-                            height: '80px',
+                            height: '100%',
+                            boxSizing: 'border-box',
                             borderRadius: '8px',
                             overflow: 'hidden',
                             border: isSel ? '2px solid var(--accent-primary)' : '1px solid var(--border-subtle)',
@@ -1262,7 +1328,8 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                           </div>
                         </div>
                       );
-                    })}
+                      }}
+                    />
                   </div>
                 </div>
               </div>

@@ -1,9 +1,11 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { Photo } from '../../types';
+import React, { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
+import { Photo } from '../../../types';
 import { PhotoCard } from './PhotoCard';
 import { getLocalPhotoUrl, libraryStore } from '../services/libraryStore';
 import { requestBatchThumbnails } from '../services/asyncImageLoader';
 import { TimelineYearScrubber } from './TimelineYearScrubber';
+import { createMonthGrouper, monthRowWindow, photoMonthInfo } from './timelineGrouping';
+import { anchorAtY, scrollTopFor, type AnchorLayoutGroup, type AnchorMetrics, type ZoomAnchor } from './zoomAnchor';
 import {
   Calendar,
   ChevronRight,
@@ -28,10 +30,51 @@ export const ZOOM_LEVELS: GalleryZoomLevel[] = [
 
 // How far above/below the visible viewport rows are still fully rendered
 // (instead of a lightweight spacer div), and thumbnails are fetched ahead of
-// time — in both scroll directions — so items are already on-screen and
+// time (same window as the render buffer) — in both scroll directions — so items are already on-screen and
 // their images already loading by the time the user scrolls to them.
 const RENDER_BUFFER_PX = 1600;
-const THUMBNAIL_PREFETCH_BUFFER_PX = 1600;
+
+/** One month group of the virtual layout (the fields of virtualMonthData that the zoom anchoring needs). */
+interface ZoomLayoutData {
+  key: string;
+  top: number;
+  bottom: number;
+  headerHeight: number;
+  group: { photos: Photo[] };
+}
+const toAnchorGroups = (data: ZoomLayoutData[]): AnchorLayoutGroup[] =>
+  data.map((d) => ({ key: d.key, top: d.top, bottom: d.bottom, headerHeight: d.headerHeight, photos: d.group.photos }));
+
+/**
+ * Where the pointer is for a Ctrl+wheel zoom: the thumbnail under it (and how far down inside it), and the pointer's
+ * Y inside the scroll viewport. Over a gap, a header or empty space the position is worked out from the layout.
+ */
+function captureWheelAnchor(
+  e: React.WheelEvent,
+  el: HTMLElement | null,
+  data: ZoomLayoutData[],
+  cfg: AnchorMetrics
+): { anchor: ZoomAnchor; viewportY: number; at: number } | null {
+  if (!el || data.length === 0) return null;
+  const rect = el.getBoundingClientRect();
+  const viewportY = e.clientY - rect.top;
+  const groups = toAnchorGroups(data);
+
+  const card = (e.target as HTMLElement | null)?.closest?.('[data-photo-id]') as HTMLElement | null;
+  const photoId = card?.getAttribute('data-photo-id');
+  if (card && photoId) {
+    const r = card.getBoundingClientRect();
+    const fracY = r.height > 0 ? Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)) : 0;
+    const group = groups.find((g) => g.photos.some((p) => p.id === photoId));
+    if (group) return { anchor: { kind: 'photo', photoId, groupKey: group.key, fracY }, viewportY, at: Date.now() };
+  }
+
+  const availableWidth = Math.max(300, el.clientWidth - 48); // same padding as gridConfig
+  const cellWidth = (availableWidth - cfg.gap * (cfg.cols - 1)) / cfg.cols;
+  const col = Math.floor((e.clientX - rect.left - 24 + cfg.gap / 2) / (cellWidth + cfg.gap));
+  const anchor = anchorAtY(groups, cfg, el.scrollTop + viewportY, { col });
+  return anchor ? { anchor, viewportY, at: Date.now() } : null;
+}
 
 interface VirtualizedTimelineGalleryProps {
   photos: Photo[];
@@ -74,6 +117,7 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
   const [containerWidth, setContainerWidth] = useState(1200);
   const lastWheelZoomTime = useRef<number>(0);
   const scrollRafRef = useRef<number | null>(null);
+  const scrollQuantumRef = useRef(80);
 
   // 2D Matrix Mouse drag-selection tracking
   const isMouseDownRef = useRef<boolean>(false);
@@ -86,6 +130,15 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
     col: number;
   } | null>(null);
   const initialSelectedIdsRef = useRef<Set<string>>(new Set());
+
+  // Keeping the same photo in view when the thumbnail size changes (see zoomAnchor.ts).
+  // lastScrollTopRef: the raw scroll offset (the state is snapped to a row pitch). layoutRef: the layout of the
+  // most recent render. zoomTransitionRef: set during the render in which the zoom level changed, holding the OLD
+  // layout and offset, and consumed by the layout effect once the new layout is committed.
+  const lastScrollTopRef = useRef(0);
+  const layoutRef = useRef<{ zoomLevel: GalleryZoomLevel; data: ZoomLayoutData[]; cfg: AnchorMetrics }>({ zoomLevel, data: [], cfg: { cols: 1, itemHeight: 1, gap: 0 } });
+  const zoomTransitionRef = useRef<{ from: { data: ZoomLayoutData[]; cfg: AnchorMetrics }; scrollTop: number; wheel: { anchor: ZoomAnchor; viewportY: number } | null } | null>(null);
+  const wheelAnchorRef = useRef<{ anchor: ZoomAnchor; viewportY: number; at: number } | null>(null);
 
   useEffect(() => {
     const handleGlobalMouseUp = () => {
@@ -121,7 +174,9 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
       resizeObserver.observe(el);
       return () => resizeObserver.disconnect();
     }
-  }, []);
+    // The scroll container is a different DOM node (or absent) for empty / years+months / grid
+    // renders, so re-attach whenever that changes instead of observing a stale/null element once.
+  }, [photos.length === 0, zoomLevel === 'years' || zoomLevel === 'months']);
 
   // Distance from the bottom of loaded content, in pixels, at which the next
   // batch of catalog pages is requested (onLoadMore loads several pages at
@@ -135,12 +190,17 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
   // visible-item recalculation below to run redundantly, which is what was
   // making fast scrolling feel like it stutters/pauses.
   const handleScroll = useCallback(() => {
+    if (containerRef.current) lastScrollTopRef.current = containerRef.current.scrollTop;
     if (scrollRafRef.current !== null) return;
     scrollRafRef.current = requestAnimationFrame(() => {
       scrollRafRef.current = null;
       const el = containerRef.current;
       if (!el) return;
-      setScrollTop(el.scrollTop);
+      // Snap to a row pitch: the mounted/prefetched window only changes once per row of
+      // scrolling, so re-render then instead of on every frame (the buffer absorbs the snap).
+      const q = scrollQuantumRef.current;
+      const snapped = Math.floor(el.scrollTop / q) * q;
+      setScrollTop((prev) => (prev === snapped ? prev : snapped));
 
       if (onLoadMore) {
         const distanceFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight);
@@ -180,18 +240,13 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
         if (now - lastWheelZoomTime.current < 140) return;
         lastWheelZoomTime.current = now;
 
-        if (e.deltaY < 0) {
-          // Scroll Up = Zoom In
-          const idx = ZOOM_LEVELS.indexOf(zoomLevel);
-          if (idx < ZOOM_LEVELS.length - 1) {
-            onZoomChange(ZOOM_LEVELS[idx + 1]);
-          }
-        } else if (e.deltaY > 0) {
-          // Scroll Down = Zoom Out
-          const idx = ZOOM_LEVELS.indexOf(zoomLevel);
-          if (idx > 0) {
-            onZoomChange(ZOOM_LEVELS[idx - 1]);
-          }
+        const idx = ZOOM_LEVELS.indexOf(zoomLevel);
+        const next = e.deltaY < 0 ? ZOOM_LEVELS[idx + 1] : e.deltaY > 0 ? ZOOM_LEVELS[idx - 1] : undefined;
+        if (next && idx >= 0) {
+          // Remember which photo is under the pointer and where on screen it is, so the new layout can put
+          // that same photo back under the pointer.
+          wheelAnchorRef.current = captureWheelAnchor(e, containerRef.current, layoutRef.current.data, layoutRef.current.cfg);
+          onZoomChange(next); // Scroll Up = Zoom In, Scroll Down = Zoom Out
         }
       }
     },
@@ -204,7 +259,7 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
     const map = new Map<number, { year: number; photos: Photo[] }>();
     for (let i = 0; i < photos.length; i++) {
       const p = photos[i];
-      const yr = new Date(p.dateTaken).getFullYear() || 1970;
+      const yr = photoMonthInfo(p).year;
       let g = map.get(yr);
       if (!g) {
         g = { year: yr, photos: [] };
@@ -216,25 +271,9 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
   }, [photos, zoomLevel]);
 
   // Group photos by Month for 'months', 'very_small', 'small', 'medium', 'large' views
-  const monthGroups = useMemo(() => {
-    const map = new Map<string, { key: string; label: string; year: number; photos: Photo[] }>();
-    for (let i = 0; i < photos.length; i++) {
-      const p = photos[i];
-      const date = new Date(p.dateTaken);
-      const yr = date.getFullYear() || 1970;
-      const mo = String(date.getMonth() + 1).padStart(2, '0');
-      const key = `${yr}-${mo}`;
-
-      let g = map.get(key);
-      if (!g) {
-        const label = date.toLocaleDateString(undefined, { year: 'numeric', month: 'long' });
-        g = { key, label, year: yr, photos: [] };
-        map.set(key, g);
-      }
-      g.photos.push(p);
-    }
-    return Array.from(map.values()).sort((a, b) => b.key.localeCompare(a.key));
-  }, [photos]);
+  // Incremental: catalog pages that only append to `photos` don't regroup the whole list.
+  const groupMonths = useMemo(() => createMonthGrouper(), []);
+  const monthGroups = useMemo(() => groupMonths(photos), [groupMonths, photos]);
 
   // Grid column count & heights based on zoom level
   const gridConfig = useMemo(() => {
@@ -270,6 +309,7 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
         return { cols: 4, itemHeight: 180, gap: 12, size: 'medium' as const };
     }
   }, [zoomLevel, containerWidth]);
+  scrollQuantumRef.current = gridConfig.itemHeight + gridConfig.gap;
 
   // Virtualized Month Layout calculations:
   // Pre-calculate positions of every month group for O(1) viewport visibility check
@@ -302,6 +342,54 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
     });
   }, [monthGroups, zoomLevel, gridConfig]);
 
+  // PhotoCard is memoized with a comparator that ignores its callback props, so the
+  // per-card handlers below can hold stale closures. They read everything that
+  // changes over time (selection, columns, groups, callbacks) through this ref.
+  // The zoom level changed in THIS render (toolbar, wheel or anything else): remember the old layout and the old
+  // offset. Idempotent, so a repeated render (StrictMode) does not lose it.
+  const previousLayout = layoutRef.current;
+  layoutRef.current = { zoomLevel, data: virtualMonthData, cfg: gridConfig };
+  if (previousLayout.zoomLevel !== zoomLevel) {
+    const wheel = wheelAnchorRef.current && Date.now() - wheelAnchorRef.current.at < 400 ? wheelAnchorRef.current : null;
+    wheelAnchorRef.current = null;
+    zoomTransitionRef.current = {
+      from: { data: previousLayout.data, cfg: previousLayout.cfg },
+      scrollTop: lastScrollTopRef.current,
+      wheel: wheel ? { anchor: wheel.anchor, viewportY: wheel.viewportY } : null,
+    };
+  }
+
+  // After the new layout is in the DOM: scroll so the photo the user was looking at is where they were looking.
+  useLayoutEffect(() => {
+    const t = zoomTransitionRef.current;
+    if (!t) return;
+    zoomTransitionRef.current = null;
+    const el = containerRef.current;
+    const cur = layoutRef.current;
+    // The years / months views have no thumbnail grid to anchor in.
+    if (!el || t.from.data.length === 0 || cur.data.length === 0) return;
+    const oldGroups = toAnchorGroups(t.from.data);
+    let anchor: ZoomAnchor | null;
+    let viewportY = 0;
+    if (t.wheel) {
+      anchor = t.wheel.anchor;
+      viewportY = t.wheel.viewportY;
+    } else {
+      // Toolbar: the thumbnail at the top-left of the viewport stays at the top-left.
+      anchor = anchorAtY(oldGroups, t.from.cfg, t.scrollTop, { topLeft: true });
+    }
+    if (!anchor) return;
+    const next = scrollTopFor(toAnchorGroups(cur.data), cur.cfg, anchor, viewportY);
+    if (next === null) return;
+    el.scrollTop = next;
+    lastScrollTopRef.current = next;
+    const q = scrollQuantumRef.current;
+    setScrollTop(Math.floor(next / q) * q);
+  }, [zoomLevel]);
+
+  const live = useRef({ selectedIds, cols: gridConfig.cols, monthGroups, onToggleSelect, onSelectPhoto, onSelectionChange, onDragSelect, isSelectMode });
+  live.current = { selectedIds, cols: gridConfig.cols, monthGroups, onToggleSelect, onSelectPhoto, onSelectionChange, onDragSelect, isSelectMode };
+
   // Must live up here with the other hooks: the 'years'/'months' zoom levels and the
   // empty-list case return early below, and a hook AFTER those returns is skipped on
   // those renders — switching to Years crashed the whole app (React error #300,
@@ -310,6 +398,20 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
     () => virtualMonthData.map((item) => ({ key: item.key, label: item.group.label, year: item.group.year, top: item.top })),
     [virtualMonthData]
   );
+
+  // Row window of every on-screen month group. Render and thumbnail prefetch use the same
+  // window (same 1600px buffer), computed once per scroll snap / data change.
+  const viewportTop = Math.max(0, scrollTop - RENDER_BUFFER_PX);
+  const viewportBottom = scrollTop + containerHeight + RENDER_BUFFER_PX;
+  const monthWindows = useMemo(() => {
+    if (zoomLevel === 'years' || zoomLevel === 'months') return [];
+    const { itemHeight, gap } = gridConfig;
+    return virtualMonthData.map((item) => monthRowWindow(item, viewportTop, viewportBottom, itemHeight, gap));
+  }, [virtualMonthData, viewportTop, viewportBottom, gridConfig, zoomLevel]);
+  // Only when this signature (the visible start/end rows) or the data changes do we refetch.
+  const windowSig = monthWindows.reduce((s, w, i) => (w ? `${s}${i}:${w.startRow}-${w.endRow};` : s), '');
+  const monthWindowsRef = useRef(monthWindows);
+  monthWindowsRef.current = monthWindows;
 
   // Automatically pre-fetch up to 100 thumbnails in 1 single async request for all
   // visible rows. This hook must be called on every render regardless of zoomLevel
@@ -320,11 +422,7 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
     if (zoomLevel === 'years' || zoomLevel === 'months') return;
     if (virtualMonthData.length === 0) return;
 
-    const bufferPx = THUMBNAIL_PREFETCH_BUFFER_PX;
-    const viewportTop = Math.max(0, scrollTop - bufferPx);
-    const viewportBottom = scrollTop + containerHeight + bufferPx;
-    const { cols, itemHeight, gap, size } = gridConfig;
-
+    const { cols, size } = gridConfig;
     const pixelSizeMap: Record<string, number> = {
       very_small: 150,
       small: 200,
@@ -334,30 +432,21 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
     const targetSize = pixelSizeMap[size] || 250;
     const itemsToFetch: Array<{ path: string; originalPath?: string }> = [];
 
-    for (const item of virtualMonthData) {
-      const isVisible = item.bottom >= viewportTop && item.top <= viewportBottom;
-      if (isVisible) {
-        const groupPhotos = item.group.photos;
-        const totalRows = item.rows;
-        const relativeScrollTop = Math.max(0, viewportTop - item.top - item.headerHeight);
-        const relativeScrollBottom = Math.max(0, viewportBottom - item.top - item.headerHeight);
-        const startRow = Math.max(0, Math.floor(relativeScrollTop / (itemHeight + gap)));
-        const endRow = Math.min(totalRows, Math.ceil(relativeScrollBottom / (itemHeight + gap)));
-
-        const visibleSlice = groupPhotos.slice(startRow * cols, endRow * cols);
-        for (const p of visibleSlice) {
-          itemsToFetch.push({
-            path: p.thumbnailPath || p.filePath,
-            originalPath: p.originalRemotePath,
-          });
-        }
+    virtualMonthData.forEach((item, i) => {
+      const w = monthWindowsRef.current[i];
+      if (!w) return;
+      for (const p of item.group.photos.slice(w.startRow * cols, w.endRow * cols)) {
+        itemsToFetch.push({
+          path: p.thumbnailPath || p.filePath,
+          originalPath: p.originalRemotePath,
+        });
       }
-    }
+    });
 
     if (itemsToFetch.length > 0) {
       requestBatchThumbnails(itemsToFetch, targetSize);
     }
-  }, [virtualMonthData, scrollTop, containerHeight, gridConfig, zoomLevel]);
+  }, [virtualMonthData, windowSig, gridConfig, zoomLevel]);
 
   if (photos.length === 0) {
     const isInitialized = libraryStore.getState().isInitialized;
@@ -619,10 +708,7 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
 
   // 3. FULL PHOTO GRID (very_small, small, medium, large) WITH HIGH-EFFICIENCY VIRTUALIZATION
   // Viewport buffer: render items within RENDER_BUFFER_PX before and after current scroll view
-  const bufferPx = RENDER_BUFFER_PX;
-  const viewportTop = Math.max(0, scrollTop - bufferPx);
-  const viewportBottom = scrollTop + containerHeight + bufferPx;
-
+  // (monthWindows above holds the resulting per-group row windows).
   const { cols, itemHeight, gap, size } = gridConfig;
 
   const handleScrubberJump = (top: number) => {
@@ -646,11 +732,11 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
         }}
         tabIndex={0}
       >
-      {virtualMonthData.map((item) => {
-        const isVisible = item.bottom >= viewportTop && item.top <= viewportBottom;
+      {virtualMonthData.map((item, itemIdx) => {
+        const win = monthWindows[itemIdx];
 
         // If offscreen, render lightweight empty placeholder div to reserve exact layout scroll height!
-        if (!isVisible) {
+        if (!win) {
           return (
             <div
               key={item.key}
@@ -667,12 +753,8 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
         const groupPhotos = item.group.photos;
         const totalRows = item.rows;
 
-        // Calculate visible row range inside this month
-        const relativeScrollTop = Math.max(0, viewportTop - item.top - item.headerHeight);
-        const relativeScrollBottom = Math.max(0, viewportBottom - item.top - item.headerHeight);
-
-        const startRow = Math.max(0, Math.floor(relativeScrollTop / (itemHeight + gap)));
-        const endRow = Math.min(totalRows, Math.ceil(relativeScrollBottom / (itemHeight + gap)));
+        // Visible row range inside this month
+        const { startRow, endRow } = win;
 
         const visiblePhotos = groupPhotos.slice(startRow * cols, endRow * cols);
         const topSpacerHeight = startRow * (itemHeight + gap);
@@ -721,9 +803,12 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
                     size={size}
                     isSelected={selectedIds.has(photo.id)}
                     isSelectMode={isSelectMode || selectedIds.size > 0}
-                    onToggleSelect={() => onToggleSelect && onToggleSelect(photo.id)}
+                    onToggleSelect={() => live.current.onToggleSelect && live.current.onToggleSelect(photo.id)}
                     onCardMouseDown={(_id, e) => {
                       if (e.button === 0) {
+                        // Read live values: this closure can be stale (memoized card).
+                        const { cols, selectedIds } = live.current;
+                        const groupPhotos = live.current.monthGroups.find((g) => g.key === item.key)?.photos ?? item.group.photos;
                         isMouseDownRef.current = true;
                         const photoIdx = groupPhotos.findIndex((p) => p.id === photo.id);
                         dragAnchorRef.current = {
@@ -733,7 +818,14 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
                           row: Math.floor(photoIdx / cols),
                           col: photoIdx % cols,
                         };
-                        initialSelectedIdsRef.current = new Set(selectedIds);
+                        // Explorer-style drag selection:
+                        //  - plain press + drag starts a NEW selection (what was selected before is replaced once the
+                        //    drag actually starts; a plain click without dragging is handled by onClick as before);
+                        //  - Ctrl/Cmd + press + drag ADDS the dragged block to the current selection. The photos that
+                        //    were already selected stay exactly as they are: never toggled off, even if the new block
+                        //    overlaps them.
+                        const additive = e.ctrlKey || e.metaKey;
+                        initialSelectedIdsRef.current = additive ? new Set(selectedIds) : new Set();
                       }
                     }}
                     onCardMouseEnter={(id) => {
@@ -742,6 +834,8 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
                           return;
                         }
                         isDragSelectingRef.current = true;
+                        const { cols, monthGroups, onSelectionChange, onDragSelect } = live.current;
+                        const groupPhotos = monthGroups.find((g) => g.key === item.key)?.photos ?? item.group.photos;
                         const anchor = dragAnchorRef.current;
                         const currentIdx = groupPhotos.findIndex((p) => p.id === photo.id);
                         const targetRow = Math.floor(currentIdx / cols);
@@ -816,6 +910,7 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
                     }}
                     onClick={(e) => {
                       if (isDragSelectingRef.current) return;
+                      const { onToggleSelect, onSelectPhoto, selectedIds, isSelectMode } = live.current;
                       if (e.ctrlKey || e.metaKey) {
                         onToggleSelect && onToggleSelect(photo.id);
                         return;

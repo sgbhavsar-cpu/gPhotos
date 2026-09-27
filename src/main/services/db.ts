@@ -108,6 +108,9 @@ const SCHEMA_STATEMENTS: string[] = [
     original_mtime_ms INTEGER
   )`,
   `CREATE INDEX IF NOT EXISTS idx_photos_date_taken ON photos(date_taken DESC)`,
+  // Matches the (date_taken DESC, id DESC) ordering every whole-library reader uses, so keyset
+  // pagination and the catalog summary window functions stream from the index without sorting.
+  `CREATE INDEX IF NOT EXISTS idx_photos_date_taken_id ON photos(date_taken DESC, id DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_photos_year_month ON photos(year, month)`,
   `CREATE INDEX IF NOT EXISTS idx_photos_storage_name ON photos(storage_name)`,
   `CREATE INDEX IF NOT EXISTS idx_photos_original_remote_path ON photos(original_remote_path)`,
@@ -264,6 +267,9 @@ function resetFaceDataIfEngineChanged(db: DatabaseSync): void {
 }
 
 function applySchema(db: DatabaseSync): void {
+  // Wait (up to 5s) instead of failing immediately with SQLITE_BUSY if another
+  // connection/process (backup reader, a second instance) briefly holds a lock.
+  db.exec('PRAGMA busy_timeout = 5000');
   db.exec('PRAGMA journal_mode = WAL');
   // Without a limit SQLite never shrinks the -wal file: after heavy writes
   // (face scans, full-library saves) the real databases carried 360-400MB of

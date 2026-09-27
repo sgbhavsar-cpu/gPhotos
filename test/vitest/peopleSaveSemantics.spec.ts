@@ -49,8 +49,14 @@ describe('people save semantics (merge vs. destructive replace)', () => {
     upsertPeople([alice]);
     expect(getAllPeople()).toHaveLength(1);
 
-    replaceAllPeople([]); // simulates the explicit Reset & Rescan save
+    replaceAllPeople([], { allowEmpty: true }); // simulates the explicit Reset & Rescan save
     expect(getAllPeople()).toHaveLength(0);
+  });
+
+  it('replaceAllPeople([]) without allowEmpty is ignored, so a stale/bogus save cannot wipe the registry', () => {
+    upsertPeople([alice]);
+    replaceAllPeople([]);
+    expect(getAllPeople()).toHaveLength(1);
   });
 
   it('upsertPeople merges updates (e.g. a new custom name) without touching unrelated people', () => {

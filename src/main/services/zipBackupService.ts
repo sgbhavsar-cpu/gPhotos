@@ -1,8 +1,10 @@
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import zlib from 'zlib';
 import { app, dialog, BrowserWindow } from 'electron';
-import { getDbPath } from './db';
+import { getDbPath, getDbForLibraryPath, getGlobalDb } from './db';
+import { writeFileAtomic } from './jsonFile';
 import { getAllPhotos, getAllPeople, getAllAlbums, getSetting } from './libraryRepository';
 
 export interface ZipFileEntry {
@@ -108,7 +110,10 @@ export async function exportLibraryBackupZip(
   totalAlbums?: number;
   canceled?: boolean;
   error?: string;
+  /** Non-fatal problems (e.g. an optional file that could not be included). */
+  warnings?: string[];
 }> {
+  const warnings: string[] = [];
   try {
     const userDir = app.getPath('userData');
 
@@ -208,15 +213,21 @@ Place gphotos.db back into the library folder's .gphotos_catalog\\gphotos.db
     ];
 
     // Include the live SQLite database itself — the authoritative, full-fidelity copy.
+    // The DB runs in WAL mode, so a raw copy of gphotos.db misses recent
+    // commits that still live in the -wal file. VACUUM INTO writes a
+    // transactionally consistent snapshot; a failure here FAILS the backup
+    // (the DB is the authoritative part) instead of silently omitting it.
     const activeDbPath = getDbPath(libState.selectedFolder || null);
     if (fs.existsSync(activeDbPath)) {
+      const snapshotPath = path.join(os.tmpdir(), `gphotos_backup_snapshot_${process.pid}_${Date.now()}.db`);
       try {
-        entries.push({
-          name: 'gphotos.db',
-          content: fs.readFileSync(activeDbPath),
-        });
-      } catch (err) {
-        console.warn('Failed to include gphotos.db in backup:', err);
+        const liveDb = libState.selectedFolder ? getDbForLibraryPath(libState.selectedFolder) : getGlobalDb();
+        liveDb.exec(`VACUUM INTO '${snapshotPath.replace(/'/g, "''")}'`);
+        entries.push({ name: 'gphotos.db', content: fs.readFileSync(snapshotPath) });
+      } catch (err: any) {
+        throw new Error(`Could not snapshot the library database for the backup: ${err?.message || err}`);
+      } finally {
+        try { fs.unlinkSync(snapshotPath); } catch {}
       }
     }
 
@@ -228,14 +239,16 @@ Place gphotos.db back into the library folder's .gphotos_catalog\\gphotos.db
           name: 'settings.json',
           content: fs.readFileSync(settingsPath),
         });
-      } catch {}
+      } catch (err: any) {
+        warnings.push(`settings.json could not be included: ${err?.message || err}`);
+      }
     }
 
     // Build the ZIP binary buffer
     const zipBuffer = createZipArchive(entries);
 
-    // Write to destination
-    fs.writeFileSync(targetZipPath, zipBuffer);
+    // Write to destination (temp + rename: a failed write never destroys an existing backup)
+    writeFileAtomic(targetZipPath, zipBuffer);
     const stats = fs.statSync(targetZipPath);
 
     return {
@@ -245,6 +258,7 @@ Place gphotos.db back into the library folder's .gphotos_catalog\\gphotos.db
       totalPhotos,
       totalPeople,
       totalAlbums,
+      ...(warnings.length > 0 ? { warnings } : {}),
     };
   } catch (err: any) {
     console.error('Error creating library backup .zip:', err);

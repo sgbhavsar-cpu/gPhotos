@@ -4,7 +4,7 @@ import fs from 'fs';
 import { spawn, execSync, execFile } from 'child_process';
 import { createCachedProbe } from './cachedProbe';
 import { BackgroundServiceStatus, BackgroundServiceSettings, VirtualStorageConfig } from '../../types';
-import { scanVirtualMirrorDirectory, processPendingRotations, processPendingMetadata, syncVirtualStorage, getStorageDetails } from './virtualMirrorService';
+import { scanVirtualMirrorDirectory, processPendingRotations, processPendingMetadata, syncVirtualStorage, scanStorageDetailsPhysical } from './virtualMirrorService';
 import os from 'os';
 import { thumbnailWorker } from './thumbnailWorkerService';
 import { setFaceDetectionPoolSize } from './faceDetectionWorkerClient';
@@ -158,7 +158,43 @@ function createTrayIcon(): Electron.NativeImage {
 // storages — that's exactly what a smoke test must never do.
 const isSmokeTestLaunch = process.argv.includes('--smoke-test') || process.env.GPHOTOS_SMOKE_TEST === '1';
 
+let daemonInitialized = false;
+let startupSyncTimer: NodeJS.Timeout | null = null;
+let rotationTimer: NodeJS.Timeout | null = null;
+let metadataTimer: NodeJS.Timeout | null = null;
+// Most recent problem seen by the unattended sync cycle (undefined = last cycle clean); surfaced via getBackgroundServiceStatus.
+let lastCycleError: string | undefined = undefined;
+
+function attachCloseToTray(mainWindow?: BrowserWindow | null) {
+  // Intercept window close to minimize to tray if enabled
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.on('close', (e) => {
+      if (!isQuitting && serviceSettings.minimizeToTray) {
+        e.preventDefault();
+        mainWindow.hide();
+
+        if (tray) {
+          tray.displayBalloon({
+            title: 'gPhotos',
+            content: 'Running in the background. Double-click tray icon to open.',
+            iconType: 'info',
+          });
+        }
+      }
+    });
+  }
+}
+
 export function initBackgroundDaemon(mainWindow?: BrowserWindow | null) {
+  // Idempotent: a second call (window re-created) must not add another tray icon
+  // or another set of timers — it only re-binds to the new window.
+  if (daemonInitialized) {
+    attachCloseToTray(mainWindow);
+    updateTrayMenu(mainWindow);
+    restartSyncTimer(mainWindow);
+    return;
+  }
+  daemonInitialized = true;
   loadSavedSettings();
   registryInstalledProbe.refresh(); // warm the cache so the first status request already has the answer
   if (isSmokeTestLaunch) {
@@ -184,23 +220,7 @@ export function initBackgroundDaemon(mainWindow?: BrowserWindow | null) {
     }
   });
 
-  // Intercept window close to minimize to tray if enabled
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.on('close', (e) => {
-      if (!isQuitting && serviceSettings.minimizeToTray) {
-        e.preventDefault();
-        mainWindow.hide();
-
-        if (tray) {
-          tray.displayBalloon({
-            title: 'gPhotos',
-            content: 'Running in the background. Double-click tray icon to open.',
-            iconType: 'info',
-          });
-        }
-      }
-    });
-  }
+  attachCloseToTray(mainWindow);
 
   // Start periodic background scanner
   restartSyncTimer(mainWindow);
@@ -213,25 +233,34 @@ export function initBackgroundDaemon(mainWindow?: BrowserWindow | null) {
   // queue) wasn't also picking them up. Run one cycle shortly after
   // startup — not immediately, so it doesn't compete with initial
   // catalog/thumbnail loading for CPU/IO — then fall back to the interval.
-  setTimeout(() => {
+  startupSyncTimer = setTimeout(() => {
+    startupSyncTimer = null;
     if (!serviceSettings.isPaused) {
-      runBackgroundSyncCycle(mainWindow);
+      runBackgroundSyncCycle(mainWindow).catch(() => {});
     }
   }, 45_000);
 
   // Periodic offline rotation sync check (every 30 seconds)
-  setInterval(async () => {
+  rotationTimer = setInterval(async () => {
     try {
       await processPendingRotations();
     } catch {}
   }, 30000);
 
   // Periodic offline date/location sync check (every 30 seconds)
-  setInterval(async () => {
+  metadataTimer = setInterval(async () => {
     try {
       await processPendingMetadata();
     } catch {}
   }, 30000);
+}
+
+/** Stops every timer the daemon owns (app quit / tests). Safe to call repeatedly. */
+export function stopBackgroundDaemonTimers() {
+  for (const t of [startupSyncTimer, rotationTimer, metadataTimer, syncTimer]) {
+    if (t) clearTimeout(t);
+  }
+  startupSyncTimer = rotationTimer = metadataTimer = syncTimer = null;
 }
 
 function updateTrayMenu(mainWindow?: BrowserWindow | null) {
@@ -267,7 +296,7 @@ function updateTrayMenu(mainWindow?: BrowserWindow | null) {
       label: 'Scan All Storages Now',
       enabled: !isScanningNow,
       click: () => {
-        runBackgroundSyncCycle(mainWindow);
+        runBackgroundSyncCycle(mainWindow).catch(() => {});
       },
     },
     {
@@ -325,7 +354,9 @@ function restartSyncTimer(mainWindow?: BrowserWindow | null) {
 
   const ms = Math.max(5, serviceSettings.syncIntervalMinutes) * 60 * 1000;
   syncTimer = setInterval(() => {
-    runBackgroundSyncCycle(mainWindow);
+    runBackgroundSyncCycle(mainWindow).catch((err) => {
+      appendDaemonLog(`Background sync cycle crashed: ${err?.message ?? err}`);
+    });
   }, ms);
 }
 
@@ -336,12 +367,24 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
   if (isScanningNow || serviceSettings.isPaused) return;
 
   isScanningNow = true;
-  if (mainWindow) updateTrayMenu(mainWindow);
+
+  // Problems seen this cycle: each is logged to daemon.log and the first few are
+  // surfaced through getBackgroundServiceStatus().lastError instead of vanishing.
+  const cycleErrors: string[] = [];
+  const noteCycleError = (message: string) => {
+    cycleErrors.push(message);
+    console.warn(`[BackgroundSync] ${message}`);
+    appendDaemonLog(message);
+  };
 
   try {
-    // First drain any pending offline rotations if storage is available
-    await processPendingRotations();
-    await processPendingMetadata();
+    // Inside the try: a throwing tray update must not leave isScanningNow stuck true forever.
+    try { if (mainWindow) updateTrayMenu(mainWindow); } catch {}
+
+    // First drain any pending offline rotations if storage is available. Each is
+    // isolated — a bad pending item must not stop the storages from syncing.
+    await processPendingRotations().catch((err) => noteCycleError(`Pending rotations failed: ${err?.message ?? err}`));
+    await processPendingMetadata().catch((err) => noteCycleError(`Pending metadata updates failed: ${err?.message ?? err}`));
 
     // Self-healing OneDrive reclaim check: evaluate whatever's already
     // pending BEFORE deciding whether reclaim still looks broken — this is
@@ -361,6 +404,9 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
     const activeStorages = storages.filter((s) => !unlinkedSet.has(s.name.toLowerCase()));
 
     for (const storage of activeStorages) {
+      // Per-storage isolation (try closes with the catch at the end of this loop
+      // body): one storage throwing must not skip the remaining storages.
+      try {
       // isPathReachable (not fs.existsSync) so a stale/disconnected mapped
       // drive or dead UNC share can't hang this periodic cycle for the OS's
       // full network timeout — and once a storage is found offline, this
@@ -437,7 +483,7 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
         { runFaceDetection: safeToRunFacePipeline }
       );
       if (result.errors.length > 0) {
-        console.warn(`[BackgroundSync] ${storage.name}: ${result.errors.length} error(s) during sync.`);
+        noteCycleError(`${storage.name}: ${result.errors.length} error(s) during sync (first: ${String(result.errors[0]).slice(0, 200)})`);
       }
       // Reflect the catalog's own authoritative count, NOT result.totalSynced
       // — that only counts how many source files THIS pass touched, which
@@ -448,7 +494,8 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
       // catalog itself never regresses this way, since it only grows via
       // confirmed processed photos).
       try {
-        const details = getStorageDetails(storage.name, storage.localMirrorRoot);
+        // Async listing walk: the sync getStorageDetails blocked the main thread on big mirrors.
+        const details = await scanStorageDetailsPhysical(storage.name, storage.localMirrorRoot);
         storage.totalItems = details.totalPhotos > 0 ? details.totalPhotos : result.totalSynced;
       } catch {
         storage.totalItems = result.totalSynced;
@@ -478,6 +525,7 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
 
       if (result.newlyAdded > 0) {
         storage.lastSynced = new Date().toISOString();
+        persistStorageStats(storage, true);
         try {
           const mirroredPhotos = await scanVirtualMirrorDirectory(mirrorDir);
           if (mirroredPhotos && mirroredPhotos.length > 0) {
@@ -501,23 +549,54 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
             }
           }
         } catch {}
+      } else {
+        persistStorageStats(storage, false);
+      }
+      } catch (err: any) {
+        noteCycleError(`Sync failed for "${storage.name}": ${err?.message ?? err}`);
       }
     }
 
     lastSyncTime = new Date().toISOString();
-    setSetting('gphotos_virtual_storages_v1', storages);
     saveSettings();
-  } catch (err) {
+  } catch (err: any) {
     console.error('Error during background daemon sync cycle:', err);
+    noteCycleError(`Sync cycle failed: ${err?.message ?? err}`);
   } finally {
     isScanningNow = false;
     activeScanStorage = undefined;
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      updateTrayMenu(mainWindow);
-      if (tray) {
-        tray.setToolTip(`gPhotos - Synced at ${new Date().toLocaleTimeString()}`);
+    lastCycleError = cycleErrors.length > 0
+      ? cycleErrors.slice(0, 3).join(' | ') + (cycleErrors.length > 3 ? ` (+${cycleErrors.length - 3} more)` : '')
+      : undefined;
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        updateTrayMenu(mainWindow);
+        if (tray) {
+          tray.setToolTip(`gPhotos - Synced at ${new Date().toLocaleTimeString()}`);
+        }
       }
-    }
+    } catch {}
+  }
+}
+
+/**
+ * Writes this cycle's stats for ONE storage back into the persisted storage list
+ * by re-reading it first and touching only totalItems / totalSizeSaved (and
+ * lastSynced when asked) on the matching entry. The old code saved the whole
+ * list read at cycle start, which could take hours — silently reverting any
+ * storage the user added/removed/edited in the meantime.
+ */
+function persistStorageStats(storage: VirtualStorageConfig, includeLastSynced: boolean): void {
+  try {
+    const fresh = getSetting<VirtualStorageConfig[]>('gphotos_virtual_storages_v1', []);
+    const target = fresh.find((s) => s.name.toLowerCase() === storage.name.toLowerCase());
+    if (!target) return; // removed while the cycle was running
+    target.totalItems = storage.totalItems;
+    target.totalSizeSaved = storage.totalSizeSaved;
+    if (includeLastSynced && storage.lastSynced) target.lastSynced = storage.lastSynced;
+    setSetting('gphotos_virtual_storages_v1', fresh);
+  } catch (err) {
+    console.warn('Failed to persist storage stats:', err);
   }
 }
 
@@ -553,14 +632,14 @@ export function getServiceLogs(): string[] {
 }
 
 function isProcessRunning(pid: number): boolean {
+  // Signal 0 only probes existence — no child process, so no main-thread stall
+  // (this used to be an execSync('tasklist') on every status request).
+  // EPERM means the process exists but belongs to someone else.
   try {
-    const stdout = execSync(`tasklist /FI "PID eq ${pid}" /NH`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'ignore'],
-    });
-    return stdout.includes(String(pid));
-  } catch {
-    return false;
+    process.kill(pid, 0);
+    return true;
+  } catch (err: any) {
+    return err?.code === 'EPERM';
   }
 }
 
@@ -669,7 +748,12 @@ export function uninstallSystemServiceDaemon(): { success: boolean; error?: stri
   }
 }
 
-export function getBackgroundServiceStatus(): BackgroundServiceStatus {
+export function getBackgroundServiceStatus(): BackgroundServiceStatus & {
+  /** Latest problem from the unattended sync cycle or the thumbnail pre-cache worker, if any. */
+  lastError?: string;
+  thumbnailsFailedCount?: number;
+  isPreCachingRamThrottled?: boolean;
+} {
   const isInstalled = isSystemServiceRegistryInstalled();
   const pid = getSystemServicePid();
   const isRunning = Boolean(pid);
@@ -707,6 +791,9 @@ export function getBackgroundServiceStatus(): BackgroundServiceStatus {
     thumbnailsPreCachedTotal: workerStatus.total,
     isPreCachingActive: workerStatus.isRunning,
     currentPreCacheFile: workerStatus.currentFile,
+    lastError: lastCycleError ?? workerStatus.lastError,
+    thumbnailsFailedCount: workerStatus.failed,
+    isPreCachingRamThrottled: workerStatus.ramThrottled,
   };
 }
 
@@ -738,5 +825,7 @@ export function updateBackgroundServiceSettings(
 
 export function markAsQuitting() {
   isQuitting = true;
+  // main.ts already calls this from before-quit, so the daemon's timers are stopped there too.
+  stopBackgroundDaemonTimers();
 }
 

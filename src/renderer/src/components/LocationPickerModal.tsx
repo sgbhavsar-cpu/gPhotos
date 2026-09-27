@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import L from 'leaflet';
 import { X, Search, Check, MapPin } from 'lucide-react';
+import { notify, notifyError } from '../services/notifications';
 
 interface LocationPickerModalProps {
   initialLat?: number;
@@ -90,16 +91,19 @@ export const LocationPickerModal: React.FC<LocationPickerModalProps> = ({
     setIsSearching(true);
     try {
       const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=1`);
+      if (!res.ok) throw new Error(`Place search returned HTTP ${res.status}`);
       const data = await res.json();
-      if (Array.isArray(data) && data[0]) {
-        const lat = parseFloat(data[0].lat);
-        const lng = parseFloat(data[0].lon);
+      const lat = Array.isArray(data) && data[0] ? parseFloat(data[0].lat) : NaN;
+      const lng = Array.isArray(data) && data[0] ? parseFloat(data[0].lon) : NaN;
+      if (Number.isFinite(lat) && Number.isFinite(lng)) {
         placePin(lat, lng);
         if (!label.trim()) setLabel(query);
         mapInstanceRef.current?.flyTo([lat, lng], 13, { duration: 0.8 });
+      } else {
+        notify('info', `No places found for "${query}".`);
       }
     } catch (err) {
-      console.warn('[LocationPickerModal] Search failed:', err);
+      notifyError('Place search failed (offline?)', err);
     } finally {
       setIsSearching(false);
     }

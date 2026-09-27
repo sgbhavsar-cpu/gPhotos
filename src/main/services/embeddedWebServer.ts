@@ -15,7 +15,8 @@ import { scanPhotoDirectory } from './fileOrganizer';
 import { getOrGenerateCachedThumbnail, clearThumbnailCache, refreshThumbnailsFromSource } from './thumbnailCacheService';
 import { getCatalogMeta, getCatalogPage, switchCatalogLibrary, ensureMigratedIfEmpty } from './catalogService';
 import { handleStorageSave, handleStorageLoad, STORAGE_KEY, GLOBAL_PEOPLE_KEY } from './storageHandlers';
-import { isPathAllowed, getDefaultMirrorRoot } from './pathSecurity';
+import { sendFileStream } from './fileStream';
+import { isPathAllowedRemote, isSafeRelativeName, getDefaultMirrorRoot } from './pathSecurity';
 import { browseDirectory } from './directoryBrowser';
 import { getSpriteCoordinate, getSpriteCoordinatesBatch, getSpritePath } from './spriteService';
 import { thumbnailWorker } from './thumbnailWorkerService';
@@ -25,11 +26,11 @@ import { detectFacesForPhoto, resolveDbForPhoto } from './pipelineOrchestrator';
 import { getFacesForPhoto, getAllPeople } from './libraryRepository';
 import { WebServerStatus, Photo } from '../../types';
 import {
-  getOrCreatePin,
   verifyPin,
   createSessionToken,
   validateToken,
   isLockedOut,
+  lockoutRetrySeconds,
   recordFailedAttempt,
   clearFailedAttempts,
 } from './webAuthService';
@@ -39,6 +40,114 @@ let activePort: number = 5173;
 let isServerRunning: boolean = false;
 let serverEnabled: boolean = true;
 let serverError: string | undefined = undefined;
+// The port the caller asked for (activePort can differ after an in-use fallback).
+let requestedPort: number = 5173;
+// Serializes start/stop so concurrent settings saves can't leak a second listening server.
+let startChain: Promise<unknown> = Promise.resolve();
+
+const MIN_PORT = 1024;
+const MAX_PORT = 65535;
+const PORT_FALLBACK_TRIES = 10;
+function isValidPort(p: unknown): p is number {
+  return typeof p === 'number' && Number.isInteger(p) && p >= MIN_PORT && p <= MAX_PORT;
+}
+
+// Request body limits (bytes). /api/auth/pair is unauthenticated, so it gets a tiny cap.
+const MAX_BODY_PAIR = 4 * 1024;
+const MAX_BODY_DEFAULT = 128 * 1024 * 1024;
+
+// Only real image formats may be served by /api/photo (no .html/.svg/.js from a library folder).
+const SERVABLE_IMAGE_EXTS = new Set([
+  '.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif', '.tiff', '.tif', '.avif',
+  '.dng', '.raw', '.cr2', '.nef',
+]);
+
+const MIN_THUMB_SIZE = 32;
+const MAX_THUMB_SIZE = 2048;
+function clampThumbSize(n: unknown, fallback: number): number {
+  const v = typeof n === 'number' ? n : NaN;
+  if (!Number.isFinite(v) || v <= 0) return fallback;
+  return Math.min(MAX_THUMB_SIZE, Math.max(MIN_THUMB_SIZE, Math.floor(v)));
+}
+
+class HttpError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+/** Reads a request body as UTF-8 (Buffer.concat, so multi-byte chars split across chunks survive) with a size cap. */
+function readBody(req: http.IncomingMessage, limit: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const declared = parseInt(String(req.headers['content-length'] || '0'), 10);
+    if (declared > limit) {
+      reject(new HttpError(413, 'Request body too large'));
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      chunks.length = 0;
+      reject(err);
+    };
+    req.on('data', (chunk: Buffer) => {
+      if (settled) return;
+      size += chunk.length;
+      if (size > limit) {
+        fail(new HttpError(413, 'Request body too large'));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks).toString('utf8'));
+    });
+    req.on('error', (err) => fail(err));
+    req.on('close', () => fail(new HttpError(400, 'Request closed before the body was received')));
+  });
+}
+
+function sendJsonError(res: http.ServerResponse, err: any): void {
+  const status = err instanceof HttpError ? err.status : 500;
+  if (res.writableEnded || res.destroyed) return;
+  if (res.headersSent) {
+    res.destroy();
+    return;
+  }
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json');
+  if (status === 413) {
+    // The client is still sending: answer, then drop the connection instead of draining it.
+    res.setHeader('Connection', 'close');
+    res.end(JSON.stringify({ error: err.message }), () => res.socket?.destroy());
+    return;
+  }
+  res.end(JSON.stringify({ error: err?.message || 'Internal Server Error' }));
+}
+
+/**
+ * Reads the request body (size-capped) then runs `handler` with it. Any read
+ * failure or error the handler lets escape becomes a JSON error response
+ * instead of an unhandled rejection inside a bare req.on('end', async ...).
+ */
+function withBody(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  limit: number,
+  handler: (body: string) => Promise<void> | void
+): void {
+  readBody(req, limit)
+    .then((body) => handler(body))
+    .catch((err) => {
+      if (!(err instanceof HttpError)) console.warn('[EmbeddedWebServer] Request handler error:', err);
+      sendJsonError(res, err);
+    });
+}
 
 const MIME_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -89,9 +198,10 @@ export function loadSavedWebServerSettings(): { enabled: boolean; port: number }
     const p = getSettingsPath();
     if (fs.existsSync(p)) {
       const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+      const port = parseInt(data.port || '5173', 10);
       return {
         enabled: data.enabled !== false,
-        port: parseInt(data.port || '5173', 10) || 5173,
+        port: isValidPort(port) ? port : 5173,
       };
     }
   } catch {}
@@ -116,9 +226,22 @@ export function saveWebServerSettings(settings: { enabled: boolean; port: number
  * the user's actual photo folders rather than the whole host filesystem.
  * Returns true (and has already written the 403 response) if rejected.
  */
+/** First entry that is not a non-empty image-file path (or is a directory); null when all are fine. */
+async function firstInvalidDeleteTarget(paths: unknown[]): Promise<unknown | null> {
+  for (const p of paths) {
+    if (typeof p !== 'string' || !p.trim() || !SERVABLE_IMAGE_EXTS.has(path.extname(p).toLowerCase())) return p;
+    try {
+      if ((await fs.promises.stat(p)).isDirectory()) return p;
+    } catch {
+      // missing/unreachable: reported per file by the delete helpers
+    }
+  }
+  return null;
+}
+
 function rejectIfPathNotAllowed(res: http.ServerResponse, candidatePaths: Array<string | null | undefined>, context: string): boolean {
   for (const p of candidatePaths) {
-    if (p && !isPathAllowed(p)) {
+    if (p && !isPathAllowedRemote(p)) {
       res.statusCode = 403;
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify({ error: `Access denied: path is outside the app's known library/mirror folders (${context}).` }));
@@ -128,12 +251,33 @@ function rejectIfPathNotAllowed(res: http.ServerResponse, candidatePaths: Array<
   return false;
 }
 
+/**
+ * True if a client-supplied Photo object only references known folders:
+ * filePath (required), originalRemotePath (if any), and — for a virtual photo —
+ * the mirror folder the per-library DB would be opened/created in (mirrors the
+ * derivation in db.ts resolveDbForPhoto).
+ */
+function isPhotoRequestAllowed(photo: any): boolean {
+  if (!photo || typeof photo !== 'object') return false;
+  if (!isPathAllowedRemote(photo.filePath)) return false;
+  if (photo.originalRemotePath && !isPathAllowedRemote(photo.originalRemotePath)) return false;
+  if (photo.isVirtual && photo.storageName) {
+    if (!isSafeRelativeName(photo.storageName)) return false;
+    const segments = String(photo.filePath).split(/[\\/]+/);
+    const idx = segments.findIndex((s) => s.toLowerCase() === String(photo.storageName).toLowerCase());
+    if (idx !== -1 && !isPathAllowedRemote(segments.slice(0, idx + 1).join(path.sep))) return false;
+  }
+  return true;
+}
+
 // Request handler for all HTTP requests
 async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  // Never let a browser sniff a served file into something executable.
+  res.setHeader('X-Content-Type-Options', 'nosniff');
 
   if (req.method === 'OPTIONS') {
     res.statusCode = 204;
@@ -147,13 +291,14 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
   // Endpoint: /api/status
   if (pathname === '/api/status') {
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify(getEmbeddedWebServerStatus()));
+    // Public endpoint: don't expose the internal error text (can contain paths).
+    res.end(JSON.stringify({ ...getEmbeddedWebServerStatus(), error: undefined }));
     return;
   }
 
-  // Endpoint: /api/auth/status — always public, lets the client know a PIN is required
+  // Endpoint: /api/auth/status — always public, lets the client know a PIN is required.
+  // (No side effects: the PIN is created lazily by Settings / the first pairing attempt.)
   if (pathname === '/api/auth/status') {
-    getOrCreatePin(); // ensure a PIN exists so Settings can display it even before first pairing
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify({ pinRequired: true }));
     return;
@@ -162,30 +307,41 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
   // Endpoint: /api/auth/pair — public, exchanges a valid PIN for a session token
   if (pathname === '/api/auth/pair' && req.method === 'POST') {
     const clientIp = req.socket.remoteAddress || 'unknown';
-    let body = '';
-    req.on('data', (chunk) => {
-      body += chunk;
-    });
-    req.on('end', () => {
+    withBody(req, res, MAX_BODY_PAIR, (body) => {
       res.setHeader('Content-Type', 'application/json');
       if (isLockedOut(clientIp)) {
+        const wait = lockoutRetrySeconds(clientIp);
         res.statusCode = 429;
-        res.end(JSON.stringify({ error: 'Too many attempts. Try again in a minute.' }));
+        if (wait > 0) res.setHeader('Retry-After', String(wait));
+        res.end(JSON.stringify({
+          error: wait > 60
+            ? `Too many failed attempts. Try again in ${Math.ceil(wait / 60)} minutes, or generate a new PIN in gPhotos Settings.`
+            : `Too many failed attempts. Try again in ${Math.max(1, wait)} seconds.`,
+        }));
         return;
       }
+      let parsed: any;
       try {
-        const { pin, deviceLabel } = JSON.parse(body || '{}');
-        if (!verifyPin(pin)) {
-          recordFailedAttempt(clientIp);
-          res.statusCode = 401;
-          res.end(JSON.stringify({ error: 'Incorrect PIN' }));
-          return;
-        }
-        clearFailedAttempts(clientIp);
+        parsed = JSON.parse(body || '{}') || {};
+      } catch (err: any) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: err.message }));
+        return;
+      }
+      const { pin, deviceLabel } = parsed;
+      if (!verifyPin(pin)) {
+        recordFailedAttempt(clientIp);
+        res.statusCode = 401;
+        res.end(JSON.stringify({ error: 'Incorrect PIN' }));
+        return;
+      }
+      clearFailedAttempts(clientIp);
+      try {
         const { token } = createSessionToken(deviceLabel || 'Unknown device');
         res.end(JSON.stringify({ token }));
       } catch (err: any) {
-        res.statusCode = 400;
+        // e.g. the pairing couldn't be saved to disk — tell the phone instead of issuing a token that won't persist.
+        res.statusCode = 500;
         res.end(JSON.stringify({ error: err.message }));
       }
     });
@@ -230,21 +386,19 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
       }
       return;
     } else if (req.method === 'POST') {
-      let body = '';
-      req.on('data', (chunk) => {
-        body += chunk;
-      });
-      req.on('end', () => {
+      withBody(req, res, MAX_BODY_DEFAULT, (body) => {
         try {
           const { key, data } = JSON.parse(body);
-          const result = handleStorageSave(key, data);
+          // isRemote: a paired device must not be able to change selectedFolder /
+          // recentLibraries / virtual-storage roots (they define what this server trusts).
+          const result = handleStorageSave(key, data, { isRemote: true });
           if (result.enqueuePhotos) {
             thumbnailWorker.enqueuePhotos(result.enqueuePhotos, result.enqueueLibraryPath || undefined);
           }
           res.setHeader('Content-Type', 'application/json');
           res.end(JSON.stringify({ success: result.success }));
         } catch (err: any) {
-          res.statusCode = 500;
+          res.statusCode = /^Access denied|cannot be written over the network/.test(err?.message || '') ? 403 : 500;
           res.end(JSON.stringify({ error: err.message }));
         }
       });
@@ -321,13 +475,23 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
 
   // Endpoint: /api/sync-virtual-storage (POST)
   if (pathname === '/api/sync-virtual-storage' && req.method === 'POST') {
-    let body = '';
-    req.on('data', (chunk) => {
-      body += chunk;
-    });
-    req.on('end', async () => {
+    withBody(req, res, MAX_BODY_DEFAULT, async (body) => {
       try {
         const config = JSON.parse(body);
+        // The config comes straight from the client: confine both roots to the
+        // known folders and make sure `name` can't climb out of localMirrorRoot.
+        if (
+          !config ||
+          typeof config.localMirrorRoot !== 'string' ||
+          !isSafeRelativeName(config.name) ||
+          (config.networkSourcePath !== undefined && typeof config.networkSourcePath !== 'string')
+        ) {
+          res.statusCode = 400;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: 'Invalid storage configuration' }));
+          return;
+        }
+        if (rejectIfPathNotAllowed(res, [config.networkSourcePath, config.localMirrorRoot], '/api/sync-virtual-storage')) return;
         // A manual sync IS the user explicitly asking to check this storage
         // again — see the matching comment on the Electron IPC equivalent
         // (mirror:sync-storage in main.ts) for why this only happens here,
@@ -359,16 +523,24 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
   // returns when it's missing — so photos synced from the mobile/web UI got
   // thumbnails but face detection never ran, with no error surfaced anywhere.
   if (pathname === '/api/faces/detect-batch' && req.method === 'POST') {
-    let body = '';
-    req.on('data', (chunk) => {
-      body += chunk;
-    });
-    req.on('end', async () => {
+    withBody(req, res, MAX_BODY_DEFAULT, async (body) => {
       try {
         const photos: Photo[] = JSON.parse(body);
+        if (!Array.isArray(photos)) {
+          res.statusCode = 400;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: 'Expected an array of photos' }));
+          return;
+        }
         const results: Array<{ photoId: string; ran: boolean; faceCount: number; locked: boolean; skippedReason?: string; faces: any[] }> = [];
         for (const photo of photos) {
           try {
+            // Paths come from the client: never decode / open a DB for anything outside the known folders.
+            // (Reported with the existing 'decode-failed' reason so the client contract is unchanged.)
+            if (!isPhotoRequestAllowed(photo)) {
+              results.push({ photoId: photo?.id, ran: false, faceCount: 0, locked: false, skippedReason: 'decode-failed', faces: [] });
+              continue;
+            }
             const sourceFilePath = photo.isVirtual ? (photo.originalRemotePath || photo.filePath) : photo.filePath;
             const db = resolveDbForPhoto(photo);
             const result = await detectFacesForPhoto(photo, sourceFilePath!, db);
@@ -403,13 +575,12 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
 
   // Endpoint: /api/start-precache (POST)
   if (pathname === '/api/start-precache' && req.method === 'POST') {
-    let body = '';
-    req.on('data', (chunk) => { body += chunk; });
-    req.on('end', () => {
+    withBody(req, res, MAX_BODY_DEFAULT, (body) => {
       try {
         const { photos } = JSON.parse(body || '{}');
-        if (Array.isArray(photos) && photos.length > 0) {
-          thumbnailWorker.enqueuePhotos(photos);
+        const safePhotos = Array.isArray(photos) ? photos.filter(isPhotoRequestAllowed) : [];
+        if (safePhotos.length > 0) {
+          thumbnailWorker.enqueuePhotos(safePhotos);
         }
         thumbnailWorker.resume();
         res.setHeader('Content-Type', 'application/json');
@@ -441,14 +612,16 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
       res.end();
       return;
     }
-    let body = '';
-    req.on('data', (chunk) => { body += chunk; });
-    req.on('end', async () => {
+    withBody(req, res, MAX_BODY_DEFAULT, async (body) => {
       try {
         const { items } = JSON.parse(body || '{}');
-        const safeItems = (Array.isArray(items) ? items : []).filter(
-          (item: any) => item && (isPathAllowed(item.filePath) || isPathAllowed(item.originalRemotePath))
-        );
+        // filePath is written to, so it must be allowed; an out-of-bounds originalRemotePath is dropped.
+        const safeItems = (Array.isArray(items) ? items : [])
+          .filter((item: any) => item && isPathAllowedRemote(item.filePath))
+          .map((item: any) => ({
+            ...item,
+            originalRemotePath: isPathAllowedRemote(item.originalRemotePath) ? item.originalRemotePath : undefined,
+          }));
         const result = await refreshThumbnailsFromSource(safeItems);
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Access-Control-Allow-Origin', '*');
@@ -465,18 +638,20 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
 
   // Endpoint: /api/batch-thumbnails (POST) - Fetch up to 100 thumbnails in one single async request
   if (pathname === '/api/batch-thumbnails' && req.method === 'POST') {
-    let body = '';
-    req.on('data', (chunk) => {
-      body += chunk;
-    });
-    req.on('end', async () => {
+    withBody(req, res, MAX_BODY_DEFAULT, async (body) => {
       try {
         const { items, size } = JSON.parse(body || '{}');
-        const targetSize = typeof size === 'number' && size > 0 ? size : 250;
+        const targetSize = clampThumbSize(size, 250);
+        // Every path that will actually be opened must be allowed: `path` is required to be,
+        // an out-of-bounds originalPath is dropped (never falls back to it).
         const requestedItems: Array<{ path: string; originalPath?: string }> = Array.isArray(items)
           ? items
               .slice(0, 100) // Cap at 100 items per batch
-              .filter((item: any) => item && (isPathAllowed(item.path) || isPathAllowed(item.originalPath)))
+              .filter((item: any) => item && isPathAllowedRemote(item.path))
+              .map((item: any) => ({
+                path: item.path as string,
+                originalPath: isPathAllowedRemote(item.originalPath) ? (item.originalPath as string) : undefined,
+              }))
           : [];
 
         const thumbnails: Record<string, string> = {};
@@ -519,13 +694,21 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
 
   // Endpoint: /api/delete-files (POST) - Delete files (Recycle Bin or permanently)
   if (pathname === '/api/delete-files' && req.method === 'POST') {
-    let body = '';
-    req.on('data', (chunk) => { body += chunk; });
-    req.on('end', async () => {
+    withBody(req, res, MAX_BODY_DEFAULT, async (body) => {
       try {
         const { filePaths, permanent } = JSON.parse(body || '{}');
         const paths = Array.isArray(filePaths) ? filePaths : [];
         if (rejectIfPathNotAllowed(res, paths, '/api/delete-files')) return;
+        // Only individual image files: never a directory (an allowed root itself passes the path
+        // gate), an empty entry, or a non-image file. A path that no longer exists is left to
+        // trashFiles/deleteFilesPermanently, which already report it per file.
+        const invalid = await firstInvalidDeleteTarget(paths);
+        if (invalid !== null) {
+          res.statusCode = 400;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ success: false, error: `Refusing to delete "${String(invalid).slice(0, 200)}": only image files can be deleted.` }));
+          return;
+        }
         const result = permanent
           ? await deleteFilesPermanently(paths)
           : await trashFiles(paths);
@@ -541,9 +724,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
 
   // Endpoint: /api/rotate-photo (POST) - Physically rotate image file on disk (with offline queue durability)
   if (pathname === '/api/rotate-photo' && req.method === 'POST') {
-    let body = '';
-    req.on('data', (chunk) => { body += chunk; });
-    req.on('end', async () => {
+    withBody(req, res, MAX_BODY_DEFAULT, async (body) => {
       try {
         const { filePath, rotationDegrees, originalRemotePath } = JSON.parse(body || '{}');
         if (rejectIfPathNotAllowed(res, [filePath, originalRemotePath], '/api/rotate-photo')) return;
@@ -611,30 +792,22 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
 
   // Endpoint: /api/switch-library (POST)
   if (pathname === '/api/switch-library' && req.method === 'POST') {
-    let body = '';
-    req.on('data', (chunk) => {
-      body += chunk;
-    });
-    req.on('end', async () => {
+    withBody(req, res, MAX_BODY_DEFAULT, async (body) => {
       try {
         const { targetPath } = JSON.parse(body);
-        if (!targetPath) {
+        if (!targetPath || typeof targetPath !== 'string') {
           res.statusCode = 400;
           res.end(JSON.stringify({ error: 'targetPath required' }));
           return;
         }
-        // Deliberately NOT gated by rejectIfPathNotAllowed, unlike most of
-        // this file's other path-accepting routes. That gate used to reject
-        // any folder the mobile/web client hadn't already been told about —
-        // which meant a paired device could never open a first-time library
-        // at all, only re-open one already known (see /api/browse-directory
-        // below and its doc comment: opening a library is now something the
-        // user reaches by browsing the host's own folder structure through
-        // this same PIN-authenticated session, the same trust level the
-        // Electron desktop app's native folder dialog already has — this
-        // channel doesn't delete or modify anything at targetPath, it only
-        // reads photos from it and creates this app's own .gphotos_catalog
-        // index alongside them.
+        // Gated to folders the app already trusts (a known library/storage
+        // root or something under one). switchCatalogLibrary persists
+        // targetPath as selectedFolder/recentLibraries, which feed the
+        // allowed-roots list — leaving this open let a paired device add e.g.
+        // C:\ as a trusted root and then read/delete anything under it.
+        // A brand-new library outside every known root must be opened once
+        // from the desktop app.
+        if (rejectIfPathNotAllowed(res, [targetPath], '/api/switch-library')) return;
         const result = await switchCatalogLibrary(targetPath);
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify(result));
@@ -677,7 +850,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     if (fs.existsSync(spriteFile)) {
       res.setHeader('Content-Type', 'image/webp');
       res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-      fs.createReadStream(spriteFile).pipe(res);
+      sendFileStream(res, spriteFile, 404, 'Sprite not found');
       return;
     } else {
       res.statusCode = 404;
@@ -702,11 +875,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
   // for many photos in one request instead of one HTTP round-trip per photo
   // card, which was the main cause of scroll stutter on large libraries.
   if (pathname === '/api/sprite-coords-batch' && req.method === 'POST') {
-    let body = '';
-    req.on('data', (chunk) => {
-      body += chunk;
-    });
-    req.on('end', () => {
+    withBody(req, res, MAX_BODY_DEFAULT, (body) => {
       try {
         const { paths } = JSON.parse(body || '{}');
         const requestedPaths: string[] = Array.isArray(paths) ? paths.slice(0, 500) : [];
@@ -751,6 +920,14 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     if (targetPath) {
       const ext = path.extname(targetPath).toLowerCase();
 
+      // Only real image formats are served — never an .html/.svg/.js/.json that happens to sit in a library folder.
+      if (!SERVABLE_IMAGE_EXTS.has(ext)) {
+        res.statusCode = 415;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: 'Unsupported file type' }));
+        return;
+      }
+
       // 1. Raw original full-resolution requested (e.g. download or 100% zoom)
       if (preferOriginal) {
         if (ext === '.heic' || ext === '.heif') {
@@ -774,14 +951,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
           res.setHeader('ETag', etag);
           res.setHeader('Content-Type', MIME_TYPES[ext] || 'image/jpeg');
           res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-          const stream = fs.createReadStream(targetPath);
-          stream.on('error', () => {
-            if (!res.headersSent) {
-              res.statusCode = 500;
-              res.end('Failed reading photo');
-            }
-          });
-          stream.pipe(res);
+          sendFileStream(res, targetPath, 500, 'Failed reading photo', req);
           return;
         } catch {
           res.statusCode = 500;
@@ -792,7 +962,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
 
       // 2. Multi-tier thumbnail caching (250px grid, 500px medium, 1600px preview)
       const targetSize = requestedSize > 0
-        ? requestedSize
+        ? clampThumbSize(requestedSize, 250)
         : (quality === 'high' ? 1600 : 250);
 
       const thumbResult = await getOrGenerateCachedThumbnail(targetPath, targetSize);
@@ -808,14 +978,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
         res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
 
         if (thumbResult.filePath && fs.existsSync(thumbResult.filePath)) {
-          const stream = fs.createReadStream(thumbResult.filePath);
-          stream.on('error', () => {
-            if (!res.headersSent) {
-              res.statusCode = 500;
-              res.end('Error streaming thumbnail');
-            }
-          });
-          stream.pipe(res);
+          sendFileStream(res, thumbResult.filePath, 500, 'Error streaming thumbnail', req);
         } else if (thumbResult.buffer) {
           res.end(thumbResult.buffer);
         } else {
@@ -837,14 +1000,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
         res.setHeader('ETag', etag);
         res.setHeader('Content-Type', MIME_TYPES[ext] || 'image/jpeg');
         res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-        const stream = fs.createReadStream(targetPath);
-        stream.on('error', () => {
-          if (!res.headersSent) {
-            res.statusCode = 500;
-            res.end('Error streaming file');
-          }
-        });
-        stream.pipe(res);
+        sendFileStream(res, targetPath, 500, 'Error streaming file', req);
         return;
       } catch {
         res.statusCode = 500;
@@ -936,6 +1092,16 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     return;
   }
 
+  // Any /api/* request that reached this point matched no route (unknown
+  // path, or a known path with the wrong method): answer with a JSON 404
+  // instead of falling through to the SPA and returning index.html as a 200.
+  if (pathname.startsWith('/api/')) {
+    res.statusCode = 404;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ error: 'Not found' }));
+    return;
+  }
+
   // Serve static assets from dist/ (or public/ in dev)
   let distDir = path.join(__dirname, '..', '..', '..', 'dist');
   let publicDir = path.join(__dirname, '..', '..', '..', 'public');
@@ -958,7 +1124,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
   if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) {
     const ext = path.extname(fullPath).toLowerCase();
     res.setHeader('Content-Type', MIME_TYPES[ext] || 'application/octet-stream');
-    fs.createReadStream(fullPath).pipe(res);
+    sendFileStream(res, fullPath, 500, 'Failed reading file');
     return;
   }
 
@@ -966,7 +1132,7 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
   const indexPath = path.join(distDir, 'index.html');
   if (fs.existsSync(indexPath)) {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    fs.createReadStream(indexPath).pipe(res);
+    sendFileStream(res, indexPath, 500, 'Failed reading file');
     return;
   }
 
@@ -974,63 +1140,109 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
   res.end('Not Found');
 }
 
+/**
+ * Starts (or restarts on a different port) the server. Calls are serialized so
+ * two overlapping starts can't each bind a server and leak one. Never rejects:
+ * a failure is reported through the returned status' `error` field.
+ */
 export function startEmbeddedWebServer(port: number = 5173): Promise<WebServerStatus> {
+  const run = startChain.then(() => doStartServer(port));
+  startChain = run.catch(() => {});
+  return run;
+}
+
+function closeServerInstance(): void {
+  if (serverInstance) {
+    const srv = serverInstance;
+    serverInstance = null;
+    try {
+      srv.close();
+      // Also drop keep-alive/in-flight connections, otherwise a "stopped" or
+      // restarted server keeps answering paired devices on old sockets.
+      (srv as any).closeAllConnections?.();
+    } catch {}
+  }
+  isServerRunning = false;
+}
+
+function doStartServer(port: number): Promise<WebServerStatus> {
   return new Promise((resolve) => {
-    if (isServerRunning && serverInstance && activePort === port) {
+    if (!isValidPort(port)) {
+      // Leave any running server untouched; just report why the new port was refused.
+      serverError = `Invalid port ${port}: use a number between ${MIN_PORT} and ${MAX_PORT}.`;
       resolve(getEmbeddedWebServerStatus());
       return;
     }
 
-    if (serverInstance) {
-      try {
-        serverInstance.close();
-      } catch {}
-      serverInstance = null;
-      isServerRunning = false;
+    if (isServerRunning && serverInstance && requestedPort === port) {
+      resolve(getEmbeddedWebServerStatus());
+      return;
     }
 
+    closeServerInstance();
+
     serverEnabled = true;
+    requestedPort = port;
+    const lastPort = Math.min(MAX_PORT, port + PORT_FALLBACK_TRIES);
+
+    function fail(message: string) {
+      serverError = message;
+      isServerRunning = false;
+      activePort = port;
+      console.warn(`[EmbeddedWebServer] ${message}`);
+      resolve(getEmbeddedWebServerStatus());
+    }
 
     function tryPort(targetPort: number) {
       const srv = http.createServer((req, res) => {
-        req.setTimeout(12000, () => {
-          if (!res.headersSent) {
-            res.statusCode = 408;
-            res.end('Request Timeout');
-          }
-        });
-
         handleHttpRequest(req, res).catch((err) => {
           console.error('[EmbeddedWebServer] Unhandled request error:', err);
           if (!res.headersSent) {
             res.statusCode = 500;
             res.end('Internal Server Error');
+          } else if (!res.writableEnded) {
+            res.destroy();
           }
         });
       });
+      // Bound how long a client may take to deliver headers/body (slowloris);
+      // does not limit how long a handler may take to respond (sync/scan can be long).
+      srv.headersTimeout = 30_000;
+      srv.requestTimeout = 120_000;
 
       srv.on('error', (err: any) => {
         if (err.code === 'EADDRINUSE') {
           try {
             srv.close();
           } catch {}
-          console.warn(`[EmbeddedWebServer] Port ${targetPort} in use, trying ${targetPort + 1}...`);
-          tryPort(targetPort + 1);
-        } else {
+          if (targetPort < lastPort) {
+            console.warn(`[EmbeddedWebServer] Port ${targetPort} in use, trying ${targetPort + 1}...`);
+            tryPort(targetPort + 1);
+          } else {
+            fail(`Ports ${port}-${lastPort} are all in use. Choose a different port in Settings.`);
+          }
+        } else if (srv === serverInstance) {
+          // Runtime error on the live server.
           serverError = err.message;
           isServerRunning = false;
-          resolve(getEmbeddedWebServerStatus());
+        } else {
+          fail(`Could not start the web server: ${err.message}`);
         }
       });
 
-      srv.listen(targetPort, '0.0.0.0', () => {
-        serverInstance = srv;
-        activePort = targetPort;
-        isServerRunning = true;
-        serverError = undefined;
-        console.log(`[EmbeddedWebServer] 🚀 Running at http://0.0.0.0:${activePort}`);
-        resolve(getEmbeddedWebServerStatus());
-      });
+      try {
+        srv.listen(targetPort, '0.0.0.0', () => {
+          serverInstance = srv;
+          activePort = targetPort;
+          isServerRunning = true;
+          // A fallback is surfaced (not silent) so the desktop user knows the URL changed.
+          serverError = targetPort !== port ? `Port ${port} was already in use, so the server is using port ${targetPort} instead.` : undefined;
+          console.log(`[EmbeddedWebServer] Running at http://0.0.0.0:${activePort}`);
+          resolve(getEmbeddedWebServerStatus());
+        });
+      } catch (err: any) {
+        fail(`Could not start the web server: ${err?.message || err}`);
+      }
     }
 
     tryPort(port);
@@ -1038,13 +1250,7 @@ export function startEmbeddedWebServer(port: number = 5173): Promise<WebServerSt
 }
 
 export function stopEmbeddedWebServer(): void {
-  if (serverInstance) {
-    try {
-      serverInstance.close();
-    } catch {}
-    serverInstance = null;
-  }
-  isServerRunning = false;
+  closeServerInstance();
 }
 
 export function getEmbeddedWebServerStatus(): WebServerStatus {
@@ -1076,11 +1282,24 @@ export async function updateEmbeddedWebServerSettings(newSettings: {
   enabled: boolean;
   port: number;
 }): Promise<WebServerStatus> {
-  saveWebServerSettings(newSettings);
+  const port = Number(newSettings.port);
   if (!newSettings.enabled) {
-    serverEnabled = false;
-    stopEmbeddedWebServer();
+    // Turning the server OFF must work even if the port field is empty/garbage: keep the
+    // last good port and stop, instead of leaving it running on 0.0.0.0.
+    saveWebServerSettings({ enabled: false, port: isValidPort(port) ? port : loadSavedWebServerSettings().port });
+    startChain = startChain.then(() => {
+      serverEnabled = false;
+      stopEmbeddedWebServer();
+    });
+    await startChain;
     return getEmbeddedWebServerStatus();
   }
-  return await startEmbeddedWebServer(newSettings.port);
+  if (!isValidPort(port)) {
+    // Refuse before saving or touching the running server, so a typo can't take the server down
+    // (or persist a port that then fails on every launch).
+    serverError = `Invalid port ${newSettings.port}: use a number between ${MIN_PORT} and ${MAX_PORT}.`;
+    return getEmbeddedWebServerStatus();
+  }
+  saveWebServerSettings({ enabled: true, port });
+  return await startEmbeddedWebServer(port);
 }

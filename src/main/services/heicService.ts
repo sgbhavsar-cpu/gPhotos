@@ -4,7 +4,8 @@ import os from 'os';
 import crypto from 'crypto';
 import exifr from 'exifr';
 import sharp from 'sharp';
-import { getHeicSavedRotation } from './heicRotationStore';
+import { getSavedRotationForContent } from './heicRotationStore';
+import { decodeHeicToJpeg, type HeicPriority } from './heicWorkerClient';
 
 // In Electron, app.getPath('userData') is used. In Node scripts/fallback, use APPDATA or HOME.
 function getUserDataDir(): string {
@@ -40,24 +41,71 @@ export function getTempHqDir(): string {
   return dir;
 }
 
-// In-memory LRU cache for 500px and HQ image buffers
+// In-memory LRU cache for 500px and HQ image buffers, bounded by item count AND
+// total bytes (an HQ JPEG of a large photo is several MB, so a count cap alone
+// could retain a gigabyte). Map insertion order = recency; getMemoryCache
+// re-inserts on hit.
 const memoryCache = new Map<string, Buffer>();
 const MAX_CACHE_ITEMS = 60;
+const MAX_CACHE_BYTES = 150 * 1024 * 1024;
+let memoryCacheBytes = 0;
+
+function getMemoryCache(key: string): Buffer | undefined {
+  const buf = memoryCache.get(key);
+  if (buf) {
+    memoryCache.delete(key);
+    memoryCache.set(key, buf);
+  }
+  return buf;
+}
+
+function deleteMemoryCache(key: string) {
+  const buf = memoryCache.get(key);
+  if (buf) {
+    memoryCacheBytes -= buf.length;
+    memoryCache.delete(key);
+  }
+}
 
 function setMemoryCache(key: string, buffer: Buffer) {
-  if (memoryCache.size >= MAX_CACHE_ITEMS) {
+  deleteMemoryCache(key);
+  if (buffer.length > MAX_CACHE_BYTES / 2) return; // never let one huge buffer flush the whole cache
+  while (memoryCache.size >= MAX_CACHE_ITEMS || (memoryCacheBytes + buffer.length > MAX_CACHE_BYTES && memoryCache.size > 0)) {
     const firstKey = memoryCache.keys().next().value;
-    if (firstKey) memoryCache.delete(firstKey);
+    if (firstKey === undefined) break;
+    deleteMemoryCache(firstKey);
   }
   memoryCache.set(key, buffer);
+  memoryCacheBytes += buffer.length;
 }
 
-let heicConvert: any = null;
-try {
-  heicConvert = require('heic-convert');
-} catch (e) {
-  console.warn('heic-convert module could not be loaded:', e);
+/** Writes via tmp + rename so an interrupted write never leaves a truncated file that later reads as a valid cache hit. */
+function writeFileAtomicSync(target: string, data: Buffer) {
+  const tmp = `${target}.${process.pid}.${Date.now().toString(36)}.tmp`;
+  try {
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, target);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw err;
+  }
 }
+
+// In-flight de-duplication: concurrent callers (UI, pre-cache worker, prepareHeicHqTemp)
+// for the same file share one decode instead of each running a full heic-convert.
+const inFlightThumb500 = new Map<string, Promise<Buffer | null>>();
+const inFlightHq = new Map<string, Promise<Buffer | null>>();
+
+function dedupe(map: Map<string, Promise<Buffer | null>>, key: string, run: () => Promise<Buffer | null>): Promise<Buffer | null> {
+  const existing = map.get(key);
+  if (existing) return existing;
+  const p = run().finally(() => map.delete(key));
+  map.set(key, p);
+  return p;
+}
+
+// heic-convert (libheif WASM) runs on a worker thread via heicWorkerClient so a
+// multi-second HEVC decode never blocks the main process.
 
 /**
  * Computes a deterministic cache key for a file based on path and modification timestamp.
@@ -75,7 +123,7 @@ function getFileCacheHash(filePath: string): string {
  *  1. Fast path: embedded high-res EXIF thumbnail (<5ms)
  *  2. Fallback: full bitstream decode via heic-convert (libheif WASM)
  */
-async function extractRawHeicJpeg(fileBuffer: Buffer, filePath: string): Promise<{ buffer: Buffer; fromThumbnail: boolean } | null> {
+async function extractRawHeicJpeg(fileBuffer: Buffer, filePath: string, priority: HeicPriority = 'low'): Promise<{ buffer: Buffer; fromThumbnail: boolean } | null> {
   // 1. Fast path: embedded EXIF thumbnail
   try {
     const thumbBuffer = await exifr.thumbnail(fileBuffer);
@@ -93,17 +141,10 @@ async function extractRawHeicJpeg(fileBuffer: Buffer, filePath: string): Promise
   } catch {}
 
   // 3. Fallback: full decode via heic-convert
-  if (heicConvert) {
-    try {
-      const converted = await heicConvert({
-        buffer: fileBuffer,
-        format: 'JPEG',
-        quality: 0.90,
-      });
-      return { buffer: Buffer.from(converted), fromThumbnail: false };
-    } catch (convErr) {
-      console.error(`heic-convert failed to decode ${filePath}:`, convErr);
-    }
+  try {
+    return { buffer: await decodeHeicToJpeg(fileBuffer, 0.90, priority), fromThumbnail: false };
+  } catch (convErr) {
+    console.error(`heic-convert failed to decode ${filePath}:`, convErr);
   }
 
   // Automatic self-healing: if file was corrupted and a .bak backup exists, restore it!
@@ -140,13 +181,10 @@ async function extractFullResolutionHeicJpeg(fileBuffer: Buffer, filePath: strin
     }
   } catch {}
 
-  if (heicConvert) {
-    try {
-      const converted = await heicConvert({ buffer: fileBuffer, format: 'JPEG', quality: 0.92 });
-      return Buffer.from(converted);
-    } catch (convErr) {
-      console.error(`heic-convert full-resolution decode failed for ${filePath}:`, convErr);
-    }
+  try {
+    return await decodeHeicToJpeg(fileBuffer, 0.92, 'low');
+  } catch (convErr) {
+    console.error(`heic-convert full-resolution decode failed for ${filePath}:`, convErr);
   }
 
   return null;
@@ -166,7 +204,7 @@ export async function getHeicFullResolutionBufferForDetection(filePath: string):
   try {
     const fileBuffer = await fs.promises.readFile(filePath);
     const rotationDeg = await detectExifRotation(fileBuffer);
-    const savedRot = getHeicSavedRotation(filePath);
+    const savedRot = getSavedRotationForContent(filePath, fileBuffer);
     const totalRotationDeg = (((rotationDeg + savedRot) % 360) + 360) % 360;
 
     const decoded = await extractFullResolutionHeicJpeg(fileBuffer, filePath);
@@ -201,7 +239,10 @@ async function detectExifRotation(fileBuffer: Buffer): Promise<number> {
  */
 export async function getOrGenerateHeicThumbnail500(filePath: string): Promise<Buffer | null> {
   if (!fs.existsSync(filePath)) return null;
+  return dedupe(inFlightThumb500, getFileCacheHash(filePath), () => generateHeicThumbnail500(filePath));
+}
 
+async function generateHeicThumbnail500(filePath: string): Promise<Buffer | null> {
   try {
     const hash = getFileCacheHash(filePath);
     const thumbFileName = `${hash}_500.jpg`;
@@ -209,8 +250,9 @@ export async function getOrGenerateHeicThumbnail500(filePath: string): Promise<B
 
     // 1. Memory cache hit
     const memKey = `thumb500:${hash}`;
-    if (memoryCache.has(memKey)) {
-      return memoryCache.get(memKey)!;
+    const memHit = getMemoryCache(memKey);
+    if (memHit) {
+      return memHit;
     }
 
     // 2. Local disk cache hit
@@ -229,10 +271,10 @@ export async function getOrGenerateHeicThumbnail500(filePath: string): Promise<B
     // 3. Generate from HEIC source
     const fileBuffer = await fs.promises.readFile(filePath);
     const rotationDeg = await detectExifRotation(fileBuffer);
-    const savedRot = getHeicSavedRotation(filePath);
+    const savedRot = getSavedRotationForContent(filePath, fileBuffer);
     const totalRotationDeg = (((rotationDeg + savedRot) % 360) + 360) % 360;
 
-    const extracted = await extractRawHeicJpeg(fileBuffer, filePath);
+    const extracted = await extractRawHeicJpeg(fileBuffer, filePath, 'high');
     if (!extracted || !extracted.buffer) return null;
 
     // Use Sharp to rotate to upright orientation (EXIF + user rotation) and resize to 500px
@@ -250,7 +292,7 @@ export async function getOrGenerateHeicThumbnail500(filePath: string): Promise<B
 
     // Persist to local disk folder
     try {
-      fs.writeFileSync(thumbPath, thumbBuffer);
+      writeFileAtomicSync(thumbPath, thumbBuffer);
     } catch (writeErr) {
       console.warn(`Failed to write thumbnail to disk at ${thumbPath}:`, writeErr);
     }
@@ -269,17 +311,21 @@ export async function getOrGenerateHeicThumbnail500(filePath: string): Promise<B
  */
 export async function getHeicHighQualityJpegBuffer(filePath: string): Promise<Buffer | null> {
   if (!fs.existsSync(filePath)) return null;
+  return dedupe(inFlightHq, getFileCacheHash(filePath), () => generateHeicHighQualityJpeg(filePath));
+}
 
+async function generateHeicHighQualityJpeg(filePath: string): Promise<Buffer | null> {
   try {
     const hash = getFileCacheHash(filePath);
     const memKey = `hq:${hash}`;
-    if (memoryCache.has(memKey)) {
-      return memoryCache.get(memKey)!;
+    const memHit = getMemoryCache(memKey);
+    if (memHit) {
+      return memHit;
     }
 
     const fileBuffer = await fs.promises.readFile(filePath);
     const rotationDeg = await detectExifRotation(fileBuffer);
-    const savedRot = getHeicSavedRotation(filePath);
+    const savedRot = getSavedRotationForContent(filePath, fileBuffer);
     const totalRotationDeg = (((rotationDeg + savedRot) % 360) + 360) % 360;
 
     const extracted = await extractRawHeicJpeg(fileBuffer, filePath);
@@ -319,7 +365,7 @@ export async function rotateHeic500Thumbnail(filePath: string, degrees: number):
     const hqKey = `hq:${hash}`;
 
     // Invalidate HQ cache so next request for HQ JPEG decodes fresh with the new rotation
-    memoryCache.delete(hqKey);
+    deleteMemoryCache(hqKey);
 
     let rotatedBuffer: Buffer | null = null;
 
@@ -331,7 +377,7 @@ export async function rotateHeic500Thumbnail(filePath: string, degrees: number):
             .rotate(degrees)
             .jpeg({ quality: 82, mozjpeg: true })
             .toBuffer();
-          fs.writeFileSync(thumbPath, rotatedBuffer);
+          writeFileAtomicSync(thumbPath, rotatedBuffer);
           setMemoryCache(memKey, rotatedBuffer);
         }
       } catch (err) {
@@ -399,8 +445,8 @@ export function cleanupHeicHqTemp(photoId: string): void {
 export function purgeHeicCache(filePath: string): void {
   try {
     const hash = getFileCacheHash(filePath);
-    memoryCache.delete(`thumb500:${hash}`);
-    memoryCache.delete(`hq:${hash}`);
+    deleteMemoryCache(`thumb500:${hash}`);
+    deleteMemoryCache(`hq:${hash}`);
 
     const thumbDir = getThumbnailsDir();
     const thumbFileName = `${hash}_500.jpg`;

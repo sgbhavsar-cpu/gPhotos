@@ -1,5 +1,6 @@
 import React, { useEffect } from 'react';
 import { X, ExternalLink, HelpCircle, BookOpen } from 'lucide-react';
+import { notifyError } from '../services/notifications';
 
 interface HelpModalProps {
   onClose: () => void;
@@ -15,11 +16,15 @@ export const HelpModal: React.FC<HelpModalProps> = ({ onClose }) => {
   }, [onClose]);
 
   const handleOpenExternal = async () => {
-    if (window.electronAPI?.openHelpInBrowser) {
-      const opened = await window.electronAPI.openHelpInBrowser();
-      if (opened) return;
+    try {
+      if (window.electronAPI?.openHelpInBrowser) {
+        const opened = await window.electronAPI.openHelpInBrowser();
+        if (opened) return;
+      }
+      window.open('/help.html', '_blank');
+    } catch (err) {
+      notifyError('Open help', err);
     }
-    window.open('/help.html', '_blank');
   };
 
   return (

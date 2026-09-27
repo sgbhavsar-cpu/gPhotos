@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { AvatarSpriteCoord } from '../../types';
+import type { AvatarSpriteCoord } from '../../../types';
 
 // Batched lookup of person-avatar sprite tiles (see main/services/
 // avatarSpriteService.ts). Same shape as the photo-sprite lookup in
@@ -69,7 +69,10 @@ async function work(): Promise<void> {
         pending.delete(it.key);
         updated.add(it.key);
       }
-      listeners.forEach((l) => l(updated));
+      // A throwing listener must not abort the loop: the remaining queued keys would stay 'pending' forever.
+      listeners.forEach((l) => {
+        try { l(updated); } catch (err) { console.warn('[AvatarSprite] listener failed:', err); }
+      });
     }
   } finally {
     working = false;

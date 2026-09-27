@@ -1,5 +1,5 @@
 import { parentPort } from 'worker_threads';
-import { detectFaces, detectFaceInRegion, type DetectedFace, type DetectFacesResult } from './faceDetectionEngine';
+import { detectFaces, detectFaceInRegion, probeOrientation, type DetectedFace, type DetectFacesResult, type OrientationProbe } from './faceDetectionEngine';
 
 // Runs ONNX face detection/recognition off the main process's thread.
 //
@@ -24,17 +24,30 @@ if (!parentPort) {
 
 type Request =
   | { id: number; kind: 'detect'; buffer: Buffer }
+  | { id: number; kind: 'probeOrientation'; buffer: Buffer }
   | { id: number; kind: 'detectRegion'; buffer: Buffer; box: { x: number; y: number; width: number; height: number }; marginRatio?: number };
 
 type Response =
-  | { id: number; result: DetectFacesResult | DetectedFace | null }
+  | { id: number; result: DetectFacesResult | DetectedFace | OrientationProbe | null }
   | { id: number; error: string };
 
-parentPort.on('message', async (msg: Request) => {
+// One request in flight at a time: each detect decodes the full-resolution image to raw RGB
+// (~144MB at 48MP), so overlapping requests (detect + region, or a burst queued by the pool)
+// would hold several full decodes at once. handle() never rejects, so the chain can't wedge.
+let queue: Promise<void> = Promise.resolve();
+
+parentPort.on('message', (msg: Request) => {
+  queue = queue.then(() => handle(msg));
+});
+
+async function handle(msg: Request): Promise<void> {
   const port = parentPort!;
   try {
     if (msg.kind === 'detect') {
       const result = await detectFaces(msg.buffer);
+      port.postMessage({ id: msg.id, result } satisfies Response);
+    } else if (msg.kind === 'probeOrientation') {
+      const result = await probeOrientation(msg.buffer);
       port.postMessage({ id: msg.id, result } satisfies Response);
     } else {
       const result = await detectFaceInRegion(msg.buffer, msg.box, msg.marginRatio);
@@ -43,4 +56,4 @@ parentPort.on('message', async (msg: Request) => {
   } catch (err) {
     port.postMessage({ id: msg.id, error: String(err) } satisfies Response);
   }
-});
+}

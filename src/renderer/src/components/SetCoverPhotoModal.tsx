@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { X, Check, Star } from 'lucide-react';
-import { DetectedFace, Photo } from '../../types';
+import { DetectedFace, Photo } from '../../../types';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { invalidateAvatarSprite } from '../services/avatarSpriteLoader';
+import { notifyError } from '../services/notifications';
 
 interface SetCoverPhotoModalProps {
   photo: Photo;
@@ -53,6 +54,12 @@ export const SetCoverPhotoModal: React.FC<SetCoverPhotoModalProps> = ({
   const imageUrl = getLocalPhotoUrl(photo.filePath, photo.originalRemotePath, true);
 
   const initializeCropBox = useCallback((natW: number, natH: number) => {
+    if (!face.box) {
+      // No detected box to start from: default to a centered square.
+      const side = Math.max(MIN_CROP_SIZE, Math.min(natW, natH));
+      setCropBox({ x: (natW - side) / 2, y: (natH - side) / 2, size: side });
+      return;
+    }
     const baseW = face.imageWidth || natW;
     const baseH = face.imageHeight || natH;
     const scaleX = natW / baseW;
@@ -189,17 +196,20 @@ export const SetCoverPhotoModal: React.FC<SetCoverPhotoModalProps> = ({
       ctx.drawImage(imgRef.current, cropBox.x, cropBox.y, cropBox.size, cropBox.size, 0, 0, targetSize, targetSize);
       const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
 
-      libraryStore.setPersonCover(personId, photo.id, face.id);
+      // Save the avatar file FIRST: if it fails the cover must not already point at the new face.
       if (window.electronAPI?.savePersonAvatar) {
-        await window.electronAPI.savePersonAvatar(personId, face.id, dataUrl);
+        // main reports failure as {success:false,error} rather than throwing.
+        const res = await window.electronAPI.savePersonAvatar(personId, face.id, dataUrl);
+        if (res && res.success === false) throw new Error(res.error || 'Failed to save cover photo.');
         invalidateAvatarSprite(personId); // grid cards must pick up the new crop, not the cached sprite tile
       }
+      libraryStore.setPersonCover(personId, photo.id, face.id);
 
       if (onSaved) onSaved();
       onClose();
     } catch (err: any) {
-      console.error('[SetCoverPhotoModal] Failed to save cover crop:', err);
       setErrorMessage(err?.message || 'Failed to save cover photo.');
+      notifyError('Save cover photo', err);
     } finally {
       setIsSaving(false);
     }
@@ -272,6 +282,7 @@ export const SetCoverPhotoModal: React.FC<SetCoverPhotoModalProps> = ({
               src={imageUrl}
               crossOrigin="anonymous"
               onLoad={handleImageLoad}
+              onError={() => setErrorMessage('The photo could not be loaded (its storage may be offline), so it cannot be cropped right now.')}
               alt="Adjust cover crop"
               draggable={false}
               style={{ width: displayW || 'auto', height: displayH || 'auto', display: 'block', userSelect: 'none' }}

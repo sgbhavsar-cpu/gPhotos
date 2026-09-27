@@ -8,7 +8,7 @@ import {
   AUTH_REQUIRED_EVENT,
 } from '../services/webAuthClient';
 
-type GateStatus = 'checking' | 'needs-pin' | 'ready';
+type GateStatus = 'checking' | 'needs-pin' | 'ready' | 'unreachable';
 
 export const MobileAuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [status, setStatus] = useState<GateStatus>(isBrowserMode() ? 'checking' : 'ready');
@@ -21,13 +21,21 @@ export const MobileAuthGate: React.FC<{ children: React.ReactNode }> = ({ childr
       setStatus('ready');
       return;
     }
-    const valid = await hasValidStoredToken();
-    if (valid) {
-      setStatus('ready');
-      return;
+    setStatus('checking');
+    setError(null);
+    try {
+      const valid = await hasValidStoredToken();
+      if (valid) {
+        setStatus('ready');
+        return;
+      }
+      const required = await checkAuthRequired();
+      setStatus(required ? 'needs-pin' : 'ready');
+    } catch (err) {
+      // Server unreachable: opening the app anyway would just fail every request silently.
+      setError(err instanceof Error ? err.message : String(err));
+      setStatus('unreachable');
     }
-    const required = await checkAuthRequired();
-    setStatus(required ? 'needs-pin' : 'ready');
   }, []);
 
   useEffect(() => {
@@ -53,6 +61,23 @@ export const MobileAuthGate: React.FC<{ children: React.ReactNode }> = ({ childr
   };
 
   if (status === 'ready') return <>{children}</>;
+
+  if (status === 'unreachable') {
+    return (
+      <div style={styles.container}>
+        <div style={styles.card}>
+          <h1 style={styles.title}>Can't reach gPhotos</h1>
+          <p style={styles.subtitle}>
+            The gPhotos desktop app didn't respond{error ? ` (${error})` : ''}. Make sure it is running and this
+            device is on the same network.
+          </p>
+          <button type="button" onClick={runCheck} style={styles.button}>
+            Try again
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   if (status === 'checking') {
     return (

@@ -1,9 +1,10 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useDeferredValue } from 'react';
 import {
   FolderPlus,
   Image as ImageIcon,
   Calendar,
   Trash2,
+  FolderInput,
   ArrowLeft,
   Plus,
   X,
@@ -18,9 +19,11 @@ import {
   ZoomIn,
   ZoomOut
 } from 'lucide-react';
-import { Album, Photo } from '../../types';
+import { Album, Photo } from '../../../types';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { VirtualCardGrid } from '../components/VirtualCardGrid';
+import { movePhotosToFolder } from '../services/photoRelocationFlow';
 
 interface AlbumsViewProps {
   photos: Photo[];
@@ -56,6 +59,10 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
     large: 280,
   };
   const [albumGridSize, setAlbumGridSize] = useState<AlbumGridSize>('medium');
+  // Both photo grids (album detail, add-photos picker) are windowed by VirtualCardGrid against
+  // these scroll containers, so every photo is reachable without capping the tile count.
+  const albumScrollRef = useRef<HTMLDivElement>(null);
+  const pickerScrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (resetTrigger) {
@@ -125,17 +132,20 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
       .filter((p): p is Photo => p !== undefined);
   }, [activeAlbum, photoMap]);
 
+  // Keystrokes stay responsive: the (100k-photo) filter below runs on the deferred query.
+  const deferredSearchQuery = useDeferredValue(photoSearchQuery);
+
   // Available photos not in this album (for picker)
   const availablePhotosForAlbum = useMemo(() => {
     if (!activeAlbum) return [];
     const existing = new Set(activeAlbum.photoIds);
     let candidates = photos.filter((p) => !existing.has(p.id) && !p.isExcluded);
 
-    if (photoSearchQuery.trim()) {
-      const q = photoSearchQuery.toLowerCase();
+    if (deferredSearchQuery.trim()) {
+      const q = deferredSearchQuery.trim().toLowerCase();
       candidates = candidates.filter(
         (p) =>
-          p.fileName.toLowerCase().includes(q) ||
+          (p.fileName || '').toLowerCase().includes(q) ||
           p.location?.city?.toLowerCase().includes(q) ||
           p.location?.country?.toLowerCase().includes(q)
       );
@@ -156,7 +166,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
       candidates = candidates.filter((p) => new Date(p.dateTaken).getTime() <= to);
     }
     return candidates;
-  }, [photos, activeAlbum, photoSearchQuery, photoFilterPersonId, photoFilterLocation, photoFilterDateFrom, photoFilterDateTo]);
+  }, [photos, activeAlbum, deferredSearchQuery, photoFilterPersonId, photoFilterLocation, photoFilterDateFrom, photoFilterDateTo]);
 
   // Filter dropdown options, derived from the library so they only ever
   // show choices that actually exist rather than a generic fixed list.
@@ -188,6 +198,21 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
     setNewEventDate('');
     setShowCreateModal(false);
     setSelectedAlbumId(created.id);
+  };
+
+  // "Move to Folder…": physically moves every photo of the open album (see photoRelocationFlow.ts).
+  const [moveProgress, setMoveProgress] = useState<{ done: number; total: number } | null>(null);
+  const handleMoveAlbumToFolder = async () => {
+    if (!activeAlbum || moveProgress) return;
+    setMoveProgress({ done: 0, total: albumPhotos.length });
+    try {
+      await movePhotosToFolder(albumPhotos, {
+        label: `the album "${activeAlbum.title}"`,
+        onProgress: (done, total) => setMoveProgress({ done, total }),
+      });
+    } finally {
+      setMoveProgress(null);
+    }
   };
 
   const handleDeleteAlbum = (albumId: string, albumTitle: string, e?: React.MouseEvent) => {
@@ -389,6 +414,26 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
             </button>
 
             <button
+              className="btn btn-secondary"
+              onClick={handleMoveAlbumToFolder}
+              disabled={moveProgress !== null || albumPhotos.length === 0}
+              title="Physically move all photos of this album into a folder of the same library or storage"
+              data-testid="album-move-to-folder"
+              style={{
+                gap: '8px',
+                height: '40px',
+                padding: isMobile ? '0 14px' : '10px 16px',
+                fontSize: '0.88rem',
+                flexShrink: 0,
+              }}
+            >
+              <FolderInput size={18} />
+              <span>
+                {moveProgress ? `Moving ${moveProgress.done}/${moveProgress.total}…` : 'Move to Folder…'}
+              </span>
+            </button>
+
+            <button
               className="btn btn-secondary btn-icon"
               onClick={(e) => handleDeleteAlbum(activeAlbum.id, activeAlbum.title, e)}
               title="Delete this album"
@@ -414,7 +459,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
         )}
 
         {/* Photos in Album Scroll Area */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '24px' }}>
+        <div ref={albumScrollRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '24px' }}>
           {albumPhotos.length === 0 ? (
             <div
               style={{
@@ -453,22 +498,22 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
               </button>
             </div>
           ) : (
-            <div
-              style={{
-                display: 'grid',
-                gridTemplateColumns: `repeat(auto-fill, minmax(${ALBUM_GRID_SIZE_PX[albumGridSize]}px, 1fr))`,
-                gap: albumGridSize === 'very_small' ? '10px' : '16px',
-              }}
-            >
-              {albumPhotos.map((photo) => {
+            <VirtualCardGrid
+              items={albumPhotos}
+              getKey={(p) => p.id}
+              scrollRef={albumScrollRef}
+              rowHeight={Math.round(ALBUM_GRID_SIZE_PX[albumGridSize] * 1.05)}
+              minColWidth={ALBUM_GRID_SIZE_PX[albumGridSize]}
+              gap={albumGridSize === 'very_small' ? 10 : 16}
+              renderItem={(photo) => {
                 const isCover = activeAlbum.coverPhotoId === photo.id;
                 return (
                   <div
-                    key={photo.id}
                     onClick={() => onSelectPhoto(photo, albumPhotos)}
                     style={{
                       position: 'relative',
-                      height: `${Math.round(ALBUM_GRID_SIZE_PX[albumGridSize] * 1.05)}px`,
+                      height: '100%',
+                      boxSizing: 'border-box',
                       borderRadius: 'var(--radius-md)',
                       overflow: 'hidden',
                       backgroundColor: 'var(--bg-surface-elevated)',
@@ -587,8 +632,8 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                     </div>
                   </div>
                 );
-              })}
-            </div>
+              }}
+            />
           )}
         </div>
 
@@ -791,28 +836,28 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
               </div>
 
               {/* Photos Picker Grid */}
-              <div style={{ flex: 1, overflowY: 'auto', padding: '20px 24px' }}>
+              <div ref={pickerScrollRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '20px 24px' }}>
                 {availablePhotosForAlbum.length === 0 ? (
                   <div style={{ textAlign: 'center', padding: '60px 20px', color: 'var(--text-muted)' }}>
                     No available photos found to add.
                   </div>
                 ) : (
-                  <div
-                    style={{
-                      display: 'grid',
-                      gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))',
-                      gap: '12px',
-                    }}
-                  >
-                    {availablePhotosForAlbum.map((photo) => {
+                  <VirtualCardGrid
+                    items={availablePhotosForAlbum}
+                    getKey={(p) => p.id}
+                    scrollRef={pickerScrollRef}
+                    rowHeight={140}
+                    minColWidth={150}
+                    gap={12}
+                    renderItem={(photo) => {
                       const isPicked = selectedPhotoIdsToAdd.has(photo.id);
                       return (
                         <div
-                          key={photo.id}
                           onClick={() => toggleSelectPhotoToAdd(photo.id)}
                           style={{
                             position: 'relative',
-                            height: '140px',
+                            height: '100%',
+                            boxSizing: 'border-box',
                             borderRadius: 'var(--radius-md)',
                             overflow: 'hidden',
                             backgroundColor: '#0f172a',
@@ -869,8 +914,8 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                           </div>
                         </div>
                       );
-                    })}
-                  </div>
+                    }}
+                  />
                 )}
               </div>
 

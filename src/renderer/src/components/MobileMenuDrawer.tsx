@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import {
   Image as ImageIcon,
   Users,
@@ -42,11 +42,14 @@ export const MobileMenuDrawer: React.FC<MobileMenuDrawerProps> = ({
   onOpenHelp,
   onOpenAiAssistant,
 }) => {
+  // Hook before the early return (rules of hooks); one pass per photos change, not per render.
+  const favoriteCount = useMemo(() => state.photos.reduce((n, p) => n + (p.isFavorite ? 1 : 0), 0), [state.photos]);
+
   if (!isOpen) return null;
 
   const navItems = [
     { id: 'photos' as ActiveTab, label: 'Photos Gallery', icon: ImageIcon, count: state.totalCount || state.photos.length },
-    { id: 'favorites' as ActiveTab, label: 'Favorites', icon: Heart, count: state.photos.filter((p) => p.isFavorite).length },
+    { id: 'favorites' as ActiveTab, label: 'Favorites', icon: Heart, count: favoriteCount },
     { id: 'albums' as ActiveTab, label: 'Albums', icon: BookImage, count: (state.albums || []).length },
     { id: 'people' as ActiveTab, label: 'People & Faces', icon: Users, count: state.people.length },
     { id: 'places' as ActiveTab, label: 'Places Map', icon: MapPin, count: state.places.length },

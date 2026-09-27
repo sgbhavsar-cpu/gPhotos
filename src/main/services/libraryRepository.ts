@@ -119,7 +119,12 @@ export function upsertPhoto(photo: Photo, db: DatabaseSync = getDb()): void {
   }
 }
 
-export function upsertPhotos(photos: Photo[]): void {
+/**
+ * `dbOverride`: write every photo to this exact database instead of resolving
+ * one per photo (used by callers that already pinned the target library, e.g.
+ * replaceAllPhotos / the legacy-JSON migration).
+ */
+export function upsertPhotos(photos: Photo[], dbOverride?: DatabaseSync): void {
   if (photos.length === 0) return;
   // Resolved PER PHOTO via resolveDbForPhoto, not once via the ambient
   // "active library" pointer (getDb()'s default) — this bulk path backs the
@@ -138,7 +143,7 @@ export function upsertPhotos(photos: Photo[]): void {
   // single transaction, same as before.
   const groups = new Map<DatabaseSync, Photo[]>();
   for (const photo of photos) {
-    const db = resolveDbForPhoto(photo);
+    const db = dbOverride ?? resolveDbForPhoto(photo);
     const group = groups.get(db);
     if (group) group.push(photo);
     else groups.set(db, [photo]);
@@ -229,18 +234,22 @@ const FULL_LOAD_CHUNK_SIZE = 2000;
  * the plain sync version above.
  */
 export async function getAllPhotosChunked(db: DatabaseSync = getDb()): Promise<Photo[]> {
-  const total = getTotalPhotoCount(db);
-  const stmt = db.prepare('SELECT * FROM photos ORDER BY date_taken DESC, id DESC LIMIT ? OFFSET ?');
+  // Keyset pagination on the unique (date_taken, id) ordering: O(chunk) per page at any depth, and a
+  // writer running between chunks can't shift rows across page boundaries (no dup / no skip of rows
+  // it didn't touch), which LIMIT/OFFSET could. Backed by idx_photos_date_taken_id.
+  const first = db.prepare('SELECT * FROM photos ORDER BY date_taken DESC, id DESC LIMIT ?');
+  const next = db.prepare('SELECT * FROM photos WHERE (date_taken, id) < (?, ?) ORDER BY date_taken DESC, id DESC LIMIT ?');
   const photos: Photo[] = [];
 
-  for (let offset = 0; offset < total; offset += FULL_LOAD_CHUNK_SIZE) {
-    const rows = stmt.all(FULL_LOAD_CHUNK_SIZE, offset) as any[];
-    if (rows.length === 0) break;
+  let rows = first.all(FULL_LOAD_CHUNK_SIZE) as any[];
+  while (rows.length > 0) {
     const chunk = rows.map(rowToPhoto);
     attachFacesToPhotos(chunk, db);
     photos.push(...chunk);
     if (rows.length < FULL_LOAD_CHUNK_SIZE) break;
+    const last = rows[rows.length - 1];
     await new Promise((resolve) => setImmediate(resolve));
+    rows = next.all(last.date_taken, last.id, FULL_LOAD_CHUNK_SIZE) as any[];
   }
 
   return photos;
@@ -274,16 +283,15 @@ const SUMMARY_QUERY_CHUNK_SIZE = 5000;
  * switch). Callers on a hot path that must stay synchronous can still fall
  * back to the exported sync variant below.
  */
-export async function getAllPhotosForSummary(): Promise<Pick<Photo, 'id' | 'filePath' | 'dateTaken' | 'fileDate' | 'location'>[]> {
-  const db = getDb();
-  const total = getTotalPhotoCount();
-  const stmt = db.prepare(
-    'SELECT id, file_path, date_taken, file_date, location_json FROM photos ORDER BY date_taken DESC, id DESC LIMIT ? OFFSET ?'
-  );
+export async function getAllPhotosForSummary(db: DatabaseSync = getDb()): Promise<Pick<Photo, 'id' | 'filePath' | 'dateTaken' | 'fileDate' | 'location'>[]> {
+  // Keyset pagination — see getAllPhotosChunked.
+  const cols = 'id, file_path, date_taken, file_date, location_json';
+  const first = db.prepare(`SELECT ${cols} FROM photos ORDER BY date_taken DESC, id DESC LIMIT ?`);
+  const next = db.prepare(`SELECT ${cols} FROM photos WHERE (date_taken, id) < (?, ?) ORDER BY date_taken DESC, id DESC LIMIT ?`);
   const results: Pick<Photo, 'id' | 'filePath' | 'dateTaken' | 'fileDate' | 'location'>[] = [];
 
-  for (let offset = 0; offset < total; offset += SUMMARY_QUERY_CHUNK_SIZE) {
-    const rows = stmt.all(SUMMARY_QUERY_CHUNK_SIZE, offset) as any[];
+  let rows = first.all(SUMMARY_QUERY_CHUNK_SIZE) as any[];
+  while (rows.length > 0) {
     for (const row of rows) {
       results.push({
         id: row.id,
@@ -294,7 +302,9 @@ export async function getAllPhotosForSummary(): Promise<Pick<Photo, 'id' | 'file
       });
     }
     if (rows.length < SUMMARY_QUERY_CHUNK_SIZE) break;
+    const last = rows[rows.length - 1];
     await new Promise((resolve) => setImmediate(resolve));
+    rows = next.all(last.date_taken, last.id, SUMMARY_QUERY_CHUNK_SIZE) as any[];
   }
 
   return results;
@@ -342,7 +352,7 @@ export function replaceAllPhotos(photos: Photo[], dbHint?: DatabaseSync): { upse
     if (idsToDelete.length > 0) {
       deletePhotos(idsToDelete, db);
     }
-    upsertPhotos(photos);
+    upsertPhotos(photos, db);
   }, db);
 
   return { upsertedCount: photos.length, deletedCount: idsToDelete.length, skipped: false };
@@ -502,14 +512,25 @@ export function getAllFaces(db: DatabaseSync = getDb()): DetectedFace[] {
 
 /** Same result as getAllFaces, chunked + yielding — see getAllPhotosChunked's doc comment for why. */
 export async function getAllFacesChunked(db: DatabaseSync = getDb()): Promise<DetectedFace[]> {
-  const stmt = db.prepare('SELECT * FROM faces LIMIT ? OFFSET ?');
+  // Keyset pagination on rowid: the same physical order the old un-ORDERed LIMIT/OFFSET scan
+  // returned, but O(chunk) per page and with well-defined page boundaries. (An id-ordered keyset
+  // would need a random table lookup per row: measured ~3x slower.) replaceFacesForPhoto deletes
+  // and re-inserts a photo's faces, moving them to a new (highest) rowid mid-read, so dedupe by
+  // id — a moved face is then returned once, and never skipped since its new rowid is ahead.
+  const page = db.prepare('SELECT rowid AS _rid, * FROM faces WHERE rowid > ? ORDER BY rowid LIMIT ?');
   const faces: DetectedFace[] = [];
-  for (let offset = 0; ; offset += FULL_LOAD_CHUNK_SIZE) {
-    const rows = stmt.all(FULL_LOAD_CHUNK_SIZE, offset) as any[];
-    if (rows.length === 0) break;
-    faces.push(...rows.map(rowToFace));
+  const seen = new Set<string>();
+  let rows = page.all(0, FULL_LOAD_CHUNK_SIZE) as any[];
+  while (rows.length > 0) {
+    for (const row of rows) {
+      if (seen.has(row.id)) continue;
+      seen.add(row.id);
+      faces.push(rowToFace(row));
+    }
     if (rows.length < FULL_LOAD_CHUNK_SIZE) break;
+    const lastRid = rows[rows.length - 1]._rid;
     await new Promise((resolve) => setImmediate(resolve));
+    rows = page.all(lastRid, FULL_LOAD_CHUNK_SIZE) as any[];
   }
   return faces;
 }
@@ -595,10 +616,21 @@ export function renamePerson(personId: string, name: string): void {
   getGlobalDb().prepare('UPDATE people SET name = ? WHERE id = ?').run(name, personId);
 }
 
-/** Replaces the global people registry. */
-export function replaceAllPeople(people: Person[]): void {
-  bumpFacesPeopleRevision();
+/**
+ * Replaces the global people registry.
+ *
+ * Safety guard (mirrors replaceAllPhotos/replaceAllAlbums): an EMPTY incoming
+ * list while people already exist is far more likely a stale/bogus save than
+ * an intentional wipe, so it is a no-op unless the caller explicitly passes
+ * `allowEmpty: true` (Reset & Rescan / deleting the last person).
+ */
+export function replaceAllPeople(people: Person[], options?: { allowEmpty?: boolean }): void {
   const db = getGlobalDb();
+  if (people.length === 0 && !options?.allowEmpty) {
+    const existing = (db.prepare('SELECT COUNT(*) as c FROM people').get() as any)?.c ?? 0;
+    if (existing > 0) return;
+  }
+  bumpFacesPeopleRevision();
   runInTransaction(() => {
     db.exec('DELETE FROM people');
     const peopleStmt = db.prepare(UPSERT_PERSON_SQL);
@@ -616,10 +648,17 @@ export function replaceAllPeople(people: Person[]): void {
   }, db);
 }
 
-/** Replaces faces in the currently active library only (people live in the global database — see replaceAllPeople). */
-export function replaceAllFaces(faces: DetectedFace[]): void {
+/**
+ * Replaces faces in the currently active library only (people live in the global database — see replaceAllPeople).
+ * Same empty-input guard as replaceAllPeople; pass `allowEmpty: true` to deliberately clear.
+ */
+export function replaceAllFaces(faces: DetectedFace[], options?: { allowEmpty?: boolean; db?: DatabaseSync }): void {
+  const db = options?.db ?? getDb();
+  if (faces.length === 0 && !options?.allowEmpty) {
+    const existing = (db.prepare('SELECT COUNT(*) as c FROM faces').get() as any)?.c ?? 0;
+    if (existing > 0) return;
+  }
   bumpFacesPeopleRevision();
-  const db = getDb();
   runInTransaction(() => {
     db.exec('DELETE FROM faces');
     const faceStmt = db.prepare(UPSERT_FACE_SQL);
@@ -630,9 +669,9 @@ export function replaceAllFaces(faces: DetectedFace[]): void {
 }
 
 /** Convenience wrapper used by the JSON migration: replaces both the global people registry and this library's faces. */
-export function replaceAllPeopleAndFaces(people: Person[], faces: DetectedFace[]): void {
-  replaceAllPeople(people);
-  replaceAllFaces(faces);
+export function replaceAllPeopleAndFaces(people: Person[], faces: DetectedFace[], options?: { allowEmpty?: boolean; db?: DatabaseSync }): void {
+  replaceAllPeople(people, options);
+  replaceAllFaces(faces, options);
 }
 
 // ---------------------------------------------------------------------------
@@ -754,4 +793,58 @@ export function setSetting<T>(key: string, value: T): void {
        ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json`
     )
     .run(key, JSON.stringify(value));
+}
+
+
+// ---------------------------------------------------------------------------
+// Photo relocation (id remap)
+//
+// A photo's id (and its faces' ids) are derived from its path, so moving a file
+// means re-keying every row that references it. See photoRelocation.ts.
+// ---------------------------------------------------------------------------
+
+export interface PhotoIdRemap {
+  oldId: string;
+  newId: string;
+  filePath: string;
+  fileName: string;
+  /** Set (virtual photos) to rewrite original_remote_path; omit to leave the column alone. */
+  originalRemotePath?: string;
+}
+
+/**
+ * In ONE transaction on `db`: re-keys the photos row (new id/file_path/file_name, thumbnail_cached_at cleared),
+ * its faces (photo_id, and the `${photoId}_face_n` id prefix), album_photos.photo_id and albums.cover_photo_id.
+ * Rows that are not in this database are simply not touched (0 changes), so it is safe on any db.
+ */
+export function remapPhotoIdInDb(db: DatabaseSync, m: PhotoIdRemap): void {
+  bumpFacesPeopleRevision();
+  runInTransaction(() => {
+    if (m.originalRemotePath !== undefined) {
+      db.prepare('UPDATE photos SET id = ?, file_path = ?, file_name = ?, original_remote_path = ?, thumbnail_cached_at = NULL WHERE id = ?')
+        .run(m.newId, m.filePath, m.fileName, m.originalRemotePath, m.oldId);
+    } else {
+      db.prepare('UPDATE photos SET id = ?, file_path = ?, file_name = ?, thumbnail_cached_at = NULL WHERE id = ?')
+        .run(m.newId, m.filePath, m.fileName, m.oldId);
+    }
+    const len = m.oldId.length;
+    db.prepare(
+      'UPDATE faces SET photo_id = ?, id = CASE WHEN substr(id, 1, ?) = ? THEN ? || substr(id, ? + 1) ELSE id END WHERE photo_id = ?'
+    ).run(m.newId, len, m.oldId, m.newId, len, m.oldId);
+    db.prepare('UPDATE album_photos SET photo_id = ? WHERE photo_id = ?').run(m.newId, m.oldId);
+    db.prepare('UPDATE albums SET cover_photo_id = ? WHERE cover_photo_id = ?').run(m.newId, m.oldId);
+  }, db);
+}
+
+/** Re-points people.cover_photo_id / cover_face_id (global db) from a photo's old id to its new one. */
+export function remapPeopleCoversForPhoto(oldId: string, newId: string): void {
+  bumpFacesPeopleRevision();
+  const db = getGlobalDb();
+  const len = oldId.length;
+  const facePrefix = `${oldId}_face_`;
+  runInTransaction(() => {
+    db.prepare('UPDATE people SET cover_photo_id = ? WHERE cover_photo_id = ?').run(newId, oldId);
+    db.prepare('UPDATE people SET cover_face_id = ? || substr(cover_face_id, ? + 1) WHERE substr(cover_face_id, 1, ?) = ?')
+      .run(newId, len, facePrefix.length, facePrefix);
+  }, db);
 }

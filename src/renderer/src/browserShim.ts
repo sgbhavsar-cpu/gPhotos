@@ -8,24 +8,33 @@
 
 import { authFetch } from './services/webAuthClient';
 
+/**
+ * Turns a non-2xx response into a thrown Error, matching the Electron IPC contract (main rejects on
+ * failure). The shim used to swallow these and return empty/fake-success values, so a failed delete,
+ * rotate or scan looked like it worked and an unreachable server looked like an empty library.
+ */
+function assertOk(res: Response, what: string): void {
+  if (res.ok) return;
+  const err = new Error(`${what} failed (HTTP ${res.status})`);
+  // A 401 already re-shows the PIN screen (authFetch); don't also pop an error over it.
+  if (res.status === 401) err.name = 'AbortError';
+  throw err;
+}
+
 if (typeof window !== 'undefined' && !(window as any).electronAPI) {
   (window as any).electronAPI = {
     isBrowserShim: true,
     isElectron: false,
 
     loadLibraryData: async (key: string, libraryDir?: string) => {
-      try {
-        const dirParam = libraryDir ? `?libraryDir=${encodeURIComponent(libraryDir)}` : '';
-        const res = await authFetch(`/api/library${dirParam}`);
-        if (!res.ok) return null;
-        const data = await res.json();
-        if (data && data[key] !== undefined) return data[key];
-        if (key === 'gphotos_library_v1' && (data.photos || data.people)) return data;
-        return null;
-      } catch (err) {
-        console.warn('[browserShim] Failed to fetch /api/library:', err);
-        return null;
-      }
+      // Throws on failure (like the IPC handler): null means "nothing stored", not "couldn't read it".
+      const dirParam = libraryDir ? `?libraryDir=${encodeURIComponent(libraryDir)}` : '';
+      const res = await authFetch(`/api/library${dirParam}`);
+      assertOk(res, 'Loading the library');
+      const data = await res.json();
+      if (data && data[key] !== undefined) return data[key];
+      if (key === 'gphotos_library_v1' && (data.photos || data.people)) return data;
+      return null;
     },
 
     saveLibraryData: async (key: string, data: any) => {
@@ -42,14 +51,11 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     },
 
     checkFileExists: async (p: string) => {
-      try {
-        const res = await authFetch(`/api/file-exists?path=${encodeURIComponent(p)}`);
-        if (!res.ok) return false;
-        const data = await res.json();
-        return !!data.exists;
-      } catch {
-        return false;
-      }
+      // Throws when the check itself fails: callers treat that as "unknown" rather than "deleted".
+      const res = await authFetch(`/api/file-exists?path=${encodeURIComponent(p)}`);
+      assertOk(res, 'Checking a path');
+      const data = await res.json();
+      return !!data.exists;
     },
 
     discoverMirrors: async () => {
@@ -85,14 +91,10 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     selectDirectory: async () => null,
 
     scanDirectory: async (dirPath?: string) => {
-      try {
-        if (!dirPath) return [];
-        const res = await authFetch(`/api/scan?path=${encodeURIComponent(dirPath)}`);
-        if (!res.ok) return [];
-        return await res.json();
-      } catch {
-        return [];
-      }
+      if (!dirPath) return [];
+      const res = await authFetch(`/api/scan?path=${encodeURIComponent(dirPath)}`);
+      assertOk(res, 'Scanning the folder');
+      return await res.json();
     },
 
     prepareHeicHq: async (filePath: string, photoId: string) => {
@@ -134,28 +136,22 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     onOrganizeProgress: () => () => {},
     readFileAsBase64: async () => '',
     syncVirtualStorage: async (config: any) => {
-      try {
-        const res = await authFetch('/api/sync-virtual-storage', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(config),
-        });
-        if (!res.ok) return { success: false, newMirroredCount: 0, totalMirroredCount: 0, totalSizeSaved: 0 };
-        return await res.json();
-      } catch {
-        return { success: false, newMirroredCount: 0, totalMirroredCount: 0, totalSizeSaved: 0 };
-      }
+      const res = await authFetch('/api/sync-virtual-storage', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(config),
+      });
+      assertOk(res, 'Syncing the storage');
+      return await res.json();
     },
     detectFacesBatch: async (photos: any[]) => {
-      try {
-        const res = await authFetch('/api/faces/detect-batch', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(photos),
-        });
-        if (res.ok) return await res.json();
-      } catch {}
-      return { results: photos.map((p) => ({ photoId: p.id, ran: false, faceCount: 0, locked: false, skippedReason: 'decode-failed', faces: [] })), people: [] };
+      const res = await authFetch('/api/faces/detect-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(photos),
+      });
+      assertOk(res, 'Face detection');
+      return await res.json();
     },
 
     scanStorageInventory: async (networkSourcePath: string) => {
@@ -167,15 +163,10 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     },
 
     scanVirtualMirror: async (dirPath?: string) => {
-      try {
-        if (!dirPath) return [];
-        const res = await authFetch(`/api/scan-mirror?path=${encodeURIComponent(dirPath)}`);
-        if (!res.ok) return [];
-        return await res.json();
-      } catch (err) {
-        console.warn('[browserShim] Failed to scan virtual mirror:', err);
-        return [];
-      }
+      if (!dirPath) return [];
+      const res = await authFetch(`/api/scan-mirror?path=${encodeURIComponent(dirPath)}`);
+      assertOk(res, 'Scanning the mirror');
+      return await res.json();
     },
     openOriginalFile: async () => {},
     onMirrorProgress: () => () => {},
@@ -184,40 +175,36 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
     saveLibraryStatus: async (s: any) => s,
     getAllLibraryStatuses: async () => ({}),
 
+    // Delete / rotate must throw on failure: they used to return { success: true } when the request
+    // failed, so the UI removed or rotated a photo that was never touched on disk.
     trashFiles: async (filePaths: string[]) => {
-      try {
-        const res = await authFetch('/api/delete-files', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filePaths, permanent: false }),
-        });
-        if (res.ok) return await res.json();
-      } catch {}
-      return { success: true, trashedCount: filePaths.length, trashedPaths: filePaths, errors: [] };
+      const res = await authFetch('/api/delete-files', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePaths, permanent: false }),
+      });
+      assertOk(res, 'Moving files to the Recycle Bin');
+      return await res.json();
     },
 
     deleteFilesPermanently: async (filePaths: string[]) => {
-      try {
-        const res = await authFetch('/api/delete-files', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filePaths, permanent: true }),
-        });
-        if (res.ok) return await res.json();
-      } catch {}
-      return { success: true, deletedCount: filePaths.length, deletedPaths: filePaths, errors: [] };
+      const res = await authFetch('/api/delete-files', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePaths, permanent: true }),
+      });
+      assertOk(res, 'Deleting files');
+      return await res.json();
     },
 
     rotatePhoto: async (filePath: string, rotationDegrees: number, originalRemotePath?: string) => {
-      try {
-        const res = await authFetch('/api/rotate-photo', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filePath, rotationDegrees, originalRemotePath }),
-        });
-        if (res.ok) return await res.json();
-      } catch {}
-      return { success: true, newPath: filePath };
+      const res = await authFetch('/api/rotate-photo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath, rotationDegrees, originalRemotePath }),
+      });
+      assertOk(res, 'Rotating the photo');
+      return await res.json();
     },
 
     processPendingRotations: async () => {
@@ -273,47 +260,27 @@ if (typeof window !== 'undefined' && !(window as any).electronAPI) {
       return true;
     },
     sendAppReady: () => {},
+    // Both reject on failure (as the IPC handlers now do): a fake empty catalog looked like an empty library.
     getCatalogMeta: async () => {
-      try {
-        const res = await authFetch('/api/catalog-meta');
-        if (res.ok) return await res.json();
-      } catch {}
-      return {
-        version: 2,
-        totalPhotos: 0,
-        totalAlbums: 0,
-        totalPeople: 0,
-        totalPlaces: 0,
-        timelineSummary: [],
-        placesSummary: [],
-        albumsSummary: [],
-        peopleSummary: [],
-        recentLibraries: [],
-        currentDirectory: null,
-        selectedFolder: null,
-        pageSize: 100,
-        totalPages: 0,
-        lastUpdated: new Date().toISOString(),
-      };
+      const res = await authFetch('/api/catalog-meta');
+      assertOk(res, 'Loading the catalog');
+      return await res.json();
     },
     getCatalogPage: async (params: { pageIndex: number; pageSize?: number; libraryDir?: string }) => {
-      try {
-        const libraryDirParam = params.libraryDir ? `&libraryDir=${encodeURIComponent(params.libraryDir)}` : '';
-        const res = await authFetch(`/api/catalog-page?page=${params.pageIndex}&size=${params.pageSize || 100}${libraryDirParam}`);
-        if (res.ok) return await res.json();
-      } catch {}
-      return { photos: [], totalPages: 0, totalPhotos: 0 };
+      const libraryDirParam = params.libraryDir ? `&libraryDir=${encodeURIComponent(params.libraryDir)}` : '';
+      const res = await authFetch(`/api/catalog-page?page=${params.pageIndex}&size=${params.pageSize || 100}${libraryDirParam}`);
+      assertOk(res, 'Loading photos');
+      return await res.json();
     },
     switchLibrary: async (targetPath: string) => {
-      try {
-        const res = await authFetch('/api/switch-library', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ targetPath }),
-        });
-        if (res.ok) return await res.json();
-      } catch {}
-      return null;
+      // Rejects on failure (e.g. the server's 403) like the other shim calls; the store reports it.
+      const res = await authFetch('/api/switch-library', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ targetPath }),
+      });
+      assertOk(res, 'Switching library');
+      return await res.json();
     },
     getSpriteCoordinate: async (photoPath: string) => {
       try {

@@ -4,6 +4,7 @@ import os from 'os';
 import { app } from 'electron';
 import { LibraryScanStatus } from '../../types';
 import { getDefaultMirrorRoot } from './pathSecurity';
+import { readJsonSafe, writeJsonAtomic } from './jsonFile';
 
 function getUserDataPath(): string {
   try {
@@ -30,6 +31,9 @@ function getGlobalStatusFilePath(): string {
 class LibraryStatusService {
   private cache: Record<string, LibraryScanStatus> = {};
   private initialized = false;
+  // True when the global file exists but could not be read: saving then would replace every
+  // library's status with just the one being saved, so the write is skipped until a clean read.
+  private loadFailed = false;
 
   private normalizeKey(libraryPath: string): string {
     if (!libraryPath || typeof libraryPath !== 'string') return '';
@@ -47,18 +51,17 @@ class LibraryStatusService {
 
   private loadAll(): void {
     try {
-      const p = getGlobalStatusFilePath();
-      if (fs.existsSync(p)) {
-        const raw = fs.readFileSync(p, 'utf-8');
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object') {
-          this.cache = parsed;
-        }
+      const parsed = readJsonSafe<Record<string, LibraryScanStatus>>(getGlobalStatusFilePath(), {});
+      if (parsed && typeof parsed === 'object') {
+        this.cache = parsed;
       }
+      this.loadFailed = false;
     } catch (err) {
+      // Transient read error (EBUSY/AV lock): leave the file alone and retry the load next call.
+      this.loadFailed = true;
       console.warn('[LibraryStatus] Failed to load global status:', err);
     }
-    this.initialized = true;
+    this.initialized = !this.loadFailed;
   }
 
   public getAllLibraryStatuses(): Record<string, LibraryScanStatus> {
@@ -153,10 +156,11 @@ class LibraryStatusService {
 
     // 1. Persist to global userData file
     try {
+      if (this.loadFailed) throw new Error('global status file unreadable; not overwriting it');
       const p = getGlobalStatusFilePath();
       const dir = path.dirname(p);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(p, JSON.stringify(this.cache, null, 2), 'utf-8');
+      writeJsonAtomic(p, this.cache);
     } catch (err) {
       console.warn('[LibraryStatus] Failed to persist global status:', err);
     }
@@ -165,7 +169,7 @@ class LibraryStatusService {
     try {
       if (fs.existsSync(status.libraryPath)) {
         const localStatusFile = path.join(status.libraryPath, '.gphotos_status.json');
-        fs.writeFileSync(localStatusFile, JSON.stringify(merged, null, 2), 'utf-8');
+        writeJsonAtomic(localStatusFile, merged);
       }
     } catch {}
 

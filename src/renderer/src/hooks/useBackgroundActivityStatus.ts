@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { faceQueue, QueueStatus } from '../services/faceQueue';
-import { NetworkStorageProgress } from '../../types';
+import { NetworkStorageProgress } from '../../../types';
 
 export interface BackgroundActivitySummary {
   /** Something is actually running right now (not just queued/paused). */

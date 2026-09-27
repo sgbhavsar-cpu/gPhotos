@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { writeFileAtomic } from './jsonFile';
 // piexifjs has no ESM/TS-friendly default export shape; require() matches
 // how the rest of this codebase pulls in similarly-shaped CJS libraries.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -42,6 +43,11 @@ export function writePhotoMetadata(filePath: string, update: PhotoMetadataUpdate
     const isJpeg = ext === '.jpg' || ext === '.jpeg';
     let wroteExif = false;
     const newDate = update.dateIso ? new Date(update.dateIso) : null;
+    // An unparseable date must fail BEFORE the file is touched — otherwise
+    // "NaN:NaN:NaN ..." gets written into the EXIF and utimesSync then throws.
+    if (newDate && isNaN(newDate.getTime())) {
+      return { success: false, wroteExif: false, error: `Invalid date: ${update.dateIso}` };
+    }
 
     if (isJpeg && (newDate || (update.latitude != null && update.longitude != null))) {
       const jpegData = fs.readFileSync(filePath).toString('binary');
@@ -77,9 +83,7 @@ export function writePhotoMetadata(filePath: string, update: PhotoMetadataUpdate
       // Sharp/other writers can't reliably overwrite a file in place on
       // Windows — write to a temp path and rename over it instead (same
       // workaround used elsewhere in this codebase for the same reason).
-      const tmpPath = `${filePath}.tmp${Date.now()}`;
-      fs.writeFileSync(tmpPath, outBuf);
-      fs.renameSync(tmpPath, filePath);
+      writeFileAtomic(filePath, outBuf); // temp + rename, temp cleaned up on failure
       wroteExif = true;
     }
 

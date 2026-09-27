@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { X, Trash2, AlertTriangle, HardDrive, FolderX, ShieldAlert, RefreshCw } from 'lucide-react';
-import { VirtualStorageConfig } from '../../types';
+import { VirtualStorageConfig } from '../../../types';
 
 interface DeleteStorageModalProps {
   storage: VirtualStorageConfig;

@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 import { resetDbForTests, setActiveLibrary } from '../../src/main/services/db';
 import { setSetting } from '../../src/main/services/libraryRepository';
-import { isPathAllowed, assertPathAllowed, assertPathsAllowed } from '../../src/main/services/pathSecurity';
+import { isPathAllowed, assertPathAllowed, assertPathsAllowed, clearPathSecurityCache } from '../../src/main/services/pathSecurity';
 
 describe('pathSecurity', () => {
   let tempDir: string;
@@ -68,6 +68,46 @@ describe('pathSecurity', () => {
   it('assertPathAllowed throws for a disallowed path and is silent for an allowed one', () => {
     expect(() => assertPathAllowed(path.join(libraryDir, 'a.jpg'), 'test')).not.toThrow();
     expect(() => assertPathAllowed(path.join(outsideDir, 'a.jpg'), 'test')).toThrow(/Access denied/);
+  });
+
+  it('rejects relative candidates instead of resolving them against cwd', () => {
+    expect(isPathAllowed('photo.jpg')).toBe(false);
+    expect(isPathAllowed(path.relative(process.cwd(), path.join(libraryDir, 'a.jpg')))).toBe(false);
+  });
+
+  it('rejects a junction/symlink inside an allowed root that points outside it', () => {
+    const secret = path.join(outsideDir, 'secret.txt');
+    fs.writeFileSync(secret, 'x');
+    const link = path.join(libraryDir, 'escape');
+    fs.symlinkSync(outsideDir, link, 'junction');
+    clearPathSecurityCache();
+    expect(isPathAllowed(path.join(link, 'secret.txt'))).toBe(false);
+    // not-yet-existing file beneath the link resolves via its nearest existing ancestor
+    expect(isPathAllowed(path.join(link, 'new', 'file.txt'))).toBe(false);
+    // a link that stays inside the root is fine
+    const inner = path.join(libraryDir, 'real');
+    fs.mkdirSync(inner);
+    fs.symlinkSync(inner, path.join(libraryDir, 'alias'), 'junction');
+    clearPathSecurityCache();
+    expect(isPathAllowed(path.join(libraryDir, 'alias', 'a.jpg'))).toBe(true);
+  });
+
+  it('allows a not-yet-existing file under an allowed root', () => {
+    expect(isPathAllowed(path.join(libraryDir, 'new', 'deep', 'a.jpg'))).toBe(true);
+  });
+
+  it('lookalike sibling prefixes are rejected', () => {
+    expect(isPathAllowed(libraryDir + '_evil')).toBe(false);
+    expect(isPathAllowed(path.join(libraryDir + '_evil', 'a.jpg'))).toBe(false);
+  });
+
+  it('case-folds only on Windows', () => {
+    const upper = path.join(libraryDir.toUpperCase(), 'A.JPG');
+    expect(isPathAllowed(upper)).toBe(process.platform === 'win32');
+  });
+
+  it('does not treat a filesystem root candidate as allowed unless it is a configured root', () => {
+    expect(isPathAllowed(path.parse(libraryDir).root)).toBe(false);
   });
 
   it('assertPathsAllowed rejects the whole batch if even one path is disallowed', () => {

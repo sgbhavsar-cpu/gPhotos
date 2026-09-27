@@ -225,13 +225,18 @@ async function buildSheet(entries: BuildEntry[], idx: Record<string, IndexEntry>
   const spriteId = `av_${Date.now().toString(36)}${(sheetSeq++).toString(36)}`;
   const target = deps.spritePath(spriteId);
 
-  await sharp({
-    create: { width: COLS * AVATAR_TILE, height: rows * AVATAR_TILE, channels: 4, background: { r: 15, g: 23, b: 42, alpha: 1 } },
-  })
-    .composite(tiles.map((t, i) => ({ input: t.input, left: (i % COLS) * AVATAR_TILE, top: Math.floor(i / COLS) * AVATAR_TILE })))
-    .webp({ quality: 82, effort: 3 })
-    .toFile(`${target}.tmp`);
-  fs.renameSync(`${target}.tmp`, target); // never serve a half-written sheet
+  try {
+    await sharp({
+      create: { width: COLS * AVATAR_TILE, height: rows * AVATAR_TILE, channels: 4, background: { r: 15, g: 23, b: 42, alpha: 1 } },
+    })
+      .composite(tiles.map((t, i) => ({ input: t.input, left: (i % COLS) * AVATAR_TILE, top: Math.floor(i / COLS) * AVATAR_TILE })))
+      .webp({ quality: 82, effort: 3 })
+      .toFile(`${target}.tmp`);
+    fs.renameSync(`${target}.tmp`, target); // never serve a half-written sheet
+  } catch (err) {
+    try { fs.unlinkSync(`${target}.tmp`); } catch {}
+    throw err;
+  }
 
   tiles.forEach((t, i) => {
     idx[t.key] = { spriteId, col: i % COLS, row: Math.floor(i / COLS), rows, tile: AVATAR_TILE, mtimeMs: t.mtimeMs, provisional: t.provisional };
@@ -287,12 +292,19 @@ export async function getAvatarSprites(
     }
 
     for (let i = 0; i < toBuild.length; i += PER_SHEET) {
-      await buildSheet(toBuild.slice(i, i + PER_SHEET), idx);
+      // One failed sheet (composite/disk error) must not lose the sheets already
+      // built or the ones still to come — its tiles just come back null below
+      // and the renderer crops those live.
+      try {
+        await buildSheet(toBuild.slice(i, i + PER_SHEET), idx);
+      } catch (err) {
+        console.warn('[AvatarSprite] Failed to build sheet:', err);
+      }
     }
     for (const b of toBuild) {
       const built = idx[b.key];
       // a tile counts only if this build produced it (a failed tile leaves an older/no entry)
-      const fresh = !!built && built.provisional === (b.kind === 'face') && (b.kind === 'face' || built.mtimeMs === b.mtimeMs);
+      const fresh = !!built && built.provisional === (b.kind === 'face') && (b.kind === 'face' || built.mtimeMs === b.mtimeMs) && fs.existsSync(deps.spritePath(built.spriteId));
       out[b.key] = fresh ? built : null;
     }
     if (toBuild.length > 0) saveIndex();

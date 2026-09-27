@@ -1,6 +1,9 @@
 import fs from 'fs';
+import path from 'path';
 import exifr from 'exifr';
 import { ExifMetadata, LocationMetadata } from '../../types';
+
+const FULL_READ_FALLBACK_EXTS = new Set(['.tif', '.tiff', '.dng', '.raw', '.cr2', '.nef', '.heic', '.heif']);
 
 // Simple offline city coordinates lookup for common cities worldwide and India
 const KNOWN_PLACES = [
@@ -95,13 +98,21 @@ export async function parsePhotoMetadata(filePath: string): Promise<{
   let height: number | undefined;
 
   try {
-    const fileBuffer = await fs.promises.readFile(filePath);
-    const raw = await exifr.parse(fileBuffer, {
-      tiff: true,
-      exif: true,
-      gps: true,
-      jfif: true,
-    });
+    // Passing the PATH (not a Buffer) makes exifr read the file in small chunks
+    // (JPEG EXIF lives in the first few KB) instead of pulling the whole file
+    // over SMB/OneDrive just for the header. Only when that finds nothing for a
+    // format whose IFDs may sit far into the file (TIFF/RAW/HEIC) do we retry
+    // with the full buffer, so the result stays identical to the old whole-file read.
+    const parseOpts = { tiff: true, exif: true, gps: true, jfif: true };
+    let raw: any;
+    try {
+      raw = await exifr.parse(filePath, parseOpts);
+    } catch {
+      raw = undefined;
+    }
+    if (!raw && FULL_READ_FALLBACK_EXTS.has(path.extname(filePath).toLowerCase())) {
+      raw = await exifr.parse(await fs.promises.readFile(filePath), parseOpts);
+    }
 
     if (raw) {
       if (raw.DateTimeOriginal instanceof Date && !isNaN(raw.DateTimeOriginal.getTime())) {
@@ -176,7 +187,7 @@ export async function parsePhotoMetadata(filePath: string): Promise<{
   // there's no embedded metadata to go by.
   if (!dateTaken) {
     try {
-      const stats = fs.statSync(filePath);
+      const stats = await fs.promises.stat(filePath);
       dateTaken = stats.mtime && !isNaN(stats.mtime.getTime()) && stats.mtime.getFullYear() > 1980
         ? stats.mtime
         : stats.birthtime;

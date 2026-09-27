@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import { X, Calendar, MapPin, Check, Sparkles } from 'lucide-react';
-import { Photo, LocationMetadata } from '../../types';
+import { Photo, LocationMetadata } from '../../../types';
 import { libraryStore } from '../services/libraryStore';
+import { notify, notifyError } from '../services/notifications';
 import { LocationPickerModal } from './LocationPickerModal';
 
 interface BulkEditModalProps {
@@ -25,6 +26,7 @@ export const BulkEditModal: React.FC<BulkEditModalProps> = ({ photos, onClose })
   const [showLocationPicker, setShowLocationPicker] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [resultMessage, setResultMessage] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const canApply = (applyDate && !!dateInput) || (applyLocation && !!locationInput.trim());
 
@@ -32,61 +34,97 @@ export const BulkEditModal: React.FC<BulkEditModalProps> = ({ photos, onClose })
     if (!canApply || isSaving) return;
     setIsSaving(true);
     setResultMessage(null);
+    setErrorMessage(null);
 
-    let newDateIso: string | null = null;
-    if (applyDate && dateInput) {
-      const d = new Date(dateInput);
-      if (!isNaN(d.getTime())) newDateIso = d.toISOString();
-    }
+    try {
+      let newDateIso: string | null = null;
+      if (applyDate && dateInput) {
+        const d = new Date(dateInput);
+        if (!isNaN(d.getTime())) newDateIso = d.toISOString();
+      }
 
-    let newLocation: LocationMetadata | null = null;
-    if (applyLocation) {
-      if (pickedLatLng) {
-        const label = locationInput.trim() || undefined;
-        newLocation = { latitude: pickedLatLng.lat, longitude: pickedLatLng.lng, label, city: label };
-      } else if (locationInput.trim()) {
-        try {
-          const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locationInput.trim())}&limit=1`);
-          const data = await res.json();
-          if (Array.isArray(data) && data[0]) {
-            newLocation = {
-              latitude: parseFloat(data[0].lat),
-              longitude: parseFloat(data[0].lon),
-              label: locationInput.trim(),
-              city: locationInput.trim(),
-            };
+      let newLocation: LocationMetadata | null = null;
+      let lookupFailed = false;
+      if (applyLocation) {
+        if (pickedLatLng) {
+          const label = locationInput.trim() || undefined;
+          newLocation = { latitude: pickedLatLng.lat, longitude: pickedLatLng.lng, label, city: label };
+        } else if (locationInput.trim()) {
+          try {
+            const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locationInput.trim())}&limit=1`);
+            if (!res.ok) throw new Error(`Place lookup returned HTTP ${res.status}`);
+            const data = await res.json();
+            if (Array.isArray(data) && data[0]) {
+              const lat = parseFloat(data[0].lat);
+              const lon = parseFloat(data[0].lon);
+              if (Number.isFinite(lat) && Number.isFinite(lon)) {
+                newLocation = { latitude: lat, longitude: lon, label: locationInput.trim(), city: locationInput.trim() };
+              }
+            }
+          } catch (err) {
+            lookupFailed = true;
+            notifyError('Place lookup failed (offline?)', err);
           }
-        } catch (err) {
-          console.warn('[BulkEditModal] Geocoding failed:', err);
         }
       }
-    }
 
-    if ((newDateIso || newLocation) && window.electronAPI?.writePhotoMetadata) {
-      const update = {
-        ...(newDateIso ? { dateIso: newDateIso } : {}),
-        ...(newLocation ? { latitude: newLocation.latitude, longitude: newLocation.longitude } : {}),
-      };
-      await Promise.all(
-        photos.map((p) => window.electronAPI!.writePhotoMetadata!(p.filePath, update, p.originalRemotePath).catch(() => null))
+      // Nothing to apply (e.g. invalid date and no resolvable place): say so instead of "Updated N photos".
+      if (!newDateIso && !newLocation) {
+        setErrorMessage(
+          applyLocation && locationInput.trim() && !applyDate
+            ? (lookupFailed
+                ? `The place lookup failed, so nothing was changed — use Pin on Map instead.`
+                : `Couldn't find map coordinates for "${locationInput.trim()}", so nothing was changed — use Pin on Map instead.`)
+            : 'Nothing to apply — enter a valid date or location.'
+        );
+        return;
+      }
+
+      // Write the files with a small worker pool (one IPC per photo, but never thousands at once).
+      let fileFailures = 0;
+      if (window.electronAPI?.writePhotoMetadata) {
+        const update = {
+          ...(newDateIso ? { dateIso: newDateIso } : {}),
+          ...(newLocation ? { latitude: newLocation.latitude, longitude: newLocation.longitude } : {}),
+        };
+        let next = 0;
+        const worker = async () => {
+          while (next < photos.length) {
+            const p = photos[next++];
+            try {
+              const r = await window.electronAPI!.writePhotoMetadata!(p.filePath, update, p.originalRemotePath);
+              if (r && r.success === false) fileFailures++;
+            } catch {
+              fileFailures++;
+            }
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(8, photos.length) }, worker));
+      }
+
+      // Patches only: the write phase above is slow, so the modal-open snapshots may be stale
+      // (faces / favorites changed meanwhile) and spreading them would revert those edits.
+      const updated = photos.map((p) => ({
+        id: p.id,
+        ...(newDateIso ? { dateTaken: newDateIso } : {}),
+        ...(newLocation ? { location: newLocation } : {}),
+      }));
+      libraryStore.updatePhotos(updated, !!newLocation);
+
+      if (fileFailures > 0) {
+        notify('warning', `Updated ${photos.length} photo${photos.length === 1 ? '' : 's'} in the app, but ${fileFailures} file${fileFailures === 1 ? '' : 's'} could not be written.`);
+      }
+      setResultMessage(
+        applyLocation && locationInput.trim() && !newLocation
+          ? `Updated date, but couldn't find map coordinates for "${locationInput.trim()}" — use Pin on Map instead.`
+          : `✓ Updated ${photos.length} photo${photos.length === 1 ? '' : 's'}${fileFailures > 0 ? ` (${fileFailures} file write${fileFailures === 1 ? '' : 's'} failed)` : ''}.`
       );
-    }
-
-    const updated = photos.map((p) => ({
-      ...p,
-      ...(newDateIso ? { dateTaken: newDateIso } : {}),
-      ...(newLocation ? { location: newLocation } : {}),
-    }));
-    libraryStore.updatePhotos(updated, !!newLocation);
-
-    setIsSaving(false);
-    setResultMessage(
-      applyLocation && locationInput.trim() && !newLocation
-        ? `Updated date, but couldn't find map coordinates for "${locationInput.trim()}" — use Pin on Map instead.`
-        : `✓ Updated ${photos.length} photo${photos.length === 1 ? '' : 's'}.`
-    );
-    if (newDateIso || newLocation) {
-      setTimeout(onClose, 1300);
+      setTimeout(onClose, fileFailures > 0 ? 2500 : 1300);
+    } catch (err) {
+      setErrorMessage('Could not apply the changes.');
+      notifyError('Bulk edit photos', err);
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -190,6 +228,9 @@ export const BulkEditModal: React.FC<BulkEditModalProps> = ({ photos, onClose })
 
           {resultMessage && (
             <div style={{ fontSize: '0.8rem', color: 'var(--accent-emerald)', fontWeight: 600 }}>{resultMessage}</div>
+          )}
+          {errorMessage && (
+            <div style={{ fontSize: '0.8rem', color: 'var(--accent-rose)', fontWeight: 600 }}>{errorMessage}</div>
           )}
         </div>
 

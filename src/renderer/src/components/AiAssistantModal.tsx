@@ -14,7 +14,7 @@ import {
   MessageSquare,
   Trash2
 } from 'lucide-react';
-import { Photo, Person } from '../../types';
+import { Photo, Person } from '../../../types';
 import {
   aiSearchService,
   AiSearchConfig,

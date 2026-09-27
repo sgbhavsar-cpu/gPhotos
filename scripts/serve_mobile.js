@@ -3,8 +3,21 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const url = require('url');
+const { pipeline } = require('stream');
+
+// DEV-ONLY, UNAUTHENTICATED standalone server. Never expose it beyond a trusted network;
+// the packaged app's embedded server (PIN pairing + token auth) is the supported LAN option.
+if (process.argv.includes('--help') || process.argv.includes('-h')) {
+  console.log('serve_mobile.js - dev-only, UNAUTHENTICATED mobile web server (no PIN, no path restrictions).\nEnv: PORT (default 5174), HOST (default 127.0.0.1; set 0.0.0.0 to reach it from a phone).');
+  process.exit(0);
+}
 
 const PORT = parseInt(process.env.PORT || '5174', 10);
+// This standalone server has NO authentication and NO path restrictions (it can
+// read/delete/overwrite any file the user can). It therefore listens on loopback
+// only unless HOST is set explicitly, e.g. HOST=0.0.0.0 to reach it from a phone.
+const HOST = process.env.HOST || '127.0.0.1';
+const IS_LOOPBACK_HOST = HOST === '127.0.0.1' || HOST === 'localhost' || HOST === '::1';
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 
@@ -111,6 +124,32 @@ function getThumbCacheDir(size) {
     fs.mkdirSync(d, { recursive: true });
   }
   return d;
+}
+
+/**
+ * Streams a file with stream.pipeline so an aborted client destroys the read
+ * stream (no leaked file handle) and a failure to open the file gets a clean
+ * error response instead of an unhandled 'error' event / hung connection.
+ */
+function sendFileStream(res, filePath, errorStatus = 500, errorMessage = 'Failed reading file') {
+  const rs = fs.createReadStream(filePath);
+  const onOpenError = () => {
+    if (res.writableEnded || res.destroyed) return;
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    res.removeHeader('ETag');
+    res.removeHeader('Cache-Control');
+    res.statusCode = errorStatus;
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.end(errorMessage);
+  };
+  rs.once('error', onOpenError);
+  rs.once('open', () => {
+    rs.off('error', onOpenError);
+    pipeline(rs, res, () => {});
+  });
 }
 
 const inFlightMobileJobs = new Map();
@@ -250,7 +289,7 @@ async function handleRequest(req, res) {
     if (req.method === 'GET') {
       res.setHeader('Content-Type', 'application/json');
       if (fs.existsSync(libPath)) {
-        fs.createReadStream(libPath).pipe(res);
+        sendFileStream(res, libPath);
       } else {
         res.end(JSON.stringify({ photos: [], people: [], faces: [], albums: [] }));
       }
@@ -556,7 +595,7 @@ async function handleRequest(req, res) {
     if (fs.existsSync(spritePath)) {
       res.setHeader('Content-Type', 'image/webp');
       res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-      fs.createReadStream(spritePath).pipe(res);
+      sendFileStream(res, spritePath, 404, 'Sprite not found');
       return;
     } else {
       res.statusCode = 404;
@@ -623,14 +662,7 @@ async function handleRequest(req, res) {
           res.setHeader('ETag', etag);
           res.setHeader('Content-Type', MIME_TYPES[ext] || 'image/jpeg');
           res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-          const stream = fs.createReadStream(targetPath);
-          stream.on('error', () => {
-            if (!res.headersSent) {
-              res.statusCode = 500;
-              res.end('Failed reading photo');
-            }
-          });
-          stream.pipe(res);
+          sendFileStream(res, targetPath, 500, 'Failed reading photo');
           return;
         } catch {
           res.statusCode = 500;
@@ -654,14 +686,7 @@ async function handleRequest(req, res) {
         res.setHeader('ETag', thumb.etag);
         res.setHeader('Content-Type', 'image/jpeg');
         res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-        const stream = fs.createReadStream(thumb.filePath);
-        stream.on('error', () => {
-          if (!res.headersSent) {
-            res.statusCode = 500;
-            res.end('Error streaming thumbnail');
-          }
-        });
-        stream.pipe(res);
+        sendFileStream(res, thumb.filePath, 500, 'Error streaming thumbnail');
         return;
       }
 
@@ -677,14 +702,7 @@ async function handleRequest(req, res) {
         res.setHeader('ETag', etag);
         res.setHeader('Content-Type', MIME_TYPES[ext] || 'image/jpeg');
         res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-        const stream = fs.createReadStream(targetPath);
-        stream.on('error', () => {
-          if (!res.headersSent) {
-            res.statusCode = 500;
-            res.end('Error streaming file');
-          }
-        });
-        stream.pipe(res);
+        sendFileStream(res, targetPath, 500, 'Error streaming file');
         return;
       } catch {
         res.statusCode = 500;
@@ -831,7 +849,7 @@ async function handleRequest(req, res) {
   if (fs.existsSync(fullPath) && !fs.statSync(fullPath).isDirectory()) {
     const ext = path.extname(fullPath).toLowerCase();
     res.setHeader('Content-Type', MIME_TYPES[ext] || 'application/octet-stream');
-    fs.createReadStream(fullPath).pipe(res);
+    sendFileStream(res, fullPath);
   } else {
     res.statusCode = 404;
     res.end('Not Found');
@@ -855,11 +873,15 @@ function startServer(port) {
       }
     });
   });
-  srv.once('error', (err) => {
+  srv.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
       try {
         srv.close();
       } catch {}
+      if (port >= 65535) {
+        console.error(`  Server error: no free port found at or above the requested one.`);
+        return;
+      }
       console.warn(`  ⚠️ Port ${port} is already in use, trying port ${port + 1}...`);
       startServer(port + 1);
     } else {
@@ -867,13 +889,22 @@ function startServer(port) {
     }
   });
 
-  srv.listen(port, '0.0.0.0', () => {
+  srv.listen(port, HOST, () => {
     const ips = getNetworkIps();
     const primaryIp = ips.find((i) => i.name.toLowerCase().includes('wi-fi') || i.name.toLowerCase().includes('wireless'))?.address || ips[0]?.address || 'localhost';
 
     console.log('\n================================================================');
     console.log('   ✨ gPhotos Desktop — Mobile Web Server is Running! ✨');
     console.log('================================================================\n');
+
+    if (IS_LOOPBACK_HOST) {
+      console.log(`  Listening on ${HOST} only (this PC). To reach it from a phone, restart with HOST=0.0.0.0`);
+      console.log('  — but read the warning that prints when you do: this script has no login.\n');
+    } else {
+      console.log('  !!! WARNING: this server has NO AUTHENTICATION and NO PATH RESTRICTIONS. !!!');
+      console.log(`  !!! Anyone who can reach ${HOST}:${port} can read, overwrite and DELETE any file this user can. !!!`);
+      console.log('  !!! Use it only on a network you fully trust, or use the desktop app (PIN-protected) instead. !!!\n');
+    }
     console.log(`  📱 Open on your iPhone or Android browser (Chrome / Safari):`);
     console.log(`     👉 http://${primaryIp}:${port}/\n`);
     console.log(`  💻 Open locally on this PC:`);

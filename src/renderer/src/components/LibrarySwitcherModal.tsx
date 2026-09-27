@@ -10,7 +10,7 @@ import {
   Sparkles,
   ArrowRight
 } from 'lucide-react';
-import { VirtualStorageConfig } from '../../types';
+import { VirtualStorageConfig } from '../../../types';
 
 interface LibrarySwitcherModalProps {
   currentLibrary: string | null;

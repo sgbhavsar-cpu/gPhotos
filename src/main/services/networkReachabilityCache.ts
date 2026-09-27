@@ -28,6 +28,12 @@ interface RootStatus {
 
 const rootStatus = new Map<string, RootStatus>();
 const inFlightProbes = new Map<string, Promise<boolean>>();
+// While the first probe against a share is still running (its state unknown), other callers
+// for the same share wait for it instead of starting probes of their own. Against a dead share
+// each probe blocks a libuv thread until the SMB timeout, so 100 concurrent probes would exhaust
+// the pool and stall all file IO; after the first one finishes they either see the share marked
+// offline (no probe at all) or, if it is healthy, proceed normally.
+const rootProbeGate = new Map<string, Promise<void>>();
 
 function normalize(p: string): string {
   return p.trim().toLowerCase().replace(/[\\/]+$/, '');
@@ -124,7 +130,20 @@ export async function isPathReachable(filePath: string | undefined | null): Prom
     }
   }
 
-  const probeKey = root || normalize(filePath);
+  if (root) {
+    const gate = rootProbeGate.get(root);
+    if (gate) {
+      await gate;
+      const status = rootStatus.get(root);
+      if (status && status.offline && Date.now() - status.lastCheckedAt <= OFFLINE_CACHE_TTL_MS) {
+        return false;
+      }
+    }
+  }
+
+  // Keyed by the FILE, not the share root: concurrent callers asking about
+  // different files must not receive each other's answer.
+  const probeKey = normalize(filePath);
   const existing = inFlightProbes.get(probeKey);
   if (existing) return existing;
 
@@ -151,13 +170,31 @@ export async function isPathReachable(filePath: string | undefined | null): Prom
         };
         setTimeout(fire, PROBE_TIMEOUT_MS);
       });
+      let missing = false; // the probe answered ENOENT/ENOTDIR (as opposed to timing out / failing)
       const probe = fs.promises.access(filePath, fs.constants.F_OK).then(
         () => true,
-        () => false
+        (err: NodeJS.ErrnoException) => {
+          missing = err?.code === 'ENOENT' || err?.code === 'ENOTDIR';
+          return false;
+        }
       );
       const reachable = await Promise.race([probe, timeout]);
       if (root) {
-        rootStatus.set(root, { offline: !reachable, lastCheckedAt: Date.now() });
+        // One missing FILE (e.g. an already-deleted photo) says nothing about
+        // whether the share is up — don't mark the whole storage offline for
+        // it. (The share root itself missing, or a timeout, still does.)
+        // A dead mapped drive also answers ENOENT for every file though, so
+        // when a file is "missing" confirm with a bounded probe of the root.
+        let fileMissingOnLiveShare = false;
+        if (!reachable && missing && normalize(filePath) !== root) {
+          fileMissingOnLiveShare = await Promise.race([
+            fs.promises.access(root, fs.constants.F_OK).then(() => true, () => false),
+            new Promise<boolean>((resolve) => setTimeout(() => resolve(false), PROBE_TIMEOUT_MS)),
+          ]);
+        }
+        if (!fileMissingOnLiveShare) {
+          rootStatus.set(root, { offline: !reachable, lastCheckedAt: Date.now() });
+        }
       }
       return reachable;
     } catch {
@@ -171,6 +208,12 @@ export async function isPathReachable(filePath: string | undefined | null): Prom
   })();
 
   inFlightProbes.set(probeKey, probePromise);
+  if (root && !rootProbeGate.has(root)) {
+    const gate: Promise<void> = probePromise.then(() => undefined, () => undefined).finally(() => {
+      if (rootProbeGate.get(root) === gate) rootProbeGate.delete(root);
+    });
+    rootProbeGate.set(root, gate);
+  }
   return probePromise;
 }
 
@@ -198,4 +241,5 @@ export async function isPathReachableForServing(filePath: string | undefined | n
 export function resetReachabilityCacheForTests(): void {
   rootStatus.clear();
   inFlightProbes.clear();
+  rootProbeGate.clear();
 }

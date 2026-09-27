@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Folder,
   FolderOpen,
@@ -11,9 +11,14 @@ import {
   ArrowRight,
   Play
 } from 'lucide-react';
-import { Photo, FolderTreeNode, VirtualStorageConfig } from '../../types';
+import { Photo, FolderTreeNode, VirtualStorageConfig } from '../../../types';
 import { getLocalPhotoUrl, libraryStore } from '../services/libraryStore';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { notifyError } from '../services/notifications';
+import { VirtualCardGrid } from '../components/VirtualCardGrid';
+
+// Fixed card height (160px thumbnail + caption) so the folder grid can be windowed.
+const FOLDER_CARD_HEIGHT = 216;
 
 interface FolderTreeViewProps {
   onSelectPhoto: (photo: Photo) => void;
@@ -21,6 +26,7 @@ interface FolderTreeViewProps {
   storages?: VirtualStorageConfig[];
   initialFolderPath?: string | null;
   onPhotosDiscovered?: (photos: Photo[]) => void;
+  resetTrigger?: number;
 }
 
 interface TreeNodeItemProps {
@@ -33,6 +39,7 @@ const TreeNodeItem: React.FC<TreeNodeItemProps> = ({ node, selectedPath, onSelec
   const [isExpanded, setIsExpanded] = useState(false);
   const [children, setChildren] = useState<FolderTreeNode[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const isSelected = selectedPath === node.path;
 
@@ -40,11 +47,19 @@ const TreeNodeItem: React.FC<TreeNodeItemProps> = ({ node, selectedPath, onSelec
     e.stopPropagation();
     if (!isExpanded && node.hasChildren && children.length === 0) {
       setIsLoading(true);
-      if (window.electronAPI?.readDirectoryTree) {
-        const sub = await window.electronAPI.readDirectoryTree(node.path);
-        setChildren(sub);
+      setLoadError(null);
+      try {
+        if (window.electronAPI?.readDirectoryTree) {
+          const sub = await window.electronAPI.readDirectoryTree(node.path);
+          setChildren(sub || []);
+        }
+      } catch (err) {
+        // Offline share / permission denied: show it on the node instead of spinning forever.
+        setLoadError('Could not read this folder');
+        notifyError(`Open folder "${node.name}"`, err);
+      } finally {
+        setIsLoading(false);
       }
-      setIsLoading(false);
     }
     setIsExpanded(!isExpanded);
   };
@@ -108,6 +123,9 @@ const TreeNodeItem: React.FC<TreeNodeItemProps> = ({ node, selectedPath, onSelec
               Loading subfolders...
             </div>
           )}
+          {loadError && (
+            <div style={{ fontSize: '0.75rem', color: 'var(--accent-rose)', padding: '4px 8px' }}>{loadError}</div>
+          )}
           {children.map((child) => (
             <TreeNodeItem
               key={child.path}
@@ -128,13 +146,21 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
   storages = [],
   initialFolderPath = null,
   onPhotosDiscovered,
+  resetTrigger,
 }) => {
   const [rootNodes, setRootNodes] = useState<FolderTreeNode[]>([]);
   const [selectedFolderPath, setSelectedFolderPath] = useState<string | null>(initialFolderPath);
+  useEffect(() => {
+    if (resetTrigger) setSelectedFolderPath(null);
+  }, [resetTrigger]);
   const isMobile = useIsMobile();
   const [folderPhotos, setFolderPhotos] = useState<Photo[]>([]);
   const [isLoadingPhotos, setIsLoadingPhotos] = useState(false);
+  const [folderError, setFolderError] = useState<string | null>(null);
+  // Only the most recent folder click may write results (slow shares answer out of order).
+  const selectRequestRef = useRef(0);
   const [customPathInput, setCustomPathInput] = useState('');
+  const gridScrollRef = useRef<HTMLDivElement>(null);
 
   // When initialFolderPath changes from external view navigation
   useEffect(() => {
@@ -162,10 +188,14 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
 
   // Initial roots: Local drives and virtual storage mirror roots
   useEffect(() => {
-    loadRoots();
+    let cancelled = false;
+    loadRoots(() => cancelled);
+    return () => {
+      cancelled = true;
+    };
   }, [storages]);
 
-  const loadRoots = async () => {
+  const loadRoots = async (isCancelled: () => boolean = () => false) => {
     const candidates = [
       'C:\\GPhotos_VirtualMirrors',
       'D:\\',
@@ -174,25 +204,21 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
       ...(storages || []).map((s) => s.networkSourcePath),
     ].filter(Boolean);
 
-    const validRoots: FolderTreeNode[] = [];
-    for (const c of candidates) {
-      if (window.electronAPI?.checkFileExists) {
-        const exists = await window.electronAPI.checkFileExists(c);
-        if (exists) {
-          validRoots.push({
-            name: c,
-            path: c,
-            hasChildren: true,
-          });
+    // Checked in parallel so one unreachable NAS path can't hold up (or break) the whole list.
+    const checks = await Promise.all(
+      candidates.map(async (c) => {
+        if (!window.electronAPI?.checkFileExists) return true;
+        try {
+          return !!(await window.electronAPI.checkFileExists(c));
+        } catch {
+          return false;
         }
-      } else {
-        validRoots.push({
-          name: c,
-          path: c,
-          hasChildren: true,
-        });
-      }
-    }
+      })
+    );
+    if (isCancelled()) return;
+    const validRoots: FolderTreeNode[] = candidates
+      .filter((_, i) => checks[i])
+      .map((c) => ({ name: c, path: c, hasChildren: true }));
     setRootNodes(validRoots);
     if (validRoots.length > 0 && !selectedFolderPath && !initialFolderPath) {
       handleSelectFolder(validRoots[0].path);
@@ -200,23 +226,34 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
   };
 
   const handleSelectFolder = async (folderPath: string) => {
+    const requestId = ++selectRequestRef.current;
     setSelectedFolderPath(folderPath);
     setIsLoadingPhotos(true);
+    setFolderError(null);
 
-    if (window.electronAPI?.readFolderPhotos) {
-      const photos = await window.electronAPI.readFolderPhotos(folderPath);
-      setFolderPhotos(photos);
-      if (onPhotosDiscovered && photos.length > 0) {
-        onPhotosDiscovered(photos);
+    try {
+      if (window.electronAPI?.readFolderPhotos) {
+        const photos = (await window.electronAPI.readFolderPhotos(folderPath)) || [];
+        if (requestId !== selectRequestRef.current) return;
+        setFolderPhotos(photos);
+        if (onPhotosDiscovered && photos.length > 0) {
+          onPhotosDiscovered(photos);
+        }
+      } else {
+        // Fallback in web / node environment
+        const matching = libraryStore.getState().photos.filter((p) =>
+          p.filePath.startsWith(folderPath) || (p.originalRemotePath && p.originalRemotePath.startsWith(folderPath))
+        );
+        setFolderPhotos(matching);
       }
-    } else {
-      // Fallback in web / node environment
-      const matching = libraryStore.getState().photos.filter((p) =>
-        p.filePath.startsWith(folderPath) || (p.originalRemotePath && p.originalRemotePath.startsWith(folderPath))
-      );
-      setFolderPhotos(matching);
+    } catch (err) {
+      if (requestId !== selectRequestRef.current) return;
+      setFolderPhotos([]);
+      setFolderError('This folder could not be read — the drive or network share may be offline, or access was denied.');
+      notifyError('Read folder', err);
+    } finally {
+      if (requestId === selectRequestRef.current) setIsLoadingPhotos(false);
     }
-    setIsLoadingPhotos(false);
   };
 
   const handleAddCustomPath = (e: React.FormEvent) => {
@@ -338,7 +375,7 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
         </div>
 
         {/* Photos Grid */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '24px' }}>
+        <div ref={gridScrollRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '24px' }}>
           {isLoadingPhotos ? (
             <div style={{ textAlign: 'center', padding: '60px', color: 'var(--text-muted)' }}>
               <RefreshCw className="animate-spin" size={28} style={{ margin: '0 auto 12px' }} />
@@ -349,6 +386,10 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
               <RefreshCw className="animate-spin" size={28} style={{ margin: '0 auto 12px' }} />
               <p>Loading folder structure...</p>
             </div>
+          ) : folderError ? (
+            <div style={{ textAlign: 'center', padding: '60px', color: 'var(--accent-rose)' }}>
+              <p>{folderError}</p>
+            </div>
           ) : folderPhotos.length === 0 ? (
             <div style={{ textAlign: 'center', padding: '60px', color: 'var(--text-muted)' }}>
               <ImageIcon size={48} style={{ margin: '0 auto 12px', opacity: 0.4 }} />
@@ -356,18 +397,19 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
               <span style={{ fontSize: '0.8rem' }}>Expand subfolders in the tree on the left to browse nested files.</span>
             </div>
           ) : (
-            <div
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))',
-                gap: '16px',
-              }}
-            >
-              {folderPhotos.map((photo) => (
+            <VirtualCardGrid
+              items={folderPhotos}
+              getKey={(photo) => photo.id}
+              scrollRef={gridScrollRef}
+              rowHeight={FOLDER_CARD_HEIGHT}
+              minColWidth={200}
+              gap={16}
+              renderItem={(photo) => (
                 <div
-                  key={photo.id}
                   onClick={() => onSelectPhoto(photo)}
                   style={{
+                    height: '100%',
+                    boxSizing: 'border-box',
                     backgroundColor: 'var(--bg-surface)',
                     borderRadius: 'var(--radius-md)',
                     overflow: 'hidden',
@@ -403,8 +445,8 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
                     </div>
                   </div>
                 </div>
-              ))}
-            </div>
+              )}
+            />
           )}
         </div>
       </main>

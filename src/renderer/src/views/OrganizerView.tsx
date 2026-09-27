@@ -30,10 +30,28 @@ import {
   DryRunSummary,
   DryRunItem,
   OrganizeProgress
-} from '../../types';
+} from '../../../types';
 import { getLocalPhotoUrl } from '../services/libraryStore';
 import { selectDirectoryOrPrompt } from '../services/selectDirectory';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { notify, notifyError } from '../services/notifications';
+import { VirtualCardGrid } from '../components/VirtualCardGrid';
+import { useDebouncedValue, useScrollParent } from '../components/listHooks';
+
+// Fixed heights let the review grid/table be windowed (only on-screen rows are mounted).
+const REVIEW_CARD_HEIGHT = 214;
+const REVIEW_ROW_HEIGHT = 41;
+const REVIEW_TABLE_COLUMNS = 'minmax(0, 2.4fr) 110px minmax(0, 2.2fr) 90px 90px';
+
+/** A dry-run item plus everything derived from it that the list needs on every render. */
+interface ReviewRow {
+  item: DryRunItem;
+  idx: number;
+  fileName: string;
+  rel: string;
+  srcLower: string;
+  tgtLower: string;
+}
 
 interface OrganizerViewProps {
   onOrganizeComplete?: (targetDir: string) => void;
@@ -66,6 +84,9 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
   const [selectedFolderPath, setSelectedFolderPath] = useState<string>('__ALL__');
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['__ALL__']));
   const [searchTerm, setSearchTerm] = useState<string>('');
+  // The filter only runs once typing pauses, not on every keystroke.
+  const debouncedSearch = useDebouncedValue(searchTerm, 200);
+  const { anchorRef: reviewAnchorRef, scrollRef: reviewScrollRef } = useScrollParent<HTMLDivElement>(isMobile);
   const [viewMode, setViewMode] = useState<'grid' | 'table'>('grid');
   const [previewPhoto, setPreviewPhoto] = useState<DryRunItem | null>(null);
 
@@ -77,23 +98,34 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
       if (p.status === 'completed' || p.status === 'error') {
         setIsOrganizing(false);
       }
+      if (p.status === 'error') {
+        notify('error', `Organizing stopped: ${p.errorMessage || 'an error occurred'}`);
+      }
     });
     return () => unsubscribe();
   }, []);
 
   const handleSelectSource = async () => {
-    const dir = await selectDirectoryOrPrompt('Enter the full path to the source folder:');
-    if (dir) {
-      setSourceDir(dir);
-      setDryRunResult(null);
+    try {
+      const dir = await selectDirectoryOrPrompt('Enter the full path to the source folder:');
+      if (dir) {
+        setSourceDir(dir);
+        setDryRunResult(null);
+      }
+    } catch (err) {
+      notifyError('Choose source folder', err);
     }
   };
 
   const handleSelectTarget = async () => {
-    const dir = await selectDirectoryOrPrompt('Enter the full path to the target folder:');
-    if (dir) {
-      setTargetDir(dir);
-      setDryRunResult(null);
+    try {
+      const dir = await selectDirectoryOrPrompt('Enter the full path to the target folder:');
+      if (dir) {
+        setTargetDir(dir);
+        setDryRunResult(null);
+      }
+    } catch (err) {
+      notifyError('Choose destination folder', err);
     }
   };
 
@@ -127,7 +159,7 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
         }
       }
     } catch (err) {
-      console.error('Dry-run failed:', err);
+      notifyError('Preview (dry-run) failed', err);
     } finally {
       setIsAnalyzing(false);
     }
@@ -157,12 +189,23 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
       };
 
       const res = await window.electronAPI.executeOrganize(options);
-      setCompletedSummary(res);
-      if (res.success && onOrganizeComplete) {
+      const errs = res?.errors && res.errors.length > 0 ? res.errors : (res?.success ? [] : ['The organize operation did not complete.']);
+      setCompletedSummary({ errors: errs, movedCount: res?.movedCount || 0 });
+      if (!res?.success || (res.errors && res.errors.length > 0)) {
+        notify(
+          'error',
+          res?.success
+            ? `Organized ${res.movedCount} photo(s), but ${res.errors.length} file(s) had problems.`
+            : `Organizing failed${res?.errors?.length ? `: ${res.errors[0]}` : '.'}`,
+          res?.errors?.slice(0, 20).join('\n')
+        );
+      }
+      if (res?.success && onOrganizeComplete) {
         onOrganizeComplete(targetDir);
       }
     } catch (err: any) {
-      console.error('Organization execution error:', err);
+      setProgress(null);
+      notifyError('Organize photos', err);
     } finally {
       setIsOrganizing(false);
     }
@@ -189,6 +232,19 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
     return parts.join('/') || 'Root';
   };
 
+  // Per-item derived values, computed once per dry run (not per render / keystroke).
+  const reviewRows = useMemo<ReviewRow[]>(() => {
+    if (!dryRunResult) return [];
+    return dryRunResult.items.map((item, idx) => ({
+      item,
+      idx,
+      fileName: item.sourceFile.split(/[\\/]/).pop() || item.sourceFile,
+      rel: getRelativeFolder(item.targetFile, targetDir),
+      srcLower: item.sourceFile.toLowerCase(),
+      tgtLower: item.targetFile.toLowerCase(),
+    }));
+  }, [dryRunResult, targetDir]);
+
   // Build hierarchical folder tree from dry run items
   const folderTree = useMemo(() => {
     if (!dryRunResult || !targetDir) return null;
@@ -201,8 +257,7 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
       children: new Map(),
     };
 
-    for (const item of dryRunResult.items) {
-      const relFolder = getRelativeFolder(item.targetFile, targetDir);
+    for (const { item, rel: relFolder } of reviewRows) {
       const parts = relFolder.split('/').filter(Boolean);
 
       let current = root;
@@ -228,31 +283,24 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
     }
 
     return root;
-  }, [dryRunResult, targetDir]);
+  }, [dryRunResult, targetDir, reviewRows]);
 
   // Filter items based on selected folder & search
   const displayedPhotos = useMemo(() => {
-    if (!dryRunResult) return [];
-
-    let filtered = dryRunResult.items;
+    let filtered = reviewRows;
     if (selectedFolderPath !== '__ALL__') {
-      filtered = filtered.filter((item) => {
-        const rel = getRelativeFolder(item.targetFile, targetDir);
-        return rel === selectedFolderPath || rel.startsWith(`${selectedFolderPath}/`);
-      });
-    }
-
-    if (searchTerm.trim()) {
-      const term = searchTerm.toLowerCase();
       filtered = filtered.filter(
-        (item) =>
-          item.sourceFile.toLowerCase().includes(term) ||
-          item.targetFile.toLowerCase().includes(term)
+        ({ rel }) => rel === selectedFolderPath || rel.startsWith(`${selectedFolderPath}/`)
       );
     }
 
+    if (debouncedSearch.trim()) {
+      const term = debouncedSearch.toLowerCase();
+      filtered = filtered.filter((r) => r.srcLower.includes(term) || r.tgtLower.includes(term));
+    }
+
     return filtered;
-  }, [dryRunResult, selectedFolderPath, searchTerm, targetDir]);
+  }, [reviewRows, selectedFolderPath, debouncedSearch]);
 
   const toggleFolderExpanded = (path: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -777,145 +825,152 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
                   split-pane body's single scroll region instead of its own
                   nested scrollbar, since that outer region is now the
                   flexible/scrollable container replacing the fixed 520px pane. */}
-              <div style={{ flex: isMobile ? undefined : 1, overflowY: isMobile ? 'visible' : 'auto', padding: '16px' }}>
+              <div ref={reviewAnchorRef} style={{ flex: isMobile ? undefined : 1, minHeight: 0, overflowY: isMobile ? 'visible' : 'auto', padding: '16px' }}>
                 {displayedPhotos.length === 0 ? (
                   <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--text-muted)' }}>
                     <ImageIcon size={42} style={{ margin: '0 auto 12px', opacity: 0.5 }} />
                     <div style={{ fontSize: '0.9rem', fontWeight: 600 }}>No photos match this folder or search</div>
                   </div>
                 ) : viewMode === 'grid' ? (
-                  <div style={{
-                    display: 'grid',
-                    gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))',
-                    gap: '14px',
-                  }}>
-                    {displayedPhotos.map((item, idx) => {
-                      const fileName = item.sourceFile.split(/[\\/]/).pop() || item.sourceFile;
-                      const relTarget = getRelativeFolder(item.targetFile, targetDir);
+                  <VirtualCardGrid
+                    key={isMobile ? 'm' : 'd'}
+                    items={displayedPhotos}
+                    getKey={(r) => String(r.idx)}
+                    scrollRef={reviewScrollRef}
+                    rowHeight={REVIEW_CARD_HEIGHT}
+                    minColWidth={180}
+                    gap={14}
+                    renderItem={({ item, fileName, rel: relTarget }) => (
+                      <div
+                        onClick={() => setPreviewPhoto(item)}
+                        style={{
+                          height: '100%',
+                          boxSizing: 'border-box',
+                          backgroundColor: 'var(--bg-surface-elevated)',
+                          borderRadius: 'var(--radius-md)',
+                          border: '1px solid var(--border-subtle)',
+                          overflow: 'hidden',
+                          cursor: 'pointer',
+                          transition: 'all 0.15s ease',
+                          display: 'flex',
+                          flexDirection: 'column',
+                        }}
+                      >
+                        {/* Thumbnail Image */}
+                        <div style={{ height: '130px', flexShrink: 0, backgroundColor: '#0f172a', position: 'relative' }}>
+                          <img
+                            src={getLocalPhotoUrl(item.sourceFile)}
+                            alt={fileName}
+                            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                            loading="lazy"
+                          />
+                          {/* Action Badge */}
+                          <span
+                            style={{
+                              position: 'absolute',
+                              top: '6px',
+                              right: '6px',
+                              padding: '2px 6px',
+                              borderRadius: '4px',
+                              fontSize: '0.68rem',
+                              fontWeight: 700,
+                              backgroundColor: item.isDuplicate ? 'rgba(245, 158, 11, 0.9)' : 'rgba(16, 185, 129, 0.9)',
+                              color: 'white',
+                              boxShadow: '0 2px 4px rgba(0,0,0,0.5)',
+                            }}
+                          >
+                            {item.conflictAction.toUpperCase()}
+                          </span>
+                        </div>
 
-                      return (
-                        <div
-                          key={idx}
-                          onClick={() => setPreviewPhoto(item)}
-                          style={{
-                            backgroundColor: 'var(--bg-surface-elevated)',
-                            borderRadius: 'var(--radius-md)',
-                            border: '1px solid var(--border-subtle)',
-                            overflow: 'hidden',
-                            cursor: 'pointer',
-                            transition: 'all 0.15s ease',
-                            display: 'flex',
-                            flexDirection: 'column',
-                          }}
-                        >
-                          {/* Thumbnail Image */}
-                          <div style={{ height: '130px', backgroundColor: '#0f172a', position: 'relative' }}>
-                            <img
-                              src={getLocalPhotoUrl(item.sourceFile)}
-                              alt={fileName}
-                              style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                              loading="lazy"
-                            />
-                            {/* Action Badge */}
-                            <span
-                              style={{
-                                position: 'absolute',
-                                top: '6px',
-                                right: '6px',
-                                padding: '2px 6px',
-                                borderRadius: '4px',
-                                fontSize: '0.68rem',
-                                fontWeight: 700,
-                                backgroundColor: item.isDuplicate ? 'rgba(245, 158, 11, 0.9)' : 'rgba(16, 185, 129, 0.9)',
-                                color: 'white',
-                                boxShadow: '0 2px 4px rgba(0,0,0,0.5)',
-                              }}
-                            >
-                              {item.conflictAction.toUpperCase()}
-                            </span>
+                        {/* Details */}
+                        <div style={{ padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: '3px', minWidth: 0 }}>
+                          <div
+                            style={{
+                              fontSize: '0.78rem',
+                              fontWeight: 600,
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                              whiteSpace: 'nowrap',
+                            }}
+                            title={fileName}
+                          >
+                            {fileName}
                           </div>
-
-                          {/* Details */}
-                          <div style={{ padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: '3px' }}>
-                            <div
-                              style={{
-                                fontSize: '0.78rem',
-                                fontWeight: 600,
-                                overflow: 'hidden',
-                                textOverflow: 'ellipsis',
-                                whiteSpace: 'nowrap',
-                              }}
-                              title={fileName}
-                            >
-                              {fileName}
-                            </div>
-                            <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>
-                              {new Date(item.date).toLocaleDateString()} • {formatBytes(item.fileSize)}
-                            </div>
-                            <div
-                              style={{
-                                fontSize: '0.68rem',
-                                color: 'var(--accent-cyan)',
-                                overflow: 'hidden',
-                                textOverflow: 'ellipsis',
-                                whiteSpace: 'nowrap',
-                                marginTop: '2px',
-                              }}
-                              title={item.targetFile}
-                            >
-                              📁 {relTarget}
-                            </div>
+                          <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                            {new Date(item.date).toLocaleDateString()} • {formatBytes(item.fileSize)}
+                          </div>
+                          <div
+                            style={{
+                              fontSize: '0.68rem',
+                              color: 'var(--accent-cyan)',
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                              whiteSpace: 'nowrap',
+                              marginTop: '2px',
+                            }}
+                            title={item.targetFile}
+                          >
+                            📁 {relTarget}
                           </div>
                         </div>
-                      );
-                    })}
-                  </div>
+                      </div>
+                    )}
+                  />
                 ) : (
-                  /* Table View — wrapped so its multiple columns scroll
-                     horizontally on mobile instead of overflowing the
-                     viewport or squeezing illegibly narrow. */
-                  <div style={{ overflowX: isMobile ? 'auto' : 'visible' }}>
-                  <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.78rem', fontFamily: 'var(--font-mono)' }}>
-                    <thead>
-                      <tr style={{ borderBottom: '1px solid var(--border-subtle)', backgroundColor: 'var(--bg-surface-elevated)', color: 'var(--text-muted)' }}>
-                        <th style={{ padding: '8px 12px' }}>Photo</th>
-                        <th style={{ padding: '8px 12px' }}>Capture Date</th>
-                        <th style={{ padding: '8px 12px' }}>Target Folder</th>
-                        <th style={{ padding: '8px 12px' }}>Size</th>
-                        <th style={{ padding: '8px 12px' }}>Action</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {displayedPhotos.map((item, idx) => {
-                        const fileName = item.sourceFile.split(/[\\/]/).pop() || item.sourceFile;
-                        const relTarget = getRelativeFolder(item.targetFile, targetDir);
-
-                        return (
-                          <tr
-                            key={idx}
+                  /* Table View — windowed rows (fixed height) on a CSS grid; wrapped so
+                     the columns scroll horizontally on mobile instead of squeezing. */
+                  <div data-no-vscroll style={{ overflowX: isMobile ? 'auto' : 'visible' }}>
+                    <div style={{ minWidth: isMobile ? '640px' : undefined, fontSize: '0.78rem', fontFamily: 'var(--font-mono)', textAlign: 'left' }}>
+                      <div style={{ display: 'grid', gridTemplateColumns: REVIEW_TABLE_COLUMNS, borderBottom: '1px solid var(--border-subtle)', backgroundColor: 'var(--bg-surface-elevated)', color: 'var(--text-muted)', fontWeight: 700 }}>
+                        <div style={{ padding: '8px 12px' }}>Photo</div>
+                        <div style={{ padding: '8px 12px' }}>Capture Date</div>
+                        <div style={{ padding: '8px 12px' }}>Target Folder</div>
+                        <div style={{ padding: '8px 12px' }}>Size</div>
+                        <div style={{ padding: '8px 12px' }}>Action</div>
+                      </div>
+                      <VirtualCardGrid
+                        key={isMobile ? 'm' : 'd'}
+                        items={displayedPhotos}
+                        getKey={(r) => String(r.idx)}
+                        scrollRef={reviewScrollRef}
+                        rowHeight={REVIEW_ROW_HEIGHT}
+                        minColWidth={100000}
+                        gap={0}
+                        renderItem={({ item, fileName, rel: relTarget }) => (
+                          <div
                             onClick={() => setPreviewPhoto(item)}
-                            style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.04)', cursor: 'pointer' }}
+                            style={{
+                              height: '100%',
+                              boxSizing: 'border-box',
+                              display: 'grid',
+                              gridTemplateColumns: REVIEW_TABLE_COLUMNS,
+                              alignItems: 'center',
+                              borderBottom: '1px solid rgba(255, 255, 255, 0.04)',
+                              cursor: 'pointer',
+                            }}
                           >
-                            <td style={{ padding: '6px 12px', display: 'flex', alignItems: 'center', gap: '8px', maxWidth: '240px' }}>
+                            <div style={{ padding: '6px 12px', display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
                               <img
                                 src={getLocalPhotoUrl(item.sourceFile)}
                                 alt=""
-                                style={{ width: '28px', height: '28px', borderRadius: '4px', objectFit: 'cover' }}
+                                loading="lazy"
+                                style={{ width: '28px', height: '28px', borderRadius: '4px', objectFit: 'cover', flexShrink: 0 }}
                               />
                               <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={fileName}>
                                 {fileName}
                               </span>
-                            </td>
-                            <td style={{ padding: '6px 12px', color: 'var(--text-secondary)' }}>
+                            </div>
+                            <div style={{ padding: '6px 12px', color: 'var(--text-secondary)' }}>
                               {new Date(item.date).toLocaleDateString()}
-                            </td>
-                            <td style={{ padding: '6px 12px', color: 'var(--accent-cyan)', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '220px' }} title={item.targetFile}>
+                            </div>
+                            <div style={{ padding: '6px 12px', color: 'var(--accent-cyan)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={item.targetFile}>
                               📁 {relTarget}
-                            </td>
-                            <td style={{ padding: '6px 12px', color: 'var(--text-muted)' }}>
+                            </div>
+                            <div style={{ padding: '6px 12px', color: 'var(--text-muted)' }}>
                               {formatBytes(item.fileSize)}
-                            </td>
-                            <td style={{ padding: '6px 12px' }}>
+                            </div>
+                            <div style={{ padding: '6px 12px' }}>
                               <span style={{
                                 padding: '2px 6px',
                                 borderRadius: '4px',
@@ -926,12 +981,11 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
                               }}>
                                 {item.conflictAction.toUpperCase()}
                               </span>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
+                            </div>
+                          </div>
+                        )}
+                      />
+                    </div>
                   </div>
                 )}
               </div>
@@ -974,8 +1028,8 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
       {completedSummary && (
         <div style={{
           marginTop: '16px',
-          backgroundColor: 'rgba(16, 185, 129, 0.12)',
-          border: '1px solid rgba(16, 185, 129, 0.3)',
+          backgroundColor: completedSummary.errors.length > 0 ? 'rgba(244, 63, 94, 0.12)' : 'rgba(16, 185, 129, 0.12)',
+          border: completedSummary.errors.length > 0 ? '1px solid rgba(244, 63, 94, 0.4)' : '1px solid rgba(16, 185, 129, 0.3)',
           borderRadius: 'var(--radius-lg)',
           padding: '24px',
           display: 'flex',
@@ -983,14 +1037,25 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
           gap: '16px',
           marginBottom: '20px',
         }}>
-          <CheckCircle2 size={32} color="var(--accent-emerald)" />
-          <div>
-            <h3 style={{ fontSize: '1.1rem', fontWeight: 700, color: 'var(--accent-emerald)', marginBottom: '4px' }}>
-              Organization Completed Successfully!
+          {completedSummary.errors.length > 0
+            ? <AlertTriangle size={32} color="var(--accent-rose)" />
+            : <CheckCircle2 size={32} color="var(--accent-emerald)" />}
+          <div style={{ minWidth: 0 }}>
+            <h3 style={{ fontSize: '1.1rem', fontWeight: 700, color: completedSummary.errors.length > 0 ? 'var(--accent-rose)' : 'var(--accent-emerald)', marginBottom: '4px' }}>
+              {completedSummary.errors.length > 0 ? 'Organization Finished With Problems' : 'Organization Completed Successfully!'}
             </h3>
             <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-              Successfully organized {completedSummary.movedCount} photos into date folders in {targetDir}.
+              Organized {completedSummary.movedCount} photos into date folders in {targetDir}.
+              {completedSummary.errors.length > 0 && ` ${completedSummary.errors.length} file(s) could not be processed:`}
             </p>
+            {completedSummary.errors.length > 0 && (
+              <ul style={{ margin: '6px 0 0', paddingLeft: '18px', fontSize: '0.78rem', color: 'var(--accent-rose)', maxHeight: '140px', overflowY: 'auto', wordBreak: 'break-all' }}>
+                {completedSummary.errors.slice(0, 50).map((e, i) => (
+                  <li key={i}>{e}</li>
+                ))}
+                {completedSummary.errors.length > 50 && <li>…and {completedSummary.errors.length - 50} more</li>}
+              </ul>
+            )}
           </div>
         </div>
       )}

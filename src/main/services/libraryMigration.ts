@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import { Photo, Person, DetectedFace, Album } from '../../types';
-import { getDb, runInTransaction, setActiveLibrary } from './db';
+import { getDb, getDbForLibraryPath, runInTransaction, setActiveLibrary } from './db';
+import type { DatabaseSync } from 'node:sqlite';
 import {
   upsertPhotos,
   replaceAllPeopleAndFaces,
@@ -38,16 +39,14 @@ export interface MigrationResult {
   backupPath?: string;
 }
 
-function isAlreadyMigrated(): boolean {
-  const db = getDb();
+function isAlreadyMigrated(db: DatabaseSync = getDb()): boolean {
   const row = db.prepare('SELECT value FROM meta WHERE key = ?').get('migrated_from_json') as
     | { value: string }
     | undefined;
   return !!row;
 }
 
-function markMigrated(sourcePath: string): void {
-  const db = getDb();
+function markMigrated(sourcePath: string, db: DatabaseSync = getDb()): void {
   db.prepare(
     `INSERT INTO meta (key, value) VALUES (?, ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value`
@@ -90,11 +89,16 @@ export function migrateLibraryJsonToSqliteIfNeeded(libraryJsonPath: string): Mig
   // library.json was last saved (falling back to the default database if none
   // was recorded) — people are migrated into the global, library-independent
   // database regardless (see replaceAllPeopleAndFaces).
-  setActiveLibrary(lib.selectedFolder || null);
-
-  if (isAlreadyMigrated() || getTotalPhotoCount() > 0) {
+  //
+  // The "already migrated / not empty" check uses that library's database
+  // EXPLICITLY, without repointing the ambient active library — repointing on
+  // a no-op call (e.g. a library.json that lingers because its rename
+  // failed) would hijack whichever library the caller just opened.
+  const targetDb = lib.selectedFolder ? getDbForLibraryPath(lib.selectedFolder) : getDb();
+  if (isAlreadyMigrated(targetDb) || getTotalPhotoCount(targetDb) > 0) {
     return { migrated: false, reason: 'already-migrated', photoCount: 0, peopleCount: 0, faceCount: 0, albumCount: 0 };
   }
+  setActiveLibrary(lib.selectedFolder || null);
 
   // People: the active library's own people list is primary, but the global
   // people registry (gphotos_people_v2) may hold custom names for people not

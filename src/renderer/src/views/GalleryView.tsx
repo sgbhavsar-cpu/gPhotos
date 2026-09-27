@@ -21,9 +21,10 @@ import {
   ZoomOut,
   Trash2,
   AlertTriangle,
-  MoreVertical
+  MoreVertical,
+  RotateCw
 } from 'lucide-react';
-import { Photo, VirtualStorageConfig, Album } from '../../types';
+import { Photo, VirtualStorageConfig, Album } from '../../../types';
 import { PhotoCard } from '../components/PhotoCard';
 import { libraryStore } from '../services/libraryStore';
 import { VirtualizedTimelineGallery, GalleryZoomLevel, ZOOM_LEVELS } from '../components/VirtualizedTimelineGallery';
@@ -33,6 +34,8 @@ import { createClusterFromSelectedPhotos } from '../services/deduplication';
 import { authFetch } from '../services/webAuthClient';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { BulkEditModal } from '../components/BulkEditModal';
+import { autoRotateUpright } from '../services/autoRotateUpright';
+import { notify, notifyError } from '../services/notifications';
 
 interface GalleryViewProps {
   photos: Photo[];
@@ -142,6 +145,24 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
     }
   };
 
+  // Automatic upright rotation of the selection (see services/autoRotateUpright.ts).
+  const [autoRotateBusy, setAutoRotateBusy] = useState(false);
+  const [autoRotateLabel, setAutoRotateLabel] = useState('Working…');
+  const handleAutoRotateSelected = async () => {
+    if (autoRotateBusy || selectedIds.size === 0) return;
+    const selected = photos.filter((p) => selectedIds.has(p.id));
+    setAutoRotateBusy(true);
+    setAutoRotateLabel('Checking…');
+    try {
+      await autoRotateUpright(selected, {
+        onProgress: (stage, done, total) =>
+          setAutoRotateLabel(stage === 'detecting' ? `Checking ${done}/${total}…` : `Rotating ${done}/${total}…`),
+      });
+    } finally {
+      setAutoRotateBusy(false);
+    }
+  };
+
   const handleSelectionChange = (newSelected: Set<string>) => {
     setSelectedIds(newSelected);
     if (!isSelectMode && newSelected.size > 0) {
@@ -178,11 +199,25 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
             : `${result.errors.length} of ${toDelete.length} photo(s) could not be deleted.`;
         }
       } else {
-        await authFetch('/api/delete-files', {
+        const res = await authFetch('/api/delete-files', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ filePaths, permanent: true }),
         });
+        if (!res.ok) throw new Error(`The server refused the delete (HTTP ${res.status}). Nothing was deleted.`);
+        try {
+          // If the server reports exactly what it deleted, only remove those from the library.
+          const body = await res.json();
+          if (body && Array.isArray(body.deletedPaths)) {
+            const deleted = new Set<string>(body.deletedPaths);
+            deletedIds = toDelete.filter((p) => deleted.has(p.originalRemotePath || p.filePath)).map((p) => p.id);
+            if (deletedIds.length < toDelete.length) {
+              failureMessage = `${toDelete.length - deletedIds.length} of ${toDelete.length} photo(s) could not be deleted.`;
+            }
+          }
+        } catch {
+          // Body isn't JSON: an ok status is all we can go on.
+        }
       }
 
       if (deletedIds.length > 0) {
@@ -195,6 +230,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       setShowDeleteConfirmModal(false);
 
       if (failureMessage) {
+        notify('error', failureMessage);
         setAlbumSuccessToast(
           deletedIds.length > 0
             ? `⚠ Deleted ${deletedIds.length} photo(s). ${failureMessage}`
@@ -206,7 +242,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
         setTimeout(() => setAlbumSuccessToast(null), 3500);
       }
     } catch (err: any) {
-      alert(`Failed to permanently delete photos: ${err.message}`);
+      notifyError('Delete photos', err);
     } finally {
       setIsDeleting(false);
     }
@@ -231,6 +267,35 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
 
     return result;
   }, [photos, filterFavorite, filterType]);
+
+  // Derived values that used to be recomputed by scanning every photo on each render (each selection toggle).
+  const excludedCount = useMemo(() => photos.filter((p) => p.isExcluded).length, [photos]);
+  const firstVirtualStorageName = useMemo(() => {
+    const v = filteredPhotos.find((p) => p.isVirtual);
+    return v ? (v.storageName || 'Network Mirror') : null;
+  }, [filteredPhotos]);
+  const hasVirtual = firstVirtualStorageName !== null;
+  const selectedPhotosForEdit = useMemo(
+    () => (showBulkEditModal ? photos.filter((p) => selectedIds.has(p.id)) : []),
+    [showBulkEditModal, photos, selectedIds]
+  );
+
+  // createClusterFromSelectedPhotos returns null unless 2+ distinct, non-hidden photos are selected;
+  // passing null on would open the cleaner in whole-library scan mode.
+  const openBestShotForSelection = () => {
+    if (!onOpenDuplicateCleaner) return;
+    try {
+      const selectedPhotos = photos.filter((p) => selectedIds.has(p.id));
+      const cluster = createClusterFromSelectedPhotos(selectedPhotos);
+      if (!cluster) {
+        notify('info', 'Select at least 2 different, visible photos to compare for the best shot.');
+        return;
+      }
+      onOpenDuplicateCleaner(cluster);
+    } catch (err) {
+      notifyError('Find best shot', err);
+    }
+  };
 
   const toggleSelectPhoto = (photoId: string) => {
     setSelectedIds((prev) => {
@@ -288,7 +353,11 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ items: itemsToRefresh }),
         });
-        if (res.ok) result = await res.json();
+        if (!res.ok) throw new Error(`The server could not refresh the thumbnails (HTTP ${res.status})`);
+        result = await res.json();
+      }
+      if (result && result.errors && result.errors.length > 0) {
+        notify('warning', `${result.errors.length} thumbnail(s) could not be refreshed from source.`, result.errors.join('\n'));
       }
 
       // 3. Immediately re-request fresh batch thumbnails for display
@@ -298,10 +367,15 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       }));
       requestBatchThumbnails(batchItems, 250);
 
-      setRefreshToast(`✓ Refreshed thumbnail cache for ${selectedPhotos.length} photo(s) from source!`);
+      const failedCount = result?.errors?.length || 0;
+      setRefreshToast(
+        failedCount > 0
+          ? `⚠ Refreshed ${Math.max(0, selectedPhotos.length - failedCount)} of ${selectedPhotos.length} thumbnail(s); ${failedCount} failed.`
+          : `✓ Refreshed thumbnail cache for ${selectedPhotos.length} photo(s) from source!`
+      );
       setTimeout(() => setRefreshToast(null), 4000);
     } catch (err: any) {
-      console.error('[GalleryView] Error refreshing thumbnails from source:', err);
+      notifyError('Refresh thumbnails from source', err);
       setRefreshToast(`Failed to refresh thumbnails: ${err.message || 'Unknown error'}`);
       setTimeout(() => setRefreshToast(null), 4000);
     } finally {
@@ -465,8 +539,6 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
     );
   }
 
-  const excludedCount = photos.filter((p) => p.isExcluded).length;
-
   const handleAddSelectedToAlbum = (e: React.FormEvent) => {
     e.preventDefault();
     if (selectedIds.size === 0) return;
@@ -519,7 +591,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
         ({filterFavorite || filterType !== 'all' ? filteredPhotos.length : (totalCount || filteredPhotos.length)})
       </span>
 
-      {!isMobile && filteredPhotos.some((p) => p.isVirtual) && (
+      {!isMobile && hasVirtual && (
         <span style={{
           display: 'inline-flex',
           alignItems: 'center',
@@ -534,7 +606,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
           marginLeft: '6px',
         }}>
           <HardDrive size={12} />
-          {filteredPhotos.find((p) => p.isVirtual)?.storageName || 'Network Mirror'}
+          {firstVirtualStorageName}
         </span>
       )}
     </div>
@@ -615,7 +687,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
     </button>
   ) : null;
 
-  const rescanButton = (filteredPhotos.some((p) => p.isVirtual) && onRefreshNetwork) ? (
+  const rescanButton = (hasVirtual && onRefreshNetwork) ? (
     <button
       className="btn btn-secondary"
       onClick={onRefreshNetwork}
@@ -785,14 +857,21 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
           <span>Refresh</span>
         </button>
 
+        <button
+          className="btn btn-secondary"
+          onClick={handleAutoRotateSelected}
+          disabled={autoRotateBusy || selectedIds.size === 0}
+          style={{ fontSize: '0.78rem', gap: '6px', padding: '6px 10px', flexShrink: 0 }}
+          title="Turn the selected photos upright automatically (looks for people's faces)"
+        >
+          <RotateCw size={14} className={autoRotateBusy ? 'animate-spin' : ''} />
+          <span>{autoRotateBusy ? autoRotateLabel : 'Upright'}</span>
+        </button>
+
         {selectedIds.size >= 2 && onOpenDuplicateCleaner && (
           <button
             className="btn btn-primary"
-            onClick={() => {
-              const selectedPhotos = photos.filter((p) => selectedIds.has(p.id));
-              const cluster = createClusterFromSelectedPhotos(selectedPhotos);
-              onOpenDuplicateCleaner(cluster);
-            }}
+            onClick={openBestShotForSelection}
             style={{
               fontSize: '0.78rem',
               gap: '6px',
@@ -1038,15 +1117,24 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
               <span>{isRefreshingThumbnails ? 'Refreshing...' : `Refresh Cache (${selectedIds.size})`}</span>
             </button>
 
+            {/* Automatic upright rotation of the selected photos (faces decide the orientation) */}
+            <button
+              className="btn btn-secondary"
+              onClick={handleAutoRotateSelected}
+              disabled={autoRotateBusy || selectedIds.size === 0}
+              data-testid="auto-rotate-upright"
+              style={{ fontSize: '0.85rem', gap: '8px', padding: '6px 14px' }}
+              title="Turn the selected photos upright automatically. The app looks for people's faces; photos without a clear answer are left unchanged."
+            >
+              <RotateCw size={16} className={autoRotateBusy ? 'animate-spin' : ''} />
+              <span>{autoRotateBusy ? autoRotateLabel : `Auto-Rotate Upright (${selectedIds.size})`}</span>
+            </button>
+
             {/* Deduplicate & Find Best Shot from Selected Photos */}
             {selectedIds.size >= 2 && onOpenDuplicateCleaner && (
               <button
                 className="btn btn-primary"
-                onClick={() => {
-                  const selectedPhotos = photos.filter((p) => selectedIds.has(p.id));
-                  const cluster = createClusterFromSelectedPhotos(selectedPhotos);
-                  onOpenDuplicateCleaner(cluster);
-                }}
+                onClick={openBestShotForSelection}
                 style={{
                   fontSize: '0.85rem',
                   gap: '8px',
@@ -1137,9 +1225,9 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
         <div
           style={{
             padding: '8px 24px',
-            backgroundColor: 'rgba(14, 165, 233, 0.15)',
-            borderBottom: '1px solid rgba(14, 165, 233, 0.4)',
-            color: 'var(--accent-cyan)',
+            backgroundColor: /^(⚠|Failed)/.test(refreshToast) ? 'rgba(244, 63, 94, 0.15)' : 'rgba(14, 165, 233, 0.15)',
+            borderBottom: /^(⚠|Failed)/.test(refreshToast) ? '1px solid rgba(244, 63, 94, 0.4)' : '1px solid rgba(14, 165, 233, 0.4)',
+            color: /^(⚠|Failed)/.test(refreshToast) ? 'var(--accent-rose)' : 'var(--accent-cyan)',
             fontSize: '0.85rem',
             fontWeight: 500,
             display: 'flex',
@@ -1232,7 +1320,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
             right: '24px',
             zIndex: 100,
             padding: '12px 20px',
-            backgroundColor: 'rgba(16, 185, 129, 0.95)',
+            backgroundColor: albumSuccessToast.startsWith('⚠') ? 'rgba(220, 38, 38, 0.95)' : 'rgba(16, 185, 129, 0.95)',
             color: 'white',
             fontWeight: 600,
             fontSize: '0.88rem',
@@ -1248,7 +1336,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       {/* Modal: Add to Album */}
       {showBulkEditModal && (
         <BulkEditModal
-          photos={photos.filter((p) => selectedIds.has(p.id))}
+          photos={selectedPhotosForEdit}
           onClose={() => setShowBulkEditModal(false)}
         />
       )}

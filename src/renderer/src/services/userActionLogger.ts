@@ -22,7 +22,7 @@ function describeTarget(el: Element | null): string {
       const label =
         node.getAttribute('aria-label') ||
         node.getAttribute('title') ||
-        (node as HTMLElement).innerText?.trim().slice(0, 40) ||
+        (node.childElementCount <= 8 ? node.textContent?.trim().slice(0, 40) : undefined) ||
         node.getAttribute('class')?.toString().slice(0, 60) ||
         tag;
       if (label) return `<${tag}> "${label}"`;

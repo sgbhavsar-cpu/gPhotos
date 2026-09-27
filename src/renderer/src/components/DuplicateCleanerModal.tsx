@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   X,
   Sparkles,
@@ -19,9 +19,10 @@ import {
   Info,
   Layers
 } from 'lucide-react';
-import { Photo, DuplicateCluster } from '../../types';
+import { Photo, DuplicateCluster } from '../../../types';
 import { identifyDuplicateClusters } from '../services/deduplication';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
+import { notify, notifyError } from '../services/notifications';
 
 interface DuplicateCleanerModalProps {
   photos: Photo[];
@@ -42,31 +43,58 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
   const [keptPhotoIds, setKeptPhotoIds] = useState<Record<string, Set<string>>>({});
   const [isDeleting, setIsDeleting] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [statusIsError, setStatusIsError] = useState(false);
+  // The first clustering pass is synchronous and can take seconds on big libraries; show a state first.
+  const [isScanning, setIsScanning] = useState(!initialCluster);
+  const photosRef = useRef(photos);
+  photosRef.current = photos;
   const [excludedPhotoIds, setExcludedPhotoIds] = useState<Set<string>>(new Set());
 
   // Fullscreen photo preview
   const [fullscreenPhoto, setFullscreenPhoto] = useState<Photo | null>(null);
 
+  // Runs on open (or when a different initial cluster is passed) — NOT whenever `photos` changes.
+  // The library array changes identity on every catalog page / face update, and re-clustering
+  // then would throw away the user's keep/remove choices mid-review. "Re-cluster" is explicit.
   useEffect(() => {
     if (initialCluster && Array.isArray(initialCluster.photos)) {
       setClusters([initialCluster]);
       setKeptPhotoIds({
         [initialCluster.id]: new Set([initialCluster.bestPhotoId]),
       });
+      setIsScanning(false);
       return;
     }
 
-    const found = identifyDuplicateClusters(photos);
-    setClusters(found);
+    setIsScanning(true);
+    const timer = setTimeout(() => {
+      try {
+        const found = identifyDuplicateClusters(photosRef.current);
+        setClusters(found);
+        setCurrentClusterIdx(0);
 
-    const initialKeepers: Record<string, Set<string>> = {};
-    for (const c of found) {
-      initialKeepers[c.id] = new Set([c.bestPhotoId]);
-    }
-    setKeptPhotoIds(initialKeepers);
-  }, [photos, initialCluster]);
+        const initialKeepers: Record<string, Set<string>> = {};
+        for (const c of found) {
+          initialKeepers[c.id] = new Set([c.bestPhotoId]);
+        }
+        setKeptPhotoIds(initialKeepers);
+      } catch (err) {
+        notifyError('Scan for duplicates', err);
+      } finally {
+        setIsScanning(false);
+      }
+    }, 30);
+    return () => clearTimeout(timer);
+  }, [initialCluster]);
 
   const activeCluster = clusters[currentClusterIdx];
+
+  // Keep the index in range when groups are removed (resolved, or every copy excluded).
+  useEffect(() => {
+    if (currentClusterIdx > 0 && currentClusterIdx >= clusters.length) {
+      setCurrentClusterIdx(Math.max(0, clusters.length - 1));
+    }
+  }, [clusters.length, currentClusterIdx]);
 
   // Helper to check if a photo in the active cluster is marked to keep
   const isPhotoKept = (clusterId: string, photoId: string): boolean => {
@@ -104,6 +132,7 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
       ...prev,
       [clusterId]: new Set(cluster.photos.map((p) => p.id)),
     }));
+    setStatusIsError(false);
     setStatusMessage('All photos in this group marked to KEEP.');
     setTimeout(() => setStatusMessage(null), 2500);
   };
@@ -116,6 +145,7 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
       ...prev,
       [clusterId]: new Set([cluster.bestPhotoId]),
     }));
+    setStatusIsError(false);
     setStatusMessage('Only AI Best Shot marked to KEEP.');
     setTimeout(() => setStatusMessage(null), 2500);
   };
@@ -131,6 +161,7 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
   // Facility to remove a photograph from clustering when it does not actually belong
   const handleExcludeFromCluster = (clusterId: string, photoId: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    if (isDeleting) return; // the in-flight delete is about to rewrite this group
     setExcludedPhotoIds((prev) => new Set(prev).add(photoId));
 
     setClusters((prevClusters) => {
@@ -176,8 +207,15 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
 
   // Re-cluster all eligible photos (excluding photos user marked as not duplicates)
   const handleReclusterAll = () => {
-    const eligible = photos.filter((p) => !excludedPhotoIds.has(p.id));
-    const found = identifyDuplicateClusters(eligible);
+    if (isDeleting) return;
+    let found: DuplicateCluster[];
+    try {
+      const eligible = photos.filter((p) => !excludedPhotoIds.has(p.id));
+      found = identifyDuplicateClusters(eligible);
+    } catch (err) {
+      notifyError('Re-cluster photos', err);
+      return;
+    }
     setClusters(found);
     setCurrentClusterIdx(0);
 
@@ -193,14 +231,22 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
 
   // Delete duplicates in active cluster (any photos not marked to keep)
   const handleDeleteRemaining = async () => {
-    if (!activeCluster) return;
+    if (!activeCluster || isDeleting) return;
 
     const keptSet = keptPhotoIds[activeCluster.id] || new Set([activeCluster.bestPhotoId]);
     const toDelete = activeCluster.photos.filter((p) => !keptSet.has(p.id));
     const count = toDelete.length;
 
     if (count === 0) {
-      alert('All photos in this group are currently selected to KEEP. To delete photos, uncheck the ones you want to remove.');
+      notify('info', 'All photos in this group are marked to KEEP. Uncheck the ones you want to remove.');
+      return;
+    }
+    if (keptSet.size === 0) {
+      notify('warning', 'Keep at least one photo in the group — this would move every copy to the Recycle Bin.');
+      return;
+    }
+    if (!window.electronAPI?.trashFiles) {
+      notify('error', 'Moving photos to the Recycle Bin is only available in the desktop app. Nothing was removed.');
       return;
     }
 
@@ -216,28 +262,26 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
       // Only remove photos that were actually trashed — a photo whose network
       // storage is offline is skipped by trashFiles rather than attempted, so
       // it must stay in the library instead of silently disappearing from view.
-      let trashedIds = toDelete.map((p) => p.id);
+      const result = await window.electronAPI.trashFiles(deletePaths);
+      const trashedPathSet = new Set(result?.trashedPaths || []);
+      const trashedIds = toDelete
+        .filter((p) => trashedPathSet.has(p.originalRemotePath || p.filePath))
+        .map((p) => p.id);
+      const errors = result?.errors || [];
+
       let failureMessage: string | null = null;
-
-      if (window.electronAPI?.trashFiles) {
-        const result = await window.electronAPI.trashFiles(deletePaths);
-        const trashedPathSet = new Set(result.trashedPaths);
-        trashedIds = toDelete
-          .filter((p) => trashedPathSet.has(p.originalRemotePath || p.filePath))
-          .map((p) => p.id);
-
-        if (result.errors.length > 0) {
-          const offlineCount = result.errors.filter((e) => e.includes('network storage is not available')).length;
-          failureMessage = offlineCount > 0
-            ? `${offlineCount} of ${count} photo(s) skipped — network storage is not available.`
-            : `${result.errors.length} of ${count} photo(s) could not be removed.`;
-        }
+      if (errors.length > 0 || trashedIds.length < count) {
+        const offlineCount = errors.filter((e) => e.includes('network storage is not available')).length;
+        failureMessage = offlineCount > 0
+          ? `${offlineCount} of ${count} photo(s) skipped — network storage is not available.`
+          : `${count - trashedIds.length} of ${count} photo(s) could not be removed.`;
       }
 
       if (trashedIds.length > 0) {
         libraryStore.removePhotos(trashedIds);
       }
 
+      setStatusIsError(!!failureMessage);
       setStatusMessage(
         failureMessage
           ? (trashedIds.length > 0
@@ -245,19 +289,26 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
               : `⚠ ${failureMessage}`)
           : `✓ Kept ${keptSet.size} photo(s) and safely removed ${count} duplicate(s)!`
       );
+      if (failureMessage) notify('error', failureMessage, errors.join('\n') || undefined);
       if (onPhotosDeleted) onPhotosDeleted(trashedIds.length);
 
-      // Remove this cluster from view
-      const remainingClusters = clusters.filter((_, idx) => idx !== currentClusterIdx);
-      setClusters(remainingClusters);
-      if (currentClusterIdx >= remainingClusters.length) {
-        setCurrentClusterIdx(Math.max(0, remainingClusters.length - 1));
-      }
+      // Drop this group only when it is resolved. If some copies could not be removed, keep the
+      // group (minus what WAS removed) so nothing that still exists silently vanishes from view.
+      // Keyed by cluster id against the LATEST list (not the pre-await closure); navigation and
+      // "not a duplicate" are disabled while deleting, and the effect below re-clamps the index.
+      const trashedSet = new Set(trashedIds);
+      const remainingInGroup = activeCluster.photos.filter((p) => !trashedSet.has(p.id));
+      const activeId = activeCluster.id;
+      setClusters((prev) =>
+        failureMessage && remainingInGroup.length >= 2
+          ? prev.map((c) => (c.id === activeId ? { ...c, photos: remainingInGroup } : c))
+          : prev.filter((c) => c.id !== activeId)
+      );
     } catch (err: any) {
-      alert(`Failed to delete duplicates: ${err.message}`);
+      notifyError('Move duplicates to the Recycle Bin', err);
     } finally {
       setIsDeleting(false);
-      setTimeout(() => setStatusMessage(null), 3500);
+      setTimeout(() => setStatusMessage(null), 5000);
     }
   };
 
@@ -417,10 +468,10 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
               style={{
                 marginBottom: '16px',
                 padding: '12px 18px',
-                backgroundColor: 'rgba(16, 185, 129, 0.15)',
-                border: '1px solid rgba(16, 185, 129, 0.3)',
+                backgroundColor: statusIsError ? 'rgba(244, 63, 94, 0.15)' : 'rgba(16, 185, 129, 0.15)',
+                border: statusIsError ? '1px solid rgba(244, 63, 94, 0.4)' : '1px solid rgba(16, 185, 129, 0.3)',
                 borderRadius: 'var(--radius-md)',
-                color: 'var(--accent-emerald)',
+                color: statusIsError ? 'var(--accent-rose)' : 'var(--accent-emerald)',
                 fontSize: '0.88rem',
                 fontWeight: 600,
                 display: 'flex',
@@ -428,12 +479,17 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
                 gap: '8px',
               }}
             >
-              <CheckCircle2 size={18} />
+              {statusIsError ? <AlertTriangle size={18} /> : <CheckCircle2 size={18} />}
               <span>{statusMessage}</span>
             </div>
           )}
 
-          {clusters.length === 0 ? (
+          {isScanning ? (
+            <div style={{ textAlign: 'center', padding: '60px 20px', color: 'var(--text-muted)' }}>
+              <RefreshCw size={40} className="animate-spin" color="var(--accent-primary)" style={{ margin: '0 auto 16px' }} />
+              <h3 style={{ fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-primary)' }}>Scanning for duplicates...</h3>
+            </div>
+          ) : clusters.length === 0 ? (
             <div style={{ textAlign: 'center', padding: '60px 20px', color: 'var(--text-muted)' }}>
               <ShieldCheck size={56} color="var(--accent-emerald)" style={{ margin: '0 auto 16px' }} />
               <h3 style={{ fontSize: '1.25rem', fontWeight: 700, color: 'var(--text-primary)', marginBottom: '8px' }}>
@@ -447,9 +503,16 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
                   className="btn btn-secondary"
                   onClick={() => {
                     setExcludedPhotoIds(new Set());
-                    const found = identifyDuplicateClusters(photos);
-                    setClusters(found);
-                    setCurrentClusterIdx(0);
+                    try {
+                      const found = identifyDuplicateClusters(photos);
+                      setClusters(found);
+                      setCurrentClusterIdx(0);
+                      const keepers: Record<string, Set<string>> = {};
+                      for (const c of found) keepers[c.id] = new Set([c.bestPhotoId]);
+                      setKeptPhotoIds(keepers);
+                    } catch (err) {
+                      notifyError('Scan for duplicates', err);
+                    }
                   }}
                   style={{ gap: '8px', padding: '10px 18px' }}
                 >
@@ -519,7 +582,7 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
                   {/* Navigation Arrows */}
                   <button
                     className="btn btn-secondary btn-icon"
-                    disabled={currentClusterIdx === 0}
+                    disabled={isDeleting || currentClusterIdx === 0}
                     onClick={() => setCurrentClusterIdx((v) => Math.max(0, v - 1))}
                     title="Previous Group"
                     style={{ width: '34px', height: '34px' }}
@@ -528,7 +591,7 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
                   </button>
                   <button
                     className="btn btn-secondary btn-icon"
-                    disabled={currentClusterIdx >= clusters.length - 1}
+                    disabled={isDeleting || currentClusterIdx >= clusters.length - 1}
                     onClick={() => setCurrentClusterIdx((v) => Math.min(clusters.length - 1, v + 1))}
                     title="Next Group"
                     style={{ width: '34px', height: '34px' }}

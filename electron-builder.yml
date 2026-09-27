@@ -32,6 +32,8 @@ asarUnpack:
   # unpacking this one small file removes any doubt/edge cases around it —
   # essentially free, since it's not a native binary.
   - "**/dist-electron/main/services/faceDetectionWorker.js"
+  # Same reasoning for the HEIC decode worker (see heicWorkerClient.ts).
+  - "**/dist-electron/main/services/heicWorker.js"
 win:
   icon: public/icon.png
   target:

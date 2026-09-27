@@ -1,8 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { X, Star, Sparkles, Check, Image as ImageIcon, CheckCircle2, User } from 'lucide-react';
-import { Person, Photo, DetectedFace } from '../../types';
+import { Person, Photo, DetectedFace } from '../../../types';
 import { FaceAvatar } from './FaceAvatar';
+import { VirtualCardGrid } from './VirtualCardGrid';
 import { libraryStore } from '../services/libraryStore';
+import { notifyError } from '../services/notifications';
 
 interface ChangeCoverFaceModalProps {
   person: Person;
@@ -21,8 +23,10 @@ export const ChangeCoverFaceModal: React.FC<ChangeCoverFaceModalProps> = ({
   const [selectedPhotoId, setSelectedPhotoId] = useState<string>(person.coverPhotoId || '');
   const [notification, setNotification] = useState<string | null>(null);
 
-  // Gather all photo/face candidate pairs for this person
-  const faceItems: Array<{
+  // Gather all photo/face candidate pairs for this person. Memoized: this scans every
+  // photo, and the modal re-renders on each notification/selection change.
+  const faceItems = useMemo(() => {
+  const items: Array<{
     photo: Photo;
     face: DetectedFace;
     isCurrent: boolean;
@@ -32,7 +36,7 @@ export const ChangeCoverFaceModal: React.FC<ChangeCoverFaceModalProps> = ({
   for (const photo of photos) {
     if (!photo.faces) continue;
     for (const face of photo.faces) {
-      if (face.personId === person.id) {
+      if (face.personId === person.id && face.box) {
         const area = (face.box.width || 50) * (face.box.height || 50);
         const sizeFactor = Math.min(2.0, Math.max(0.5, Math.sqrt(area) / 100));
         const conf = face.confidence || 0.8;
@@ -43,7 +47,7 @@ export const ChangeCoverFaceModal: React.FC<ChangeCoverFaceModalProps> = ({
 
         const isCurrent = (person.coverFaceId ? face.id === person.coverFaceId : photo.id === person.coverPhotoId);
 
-        faceItems.push({
+        items.push({
           photo,
           face,
           isCurrent,
@@ -54,11 +58,17 @@ export const ChangeCoverFaceModal: React.FC<ChangeCoverFaceModalProps> = ({
   }
 
   // Sort: current cover first, then highest quality score
-  faceItems.sort((a, b) => {
-    if (a.isCurrent) return -1;
-    if (b.isCurrent) return 1;
+  items.sort((a, b) => {
+    if (a.isCurrent !== b.isCurrent) return a.isCurrent ? -1 : 1;
     return b.score - a.score;
   });
+  return items;
+  }, [photos, person.id, person.coverFaceId, person.coverPhotoId]);
+
+  // Each tile decodes a full-resolution crop: the grid is windowed, so only the tiles in (or
+  // just beyond) view are mounted — and decoded — however many faces there are.
+  const FACE_TILE_HEIGHT = 190;
+  const gridScrollRef = useRef<HTMLDivElement>(null);
 
   // Handle Escape key
   useEffect(() => {
@@ -76,7 +86,12 @@ export const ChangeCoverFaceModal: React.FC<ChangeCoverFaceModalProps> = ({
   const handleSelectCover = (photoId: string, faceId: string) => {
     setSelectedPhotoId(photoId);
     setSelectedFaceId(faceId);
-    libraryStore.setPersonCover(person.id, photoId, faceId);
+    try {
+      libraryStore.setPersonCover(person.id, photoId, faceId);
+    } catch (err) {
+      notifyError('Change cover face', err);
+      return;
+    }
     setNotification('✓ Cover face updated successfully!');
     if (onCoverChanged) onCoverChanged(photoId, faceId);
     setTimeout(() => setNotification(null), 3000);
@@ -191,29 +206,30 @@ export const ChangeCoverFaceModal: React.FC<ChangeCoverFaceModalProps> = ({
         )}
 
         {/* Candidates Grid */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '24px 28px' }}>
+        <div ref={gridScrollRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '24px 28px' }}>
           {faceItems.length === 0 ? (
             <div style={{ textAlign: 'center', padding: '60px 20px', color: 'var(--text-muted)' }}>
               <User size={48} style={{ margin: '0 auto 12px', opacity: 0.4 }} />
               <p>No detected face instances found for {person.name}.</p>
             </div>
           ) : (
-            <div
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))',
-                gap: '16px',
-              }}
-            >
-              {faceItems.map(({ photo, face, score }) => {
+            <VirtualCardGrid
+              items={faceItems}
+              getKey={({ face }) => face.id}
+              scrollRef={gridScrollRef}
+              rowHeight={FACE_TILE_HEIGHT}
+              minColWidth={150}
+              gap={16}
+              renderItem={({ photo, face, score }) => {
                 const isSelected = selectedFaceId === face.id || (!selectedFaceId && selectedPhotoId === photo.id);
 
                 return (
                   <div
-                    key={face.id}
                     onClick={() => handleSelectCover(photo.id, face.id)}
                     style={{
                       position: 'relative',
+                      height: '100%',
+                      boxSizing: 'border-box',
                       backgroundColor: 'var(--bg-surface-elevated)',
                       borderRadius: 'var(--radius-lg)',
                       border: isSelected
@@ -298,8 +314,8 @@ export const ChangeCoverFaceModal: React.FC<ChangeCoverFaceModalProps> = ({
                     </div>
                   </div>
                 );
-              })}
-            </div>
+              }}
+            />
           )}
         </div>
 
@@ -315,7 +331,7 @@ export const ChangeCoverFaceModal: React.FC<ChangeCoverFaceModalProps> = ({
           }}
         >
           <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-            {faceItems.length} face {faceItems.length === 1 ? 'instance' : 'instances'} available
+            {faceItems.length} face {faceItems.length === 1 ? 'instance' : 'instances'} available{faceItems.length > 1 ? ' (best quality first)' : ''}
           </span>
 
           <button

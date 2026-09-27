@@ -8,6 +8,14 @@
 export interface FolderBrowserRequest {
   title?: string;
   initialPath?: string;
+  /** Only this folder and the folders below it can be browsed to and chosen. */
+  restrictToRoot?: string;
+  /** Label of the confirm button (default "Select This Folder"). */
+  confirmLabel?: string;
+  /** One line of explanation shown under the title. */
+  hint?: string;
+  /** Show a "new folder" name box: the chosen path becomes <current folder>/<name>. */
+  allowNewFolder?: boolean;
 }
 
 type Listener = (request: FolderBrowserRequest | null) => void;
@@ -24,6 +32,8 @@ export function subscribeFolderBrowser(listener: Listener): () => void {
 
 export function requestFolderBrowser(request?: FolderBrowserRequest): Promise<string | null> {
   return new Promise((resolve) => {
+    // A newer request replaces the pending one: settle the old promise so its awaiting caller isn't stuck forever.
+    activeResolve?.(null);
     activeResolve = resolve;
     listeners.forEach((l) => l(request || {}));
   });

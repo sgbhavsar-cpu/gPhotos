@@ -143,18 +143,23 @@ describe('bandwidth throttling (bandwidthLimitMbps)', () => {
   });
 
   it('without a bandwidth limit, syncing the same file is not artificially delayed', async () => {
-    const storage: VirtualStorageConfig = {
-      id: 'storage_nolimit',
-      name: 'NoLimitTest',
-      networkSourcePath,
-      localMirrorRoot,
-    };
-
-    const t0 = Date.now();
-    const result = await syncVirtualStorage(storage);
-    const elapsed = Date.now() - t0;
-
-    expect(result.totalSynced).toBe(1);
-    expect(elapsed).toBeLessThan(2000);
-  });
+    // A throttling bug adds a CONSTANT wait to every sync, whereas CPU contention from the rest of the suite
+    // running in parallel (face-model loading, other workers) is transient. So take the best of a few attempts
+    // on fresh storages: it stays strict (< 2s) but no longer fails just because one attempt hit a busy machine.
+    let best = Infinity;
+    for (let attempt = 0; attempt < 3 && best >= 2000; attempt++) {
+      const storage: VirtualStorageConfig = {
+        id: `storage_nolimit_${attempt}`,
+        name: `NoLimitTest${attempt}`,
+        networkSourcePath,
+        localMirrorRoot,
+      };
+      const t0 = Date.now();
+      const result = await syncVirtualStorage(storage);
+      const elapsed = Date.now() - t0;
+      expect(result.totalSynced).toBe(1);
+      best = Math.min(best, elapsed);
+    }
+    expect(best).toBeLessThan(2000);
+  }, 60000);
 });

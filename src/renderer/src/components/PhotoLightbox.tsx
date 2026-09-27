@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   X,
   Image as ImageIcon,
@@ -42,18 +42,22 @@ import {
   BookImage,
   Star
 } from 'lucide-react';
-import { Photo, Person, DetectedFace, LocationMetadata } from '../../types';
+import { Photo, Person, DetectedFace, LocationMetadata } from '../../../types';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { FaceAvatar } from './FaceAvatar';
 import { ReassignFaceModal } from './ReassignFaceModal';
 import { PersonNameInput } from './PersonNameInput';
 import { LocationPickerModal } from './LocationPickerModal';
 import { SetCoverPhotoModal } from './SetCoverPhotoModal';
-import { evictAndRefreshThumbnail } from '../services/asyncImageLoader';
+import { afterPhotoRotated } from '../services/photoRotation';
 import { authFetch } from '../services/webAuthClient';
 import { isOneDriveBackedPath } from '../services/storageValidation';
 import { logger } from '../services/logger';
 import { useIsMobile } from '../hooks/useIsMobile';
+import { notify, notifyError } from '../services/notifications';
+
+// True only for real, usable coordinates (guards .toFixed / links on undefined or NaN).
+const isFiniteCoord = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n);
 
 function getExpressionEmoji(expr?: string): string {
   if (!expr) return '';
@@ -196,12 +200,13 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
         );
       } else {
         setScanStatusMessage('✓ Date updated in the app, but the file itself could not be updated.');
+        notify('warning', 'Date updated in the app, but the photo file itself could not be updated.', fileRes?.error);
       }
       setTimeout(() => setScanStatusMessage(null), 4500);
     } catch (err) {
-      console.error('[PhotoLightbox] Failed to write date/EXIF:', err);
       libraryStore.updatePhoto({ ...photo, dateTaken: newDateIso });
       setIsEditingDate(false);
+      notifyError('Date saved in the app only — writing it to the file failed', err);
     } finally {
       setIsSavingDate(false);
     }
@@ -224,14 +229,19 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
 
     setIsSavingLocation(true);
     let geocoded: { lat: number; lon: number } | null = null;
+    let lookupFailed = false;
     try {
       const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(clean)}&limit=1`);
+      if (!res.ok) throw new Error(`Place lookup returned HTTP ${res.status}`);
       const data = await res.json();
       if (Array.isArray(data) && data[0]) {
-        geocoded = { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
+        const lat = parseFloat(data[0].lat);
+        const lon = parseFloat(data[0].lon);
+        if (Number.isFinite(lat) && Number.isFinite(lon)) geocoded = { lat, lon };
       }
     } catch (err) {
-      console.warn('[PhotoLightbox] Location geocoding failed:', err);
+      lookupFailed = true;
+      notifyError('Place lookup failed (offline?)', err);
     } finally {
       setIsSavingLocation(false);
     }
@@ -247,7 +257,9 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     setIsEditingLocation(false);
 
     if (!geocoded) {
-      setScanStatusMessage(`Saved "${clean}" as the label, but couldn't find map coordinates for it — use "Pin on Map" below to set it manually.`);
+      setScanStatusMessage(lookupFailed
+        ? `Saved "${clean}" as the label, but the place lookup failed — use "Pin on Map" below to set it manually.`
+        : `Saved "${clean}" as the label, but couldn't find map coordinates for it — use "Pin on Map" below to set it manually.`);
       setTimeout(() => setScanStatusMessage(null), 5000);
     } else {
       await writeLocationToFile(geocoded.lat, geocoded.lon);
@@ -267,9 +279,11 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
       if (fileRes?.isQueued) {
         setScanStatusMessage('✓ Location updated. Original storage is offline — it will be updated automatically once it reconnects.');
         setTimeout(() => setScanStatusMessage(null), 5000);
+      } else if (fileRes && fileRes.success === false) {
+        notify('warning', 'Location saved in the app, but the photo file itself could not be updated.', fileRes.error);
       }
     } catch (err) {
-      console.error('[PhotoLightbox] Failed to write location to file:', err);
+      notifyError('Location saved in the app only — writing it to the file failed', err);
     }
   };
 
@@ -282,6 +296,13 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const dragStartRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const markerDownRef = useRef<{ x: number; y: number } | null>(null);
+  // While panning, the transform is written straight to the stage element (this component is
+  // ~3000 lines; re-rendering it per mousemove made dragging a zoomed photo janky). React state
+  // (`pan`) is only committed on release. React doesn't touch style.transform in between as long
+  // as pan/zoom state — and so the transform string it renders — hasn't changed.
+  const stageRef = useRef<HTMLDivElement>(null);
+  const livePanRef = useRef<{ x: number; y: number } | null>(null);
 
   // Single Photo Scanning & Manual Tagging states
   const [isScanningSinglePhoto, setIsScanningSinglePhoto] = useState(false);
@@ -308,7 +329,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   useEffect(() => {
     window.electronAPI?.getOneDriveStatus?.().then((status) => {
       if (status?.detectedRoots) setOneDriveRoots(status.detectedRoots);
-    });
+    }).catch(() => {});
   }, []);
   const isOneDriveBacked = !!(photo.isVirtual && photo.originalRemotePath && isOneDriveBackedPath(photo.originalRemotePath, oneDriveRoots));
 
@@ -317,6 +338,9 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     if (photo.isVirtual && photo.originalRemotePath && window.electronAPI?.checkFileExists) {
       window.electronAPI.checkFileExists(photo.originalRemotePath).then((exists) => {
         if (isMounted) setIsOriginalAvailable(exists);
+      }).catch(() => {
+        // Unknown => treat as offline so the UI falls back to the cached mirror instead of staying "unknown" forever.
+        if (isMounted) setIsOriginalAvailable(false);
       });
     } else if (!photo.isVirtual) {
       // Regular local photo stored on current machine is always available
@@ -340,7 +364,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     }
     return () => {
       if (previousFullResOneDrivePath.current) {
-        window.electronAPI?.markOneDriveReclaimable?.([previousFullResOneDrivePath.current]).catch(() => {});
+        Promise.resolve(window.electronAPI?.markOneDriveReclaimable?.([previousFullResOneDrivePath.current])).catch(() => {});
         previousFullResOneDrivePath.current = null;
       }
     };
@@ -350,11 +374,14 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   useEffect(() => {
     setZoom(1);
     setPan({ x: 0, y: 0 });
+    livePanRef.current = null;
+    if (stageRef.current) stageRef.current.style.transform = 'translate(0px, 0px) scale(1)';
     setIsDragging(false);
     setIsTaggingMode(false);
     setScanStatusMessage(null);
     setIsEditing(false);
     setEditRotation(0);
+    rotateStateRef.current = { photoId: photo.id, queued: 0, busy: false, applied: 0 };
     setEditFlipH(false);
     setIsEditingLocation(false);
     setIsLightboxImgLoaded(false);
@@ -508,14 +535,14 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
           setCropRect(null);
           setIsCropping(false);
         } else {
-          alert(`Error saving photo: ${res.error || 'Unknown error'}`);
+          notifyError('Save photo', res.error || 'Unknown error');
         }
       } else {
         setScanStatusMessage('✓ Photo orientation updated!');
         setIsEditing(false);
       }
     } catch (err: any) {
-      alert(`Failed to save edit: ${err.message}`);
+      notifyError('Save photo edit', err);
     } finally {
       setIsSavingEdit(false);
       setTimeout(() => setScanStatusMessage(null), 4000);
@@ -531,6 +558,73 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
       });
     }
   }, [photo.id, photo.filePath]);
+
+  // Quick rotate. Clicks made while a rotation is in flight add up and are applied as ONE rotation afterwards.
+  // `editRotation` is only a CSS preview of what was requested: the part that is already in the file's pixels
+  // (`applied`) is dropped when the rotated picture has actually loaded (see the <img> onLoad), so there is
+  // neither a flash of the old orientation nor a double rotation.
+  const rotateStateRef = useRef({ photoId: photo.id, queued: 0, busy: false, applied: 0 });
+  const handleQuickRotate = async () => {
+    const st = rotateStateRef.current;
+    if (st.busy && st.photoId !== photo.id) return; // the previous photo's rotation is still finishing
+    if (st.photoId !== photo.id) Object.assign(st, { photoId: photo.id, queued: 0, applied: 0 });
+    setEditRotation((r) => (r + 90) % 360);
+    st.queued = (st.queued + 90) % 360;
+    if (st.busy) return;
+    st.busy = true;
+    const target = photo;
+    let inFlight = 0; // degrees currently being written (not yet in the file)
+    try {
+      while (st.queued !== 0) {
+        const degrees = st.queued;
+        st.queued = 0;
+        inFlight = degrees;
+        const localPath = target.filePath;
+        const remotePath = target.originalRemotePath;
+        let res: any = null;
+        if (window.electronAPI?.rotatePhoto) {
+          res = await window.electronAPI.rotatePhoto(localPath, degrees, remotePath);
+        } else {
+          const fetchRes = await authFetch('/api/rotate-photo', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filePath: localPath, originalRemotePath: remotePath, rotationDegrees: degrees }),
+          });
+          if (fetchRes.ok) res = await fetchRes.json();
+        }
+        if (!res || res.success === false) {
+          throw new Error(res?.error || res?.message || 'The photo could not be rotated on disk');
+        }
+
+        // If HEIC photo, flag and persist updated rotation to libraryStore
+        const isTargetHeic = /\.(heic|heif)$/i.test(localPath) || /\.(heic|heif)$/i.test(remotePath || '');
+        if (res?.isHeic || isTargetHeic || res?.isHeicRotated) {
+          const newRot = res?.heicRotation ?? (((target.heicRotation || target.rotation || 0) + degrees) % 360);
+          libraryStore.updatePhoto({ ...target, isHeicRotated: newRot !== 0, heicRotation: newRot, rotation: newRot });
+        }
+
+        // Mark the degrees as "in the file now" BEFORE the URL changes, so the load handler can subtract them.
+        st.applied = (st.applied + degrees) % 360;
+        inFlight = 0;
+        await afterPhotoRotated(target, degrees, 500);
+        if (res?.isQueued) {
+          setScanStatusMessage('✓ Rotated. The original storage is offline, so it will be rotated when it reconnects.');
+        } else {
+          setScanStatusMessage('✓ Rotated 90° clockwise');
+        }
+        setTimeout(() => setScanStatusMessage(null), 2500);
+      }
+    } catch (err: any) {
+      // What was requested but never reached the file (the failed rotation and anything queued behind it):
+      // drop that part of the preview so the picture does not lie.
+      const unapplied = (inFlight + st.queued) % 360;
+      setEditRotation((r) => (r - unapplied + 360) % 360);
+      st.queued = 0;
+      notifyError('Rotate photo', err);
+    } finally {
+      st.busy = false;
+    }
+  };
 
   // Helper to compute normalized coordinates across resolutions
   const getFaceNormalizedCoords = (
@@ -640,7 +734,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
       setTimeout(() => setScanStatusMessage(null), 3500);
     } catch (err) {
       logger.error('PhotoLightbox', 'detectFacesForced: threw an exception', { photoId: photo.id, err: String(err) });
-      console.error('Failed to scan faces in photo:', err);
+      notifyError('Scan faces', err);
       setScanStatusMessage('Error scanning faces.');
       setTimeout(() => setScanStatusMessage(null), 3500);
     } finally {
@@ -648,7 +742,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     }
   };
 
-  const currentIndex = allPhotos.findIndex((p) => p.id === photo.id);
+  const currentIndex = useMemo(() => allPhotos.findIndex((p) => p.id === photo.id), [allPhotos, photo.id]);
   const hasPrev = currentIndex > 0;
   const hasNext = currentIndex < allPhotos.length - 1;
 
@@ -664,6 +758,13 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   const handleWheel = (e: React.WheelEvent) => {
     e.preventDefault();
     e.stopPropagation();
+
+    // Zooming mid-drag: commit the pan drawn so far so the queued setPan(prev => ...) builds on it.
+    if (livePanRef.current) {
+      const live = livePanRef.current;
+      livePanRef.current = null;
+      setPan(live);
+    }
 
     const zoomStep = 1.15;
     let newZoom = e.deltaY < 0 ? zoom * zoomStep : zoom / zoomStep;
@@ -697,6 +798,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     if (zoom > 1 && e.button === 0) {
       if ((e.target as HTMLElement).closest('button, .face-tag-label, span')) return;
       setIsDragging(true);
+      livePanRef.current = null;
       dragStartRef.current = {
         x: e.clientX - pan.x,
         y: e.clientY - pan.y,
@@ -706,14 +808,23 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
 
   const handleMouseMove = (e: React.MouseEvent) => {
     if (isDragging && zoom > 1) {
-      setPan({
+      const next = {
         x: e.clientX - dragStartRef.current.x,
         y: e.clientY - dragStartRef.current.y,
-      });
+      };
+      if (stageRef.current) {
+        livePanRef.current = next;
+        stageRef.current.style.transform = `translate(${next.x}px, ${next.y}px) scale(${zoom})`;
+      } else {
+        setPan(next);
+      }
     }
   };
 
   const handleMouseUp = () => {
+    const live = livePanRef.current;
+    livePanRef.current = null;
+    if (live) setPan(live);
     setIsDragging(false);
   };
 
@@ -831,10 +942,13 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
       if (
         e.target instanceof HTMLInputElement ||
         e.target instanceof HTMLTextAreaElement ||
+        e.target instanceof HTMLSelectElement ||
         (e.target as HTMLElement)?.isContentEditable
       ) {
         return;
       }
+      // Ctrl/Cmd/Alt combos (e.g. Ctrl+F, Ctrl+I) must not trigger single-key shortcuts.
+      const hasModifier = e.ctrlKey || e.metaKey || e.altKey;
 
       if (e.key === 'Escape') {
         // Nested modals here (LocationPickerModal, ReassignFaceModal) mount
@@ -884,9 +998,9 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
         handlePrev();
       } else if (e.key === 'ArrowRight' && !isTaggingMode) {
         handleNext();
-      } else if (e.key === 'i') {
+      } else if (e.key === 'i' && !hasModifier) {
         setShowInfo((v) => !v);
-      } else if (e.key === 'f') {
+      } else if (e.key === 'f' && !hasModifier) {
         onToggleFavorite(photo.id);
       }
     };
@@ -906,6 +1020,9 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     isEditingLocation,
     isEditingDate,
     isEditing,
+    onClose,
+    onSelectPhoto,
+    onToggleFavorite,
   ]);
 
   const onImageLoad = () => {
@@ -1061,42 +1178,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
           {/* Quick Rotate button (rotates photo or local HEIC thumbnail) */}
           <button
             className="btn btn-ghost btn-icon"
-            onClick={async () => {
-              const localPath = photo.filePath;
-              const remotePath = photo.originalRemotePath;
-              try {
-                let res: any = null;
-                if (window.electronAPI?.rotatePhoto) {
-                  res = await window.electronAPI.rotatePhoto(localPath, 90, remotePath);
-                } else {
-                  const fetchRes = await authFetch('/api/rotate-photo', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ filePath: localPath, originalRemotePath: remotePath, rotationDegrees: 90 }),
-                  });
-                  if (fetchRes.ok) res = await fetchRes.json();
-                }
-
-                // If HEIC photo, flag and persist updated rotation to libraryStore
-                const isTargetHeic = /\.(heic|heif)$/i.test(localPath) || /\.(heic|heif)$/i.test(remotePath || '');
-                if (res?.isHeic || isTargetHeic || res?.isHeicRotated) {
-                  const newRot = res?.heicRotation ?? (((photo.heicRotation || photo.rotation || 0) + 90) % 360);
-                  libraryStore.updatePhoto({
-                    ...photo,
-                    isHeicRotated: newRot !== 0,
-                    heicRotation: newRot,
-                    rotation: newRot,
-                  });
-                }
-
-                setEditRotation((r) => (r + 90) % 360);
-                evictAndRefreshThumbnail(photo.thumbnailPath || photo.filePath, remotePath, 500);
-                setScanStatusMessage('✓ Rotated 90° clockwise');
-                setTimeout(() => setScanStatusMessage(null), 2500);
-              } catch (err: any) {
-                console.error('[PhotoLightbox] Rotate error:', err);
-              }
-            }}
+            onClick={handleQuickRotate}
             title="Rotate photo 90° clockwise"
           >
             <RotateCw size={18} />
@@ -1438,6 +1520,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
 
           {/* Transformed Stage holding BOTH Image and Face Overlays in lockstep */}
           <div
+            ref={stageRef}
             style={{
               position: 'relative',
               display: 'inline-block',
@@ -1483,6 +1566,14 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
               onLoad={() => {
                 setIsLightboxImgLoaded(true);
                 onImageLoad();
+                // The rotated pixels are on screen now: the part of the CSS preview that they already contain
+                // must go, or the picture would be rotated twice.
+                const st = rotateStateRef.current;
+                if (st.applied !== 0) {
+                  const applied = st.applied;
+                  st.applied = 0;
+                  setEditRotation((r) => (r - applied + 360) % 360);
+                }
               }}
               onError={() => {
                 if (isOriginalAvailable !== false && !fallbackToThumbnail && photo.isVirtual) {
@@ -1588,22 +1679,26 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                       const result = await window.electronAPI?.computeDescriptorForRegion?.(sourceFilePath, box);
                       descriptor = result?.descriptor;
                     } catch (err) {
-                      console.warn('Could not compute descriptor for manual box:', err);
+                      notify('warning', 'The face was tagged, but its recognition data could not be computed, so it will not help match other photos.', err instanceof Error ? err.message : undefined);
                     }
 
-                    const newFace = libraryStore.addManualFace(
-                      photo.id,
-                      box,
-                      descriptor,
-                      natW,
-                      natH
-                    );
-                    setIsTaggingMode(false);
-                    setShowFaces(true);
-                    setReassignFace({
-                      face: newFace,
-                      currentPersonName: 'New Face',
-                    });
+                    try {
+                      const newFace = libraryStore.addManualFace(
+                        photo.id,
+                        box,
+                        descriptor,
+                        natW,
+                        natH
+                      );
+                      setIsTaggingMode(false);
+                      setShowFaces(true);
+                      setReassignFace({
+                        face: newFace,
+                        currentPersonName: 'New Face',
+                      });
+                    } catch (err) {
+                      notifyError('Tag face', err);
+                    }
                   } else {
                     setScanStatusMessage('Click and drag across the face to create a box');
                     setTimeout(() => setScanStatusMessage(null), 3000);
@@ -1755,6 +1850,8 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
             {/* Face Bounding Box Overlays (Locked to transformed stage) */}
             {showFaces && imgRef.current && photo.faces && (
               photo.faces.map((face) => {
+                // A detection without a bounding box can't be drawn (and would throw below).
+                if (!face.box) return null;
                 const imgElem = imgRef.current!;
                 const natural = imgNaturalSize || {
                   width: imgElem.naturalWidth || photo.width || 500,
@@ -1784,6 +1881,14 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                   <div
                     key={face.id}
                     className="face-box-overlay"
+                    onMouseDown={(e) => { markerDownRef.current = { x: e.clientX, y: e.clientY }; }}
+                    onClick={(e) => {
+                      // Default action of a face marker: assign / reassign the person. A drag-pan that started on the box is not a click.
+                      const d = markerDownRef.current;
+                      if (isTaggingMode || (d && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 4)) return;
+                      e.stopPropagation();
+                      setReassignFace({ face, currentPersonName: personName });
+                    }}
                     onMouseEnter={() => setHoveredFaceId(face.id)}
                     onMouseLeave={() => setHoveredFaceId((prev) => (prev === face.id ? null : prev))}
                     style={{
@@ -2224,7 +2329,15 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                   {isOriginalAvailable ? (
                     <button
                       className="btn btn-secondary"
-                      onClick={() => photo.originalRemotePath && window.electronAPI?.openOriginalFile(photo.originalRemotePath)}
+                      onClick={async () => {
+                        if (!photo.originalRemotePath) return;
+                        try {
+                          const ok = await window.electronAPI?.openOriginalFile?.(photo.originalRemotePath);
+                          if (ok === false) notify('error', 'Could not open the original file location.');
+                        } catch (err) {
+                          notifyError('Show original in Explorer', err);
+                        }
+                      }}
                       style={{ width: '100%', fontSize: '0.75rem', padding: '6px 12px', gap: '6px' }}
                     >
                       <ExternalLink size={13} />
@@ -2276,7 +2389,9 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                   <div style={{ display: 'flex', gap: '12px', marginTop: '6px', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)', fontSize: '0.75rem' }}>
                     {photo.exif.focalLength && <span>{photo.exif.focalLength}mm</span>}
                     {photo.exif.fNumber && <span>ƒ/{photo.exif.fNumber}</span>}
-                    {photo.exif.exposureTime && <span>1/{Math.round(1 / photo.exif.exposureTime)}s</span>}
+                    {photo.exif.exposureTime && (
+                      <span>{photo.exif.exposureTime >= 0.5 ? `${Math.round(photo.exif.exposureTime * 10) / 10}s` : `1/${Math.round(1 / photo.exif.exposureTime)}s`}</span>
+                    )}
                     {photo.exif.iso && <span>ISO {photo.exif.iso}</span>}
                   </div>
                 </div>
@@ -2364,7 +2479,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
                     <div style={{ fontWeight: 600, fontSize: '0.9rem', color: 'var(--text-primary)' }}>
-                      {photo.location.label || (photo.location.latitude ? `${photo.location.latitude.toFixed(4)}, ${photo.location.longitude.toFixed(4)}` : 'Location named')}
+                      {photo.location.label || (isFiniteCoord(photo.location.latitude) && isFiniteCoord(photo.location.longitude) ? `${photo.location.latitude.toFixed(4)}, ${photo.location.longitude.toFixed(4)}` : 'Location named')}
                     </div>
                     <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
                       <button
@@ -2385,7 +2500,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                       </button>
                     </div>
                   </div>
-                  {photo.location.latitude !== 0 && photo.location.longitude !== 0 && (
+                  {isFiniteCoord(photo.location.latitude) && isFiniteCoord(photo.location.longitude) && (photo.location.latitude !== 0 || photo.location.longitude !== 0) && (
                     <>
                       <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
                         {photo.location.latitude.toFixed(5)}°, {photo.location.longitude.toFixed(5)}°
@@ -2846,11 +2961,11 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
               onSave={(clean) => {
                 const res = libraryStore.updatePersonName(renamePersonState.personId, clean);
                 if (!res.success) {
-                  alert(res.error || 'Failed to rename person');
+                  notify('error', res.error || 'Failed to rename person');
                   return;
                 }
                 if (res.merged) {
-                  alert(`Merged with existing person "${res.targetPersonName}".`);
+                  notify('info', `Merged with existing person "${res.targetPersonName}".`);
                 }
                 setRenamePersonState(null);
               }}

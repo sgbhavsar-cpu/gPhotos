@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { Folder, ArrowUp, X, Check, HardDrive, AlertCircle, RotateCw } from 'lucide-react';
 import { subscribeFolderBrowser, resolveFolderBrowser, FolderBrowserRequest } from '../services/folderBrowserController';
+import { notifyError } from '../services/notifications';
+import { isPathInsideRoot, isValidFolderName, joinChildPath } from '../services/pathUtils';
 
 interface DirEntry {
   name: string;
@@ -17,6 +19,11 @@ interface BrowseResult {
 interface FolderBrowserModalProps {
   title?: string;
   initialPath?: string;
+  /** Only this folder and the folders below it can be browsed to and chosen. */
+  restrictToRoot?: string;
+  confirmLabel?: string;
+  hint?: string;
+  allowNewFolder?: boolean;
   onSelect: (path: string) => void;
   onCancel: () => void;
 }
@@ -31,28 +38,40 @@ interface FolderBrowserModalProps {
 export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
   title = 'Select a Folder',
   initialPath,
+  restrictToRoot,
+  confirmLabel = 'Select This Folder',
+  hint,
+  allowNewFolder = false,
   onSelect,
   onCancel,
 }) => {
   const [result, setResult] = useState<BrowseResult | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [pathInput, setPathInput] = useState(initialPath || '');
+  const [pathInput, setPathInput] = useState(initialPath || restrictToRoot || '');
+  const [newFolderName, setNewFolderName] = useState('');
 
   const load = async (targetPath?: string) => {
     setIsLoading(true);
     try {
+      // In a restricted browser a typed/pasted path (or "drive list") outside the root is not followed.
+      if (restrictToRoot && !isPathInsideRoot(targetPath, restrictToRoot)) {
+        if (targetPath) notifyError('Open folder', new Error(`Only folders inside "${restrictToRoot}" can be chosen here.`));
+        targetPath = restrictToRoot;
+      }
       const res = await window.electronAPI?.browseDirectory?.(targetPath);
       if (res) {
         setResult(res);
         setPathInput(res.path || '');
       }
+    } catch (err) {
+      notifyError('Open folder', err);
     } finally {
       setIsLoading(false);
     }
   };
 
   useEffect(() => {
-    load(initialPath);
+    load(initialPath || restrictToRoot);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -70,6 +89,11 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
 
   const currentPath = result?.path ?? null;
   const isAtDriveList = currentPath === null;
+  const atRestrictedRoot = !!restrictToRoot && !!currentPath && !isPathInsideRoot(result?.parent, restrictToRoot);
+  const canChooseHere = !!currentPath && (!restrictToRoot || isPathInsideRoot(currentPath, restrictToRoot));
+  const newName = newFolderName.trim();
+  const newNameInvalid = allowNewFolder && newName !== '' && !isValidFolderName(newName);
+  const chosenPath = currentPath && allowNewFolder && newName && !newNameInvalid ? joinChildPath(currentPath, newName) : currentPath;
 
   return (
     <div
@@ -124,12 +148,18 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
           </button>
         </div>
 
+        {(hint || restrictToRoot) && (
+          <div style={{ padding: '8px 20px', fontSize: '0.78rem', color: 'var(--text-secondary)', backgroundColor: 'var(--bg-surface-elevated)', borderBottom: '1px solid var(--border-subtle)' }}>
+            {hint || `Only folders inside ${restrictToRoot} can be chosen.`}
+          </div>
+        )}
+
         {/* Path bar: editable text + Go, plus Up */}
         <div style={{ padding: '12px 20px', borderBottom: '1px solid var(--border-subtle)', display: 'flex', gap: '8px' }}>
           <button
             className="btn btn-secondary btn-icon"
             onClick={() => load(result?.parent === null ? undefined : result?.parent)}
-            disabled={isAtDriveList || isLoading}
+            disabled={isAtDriveList || isLoading || atRestrictedRoot}
             title="Go up one level"
             style={{ width: '36px', height: '36px', flexShrink: 0 }}
           >
@@ -201,10 +231,26 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
           )}
         </div>
 
+        {allowNewFolder && (
+          <div style={{ padding: '10px 20px', borderTop: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <Folder size={16} color="var(--text-muted)" />
+            <input
+              type="text"
+              className="input"
+              value={newFolderName}
+              onChange={(e) => setNewFolderName(e.target.value)}
+              placeholder="Optional: name of a NEW folder to create here"
+              data-testid="new-folder-name"
+              style={{ flex: 1, height: '34px', fontSize: '0.85rem', borderColor: newNameInvalid ? 'var(--accent-rose)' : undefined }}
+            />
+            {newNameInvalid && <span style={{ fontSize: '0.75rem', color: 'var(--accent-rose)' }}>Not a valid folder name</span>}
+          </div>
+        )}
+
         {/* Footer */}
         <div style={{ padding: '14px 20px', borderTop: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
           <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>
-            {currentPath || 'Select a drive'}
+            {chosenPath || 'Select a drive'}
           </span>
           <div style={{ display: 'flex', gap: '10px', flexShrink: 0 }}>
             <button className="btn btn-ghost" onClick={onCancel} style={{ height: '38px', padding: '0 16px' }}>
@@ -212,12 +258,12 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
             </button>
             <button
               className="btn btn-primary"
-              onClick={() => currentPath && onSelect(currentPath)}
-              disabled={!currentPath}
+              onClick={() => chosenPath && canChooseHere && !newNameInvalid && onSelect(chosenPath)}
+              disabled={!canChooseHere || newNameInvalid}
               style={{ height: '38px', padding: '0 20px', gap: '8px' }}
             >
               <Check size={16} />
-              <span>Select This Folder</span>
+              <span>{confirmLabel}</span>
             </button>
           </div>
         </div>
@@ -245,6 +291,10 @@ export const FolderBrowserModalHost: React.FC = () => {
     <FolderBrowserModal
       title={request.title}
       initialPath={request.initialPath}
+      restrictToRoot={request.restrictToRoot}
+      confirmLabel={request.confirmLabel}
+      hint={request.hint}
+      allowNewFolder={request.allowNewFolder}
       onSelect={(path) => resolveFolderBrowser(path)}
       onCancel={() => resolveFolderBrowser(null)}
     />
