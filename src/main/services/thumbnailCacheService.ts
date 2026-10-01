@@ -426,14 +426,13 @@ export async function rotateCachedHeicThumbnail(
   pathsToRotate.add(sourcePath);
   if (secondaryPath) pathsToRotate.add(secondaryPath);
 
-  // Check if sourcePath has sidecar metadata specifying originalFilePath
+  // Check if sourcePath has sidecar metadata specifying originalFilePath. Async: sourcePath can be
+  // a network-mounted original/mirror path, and a sync read there blocks the whole main process.
   try {
     const sidecarPath = sourcePath.replace(/\.[^/.]+$/, '.json');
-    if (fs.existsSync(sidecarPath)) {
-      const meta = JSON.parse(fs.readFileSync(sidecarPath, 'utf-8'));
-      if (meta.originalFilePath) {
-        pathsToRotate.add(meta.originalFilePath);
-      }
+    const meta = JSON.parse(await fs.promises.readFile(sidecarPath, 'utf-8'));
+    if (meta.originalFilePath) {
+      pathsToRotate.add(meta.originalFilePath);
     }
   } catch {}
 

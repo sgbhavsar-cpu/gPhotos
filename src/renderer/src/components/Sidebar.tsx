@@ -7,7 +7,6 @@ import {
   Heart,
   FolderOpen,
   Sparkles,
-  Layers,
   HardDrive,
   RefreshCw,
   FolderTree,
@@ -18,6 +17,7 @@ import {
   ChevronDown,
   ChevronRight,
   PauseCircle,
+  Wand2,
 } from 'lucide-react';
 import { LibraryState } from '../services/libraryStore';
 import { VirtualStorageConfig, NetworkStorageProgress } from '../../../types';
@@ -44,9 +44,8 @@ interface SidebarProps {
   storageProgressMap?: Record<string, NetworkStorageProgress>;
   onSelectStorage?: (storage: VirtualStorageConfig) => void;
   onRefreshStorage?: (storage: VirtualStorageConfig) => void;
-  onOpenDuplicateCleaner?: () => void;
   onOpenHelp?: () => void;
-  onOpenAiAssistant?: () => void;
+  onOpenSmartFlows?: () => void;
   onOpenLibrarySwitcher?: () => void;
 }
 
@@ -60,9 +59,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   storageProgressMap = {},
   onSelectStorage,
   onRefreshStorage,
-  onOpenDuplicateCleaner,
   onOpenHelp,
-  onOpenAiAssistant,
+  onOpenSmartFlows,
   onOpenLibrarySwitcher,
 }) => {
   const [isLibraryCollapsed, setIsLibraryCollapsed] = useState(false);
@@ -86,7 +84,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: 'virtual_storage' as ActiveTab, label: 'Network Mirrors', icon: HardDrive },
     { id: 'folders' as ActiveTab, label: 'Folder Tree', icon: FolderTree },
     { id: 'organize' as ActiveTab, label: 'Organize by Date', icon: FolderSync },
-    { id: 'settings' as ActiveTab, label: 'Settings & Mobile', icon: Settings },
+    { id: 'settings' as ActiveTab, label: 'Settings', icon: Settings },
   ];
 
   return (
@@ -181,35 +179,18 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </button>
         )}
 
-        {state.photos.length > 1 && onOpenDuplicateCleaner && (
-          <button
-            className="btn btn-secondary"
-            onClick={onOpenDuplicateCleaner}
-            style={{ width: '100%', justifyContent: 'flex-start', fontSize: '0.82rem', height: '38px', gap: '10px' }}
-            title="Cluster similar photos and suggest best shots to keep"
-          >
-            <Layers size={17} color="#818cf8" />
-            <span>Clean Duplicates</span>
-          </button>
-        )}
+        {/* "Clean Duplicates" and "Search with AI" live in the Photos page's own toolbar now
+            (GalleryView.tsx) — kept here too would just be a second way to reach the same thing. */}
 
-        {onOpenAiAssistant && (
+        {onOpenSmartFlows && (
           <button
             className="btn btn-secondary"
-            onClick={onOpenAiAssistant}
-            style={{
-              width: '100%',
-              justifyContent: 'flex-start',
-              fontSize: '0.82rem',
-              height: '38px',
-              gap: '10px',
-              background: 'linear-gradient(135deg, rgba(99, 102, 241, 0.15) 0%, rgba(168, 85, 247, 0.15) 100%)',
-              borderColor: 'rgba(168, 85, 247, 0.35)',
-            }}
-            title="Chat with AI assistant to search photos, people combinations, places and memories"
+            onClick={onOpenSmartFlows}
+            style={{ width: '100%', justifyContent: 'flex-start', fontSize: '0.82rem', height: '38px', gap: '10px' }}
+            title="Describe a kind of photo (screenshots, bills, visiting cards...) and auto-album or move matches"
           >
-            <Sparkles size={17} color="#c084fc" />
-            <span>Search with AI</span>
+            <Wand2 size={17} color="#c084fc" />
+            <span>Smart Flows</span>
           </button>
         )}
       </div>

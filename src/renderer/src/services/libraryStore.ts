@@ -1,4 +1,4 @@
-import { Photo, Person, DetectedFace, PlaceAlbum, Album, CatalogMeta } from '../../../types';
+import { Photo, Person, DetectedFace, PlaceAlbum, Album, AlbumChapter, CatalogMeta } from '../../../types';
 import { groupPhotosByPlace } from './placesService';
 import { logger } from './logger';
 import { trackBackendCall } from './responseTracker';
@@ -2780,6 +2780,16 @@ export class LibraryManager {
       album.coverPhotoId = album.photoIds.length > 0 ? album.photoIds[0] : undefined;
     }
 
+    // A photo removed from the album can't stay listed in one of its chapters either.
+    if (album.chapters) {
+      for (const chapter of album.chapters) {
+        chapter.photoIds = chapter.photoIds.filter((id) => !toRemoveSet.has(id));
+        if (chapter.coverPhotoId && toRemoveSet.has(chapter.coverPhotoId)) {
+          chapter.coverPhotoId = chapter.photoIds[0];
+        }
+      }
+    }
+
     album.updatedAt = new Date().toISOString();
     this.notify();
     return true;
@@ -2790,6 +2800,161 @@ export class LibraryManager {
     if (!album) return false;
 
     album.coverPhotoId = photoId;
+    album.updatedAt = new Date().toISOString();
+    this.notify();
+    return true;
+  }
+
+  // ================= ALBUM CHAPTERS =================
+  public createChapter(albumId: string, title: string, photoIds: string[] = []): AlbumChapter | null {
+    const album = this.state.albums.find((a) => a.id === albumId);
+    if (!album) return null;
+
+    const now = new Date().toISOString();
+    const chapter: AlbumChapter = {
+      id: `chapter_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      title: title.trim() || 'Untitled chapter',
+      photoIds: [],
+      createdAt: now,
+      updatedAt: now,
+    };
+    album.chapters = [...(album.chapters || []), chapter];
+    album.lastUsedChapterId = chapter.id;
+    album.updatedAt = now;
+    this.notify();
+
+    if (photoIds.length > 0) {
+      this.addPhotosToChapter(albumId, chapter.id, photoIds);
+    }
+    return chapter;
+  }
+
+  public renameChapter(albumId: string, chapterId: string, title: string): boolean {
+    const album = this.state.albums.find((a) => a.id === albumId);
+    const chapter = album?.chapters?.find((c) => c.id === chapterId);
+    if (!album || !chapter) return false;
+
+    chapter.title = title.trim() || chapter.title;
+    chapter.updatedAt = new Date().toISOString();
+    album.updatedAt = chapter.updatedAt;
+    this.notify();
+    return true;
+  }
+
+  public reorderChapters(albumId: string, orderedChapterIds: string[]): boolean {
+    const album = this.state.albums.find((a) => a.id === albumId);
+    if (!album?.chapters) return false;
+
+    const byId = new Map(album.chapters.map((c) => [c.id, c]));
+    const reordered = orderedChapterIds.map((id) => byId.get(id)).filter((c): c is AlbumChapter => !!c);
+    // Any chapter missing from the given order (shouldn't happen) is kept, appended at the end,
+    // so a chapter can never silently disappear from a reorder call.
+    for (const c of album.chapters) if (!orderedChapterIds.includes(c.id)) reordered.push(c);
+
+    album.chapters = reordered;
+    album.updatedAt = new Date().toISOString();
+    this.notify();
+    return true;
+  }
+
+  /**
+   * Deleting a chapter never deletes photos: they fall back to the album's default
+   * (no-chapter) bucket, exactly as if they'd never been chaptered.
+   */
+  public deleteChapter(albumId: string, chapterId: string): boolean {
+    const album = this.state.albums.find((a) => a.id === albumId);
+    if (!album?.chapters) return false;
+
+    const before = album.chapters.length;
+    album.chapters = album.chapters.filter((c) => c.id !== chapterId);
+    if (album.chapters.length === before) return false;
+
+    if (album.lastUsedChapterId === chapterId) album.lastUsedChapterId = undefined;
+    album.updatedAt = new Date().toISOString();
+    this.notify();
+    return true;
+  }
+
+  /**
+   * Adds photos to a chapter (creating the album membership too, if they weren't already in the
+   * album) and records this as the album's last-used chapter. A photo belongs to at most one
+   * chapter at a time, so it's removed from any other chapter of the same album first.
+   */
+  /**
+   * `insertBeforePhotoId`, if given and currently in this chapter, positions the moved photos
+   * right before it instead of appending them at the end — this is also how reordering *within*
+   * one chapter works: every chapter (including this one) is stripped of the moved ids first, so
+   * dropping a photo already in this chapter onto another one of its own photos just relocates it.
+   */
+  public addPhotosToChapter(albumId: string, chapterId: string, photoIds: string[], insertBeforePhotoId?: string): boolean {
+    const album = this.state.albums.find((a) => a.id === albumId);
+    const chapter = album?.chapters?.find((c) => c.id === chapterId);
+    if (!album || !chapter) return false;
+
+    const idsSet = new Set(photoIds);
+    for (const other of album.chapters!) {
+      other.photoIds = other.photoIds.filter((id) => !idsSet.has(id));
+    }
+
+    let insertIdx = chapter.photoIds.length;
+    if (insertBeforePhotoId) {
+      const idx = chapter.photoIds.indexOf(insertBeforePhotoId);
+      if (idx !== -1) insertIdx = idx;
+    }
+    chapter.photoIds.splice(insertIdx, 0, ...photoIds);
+    if (!chapter.coverPhotoId && chapter.photoIds.length > 0) chapter.coverPhotoId = chapter.photoIds[0];
+
+    const existingAlbumSet = new Set(album.photoIds);
+    for (const id of photoIds) {
+      if (!existingAlbumSet.has(id)) {
+        album.photoIds.push(id);
+        existingAlbumSet.add(id);
+      }
+    }
+    if (!album.coverPhotoId && album.photoIds.length > 0) album.coverPhotoId = album.photoIds[0];
+
+    const now = new Date().toISOString();
+    chapter.updatedAt = now;
+    album.lastUsedChapterId = chapterId;
+    album.updatedAt = now;
+    this.notify();
+    return true;
+  }
+
+  /** Moves photos back to the album's default (no-chapter) bucket without removing them from the album. */
+  public removePhotosFromChapter(albumId: string, chapterId: string, photoIds: string[]): boolean {
+    const album = this.state.albums.find((a) => a.id === albumId);
+    const chapter = album?.chapters?.find((c) => c.id === chapterId);
+    if (!album || !chapter) return false;
+
+    const toRemoveSet = new Set(photoIds);
+    chapter.photoIds = chapter.photoIds.filter((id) => !toRemoveSet.has(id));
+    if (chapter.coverPhotoId && toRemoveSet.has(chapter.coverPhotoId)) {
+      chapter.coverPhotoId = chapter.photoIds[0];
+    }
+    chapter.updatedAt = new Date().toISOString();
+    album.updatedAt = chapter.updatedAt;
+    this.notify();
+    return true;
+  }
+
+  /** Every album photo id not currently listed in any of its chapters. */
+  public getUnchapteredPhotoIds(album: Album): string[] {
+    if (!album.chapters || album.chapters.length === 0) return album.photoIds;
+    const chaptered = new Set(album.chapters.flatMap((c) => c.photoIds));
+    return album.photoIds.filter((id) => !chaptered.has(id));
+  }
+
+  /** Drops photos back to the album's default (no-chapter) bucket, whichever chapter(s) they were in — e.g. dragging a mixed-source selection onto "Other Photos". */
+  public removePhotosFromAllChapters(albumId: string, photoIds: string[]): boolean {
+    const album = this.state.albums.find((a) => a.id === albumId);
+    if (!album?.chapters || album.chapters.length === 0) return false;
+
+    const idsSet = new Set(photoIds);
+    for (const chapter of album.chapters) {
+      chapter.photoIds = chapter.photoIds.filter((id) => !idsSet.has(id));
+      if (chapter.coverPhotoId && idsSet.has(chapter.coverPhotoId)) chapter.coverPhotoId = chapter.photoIds[0];
+    }
     album.updatedAt = new Date().toISOString();
     this.notify();
     return true;

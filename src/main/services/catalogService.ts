@@ -57,11 +57,19 @@ export function computeTimelineSummary(photos: SummaryPhoto[]): TimelineMonthSum
 }
 
 function placeKeyAndName(loc: NonNullable<SummaryPhoto['location']>): { placeKey: string; albumName: string } {
+  // A custom label (set via "rename this location" on the map) is the user's own deliberate name
+  // for this spot and always wins over the auto-derived "City, Country" string — see the identical
+  // fix/comment in the renderer's placesService.ts (groupPhotosByPlace). This is a separate,
+  // SQL-backed fast-path duplicate of that same naming logic (startup/catalog summary, instead of
+  // recomputing from the full in-memory photo list), so it needed the identical fix on its own —
+  // renaming a cluster to "Andaman" kept showing as "Andaman, India" after a restart specifically
+  // because this copy of the logic never looked at the label either.
+  const customLabel = loc.label?.trim();
   if (loc.city && loc.country) {
-    return { placeKey: `${loc.city}_${loc.country}`.toLowerCase(), albumName: `${loc.city}, ${loc.country}` };
+    return { placeKey: `${loc.city}_${loc.country}`.toLowerCase(), albumName: customLabel || `${loc.city}, ${loc.country}` };
   }
   if (loc.city) {
-    return { placeKey: loc.city.toLowerCase(), albumName: loc.city };
+    return { placeKey: loc.city.toLowerCase(), albumName: customLabel || loc.city };
   }
   const gridLat = loc.latitude.toFixed(1);
   const gridLng = loc.longitude.toFixed(1);

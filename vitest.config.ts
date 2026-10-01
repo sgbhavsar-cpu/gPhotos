@@ -17,6 +17,7 @@ export default defineConfig({
   },
   test: {
     include: ['test/vitest/**/*.spec.ts'],
+    setupFiles: ['test/vitest/setup/isolateAppData.ts'],
     environment: 'node',
     testTimeout: 480000,
     hookTimeout: 30000,

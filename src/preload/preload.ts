@@ -105,6 +105,13 @@ const electronAPI: IElectronAPI = {
       ipcRenderer.removeListener('mirror:progress', subscription);
     };
   },
+  onPhotoRotationFailed: (callback) => {
+    const subscription = (_event: any, info: any) => callback(info);
+    ipcRenderer.on('photo:rotation-failed', subscription);
+    return () => {
+      ipcRenderer.removeListener('photo:rotation-failed', subscription);
+    };
+  },
   startBackgroundScan: (sourcePath: string, mirrorRoot?: string, storageName?: string) =>
     ipcRenderer.invoke('mirror:start-bg-scan', sourcePath, mirrorRoot, storageName),
   onBackgroundScanProgress: (callback) => {
@@ -155,6 +162,7 @@ const electronAPI: IElectronAPI = {
   switchLibrary: (targetPath: string) => ipcRenderer.invoke('catalog:switch-library', targetPath),
   getSpriteCoordinate: (photoPath: string) => ipcRenderer.invoke('sprite:get-coordinate', photoPath),
   getSpriteCoordinatesBatch: (photoPaths: string[]) => ipcRenderer.invoke('sprite:get-coordinates-batch', photoPaths),
+  invalidateSpriteCoordinate: (photoPath: string) => ipcRenderer.invoke('sprite:invalidate', photoPath),
   getPersonAvatarSprites: (items: Array<{ personId: string; cacheKey: string }>) => ipcRenderer.invoke('person:get-avatar-sprites', items),
   getThumbnailPreCacheStatus: () => ipcRenderer.invoke('service:get-precache-status'),
   startThumbnailPreCache: (photos) => ipcRenderer.invoke('service:start-precache', photos),
@@ -180,6 +188,46 @@ const electronAPI: IElectronAPI = {
   savePersonAvatar: (personId: string, cacheKey: string, dataUrl: string) =>
     ipcRenderer.invoke('person:save-avatar', personId, cacheKey, dataUrl),
   deletePersonAvatar: (personId: string) => ipcRenderer.invoke('person:delete-avatar', personId),
+  getPhotoContentEntry: (photoId: string) => ipcRenderer.invoke('photoContent:get', photoId),
+  getAllPhotoContentEntries: () => ipcRenderer.invoke('photoContent:get-all'),
+  upsertPhotoContentEntry: (photoId: string, entry: unknown) => ipcRenderer.invoke('photoContent:upsert', photoId, entry),
+  chooseVideoOutputPath: (suggestedName: string) => ipcRenderer.invoke('video:choose-output-path', suggestedName),
+  exportVideo: (request: unknown) => ipcRenderer.invoke('video:export', request),
+  cancelVideoExport: () => ipcRenderer.invoke('video:cancel-export'),
+  openVideoFile: (filePath: string) => ipcRenderer.invoke('video:open-file', filePath),
+  chooseAudioFile: () => ipcRenderer.invoke('audio:choose-file'),
+  getAudioPreview: (filePath: string, startSec: number, endSec: number | null) => ipcRenderer.invoke('audio:preview', filePath, startSec, endSec),
+  getYtDlpStatus: () => ipcRenderer.invoke('audio:ytdlp-status'),
+  installYtDlp: () => ipcRenderer.invoke('audio:ytdlp-install'),
+  downloadYouTubeAudio: (url: string) => ipcRenderer.invoke('audio:youtube-download', url),
+  cancelYouTubeDownload: () => ipcRenderer.invoke('audio:youtube-cancel'),
+  resolveMapsUrl: (url: string) => ipcRenderer.invoke('location:resolve-maps-url', url),
+  getMusicLibraryCached: () => ipcRenderer.invoke('music:cached'),
+  fetchMusicTrack: (trackId: string) => ipcRenderer.invoke('music:fetch-track', trackId),
+  onAudioFetchProgress: (callback: (p: { kind: 'install' | 'download'; pct: number }) => void) => {
+    const subscription = (_event: unknown, p: any) => callback(p);
+    ipcRenderer.on('audio:fetch-progress', subscription);
+    return () => {
+      ipcRenderer.removeListener('audio:fetch-progress', subscription);
+    };
+  },
+  ollamaRequest: (req: unknown) => ipcRenderer.invoke('ollama:request', req),
+  ollamaPull: (baseUrl: string, model: string) => ipcRenderer.invoke('ollama:pull', baseUrl, model),
+  ollamaCancelPull: (model: string) => ipcRenderer.invoke('ollama:cancel-pull', model),
+  onOllamaPullProgress: (callback: (p: { model: string; status: string; completed?: number; total?: number }) => void) => {
+    const subscription = (_event: unknown, p: any) => callback(p);
+    ipcRenderer.on('ollama:pull-progress', subscription);
+    return () => {
+      ipcRenderer.removeListener('ollama:pull-progress', subscription);
+    };
+  },
+  onVideoExportProgress: (callback: (p: { stage: 'preparing' | 'encoding'; done: number; total: number }) => void) => {
+    const subscription = (_event: unknown, p: any) => callback(p);
+    ipcRenderer.on('video:export-progress', subscription);
+    return () => {
+      ipcRenderer.removeListener('video:export-progress', subscription);
+    };
+  },
   getOneDriveStatus: () => ipcRenderer.invoke('onedrive:get-status'),
   setOneDriveReclaimEnabled: (enabled: boolean) => ipcRenderer.invoke('onedrive:set-reclaim-enabled', enabled),
   markOneDriveReclaimable: (filePaths: string[]) => ipcRenderer.invoke('onedrive:mark-reclaimable', filePaths),

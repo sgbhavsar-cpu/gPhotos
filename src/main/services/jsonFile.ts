@@ -40,6 +40,40 @@ export function writeJsonAtomic(filePath: string, data: unknown, space: number |
   writeFileAtomic(filePath, JSON.stringify(data, null, space));
 }
 
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Same temp-file-plus-rename atomic write as writeFileAtomic above, but non-blocking end to end —
+ * for any write of a file whose path might be a slow/degraded network mount (a photo being edited
+ * in place, say) rather than a small local config file. The sync version's `fs.*Sync` calls (and
+ * its `Atomics.wait`-based retry sleep) run on — and fully block — whichever thread calls them;
+ * from Electron's main process that is the one thread serving every other IPC call, menu action and
+ * window repaint, so a single slow network write there freezes the entire app, not just this call.
+ */
+export async function writeFileAtomicAsync(filePath: string, data: Buffer, mode?: number): Promise<void> {
+  const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}-${++tmpCounter}`;
+  try {
+    await fs.promises.writeFile(tmp, data, mode === undefined ? undefined : { mode });
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await fs.promises.rename(tmp, filePath);
+        break;
+      } catch (err: any) {
+        const transient = err && (err.code === 'EPERM' || err.code === 'EBUSY' || err.code === 'EACCES');
+        if (!transient || attempt >= 5) throw err;
+        await delay(20 * (attempt + 1));
+      }
+    }
+  } catch (err) {
+    await fs.promises.unlink(tmp).catch(() => {});
+    throw err;
+  }
+}
+
+export async function writeJsonAtomicAsync(filePath: string, data: unknown, space: number | undefined = 2): Promise<void> {
+  await writeFileAtomicAsync(filePath, Buffer.from(JSON.stringify(data, null, space), 'utf-8'));
+}
+
 /**
  * Reads + parses a JSON file. Missing file -> `fallback`. A file that exists
  * but does not parse is renamed to `<name>.corrupt-<timestamp>` (so the next

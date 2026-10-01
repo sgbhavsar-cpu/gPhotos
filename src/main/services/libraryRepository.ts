@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { getDb, getGlobalDb, getDbForLibraryPath, runInTransaction, resolveDbForPhoto, bumpFacesPeopleRevision } from './db';
-import { Photo, Person, DetectedFace, Album, ExifMetadata, LocationMetadata } from '../../types';
+import { Photo, Person, DetectedFace, Album, AlbumChapter, ExifMetadata, LocationMetadata, PhotoContentEntry } from '../../types';
 
 function toBool(v: any): boolean {
   return v === 1 || v === true;
@@ -678,7 +678,40 @@ export function replaceAllPeopleAndFaces(people: Person[], faces: DetectedFace[]
 // Albums
 // ---------------------------------------------------------------------------
 
+/**
+ * Reads the stored chapters, dropping anything that no longer matches the album: photos that left the album
+ * (deleted, removed) and photos claimed by an earlier chapter (a photo is in at most one chapter). Empty
+ * chapters are kept — a freshly created chapter is empty on purpose. Malformed JSON reads as "no chapters".
+ */
+function parseChapters(json: unknown, albumPhotoIds: string[]): AlbumChapter[] | undefined {
+  if (typeof json !== 'string' || !json) return undefined;
+  let raw: any;
+  try { raw = JSON.parse(json); } catch { return undefined; }
+  if (!Array.isArray(raw)) return undefined;
+  const inAlbum = new Set(albumPhotoIds);
+  const claimed = new Set<string>();
+  const chapters: AlbumChapter[] = [];
+  for (const c of raw) {
+    if (!c || typeof c.id !== 'string' || typeof c.title !== 'string') continue;
+    const photoIds = (Array.isArray(c.photoIds) ? c.photoIds : []).filter((id: unknown): id is string => {
+      if (typeof id !== 'string' || !inAlbum.has(id) || claimed.has(id)) return false;
+      claimed.add(id);
+      return true;
+    });
+    chapters.push({
+      id: c.id,
+      title: c.title,
+      photoIds,
+      coverPhotoId: typeof c.coverPhotoId === 'string' && inAlbum.has(c.coverPhotoId) ? c.coverPhotoId : undefined,
+      createdAt: typeof c.createdAt === 'string' ? c.createdAt : '',
+      updatedAt: typeof c.updatedAt === 'string' ? c.updatedAt : '',
+    });
+  }
+  return chapters.length ? chapters : undefined;
+}
+
 function rowToAlbum(row: any, photoIds: string[]): Album {
+  const chapters = parseChapters(row.chapters_json, photoIds);
   return {
     id: row.id,
     title: row.title,
@@ -688,17 +721,20 @@ function rowToAlbum(row: any, photoIds: string[]): Album {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     eventDate: row.event_date ?? undefined,
+    ...(chapters ? { chapters } : {}),
+    ...(chapters && row.last_used_chapter_id && chapters.some((c) => c.id === row.last_used_chapter_id) ? { lastUsedChapterId: row.last_used_chapter_id } : {}),
   };
 }
 
 export function upsertAlbum(album: Album, db: DatabaseSync = getDb()): void {
   runInTransaction(() => {
     db.prepare(
-      `INSERT INTO albums (id, title, description, cover_photo_id, created_at, updated_at, event_date)
-       VALUES (@id, @title, @description, @coverPhotoId, @createdAt, @updatedAt, @eventDate)
+      `INSERT INTO albums (id, title, description, cover_photo_id, created_at, updated_at, event_date, chapters_json, last_used_chapter_id)
+       VALUES (@id, @title, @description, @coverPhotoId, @createdAt, @updatedAt, @eventDate, @chaptersJson, @lastUsedChapterId)
        ON CONFLICT(id) DO UPDATE SET
          title=excluded.title, description=excluded.description, cover_photo_id=excluded.cover_photo_id,
-         updated_at=excluded.updated_at, event_date=excluded.event_date`
+         updated_at=excluded.updated_at, event_date=excluded.event_date,
+         chapters_json=excluded.chapters_json, last_used_chapter_id=excluded.last_used_chapter_id`
     ).run({
       id: album.id,
       title: album.title,
@@ -707,6 +743,8 @@ export function upsertAlbum(album: Album, db: DatabaseSync = getDb()): void {
       createdAt: album.createdAt,
       updatedAt: album.updatedAt,
       eventDate: album.eventDate ?? null,
+      chaptersJson: album.chapters && album.chapters.length ? JSON.stringify(album.chapters) : null,
+      lastUsedChapterId: album.lastUsedChapterId ?? null,
     } as any);
 
     db.prepare('DELETE FROM album_photos WHERE album_id = ?').run(album.id);
@@ -833,6 +871,18 @@ export function remapPhotoIdInDb(db: DatabaseSync, m: PhotoIdRemap): void {
     ).run(m.newId, len, m.oldId, m.newId, len, m.oldId);
     db.prepare('UPDATE album_photos SET photo_id = ? WHERE photo_id = ?').run(m.newId, m.oldId);
     db.prepare('UPDATE albums SET cover_photo_id = ? WHERE cover_photo_id = ?').run(m.newId, m.oldId);
+    // Chapters hold photo ids inside a JSON column, so those are re-pointed by hand.
+    const withChapters = db.prepare('SELECT id, chapters_json FROM albums WHERE chapters_json LIKE ?').all(`%${m.oldId}%`) as Array<{ id: string; chapters_json: string }>;
+    for (const row of withChapters) {
+      let chapters: any;
+      try { chapters = JSON.parse(row.chapters_json); } catch { continue; }
+      if (!Array.isArray(chapters)) continue;
+      for (const c of chapters) {
+        if (Array.isArray(c.photoIds)) c.photoIds = c.photoIds.map((id: string) => (id === m.oldId ? m.newId : id));
+        if (c.coverPhotoId === m.oldId) c.coverPhotoId = m.newId;
+      }
+      db.prepare('UPDATE albums SET chapters_json = ? WHERE id = ?').run(JSON.stringify(chapters), row.id);
+    }
   }, db);
 }
 
@@ -847,4 +897,49 @@ export function remapPeopleCoversForPhoto(oldId: string, newId: string): void {
     db.prepare('UPDATE people SET cover_face_id = ? || substr(cover_face_id, ? + 1) WHERE substr(cover_face_id, 1, ?) = ?')
       .run(newId, len, facePrefix.length, facePrefix);
   }, db);
+}
+
+// ================= SMART FLOWS: PHOTO CONTENT CACHE / RAG INDEX =================
+// One row per photo that has ever been sent to a vision model by any Smart Flow: a caption, a
+// few content tags, an embedding vector (for semantic local matching) and the exact verdicts
+// already given for specific flow descriptions. See photoContentCache.ts (renderer) for how this
+// is used to skip a repeat API call.
+function rowToPhotoContentEntry(row: any): PhotoContentEntry {
+  return {
+    caption: row.caption || '',
+    tags: row.tags_json ? JSON.parse(row.tags_json) : [],
+    embedding: row.embedding_json ? JSON.parse(row.embedding_json) : null,
+    verdicts: row.verdicts_json ? JSON.parse(row.verdicts_json) : {},
+    updatedAt: row.updated_at,
+  };
+}
+
+export function getPhotoContentEntry(photoId: string, db: DatabaseSync = getDb()): PhotoContentEntry | null {
+  const row = db.prepare('SELECT * FROM photo_content WHERE photo_id = ?').get(photoId) as any;
+  return row ? rowToPhotoContentEntry(row) : null;
+}
+
+/** Every cached entry for the current library, keyed by photo id — used to warm the renderer's in-memory mirror once per library. */
+export function getAllPhotoContentEntries(db: DatabaseSync = getDb()): Record<string, PhotoContentEntry> {
+  const rows = db.prepare('SELECT * FROM photo_content').all() as any[];
+  const out: Record<string, PhotoContentEntry> = {};
+  for (const row of rows) out[row.photo_id] = rowToPhotoContentEntry(row);
+  return out;
+}
+
+export function upsertPhotoContentEntry(photoId: string, entry: PhotoContentEntry, db: DatabaseSync = getDb()): void {
+  db.prepare(
+    `INSERT INTO photo_content (photo_id, caption, tags_json, embedding_json, verdicts_json, updated_at)
+     VALUES (@photoId, @caption, @tagsJson, @embeddingJson, @verdictsJson, @updatedAt)
+     ON CONFLICT(photo_id) DO UPDATE SET
+       caption=excluded.caption, tags_json=excluded.tags_json, embedding_json=excluded.embedding_json,
+       verdicts_json=excluded.verdicts_json, updated_at=excluded.updated_at`
+  ).run({
+    photoId,
+    caption: entry.caption || '',
+    tagsJson: JSON.stringify(entry.tags || []),
+    embeddingJson: entry.embedding ? JSON.stringify(entry.embedding) : null,
+    verdictsJson: JSON.stringify(entry.verdicts || {}),
+    updatedAt: entry.updatedAt,
+  } as any);
 }

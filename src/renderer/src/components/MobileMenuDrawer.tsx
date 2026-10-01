@@ -56,7 +56,7 @@ export const MobileMenuDrawer: React.FC<MobileMenuDrawerProps> = ({
     { id: 'folders' as ActiveTab, label: 'Folder Tree View', icon: FolderTree },
     { id: 'virtual_storage' as ActiveTab, label: 'Network Mirrors (NAS/SMB)', icon: HardDrive },
     { id: 'organize' as ActiveTab, label: 'Organize by Date', icon: FolderSync },
-    { id: 'settings' as ActiveTab, label: 'Settings & Mobile Server', icon: Settings },
+    { id: 'settings' as ActiveTab, label: 'Settings', icon: Settings },
   ];
 
   return (

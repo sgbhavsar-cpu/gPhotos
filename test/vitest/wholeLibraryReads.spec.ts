@@ -16,6 +16,7 @@ import {
 import {
   computeTimelineSummarySql,
   computePlacesSummarySql,
+  computePlacesSummary,
   getCatalogMeta,
 } from '../../src/main/services/catalogService';
 import type { Photo, DetectedFace, TimelineMonthSummary, PlaceSummaryItem, LocationMetadata } from '../../src/types';
@@ -311,6 +312,37 @@ describe('whole-library read paths (keyset pagination + SQL aggregates)', () => 
     expect(await getAllPhotosForSummary(db)).toEqual([]);
     expect(computeTimelineSummarySql(db)).toEqual([]);
     expect(computePlacesSummarySql(db)).toEqual([]);
+  });
+
+  // Reported bug: renaming a cluster of photos to "Andaman" (sets label + city, deliberately leaves
+  // the geographically-correct country alone) still showed "Andaman, India" after restarting the
+  // app — because this SQL-backed startup summary (computePlacesSummarySql, and its plain-JS
+  // sibling computePlacesSummary) has its own, separate copy of the "derive a place's display name"
+  // logic (placeKeyAndName), which the equivalent fix in the renderer's placesService.ts never
+  // reached. Both copies needed the identical fix: a custom label always wins over the "City,
+  // Country" string derived from city+country.
+  it('a custom label on the place wins over the derived "City, Country" name, in both the SQL and plain-JS summaries', () => {
+    const photos: Photo[] = [
+      {
+        id: 'photo_0000000', filePath: 'C:\\Photos\\andaman.jpg', fileName: 'andaman.jpg', fileSize: 1,
+        dateTaken: '2024-01-01T00:00:00Z', fileDate: '2024-01-01T00:00:00Z', year: 2024, month: 1, day: 1,
+        location: { latitude: 11.6, longitude: 92.7, city: 'Andaman', country: 'India', label: 'Andaman' },
+      } as any,
+      {
+        id: 'photo_0000001', filePath: 'C:\\Photos\\udaipur.jpg', fileName: 'udaipur.jpg', fileSize: 1,
+        dateTaken: '2024-01-02T00:00:00Z', fileDate: '2024-01-02T00:00:00Z', year: 2024, month: 1, day: 2,
+        location: { latitude: 24.5, longitude: 73.6, city: 'Udaipur', country: 'India' }, // never renamed
+      } as any,
+    ];
+    upsertPhotos(photos, db);
+
+    const sqlResult = computePlacesSummarySql(db);
+    expect(sqlResult.find((p) => p.city === 'Andaman')?.name).toBe('Andaman'); // not "Andaman, India"
+    expect(sqlResult.find((p) => p.city === 'Udaipur')?.name).toBe('Udaipur, India'); // unchanged without a label
+
+    const jsResult = computePlacesSummary(photos);
+    expect(jsResult.find((p) => p.city === 'Andaman')?.name).toBe('Andaman');
+    expect(jsResult.find((p) => p.city === 'Udaipur')?.name).toBe('Udaipur, India');
   });
 
   it('exactly one full chunk (2000 rows) terminates cleanly', async () => {

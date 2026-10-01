@@ -89,6 +89,21 @@ export function getSpritePath(spriteId: string): string {
 }
 
 /**
+ * Drops a photo's cached sprite coordinate — e.g. after its pixels changed (crop/rotate/flip in
+ * the lightbox editor) — so it's no longer handed out to a fresh lookup and stops being shown as
+ * a stale, pre-edit tile. The sprite sheet image itself isn't rewritten; the photo just falls back
+ * to its live/batch thumbnail until a future rebake includes it again.
+ */
+export function invalidateSpriteCoordinate(photoPath: string): void {
+  const index = loadSpriteIndex();
+  const key = photoPath.toLowerCase();
+  if (key in index) {
+    delete index[key];
+    saveSpriteIndex();
+  }
+}
+
+/**
  * Pre-bakes a tiled WebP sprite sheet for up to 50 photos.
  * Serves as 1 static image transferring 50 thumbnails in 1 request (~120 KB total).
  */

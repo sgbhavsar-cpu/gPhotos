@@ -12,6 +12,7 @@ import { FolderBrowserModalHost } from './components/FolderBrowserModal';
 import { DuplicateCleanerModal } from './components/DuplicateCleanerModal';
 import { HelpModal } from './components/HelpModal';
 import { AiAssistantModal } from './components/AiAssistantModal';
+import { SmartFlowsModal } from './components/SmartFlowsModal';
 import { LibrarySwitcherModal } from './components/LibrarySwitcherModal';
 import { SettingsView } from './views/SettingsView';
 import { MobileTopBar } from './components/MobileTopBar';
@@ -32,6 +33,9 @@ import { ResponseActivityIndicator } from './components/ResponseActivityIndicato
 import { PrefetchStatusIndicator } from './components/PrefetchStatusIndicator';
 import { responseTracker } from './services/responseTracker';
 import { splitStoragesByExistence, isPathConfirmedMissing } from './services/storageValidation';
+import { popTabHistory } from './services/tabHistory';
+import { bumpImageVersion } from './services/imageVersion';
+import { evictAndRefreshThumbnail, invalidateSpriteCoordinate } from './services/asyncImageLoader';
 import { useIsMobile } from './hooks/useIsMobile';
 
 export const App: React.FC = () => {
@@ -55,6 +59,14 @@ export const App: React.FC = () => {
   const [duplicateCleanerCluster, setDuplicateCleanerCluster] = useState<DuplicateCluster | null>(null);
   const [showHelpModal, setShowHelpModal] = useState(false);
   const [showAiAssistant, setShowAiAssistant] = useState(false);
+  const [showSmartFlows, setShowSmartFlows] = useState(false);
+  // Set when Smart Flows is opened via a "Run Smart Flow" button on a gallery/album selection,
+  // so the modal defaults its scope to just those photos instead of the whole library.
+  const [smartFlowsPreselect, setSmartFlowsPreselect] = useState<Photo[] | null>(null);
+  const handleRunSmartFlowOnSelection = (selected: Photo[]) => {
+    setSmartFlowsPreselect(selected);
+    setShowSmartFlows(true);
+  };
   const [showLibrarySwitcher, setShowLibrarySwitcher] = useState(false);
   const [showMobileDrawer, setShowMobileDrawer] = useState(false);
   const isMobile = useIsMobile();
@@ -183,6 +195,10 @@ export const App: React.FC = () => {
         setShowAiAssistant(false);
         return;
       }
+      if (showSmartFlows) {
+        setShowSmartFlows(false);
+        return;
+      }
       if (showLibrarySwitcher) {
         setShowLibrarySwitcher(false);
         return;
@@ -209,12 +225,9 @@ export const App: React.FC = () => {
 
       // 4. Pop tab navigation history back to previous tab
       if (activeTab !== 'photos') {
-        const history = tabHistoryRef.current;
-        while (history.length > 0 && history[history.length - 1] === activeTab) {
-          history.pop();
-        }
-        const previousTab = history.length > 0 ? history.pop()! : 'photos';
-        setActiveTab(previousTab);
+        const { previousTab, nextHistory } = popTabHistory(tabHistoryRef.current, activeTab, 'photos' as ActiveTab);
+        tabHistoryRef.current = nextHistory;
+        navigateToTab(previousTab);
       }
     };
 
@@ -225,6 +238,7 @@ export const App: React.FC = () => {
     showDuplicateCleaner,
     showHelpModal,
     showAiAssistant,
+    showSmartFlows,
     showLibrarySwitcher,
     showMobileDrawer,
     activeAiFilter,
@@ -699,6 +713,33 @@ export const App: React.FC = () => {
     };
   }, []);
 
+  // A background-queued original-photo rotation (see rotatePhotoWithOfflineQueue) that never made
+  // it — unsupported format, or persistently failing after several retries — once its local
+  // thumbnail was already optimistically rotated for instant feedback. The main process has already
+  // undone that thumbnail's rotation on disk by the time this fires; here we just tell the user why
+  // and make sure the grid re-fetches it instead of continuing to show the (now wrong) cached pixels.
+  // Doesn't also re-rotate the photo's stored face boxes back — unlike a normal rotate's own
+  // afterPhotoRotated — since that would only matter if faces were re-scanned in the narrow window
+  // between the original rotation and this eventual revert, which is an edge case of an edge case.
+  useEffect(() => {
+    if (!window.electronAPI?.onPhotoRotationFailed) return;
+    const unsubscribe = window.electronAPI.onPhotoRotationFailed((info) => {
+      const photo = libraryStore.getState().photos.find((p) =>
+        (info.localFilePath && p.filePath === info.localFilePath) || p.originalRemotePath === info.originalRemotePath
+      );
+      notify('warning', `Could not finish rotating "${photo?.fileName || info.originalRemotePath.split(/[\\/]/).pop()}" — ${info.reason}. The thumbnail has been reverted to its original orientation.`);
+      const thumbPath = info.localFilePath || photo?.filePath;
+      if (thumbPath) {
+        bumpImageVersion(thumbPath);
+        evictAndRefreshThumbnail(thumbPath, info.originalRemotePath, 250);
+        invalidateSpriteCoordinate(thumbPath);
+      }
+    });
+    return () => {
+      if (typeof unsubscribe === 'function') unsubscribe();
+    };
+  }, []);
+
   // Load any previously saved/interrupted storage checkpoints and library statuses
   useEffect(() => {
     if (window.electronAPI?.getStorageCheckpoints) {
@@ -1076,7 +1117,7 @@ export const App: React.FC = () => {
     try {
       const switched = await libraryStore.switchLibrary(dir);
       if (switched) {
-        setActiveTab('photos');
+        navigateToTab('photos');
         showToast(`Opened library: ${dir}`, 'success');
         // Cheap no-op for a library that was already indexed (every
         // candidate is filtered out by faceScanCompleted) — but for a
@@ -1090,7 +1131,7 @@ export const App: React.FC = () => {
       setSwitchingLibraryLabel(`Scanning ${dir}...`);
       const photos = await window.electronAPI.scanDirectory(dir);
       const enriched = libraryStore.setPhotos(photos, dir);
-      setActiveTab('photos');
+      navigateToTab('photos');
 
       // Unified single-pass: automatically run face detection on any remaining unscanned photos
       await runFaceDetectionForPhotos(enriched, false);
@@ -1111,7 +1152,7 @@ export const App: React.FC = () => {
     try {
       const switched = await libraryStore.switchLibrary(dirPath);
       if (switched) {
-        setActiveTab('photos');
+        navigateToTab('photos');
         showToast(`Switched library: ${dirPath}`, 'success');
         await runFaceDetectionForPhotos(libraryStore.getState().photos, false);
         return;
@@ -1121,7 +1162,7 @@ export const App: React.FC = () => {
         setSwitchingLibraryLabel(`Scanning ${dirPath}...`);
         const photos = await window.electronAPI.scanDirectory(dirPath);
         const enriched = libraryStore.setPhotos(photos, dirPath);
-        setActiveTab('photos');
+        navigateToTab('photos');
         await runFaceDetectionForPhotos(enriched, false);
       }
     } catch (err) {
@@ -1159,6 +1200,7 @@ export const App: React.FC = () => {
 
   const handleNavigateToPerson = (personId: string) => {
     setActiveLightboxPhoto(null);
+    setSelectedFolderForTree(null); // a stale folder selection from a different tab, not this one
     setSelectedPersonIdForView(personId);
     setActiveTab('people');
   };
@@ -1170,7 +1212,7 @@ export const App: React.FC = () => {
       try {
         const organizedPhotos = await window.electronAPI.scanDirectory(targetDir);
         libraryStore.setPhotos(organizedPhotos, targetDir);
-        setActiveTab('photos');
+        navigateToTab('photos');
       } catch (err) {
         notifyError('Could not load the organized folder', err);
       } finally {
@@ -1187,7 +1229,7 @@ export const App: React.FC = () => {
       try {
         const mirroredPhotos = await window.electronAPI.scanVirtualMirror(mirrorRootPath);
         const enriched = libraryStore.setPhotos(mirroredPhotos, mirrorRootPath);
-        setActiveTab('photos');
+        navigateToTab('photos');
 
         // Auto-run face detection on any remaining unscanned photos
         await runFaceDetectionForPhotos(enriched, false);
@@ -1213,7 +1255,7 @@ export const App: React.FC = () => {
       // storage take a long time and feel stuck.
       const switched = await libraryStore.switchLibrary(mirrorLocalPath);
       if (switched) {
-        setActiveTab('photos');
+        navigateToTab('photos');
         await runFaceDetectionForPhotos(libraryStore.getState().photos, false);
         return;
       }
@@ -1451,14 +1493,25 @@ export const App: React.FC = () => {
 
   const [tabResetTrigger, setTabResetTrigger] = useState<number>(0);
 
+  // The reset half of a tab switch, split out of handleSelectTab so every OTHER place that
+  // switches tabs directly (library open/switch, applying an AI filter, Smart Flows' "open
+  // Settings" link, ...) gets it too — not just a Sidebar click. Without this, a sub-view
+  // selection left over from before the switch (e.g. a Person's profile, a Folder) stays set on
+  // a tab the user is no longer viewing; the Escape handler below still finds it "active" and
+  // clears it first, which has no visible effect, making that Escape press look like it did
+  // nothing instead of navigating back a screen.
+  const navigateToTab = (tab: ActiveTab) => {
+    setSelectedPersonIdForView(null);
+    setSelectedFolderForTree(null);
+    setActiveTab(tab);
+  };
+
   const handleSelectTab = (tab: ActiveTab) => {
     logNavigation(tab, activeTab);
     stopBackgroundTasksImmediately();
     responseTracker.clearAll();
-    setSelectedPersonIdForView(null);
-    setSelectedFolderForTree(null);
     setTabResetTrigger(Date.now());
-    setActiveTab(tab);
+    navigateToTab(tab);
   };
 
   const handleOpenDuplicateCleaner = (cluster?: DuplicateCluster | null) => {
@@ -1509,9 +1562,8 @@ export const App: React.FC = () => {
           storageProgressMap={storageProgressMap}
           onSelectStorage={handleSelectVirtualStorage}
           onRefreshStorage={handleRefreshNetworkStorage}
-          onOpenDuplicateCleaner={() => handleOpenDuplicateCleaner()}
           onOpenHelp={() => setShowHelpModal(true)}
-          onOpenAiAssistant={() => setShowAiAssistant(true)}
+          onOpenSmartFlows={() => { setSmartFlowsPreselect(null); setShowSmartFlows(true); }}
           onOpenLibrarySwitcher={() => setShowLibrarySwitcher(true)}
         />
       )}
@@ -1540,6 +1592,8 @@ export const App: React.FC = () => {
             virtualStorages={virtualStorages}
             onSelectStorage={handleSelectVirtualStorage}
             onOpenDuplicateCleaner={handleOpenDuplicateCleaner}
+            onRunSmartFlow={handleRunSmartFlowOnSelection}
+            libraryFolder={libraryState.selectedFolder || libraryState.currentDirectory}
             onOpenHelp={() => setShowHelpModal(true)}
             onOpenAiSearch={() => setShowAiAssistant(true)}
             activeAiFilter={activeAiFilter}
@@ -1563,6 +1617,7 @@ export const App: React.FC = () => {
             virtualStorages={virtualStorages}
             onSelectStorage={handleSelectVirtualStorage}
             onOpenDuplicateCleaner={handleOpenDuplicateCleaner}
+            onRunSmartFlow={handleRunSmartFlowOnSelection}
             onOpenHelp={() => setShowHelpModal(true)}
             resetTrigger={tabResetTrigger}
           />
@@ -1576,6 +1631,7 @@ export const App: React.FC = () => {
               setActiveLightboxPhoto(p);
               setActiveLightboxContextIds(contextPhotos ? contextPhotos.map((cp) => cp.id) : null);
             }}
+            onRunSmartFlow={handleRunSmartFlowOnSelection}
             resetTrigger={tabResetTrigger}
           />
         )}
@@ -1629,6 +1685,7 @@ export const App: React.FC = () => {
             onStoragesUpdated={(storages) => updateVirtualStorages(() => storages)}
             storageProgressMap={storageProgressMap}
             onBrowseFolderTree={(folderPath) => {
+              setSelectedPersonIdForView(null); // a stale person selection from a different tab, not this one
               setSelectedFolderForTree(folderPath);
               setActiveTab('folders');
             }}
@@ -1761,12 +1818,26 @@ export const App: React.FC = () => {
       <AiAssistantModal
         photos={libraryState.photos}
         people={libraryState.people}
+        places={libraryState.places}
         isOpen={showAiAssistant}
         onClose={() => setShowAiAssistant(false)}
         onApplyFilter={(filter, matchedPhotos) => {
           setActiveAiFilter(filter);
           setAiFilteredPhotos(matchedPhotos);
-          setActiveTab('photos');
+          navigateToTab('photos');
+        }}
+      />
+
+      {/* Smart Flows Modal */}
+      <SmartFlowsModal
+        photos={libraryState.photos}
+        albums={libraryState.albums || []}
+        preselectedPhotos={smartFlowsPreselect || undefined}
+        isOpen={showSmartFlows}
+        onClose={() => { setShowSmartFlows(false); setSmartFlowsPreselect(null); }}
+        onOpenSettings={() => {
+          setShowSmartFlows(false);
+          navigateToTab('settings');
         }}
       />
 

@@ -14,7 +14,8 @@ import {
   MessageSquare,
   Trash2
 } from 'lucide-react';
-import { Photo, Person } from '../../../types';
+import { Photo, Person, PlaceAlbum } from '../../../types';
+import { MentionAutocompleteInput, type MentionSource } from './MentionAutocompleteInput';
 import {
   aiSearchService,
   AiSearchConfig,
@@ -23,6 +24,7 @@ import {
   AiProvider
 } from '../services/aiSearchService';
 import { getLocalPhotoUrl } from '../services/libraryStore';
+import { ensureLoaded as ensurePhotoContentLoaded, getAllKnownTags } from '../services/photoContentCache';
 
 interface AiChatMessage {
   id: string;
@@ -35,10 +37,16 @@ interface AiChatMessage {
 interface AiAssistantModalProps {
   photos: Photo[];
   people: Person[];
+  /** Offered as '#place' autocomplete suggestions in the search box. */
+  places?: PlaceAlbum[];
   isOpen: boolean;
   onClose: () => void;
   onApplyFilter: (filter: AiPhotoFilter, matchedPhotos: Photo[]) => void;
 }
+
+// Auto-generated placeholder names ("Person 12") from face clustering aren't useful @mentions —
+// they don't identify anyone the AI provider (or the person typing) can recognise.
+const isPlaceholderPersonName = (name: string) => /^Person\s+\d+$/i.test(name.trim());
 
 const SAMPLE_PROMPTS = [
   "Photo of rajshree's childhood",
@@ -51,6 +59,7 @@ const SAMPLE_PROMPTS = [
 export const AiAssistantModal: React.FC<AiAssistantModalProps> = ({
   photos,
   people,
+  places = [],
   isOpen,
   onClose,
   onApplyFilter,
@@ -80,6 +89,37 @@ export const AiAssistantModal: React.FC<AiAssistantModalProps> = ({
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isProcessing]);
+
+  // photoContentCache (Smart Flow captions/tags) is read synchronously by getAllKnownTags() below —
+  // warm its in-memory mirror once so tags from past Smart Flow runs are offered as "&tag" suggestions
+  // without needing a flow to run again first (same pattern as PhotoLightbox's AI Info panel).
+  const [tagsVersion, setTagsVersion] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    ensurePhotoContentLoaded().then(() => { if (!cancelled) setTagsVersion((n) => n + 1); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const mentionSources: MentionSource[] = React.useMemo(() => [
+    {
+      trigger: '@',
+      items: people.filter((p) => p.name && !isPlaceholderPersonName(p.name)).map((p) => ({ id: p.id, label: p.name })),
+      emptyLabel: 'No people found',
+    },
+    {
+      trigger: '#',
+      items: places.filter((pl) => pl.name?.trim()).map((pl) => ({ id: pl.id, label: pl.name })),
+      emptyLabel: 'No places found',
+    },
+    {
+      trigger: '&',
+      items: getAllKnownTags().map((tag) => ({ id: tag, label: tag })),
+      emptyLabel: 'No tags found — run a Smart Flow first to generate some',
+    },
+    // tagsVersion isn't read directly, but bumping it after ensurePhotoContentLoaded() resolves is
+    // what makes this recompute once getAllKnownTags() actually has something to return.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  ], [people, places, tagsVersion]);
 
   if (!isOpen) return null;
 
@@ -565,20 +605,15 @@ export const AiAssistantModal: React.FC<AiAssistantModalProps> = ({
             gap: '12px',
           }}
         >
-          <input
-            type="text"
+          <MentionAutocompleteInput
             className="input"
-            placeholder="Ask AI to find photos... (e.g. 'Photo of sachin and monika', 'Photo of monika alone')"
+            placeholder="Ask AI to find photos... (@ for people, # for places, & for Smart Flow tags)"
             value={inputText}
-            onChange={(e) => setInputText(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault();
-                handleSendMessage();
-              }
-            }}
+            onChange={setInputText}
+            onSubmit={() => handleSendMessage()}
+            sources={mentionSources}
             disabled={isProcessing}
-            style={{ height: '44px', flex: 1, fontSize: '0.9rem' }}
+            style={{ height: '44px', fontSize: '0.9rem' }}
             autoFocus
           />
 

@@ -190,6 +190,19 @@ const SCHEMA_STATEMENTS: string[] = [
     value_json TEXT NOT NULL
   )`,
 
+  // Smart Flows' shared per-photo "what does the AI think this photo is" cache/RAG index (see
+  // photoContentCache.ts): a caption + tags + embedding, plus exact verdicts already given for
+  // specific flow descriptions, kept once per photo — reused by every flow, not just the one that
+  // first asked — so classifying against a NEW flow rarely needs another vision API call.
+  `CREATE TABLE IF NOT EXISTS photo_content (
+    photo_id TEXT PRIMARY KEY,
+    caption TEXT,
+    tags_json TEXT,
+    embedding_json TEXT,
+    verdicts_json TEXT,
+    updated_at TEXT NOT NULL
+  )`,
+
   `CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -281,6 +294,9 @@ function applySchema(db: DatabaseSync): void {
   }
   // Columns added after a table's original CREATE TABLE IF NOT EXISTS need
   // an explicit ALTER for databases created before they existed.
+  // Album chapters (a JSON array) and the chapter last added to — before these columns existed, chapters lived only in memory.
+  ensureColumn(db, 'albums', 'chapters_json', 'TEXT');
+  ensureColumn(db, 'albums', 'last_used_chapter_id', 'TEXT');
   ensureColumn(db, 'photos', 'faces_locked', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'photos', 'thumbnail_cached_at', 'TEXT');
   ensureColumn(db, 'photos', 'onedrive_released_at', 'TEXT');

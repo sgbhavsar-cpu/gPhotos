@@ -22,6 +22,7 @@ import {
   deleteFilesPermanently,
   rotatePhotoWithOfflineQueue,
   processPendingRotations,
+  onRotationFailure,
   writePhotoMetadataWithOfflineQueue,
   processPendingMetadata,
   generateThumbnailBuffer,
@@ -76,12 +77,27 @@ import {
   switchCatalogLibrary,
 } from './services/catalogService';
 import { handleStorageSave, handleStorageLoad } from './services/storageHandlers';
-import { getPhotosByStorageName, getFacesForPhoto, getAllPeople, getSetting } from './services/libraryRepository';
+import {
+  getPhotosByStorageName,
+  getFacesForPhoto,
+  getAllPeople,
+  getSetting,
+  getPhotoContentEntry,
+  getAllPhotoContentEntries,
+  upsertPhotoContentEntry,
+} from './services/libraryRepository';
+import type { PhotoContentEntry } from '../types';
 import { getDbForLibraryPath } from './services/db';
 import type { DatabaseSync } from 'node:sqlite';
 import { detectFacesForPhoto, forceRedetectFacesForPhoto, resolveDbForPhoto, getSharedFaceClusterCache, type FaceClusterCache } from './services/pipelineOrchestrator';
 import { detectFaceInRegion, terminateFaceDetectionWorker, getFaceDetectionPoolSize } from './services/faceDetectionWorkerClient';
 import { assertPathsAllowed, isPathAllowed, getDefaultMirrorRoot } from './services/pathSecurity';
+import { exportVideo, getFfmpegPath, probeMedia, makeAudioPreview } from './services/videoExportService';
+import { resolveYtDlp, installYtDlp, downloadYouTubeAudio } from './services/ytDlpService';
+import { fetchMusicTrack, listCachedTrackIds } from './services/musicLibraryService';
+import { findMusicTrack } from '../types/musicCatalog';
+import { ollamaRequest, ollamaPull, type OllamaRequest } from './services/ollamaClient';
+import type { VideoExportRequest } from '../types';
 import { detectUprightRotations } from './services/orientationService';
 import { planRelocation, relocatePhotos } from './services/photoRelocation';
 import { browseDirectory } from './services/directoryBrowser';
@@ -89,6 +105,7 @@ import {
   getSpriteCoordinate,
   getSpriteCoordinatesBatch,
   getSpritePath,
+  invalidateSpriteCoordinate,
 } from './services/spriteService';
 import { thumbnailWorker } from './services/thumbnailWorkerService';
 import { libraryStatusService } from './services/libraryStatusService';
@@ -125,6 +142,15 @@ if (!gotSingleInstanceLock) {
 } else {
   initLogger();
   installHangWatchdog();
+  // A queued original-photo rotation that never made it (unsupported format, or persistently
+  // failing) after its local thumbnail was already optimistically rotated — forward it to the
+  // renderer as a toast + a thumbnail refresh, so the grid stops showing pixels the real file never
+  // actually matched.
+  onRotationFailure((info) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('photo:rotation-failed', info);
+    }
+  });
 }
 
 app.name = 'gPhotos';
@@ -858,6 +884,16 @@ ipcMain.handle('sprite:get-coordinates-batch', async (_event, photoPaths: string
   }
 });
 
+ipcMain.handle('sprite:invalidate', async (_event, photoPath: string) => {
+  try {
+    invalidateSpriteCoordinate(photoPath);
+    return true;
+  } catch (err) {
+    console.error('sprite:invalidate error:', err);
+    return false;
+  }
+});
+
 // Virtual Mirror & Network Storage Handlers
 ipcMain.handle('mirror:sync-storage', async (event, config: VirtualStorageConfig) => {
   try {
@@ -1063,6 +1099,239 @@ ipcMain.handle('photos:detect-orientation', async (event, photos: OrientationInp
     console.error('photos:detect-orientation error:', err);
     logger.error('Orientation', 'detect-orientation failed', { err: String(err?.stack || err) });
     throw err;
+  }
+});
+
+// Paths the user explicitly picked in the native save dialog. Those may be anywhere on disk (like every
+// other native-dialog pick in this app), so they're remembered here and accepted by video:export even
+// though they aren't under a known library root; anything else must pass the normal allow-list.
+const userApprovedVideoOutputs = new Set<string>();
+
+ipcMain.handle('video:choose-output-path', async (_event, suggestedName: string) => {
+  try {
+    if (!mainWindow) return null;
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Save Video As',
+      defaultPath: suggestedName || 'video.mp4',
+      filters: [{ name: 'MP4 Video', extensions: ['mp4'] }],
+    });
+    if (result.canceled || !result.filePath) return null;
+    userApprovedVideoOutputs.add(result.filePath);
+    return result.filePath;
+  } catch (err) {
+    console.error('video:choose-output-path error:', err);
+    return null;
+  }
+});
+
+// ---- Video music: a picked file or a YouTube download (see ytDlpService.ts) ----
+// Like the save dialog above, a file the user picked in the native dialog (or that we just downloaded)
+// may live anywhere, so those paths are remembered and accepted by audio:preview / video:export.
+const userApprovedAudioFiles = new Set<string>();
+const audioInfo = async (filePath: string) => ({ filePath, name: path.basename(filePath), durationSec: (await probeMedia(filePath)).durationSec });
+
+ipcMain.handle('audio:choose-file', async () => {
+  try {
+    if (!mainWindow) return null;
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose music for the video',
+      properties: ['openFile'],
+      filters: [{ name: 'Audio', extensions: ['mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg', 'opus', 'wma'] }, { name: 'All files', extensions: ['*'] }],
+    });
+    if (result.canceled || !result.filePaths[0]) return null;
+    const filePath = result.filePaths[0];
+    userApprovedAudioFiles.add(filePath);
+    return await audioInfo(filePath);
+  } catch (err) {
+    console.error('audio:choose-file error:', err);
+    return null;
+  }
+});
+
+ipcMain.handle('audio:preview', async (_event, filePath: string, startSec: number, endSec: number | null) => {
+  try {
+    if (typeof filePath !== 'string' || !userApprovedAudioFiles.has(filePath)) return null;
+    return await makeAudioPreview(filePath, Number(startSec) || 0, endSec == null ? null : Number(endSec));
+  } catch (err) {
+    console.error('audio:preview error:', err);
+    return null;
+  }
+});
+
+ipcMain.handle('audio:ytdlp-status', async () => (await resolveYtDlp(app.getPath('userData'))).status);
+
+let currentAudioFetchAbort: AbortController | null = null;
+
+ipcMain.handle('audio:ytdlp-install', async (event) => {
+  if (currentAudioFetchAbort) return { ok: false, error: 'Another download is already running.' };
+  const controller = new AbortController();
+  currentAudioFetchAbort = controller;
+  try {
+    const r = await installYtDlp({
+      userDataDir: app.getPath('userData'),
+      signal: controller.signal,
+      onProgress: (pct) => { try { if (!event.sender.isDestroyed()) event.sender.send('audio:fetch-progress', { kind: 'install', pct }); } catch {} },
+    });
+    logger.info('YtDlp', `Install: ${r.ok ? 'ok ' + (r.version || '') : 'failed'}`, { error: r.error });
+    return r;
+  } finally {
+    if (currentAudioFetchAbort === controller) currentAudioFetchAbort = null;
+  }
+});
+
+ipcMain.handle('audio:youtube-download', async (event, url: string) => {
+  if (typeof url !== 'string') return { ok: false, error: 'Invalid link.' };
+  if (currentAudioFetchAbort) return { ok: false, error: 'Another download is already running.' };
+  const controller = new AbortController();
+  currentAudioFetchAbort = controller;
+  try {
+    const { launcher, status } = await resolveYtDlp(app.getPath('userData'));
+    if (!status.installed) return { ok: false, error: 'yt-dlp is not installed yet.' };
+    const r = await downloadYouTubeAudio({
+      url,
+      outDir: path.join(app.getPath('userData'), 'audio_downloads'),
+      launcher,
+      ffmpegPath: getFfmpegPath(),
+      signal: controller.signal,
+      onProgress: (pct) => { try { if (!event.sender.isDestroyed()) event.sender.send('audio:fetch-progress', { kind: 'download', pct }); } catch {} },
+    });
+    if (!r.ok || !r.filePath) {
+      logger.warn('YtDlp', 'YouTube audio download failed', { error: r.error });
+      return { ok: false, error: r.error };
+    }
+    userApprovedAudioFiles.add(r.filePath);
+    return { ok: true, file: await audioInfo(r.filePath) };
+  } finally {
+    if (currentAudioFetchAbort === controller) currentAudioFetchAbort = null;
+  }
+});
+
+ipcMain.handle('music:cached', async () => listCachedTrackIds(app.getPath('userData')));
+
+ipcMain.handle('music:fetch-track', async (event, trackId: string) => {
+  const track = typeof trackId === 'string' ? findMusicTrack(trackId) : undefined;
+  if (!track) return { ok: false, error: 'Unknown track.' };
+  if (currentAudioFetchAbort) return { ok: false, error: 'Another download is already running.' };
+  const controller = new AbortController();
+  currentAudioFetchAbort = controller;
+  try {
+    const userDataDir = app.getPath('userData');
+    const r = await fetchMusicTrack({
+      userDataDir, track, signal: controller.signal,
+      onProgress: (pct) => { try { if (!event.sender.isDestroyed()) event.sender.send('audio:fetch-progress', { kind: 'download', pct }); } catch {} },
+    });
+    if (!r.ok || !r.filePath) return { ok: false, error: r.error };
+    const info = await probeMedia(r.filePath);
+    if (!info.hasAudio) { // a damaged / replaced file must not stay cached
+      try { fs.rmSync(r.filePath, { force: true }); } catch {}
+      return { ok: false, error: `"${track.title}" did not download correctly — please try again.` };
+    }
+    userApprovedAudioFiles.add(r.filePath);
+    return { ok: true, file: { filePath: r.filePath, name: `${track.title}.mp3`, durationSec: info.durationSec } };
+  } finally {
+    if (currentAudioFetchAbort === controller) currentAudioFetchAbort = null;
+  }
+});
+
+ipcMain.handle('audio:youtube-cancel', async () => {
+  currentAudioFetchAbort?.abort();
+  return true;
+});
+
+// A shortened Google Maps link (maps.app.goo.gl, goo.gl/maps/…) carries no coordinates of its own —
+// only the destination it redirects to does. Resolved here (not the renderer): the redirect target is
+// a plain google.com URL with no CORS allowance, so a renderer `fetch` can't read `response.url` back;
+// Node's fetch has no CORS concept at all and just follows the chain.
+ipcMain.handle('location:resolve-maps-url', async (_event, url: string) => {
+  try {
+    if (typeof url !== 'string' || !url.trim()) return { ok: false, error: 'No link given.' };
+    const res = await fetch(url.trim(), { redirect: 'follow' });
+    return { ok: true, resolvedUrl: res.url };
+  } catch (err: any) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+});
+
+// Single-flight: the wizard only ever has one export running at a time, so one module-level
+// controller is enough to let a later cancel call reach the render currently in progress.
+let currentVideoExportAbort: AbortController | null = null;
+
+ipcMain.handle('video:export', async (event, request: VideoExportRequest) => {
+  try {
+    const photoPaths = request.slides.flatMap((s) => s.photoPaths || []);
+    assertPathsAllowed(photoPaths, 'video:export');
+    if (typeof request.outputPath !== 'string' || !/.mp4$/i.test(request.outputPath)) throw new Error('The output file must be an .mp4 path.');
+    if (!userApprovedVideoOutputs.has(request.outputPath)) assertPathsAllowed([request.outputPath], 'video:export');
+    if (request.audio && !userApprovedAudioFiles.has(request.audio.filePath)) throw new Error('The chosen music file was not picked through the app.');
+
+    const tempDir = path.join(os.tmpdir(), 'gphotos_video_export', `job_${Date.now()}`);
+    const controller = new AbortController();
+    currentVideoExportAbort = controller;
+    try {
+      return await exportVideo(
+        { ...request, tempDir },
+        (p) => {
+          try {
+            if (!event.sender.isDestroyed()) event.sender.send('video:export-progress', p);
+          } catch {}
+        },
+        controller.signal
+      );
+    } finally {
+      if (currentVideoExportAbort === controller) currentVideoExportAbort = null;
+    }
+  } catch (err: any) {
+    console.error('video:export error:', err);
+    logger.error('VideoExport', 'export failed', { err: String(err?.stack || err) });
+    return { success: false, error: err.message || 'Video export failed', skippedSlides: 0 };
+  }
+});
+
+ipcMain.handle('video:cancel-export', async () => {
+  currentVideoExportAbort?.abort();
+  return true;
+});
+
+// ---- Local Ollama (see ollamaClient.ts: why this is main-process only) ----
+ipcMain.handle('ollama:request', async (_event, req: OllamaRequest) => {
+  if (!req || typeof req.baseUrl !== 'string' || typeof req.path !== 'string') return { ok: false, status: 0, error: 'Invalid Ollama request.' };
+  return ollamaRequest({ baseUrl: req.baseUrl, path: req.path, method: req.method, body: req.body, timeoutMs: req.timeoutMs });
+});
+
+// One download per model name at a time; a second click on the same model just reports the first one's result.
+const ollamaPulls = new Map<string, AbortController>();
+
+ipcMain.handle('ollama:pull', async (event, baseUrl: string, model: string) => {
+  if (typeof baseUrl !== 'string' || typeof model !== 'string' || !model.trim()) return { result: 'failed', error: 'Invalid download request.' };
+  if (ollamaPulls.has(model)) return { result: 'failed', error: `"${model}" is already downloading.` };
+  const controller = new AbortController();
+  ollamaPulls.set(model, controller);
+  try {
+    const outcome = await ollamaPull(baseUrl, model, (e) => {
+      try {
+        if (!event.sender.isDestroyed()) event.sender.send('ollama:pull-progress', { model, ...e });
+      } catch {}
+    }, controller.signal);
+    logger.info('Ollama', `Download of "${model}": ${outcome.result}`, { error: outcome.error });
+    return outcome;
+  } finally {
+    ollamaPulls.delete(model);
+  }
+});
+
+ipcMain.handle('ollama:cancel-pull', async (_event, model: string) => {
+  ollamaPulls.get(model)?.abort();
+  return true;
+});
+
+ipcMain.handle('video:open-file', async (_event, filePath: string) => {
+  try {
+    if (!userApprovedVideoOutputs.has(filePath)) assertPathsAllowed([filePath], 'video:open-file');
+    const err = await shell.openPath(filePath);
+    return !err;
+  } catch (err) {
+    console.error('video:open-file error:', err);
+    return false;
   }
 });
 
@@ -1302,6 +1571,34 @@ ipcMain.handle('person:save-avatar', async (_event, personId: string, cacheKey: 
   } catch (err: any) {
     console.error('person:save-avatar error:', err);
     return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('photoContent:get', async (_event, photoId: string) => {
+  try {
+    return getPhotoContentEntry(photoId);
+  } catch (err) {
+    console.error('photoContent:get error:', err);
+    return null;
+  }
+});
+
+ipcMain.handle('photoContent:get-all', async () => {
+  try {
+    return getAllPhotoContentEntries();
+  } catch (err) {
+    console.error('photoContent:get-all error:', err);
+    return {};
+  }
+});
+
+ipcMain.handle('photoContent:upsert', async (_event, photoId: string, entry: PhotoContentEntry) => {
+  try {
+    upsertPhotoContentEntry(photoId, entry);
+    return true;
+  } catch (err) {
+    console.error('photoContent:upsert error:', err);
+    return false;
   }
 });
 

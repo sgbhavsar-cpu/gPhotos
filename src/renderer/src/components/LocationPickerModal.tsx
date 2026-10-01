@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import L from 'leaflet';
-import { X, Search, Check, MapPin } from 'lucide-react';
+import { X, Search, Check, MapPin, Link2 } from 'lucide-react';
 import { notify, notifyError } from '../services/notifications';
+import { isGoogleMapsUrl, isShortGoogleMapsUrl, parseGoogleMapsUrl } from '../services/googleMapsUrl';
 
 interface LocationPickerModalProps {
   initialLat?: number;
@@ -41,6 +42,12 @@ export const LocationPickerModal: React.FC<LocationPickerModalProps> = ({
   const [label, setLabel] = useState(initialLabel || '');
   const [searchQuery, setSearchQuery] = useState('');
   const [isSearching, setIsSearching] = useState(false);
+  const [mapsUrl, setMapsUrl] = useState('');
+  const [isResolvingMapsUrl, setIsResolvingMapsUrl] = useState(false);
+  const [mapsUrlError, setMapsUrlError] = useState<string | null>(null);
+  // A pin with no name is a location nobody (including the caller's own "previous popup", if any)
+  // can tell apart from any other pin later — require a label before "Use This Location" is live.
+  const needsLabel = !!pin && !label.trim();
 
   const placePin = (lat: number, lng: number) => {
     setPin({ lat, lng });
@@ -109,6 +116,47 @@ export const LocationPickerModal: React.FC<LocationPickerModalProps> = ({
     }
   };
 
+  // Exact coordinates straight from a pasted Google Maps link — no name-guessing, no OpenStreetMap
+  // lookup needed. A shortened link (maps.app.goo.gl, goo.gl/maps/…) is resolved via the main process
+  // first (it has no CORS restrictions; the renderer alone can't read where a cross-origin redirect landed).
+  const handleUseMapsUrl = async () => {
+    const raw = mapsUrl.trim();
+    if (!raw) return;
+    setMapsUrlError(null);
+
+    if (!isGoogleMapsUrl(raw)) {
+      setMapsUrlError('That doesn\'t look like a Google Maps link.');
+      return;
+    }
+
+    let target = raw;
+    if (isShortGoogleMapsUrl(raw)) {
+      if (!window.electronAPI?.resolveMapsUrl) {
+        setMapsUrlError('Shortened links need the desktop app to resolve them — paste the full maps.google.com link instead.');
+        return;
+      }
+      setIsResolvingMapsUrl(true);
+      try {
+        const res = await window.electronAPI.resolveMapsUrl(raw);
+        if (!res.ok || !res.resolvedUrl) {
+          setMapsUrlError(res.error || 'Could not follow that link.');
+          return;
+        }
+        target = res.resolvedUrl;
+      } finally {
+        setIsResolvingMapsUrl(false);
+      }
+    }
+
+    const coords = parseGoogleMapsUrl(target);
+    if (!coords) {
+      setMapsUrlError('Could not find coordinates in that link — try opening it in Google Maps and copying the address-bar URL instead.');
+      return;
+    }
+    placePin(coords.lat, coords.lng);
+    mapInstanceRef.current?.flyTo([coords.lat, coords.lng], 16, { duration: 0.8 });
+  };
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -167,44 +215,105 @@ export const LocationPickerModal: React.FC<LocationPickerModalProps> = ({
           </button>
         </div>
 
-        <div style={{ padding: '12px 20px', borderBottom: '1px solid var(--border-subtle)', display: 'flex', gap: '8px' }}>
+        <div style={{ padding: '12px 20px', borderBottom: '1px solid var(--border-subtle)', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  handleSearch();
+                }
+              }}
+              placeholder="Search a place to jump the map there..."
+              className="input"
+              style={{ flex: 1, fontSize: '0.85rem' }}
+            />
+            <button
+              className="btn btn-secondary"
+              onClick={handleSearch}
+              disabled={isSearching || !searchQuery.trim()}
+              style={{ fontSize: '0.8rem' }}
+            >
+              <Search size={14} />
+              <span>{isSearching ? 'Searching...' : 'Search'}</span>
+            </button>
+          </div>
+
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+            <div style={{ height: '1px', flex: '0 0 24px', backgroundColor: 'var(--border-subtle)' }} />
+            <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', flexShrink: 0 }}>or, for the exact spot</span>
+            <div style={{ height: '1px', flex: 1, backgroundColor: 'var(--border-subtle)' }} />
+          </div>
+
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <input
+              type="text"
+              value={mapsUrl}
+              onChange={(e) => { setMapsUrl(e.target.value); setMapsUrlError(null); }}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  handleUseMapsUrl();
+                }
+              }}
+              placeholder="Paste a Google Maps link (google.com/maps/... or a maps.app.goo.gl share link)"
+              className="input"
+              style={{ flex: 1, fontSize: '0.85rem' }}
+              data-testid="maps-url-input"
+            />
+            <button
+              className="btn btn-secondary"
+              onClick={handleUseMapsUrl}
+              disabled={isResolvingMapsUrl || !mapsUrl.trim()}
+              style={{ fontSize: '0.8rem' }}
+              data-testid="maps-url-use"
+            >
+              <Link2 size={14} />
+              <span>{isResolvingMapsUrl ? 'Resolving...' : 'Use Link'}</span>
+            </button>
+          </div>
+          {mapsUrlError && (
+            <div role="alert" style={{ fontSize: '0.76rem', color: '#f87171' }}>{mapsUrlError}</div>
+          )}
+
           <input
             type="text"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            onKeyDown={(e) => {
-              e.stopPropagation();
-              if (e.key === 'Enter') {
-                e.preventDefault();
-                handleSearch();
-              }
-            }}
-            placeholder="Search a place to jump the map there..."
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            onKeyDown={(e) => e.stopPropagation()}
+            placeholder="Label for this place — required (e.g. Grandma's House, Lake Palace)"
             className="input"
-            style={{ flex: 1, fontSize: '0.85rem' }}
+            style={needsLabel ? { fontSize: '0.85rem', borderColor: '#f59e0b' } : { fontSize: '0.85rem' }}
+            data-testid="location-label-input"
           />
-          <button
-            className="btn btn-secondary"
-            onClick={handleSearch}
-            disabled={isSearching || !searchQuery.trim()}
-            style={{ fontSize: '0.8rem' }}
-          >
-            <Search size={14} />
-            <span>{isSearching ? 'Searching...' : 'Search'}</span>
-          </button>
+          {needsLabel && (
+            <div role="alert" style={{ fontSize: '0.76rem', color: '#f59e0b' }}>
+              Add a name for this place above before using it.
+            </div>
+          )}
         </div>
 
         <div ref={mapContainerRef} style={{ flex: 1, minHeight: 0 }} />
 
         <div style={{ padding: '14px 20px', borderTop: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
           <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-            {pin ? `${pin.lat.toFixed(5)}°, ${pin.lng.toFixed(5)}° — drag the pin to fine-tune` : 'Click anywhere on the map to drop a pin'}
+            {!pin
+              ? 'Click anywhere on the map to drop a pin'
+              : needsLabel
+                ? `${pin.lat.toFixed(5)}°, ${pin.lng.toFixed(5)}° — now give it a name above`
+                : `${pin.lat.toFixed(5)}°, ${pin.lng.toFixed(5)}° — drag the pin to fine-tune`}
           </div>
           <button
             className="btn btn-primary"
-            disabled={!pin}
-            onClick={() => pin && onConfirm(pin.lat, pin.lng, label.trim())}
+            disabled={!pin || !label.trim()}
+            onClick={() => pin && label.trim() && onConfirm(pin.lat, pin.lng, label.trim())}
             style={{ fontSize: '0.85rem' }}
+            title={needsLabel ? 'Add a name for this place first' : undefined}
           >
             <Check size={16} />
             <span>Use This Location</span>

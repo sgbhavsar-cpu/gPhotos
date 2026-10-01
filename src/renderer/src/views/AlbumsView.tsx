@@ -17,12 +17,18 @@ import {
   Layers,
   Sparkles,
   ZoomIn,
-  ZoomOut
+  ZoomOut,
+  Film
 } from 'lucide-react';
 import { Album, Photo } from '../../../types';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { VirtualCardGrid } from '../components/VirtualCardGrid';
+import { AlbumChapterSection } from '../components/AlbumChapterSection';
+import { ChapterPicker } from '../components/ChapterPicker';
+import { VideoWizardModal } from '../components/VideoWizardModal';
+import { PromptModal } from '../components/PromptModal';
+import { useMarqueeSelect, MarqueeBox, ChapterDropBar, AlbumSelectionBar } from '../components/albumSelection';
 import { movePhotosToFolder } from '../services/photoRelocationFlow';
 
 interface AlbumsViewProps {
@@ -33,6 +39,8 @@ interface AlbumsViewProps {
   // the currently open album's own photos, so browsing an album's lightbox
   // stays inside that album.
   onSelectPhoto: (photo: Photo, contextPhotos?: Photo[]) => void;
+  /** Opens Smart Flows pre-scoped to the given photos (the current drag-selection). */
+  onRunSmartFlow?: (photos: Photo[]) => void;
   resetTrigger?: number;
 }
 
@@ -40,6 +48,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
   photos,
   albums,
   onSelectPhoto,
+  onRunSmartFlow,
   resetTrigger,
 }) => {
   const [selectedAlbumId, setSelectedAlbumId] = useState<string | null>(null);
@@ -74,6 +83,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
   const [showAddPhotosModal, setShowAddPhotosModal] = useState(false);
   const [photoSearchQuery, setPhotoSearchQuery] = useState('');
   const [selectedPhotoIdsToAdd, setSelectedPhotoIdsToAdd] = useState<Set<string>>(new Set());
+  const [addToChapterId, setAddToChapterId] = useState<string>('');
   // Picker filters — Person reuses face-detection data already in the app
   // ("Filter by AI"); a from-scratch scene/object filter isn't built yet.
   const [photoFilterPersonId, setPhotoFilterPersonId] = useState('');
@@ -228,7 +238,9 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
 
   const handleAddSelectedPhotos = () => {
     if (!activeAlbum || selectedPhotoIdsToAdd.size === 0) return;
-    libraryStore.addPhotosToAlbum(activeAlbum.id, Array.from(selectedPhotoIdsToAdd));
+    const ids = Array.from(selectedPhotoIdsToAdd);
+    if (addToChapterId) libraryStore.addPhotosToChapter(activeAlbum.id, addToChapterId, ids);
+    else libraryStore.addPhotosToAlbum(activeAlbum.id, ids);
     setSelectedPhotoIdsToAdd(new Set());
     setShowAddPhotosModal(false);
   };
@@ -243,6 +255,110 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
     e.stopPropagation();
     if (!activeAlbum) return;
     libraryStore.setAlbumCover(activeAlbum.id, photoId);
+  };
+
+  const [showVideoWizard, setShowVideoWizard] = useState(false);
+
+  // Chapters
+  const [movePhotoPopoverId, setMovePhotoPopoverId] = useState<string | null>(null);
+  const [showNewChapterPrompt, setShowNewChapterPrompt] = useState(false);
+  // Photos picked (in the chapter view itself, not the Add-Photos picker) to drag as a group
+  // between chapters. A drag that starts on a photo NOT in this set just drags that one photo.
+  const [dragSelectedIds, setDragSelectedIds] = useState<Set<string>>(new Set());
+  const [dragOverTarget, setDragOverTarget] = useState<string | null>(null); // chapterId, or 'unchaptered'
+  // How many photos are being dragged right now (0 = no drag): while > 0 the chapter drop bar is shown.
+  const [draggingCount, setDraggingCount] = useState(0);
+  // Rubber-band selection: press on empty space (or a photo's checkbox) and drag across photos.
+  const marquee = useMarqueeSelect({
+    containerRef: albumScrollRef,
+    selected: dragSelectedIds,
+    onChange: setDragSelectedIds,
+    enabled: !!selectedAlbumId && !showAddPhotosModal,
+  });
+  // A new album (or leaving one) starts with nothing selected.
+  useEffect(() => { setDragSelectedIds(new Set()); setDraggingCount(0); }, [selectedAlbumId]);
+  // The drag ends on the dragged tile — which the windowed grid may have unmounted (or the drop may land elsewhere) —
+  // so the drop bar is also put away by document-level events.
+  useEffect(() => {
+    const stop = () => setDraggingCount(0);
+    document.addEventListener('dragend', stop);
+    document.addEventListener('drop', stop);
+    return () => { document.removeEventListener('dragend', stop); document.removeEventListener('drop', stop); };
+  }, []);
+  const chapterOfPhoto = (photoId: string): string | null =>
+    activeAlbum?.chapters?.find((c) => c.photoIds.includes(photoId))?.id ?? null;
+
+  const handleCreateChapter = () => setShowNewChapterPrompt(true);
+
+  const submitNewChapter = (title: string) => {
+    if (activeAlbum) libraryStore.createChapter(activeAlbum.id, title);
+    setShowNewChapterPrompt(false);
+  };
+
+  const handleMovePhotoToChapter = (photoId: string, chapterId: string | null) => {
+    if (!activeAlbum) return;
+    const current = chapterOfPhoto(photoId);
+    if (current) libraryStore.removePhotosFromChapter(activeAlbum.id, current, [photoId]);
+    if (chapterId) libraryStore.addPhotosToChapter(activeAlbum.id, chapterId, [photoId]);
+    setMovePhotoPopoverId(null);
+  };
+
+  const handleCreateChapterAndMove = (photoId: string, title: string) => {
+    if (!activeAlbum) return;
+    const chapter = libraryStore.createChapter(activeAlbum.id, title);
+    if (chapter) handleMovePhotoToChapter(photoId, chapter.id);
+  };
+
+  const toggleDragSelected = (photoId: string) => {
+    setDragSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(photoId)) next.delete(photoId);
+      else next.add(photoId);
+      return next;
+    });
+  };
+
+  // Drag one or more photos (from any chapter, or "Other Photos") onto a chapter section or the
+  // "Other Photos" bucket to reassign them — including dragging several at once via dragSelectedIds.
+  const handlePhotoDragStart = (photoId: string, e: React.DragEvent) => {
+    const ids = dragSelectedIds.has(photoId) && dragSelectedIds.size > 1 ? Array.from(dragSelectedIds) : [photoId];
+    e.dataTransfer.setData('application/x-gphotos-photo-ids', JSON.stringify(ids));
+    e.dataTransfer.effectAllowed = 'move';
+    if (ids.length > 1 && e.dataTransfer.setDragImage) {
+      const ghost = document.createElement('div');
+      ghost.textContent = `${ids.length} photos`;
+      ghost.style.cssText = 'position:fixed;top:-100px;left:-100px;padding:8px 14px;border-radius:999px;background:#10b981;color:white;font:600 13px sans-serif';
+      document.body.appendChild(ghost);
+      e.dataTransfer.setDragImage(ghost, 20, 16);
+      setTimeout(() => ghost.remove(), 0);
+    }
+    // Deferred: changing the page inside dragstart can make the browser cancel the drag.
+    setTimeout(() => setDraggingCount(ids.length), 0);
+  };
+
+  // Moves photos into a chapter (out of whichever chapter they were in), or back to "no chapter" for null.
+  const moveIdsToChapter = (chapterId: string | null, ids: string[]) => {
+    if (!activeAlbum || ids.length === 0) return;
+    if (chapterId) libraryStore.addPhotosToChapter(activeAlbum.id, chapterId, ids);
+    else libraryStore.removePhotosFromAllChapters(activeAlbum.id, ids);
+    setDragSelectedIds(new Set());
+  };
+
+  const handleDropOnChapter = (chapterId: string | null, e: React.DragEvent, insertBeforePhotoId?: string) => {
+    e.preventDefault();
+    setDragOverTarget(null);
+    setDraggingCount(0);
+    if (!activeAlbum) return;
+    const raw = e.dataTransfer.getData('application/x-gphotos-photo-ids');
+    if (!raw) return;
+    try {
+      const ids: string[] = JSON.parse(raw);
+      if (!Array.isArray(ids) || ids.length === 0) return;
+      if (insertBeforePhotoId && ids.length === 1 && ids[0] === insertBeforePhotoId) return; // dropped on itself — no-op
+      if (chapterId) libraryStore.addPhotosToChapter(activeAlbum.id, chapterId, ids, insertBeforePhotoId);
+      else libraryStore.removePhotosFromAllChapters(activeAlbum.id, ids);
+      setDragSelectedIds(new Set());
+    } catch {}
   };
 
   const toggleSelectPhotoToAdd = (photoId: string) => {
@@ -398,6 +514,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                 setPhotoFilterLocation('');
                 setPhotoFilterDateFrom('');
                 setPhotoFilterDateTo('');
+                setAddToChapterId(activeAlbum?.lastUsedChapterId || '');
                 setShowAddPhotosModal(true);
               }}
               style={{
@@ -411,6 +528,27 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
             >
               <Plus size={18} />
               <span>Add Photos</span>
+            </button>
+
+            <button
+              className="btn btn-secondary"
+              onClick={handleCreateChapter}
+              title="Split this album into named sections (e.g. by day or ceremony)"
+              style={{ gap: '8px', height: '40px', padding: isMobile ? '0 14px' : '10px 16px', fontSize: '0.88rem', flexShrink: 0 }}
+            >
+              <BookImage size={18} />
+              <span>New Chapter</span>
+            </button>
+
+            <button
+              className="btn btn-secondary"
+              onClick={() => setShowVideoWizard(true)}
+              disabled={albumPhotos.length === 0}
+              title="Create a video slideshow from this album's photos"
+              style={{ gap: '8px', height: '40px', padding: isMobile ? '0 14px' : '10px 16px', fontSize: '0.88rem', flexShrink: 0 }}
+            >
+              <Film size={18} />
+              <span>Create Video</span>
             </button>
 
             <button
@@ -459,7 +597,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
         )}
 
         {/* Photos in Album Scroll Area */}
-        <div ref={albumScrollRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '24px' }}>
+        <div ref={albumScrollRef} onMouseDown={marquee.onMouseDown} data-testid="album-scroll-area" style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '24px' }}>
           {albumPhotos.length === 0 ? (
             <div
               style={{
@@ -489,6 +627,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                   setPhotoFilterLocation('');
                   setPhotoFilterDateFrom('');
                   setPhotoFilterDateTo('');
+                  setAddToChapterId(activeAlbum?.lastUsedChapterId || '');
                   setShowAddPhotosModal(true);
                 }}
                 style={{ gap: '8px', padding: '10px 20px', margin: '0 auto' }}
@@ -497,145 +636,309 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                 <span>Add Photos to Album</span>
               </button>
             </div>
-          ) : (
-            <VirtualCardGrid
-              items={albumPhotos}
-              getKey={(p) => p.id}
-              scrollRef={albumScrollRef}
-              rowHeight={Math.round(ALBUM_GRID_SIZE_PX[albumGridSize] * 1.05)}
-              minColWidth={ALBUM_GRID_SIZE_PX[albumGridSize]}
-              gap={albumGridSize === 'very_small' ? 10 : 16}
-              renderItem={(photo) => {
-                const isCover = activeAlbum.coverPhotoId === photo.id;
-                return (
-                  <div
-                    onClick={() => onSelectPhoto(photo, albumPhotos)}
-                    style={{
-                      position: 'relative',
-                      height: '100%',
-                      boxSizing: 'border-box',
-                      borderRadius: 'var(--radius-md)',
-                      overflow: 'hidden',
-                      backgroundColor: 'var(--bg-surface-elevated)',
-                      cursor: 'pointer',
-                      boxShadow: isCover ? '0 0 16px rgba(59, 130, 246, 0.4)' : 'var(--shadow-sm)',
-                      border: isCover ? '2px solid var(--accent-primary)' : '1px solid var(--border-subtle)',
-                      transition: 'transform 0.15s ease, box-shadow 0.15s ease',
-                    }}
-                  >
-                    <img
-                      src={getLocalPhotoUrl(photo.filePath, photo.originalRemotePath)}
-                      alt={photo.fileName}
-                      loading="lazy"
-                      style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                    />
+          ) : (() => {
+            // `chapterIdContext` is which chapter (or null for "Other Photos"/no chapters yet) this
+            // tile is currently rendered in — dropping another photo directly ON a tile inserts it
+            // right before that tile in `chapterIdContext`'s own order, which is also how
+            // reordering *within* one chapter works (dragging one of its own photos onto a sibling).
+            const renderPhotoTile = (photo: Photo, chapterIdContext: string | null) => {
+              const isCover = activeAlbum.coverPhotoId === photo.id;
+              const hasChapters = (activeAlbum.chapters?.length || 0) > 0;
+              const isDragSelected = dragSelectedIds.has(photo.id);
+              return (
+                <div
+                  data-album-photo-id={photo.id}
+                  onClick={(e) => {
+                    // Same as the gallery: Ctrl/Cmd-click, or any click once something is selected, toggles selection.
+                    if (e.ctrlKey || e.metaKey || dragSelectedIds.size > 0) toggleDragSelected(photo.id);
+                    else onSelectPhoto(photo, albumPhotos);
+                  }}
+                  draggable={hasChapters && !marquee.armed}
+                  onDragStart={hasChapters ? (e) => handlePhotoDragStart(photo.id, e) : undefined}
+                  onDragEnd={() => setDraggingCount(0)}
+                  onDragOver={hasChapters && chapterIdContext ? (e) => { e.preventDefault(); e.stopPropagation(); } : undefined}
+                  onDrop={hasChapters && chapterIdContext ? (e) => { e.stopPropagation(); handleDropOnChapter(chapterIdContext, e, photo.id); } : undefined}
+                  style={{
+                    position: 'relative',
+                    height: '100%',
+                    boxSizing: 'border-box',
+                    borderRadius: 'var(--radius-md)',
+                    overflow: 'hidden',
+                    backgroundColor: 'var(--bg-surface-elevated)',
+                    cursor: 'pointer',
+                    boxShadow: isCover ? '0 0 16px rgba(59, 130, 246, 0.4)' : 'var(--shadow-sm)',
+                    border: isDragSelected ? '2px solid #10b981' : isCover ? '2px solid var(--accent-primary)' : '1px solid var(--border-subtle)',
+                    transition: 'transform 0.15s ease, box-shadow 0.15s ease',
+                  }}
+                >
+                  <img
+                    src={getLocalPhotoUrl(photo.filePath, photo.originalRemotePath)}
+                    alt={photo.fileName}
+                    loading="lazy"
+                    style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                  />
 
-                    {/* Cover Photo Badge */}
-                    {isCover && (
-                      <div
-                        style={{
-                          position: 'absolute',
-                          top: '8px',
-                          left: '8px',
-                          backgroundColor: 'var(--accent-primary)',
-                          color: 'white',
-                          fontSize: '0.72rem',
-                          fontWeight: 700,
-                          padding: '3px 8px',
-                          borderRadius: 'var(--radius-full)',
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: '4px',
-                          boxShadow: '0 2px 6px rgba(0,0,0,0.5)',
-                        }}
-                      >
-                        <Star size={12} fill="white" />
-                        <span>Album Cover</span>
-                      </div>
-                    )}
+                  {/* Selection checkbox. Click toggles; press + drag from here rubber-bands across more photos. */}
+                  {(
+                    <div
+                      data-marquee-start
+                      data-testid="tile-checkbox"
+                      role="checkbox"
+                      aria-checked={isDragSelected}
+                      aria-label={`Select ${photo.fileName}`}
+                      onClick={(e) => { e.stopPropagation(); if (!marquee.suppressClick.current) toggleDragSelected(photo.id); }}
+                      title="Select — then drag the selected photos onto a chapter, or press and drag across photos to select several"
+                      style={{
+                        position: 'absolute', bottom: '8px', left: '8px', width: '22px', height: '22px', borderRadius: '50%',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        backgroundColor: isDragSelected ? '#10b981' : 'rgba(15, 23, 42, 0.75)', border: '1px solid rgba(255,255,255,0.3)', cursor: 'pointer',
+                      }}
+                    >
+                      {isDragSelected && <Check size={13} color="white" />}
+                    </div>
+                  )}
 
-                    {/* Top Action Overlay */}
+                  {/* Cover Photo Badge */}
+                  {isCover && (
                     <div
                       style={{
                         position: 'absolute',
                         top: '8px',
-                        right: '8px',
+                        left: '8px',
+                        backgroundColor: 'var(--accent-primary)',
+                        color: 'white',
+                        fontSize: '0.72rem',
+                        fontWeight: 700,
+                        padding: '3px 8px',
+                        borderRadius: 'var(--radius-full)',
                         display: 'flex',
                         alignItems: 'center',
-                        gap: '6px',
+                        gap: '4px',
+                        boxShadow: '0 2px 6px rgba(0,0,0,0.5)',
                       }}
                     >
-                      {/* Set Cover Button */}
-                      {!isCover && (
-                        <button
-                          onClick={(e) => handleSetCoverPhoto(photo.id, e)}
-                          style={{
-                            backgroundColor: 'rgba(15, 23, 42, 0.85)',
-                            backdropFilter: 'blur(6px)',
-                            border: '1px solid rgba(255,255,255,0.2)',
-                            borderRadius: 'var(--radius-full)',
-                            width: '32px',
-                            height: '32px',
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            color: 'white',
-                            cursor: 'pointer',
-                            boxShadow: '0 2px 6px rgba(0,0,0,0.5)',
-                          }}
-                          title="Set as Album Cover Photo"
-                        >
-                          <Star size={15} />
-                        </button>
-                      )}
+                      <Star size={12} fill="white" />
+                      <span>Album Cover</span>
+                    </div>
+                  )}
 
-                      {/* Remove from Album Button */}
+                  {/* Top Action Overlay */}
+                  <div
+                    style={{
+                      position: 'absolute',
+                      top: '8px',
+                      right: '8px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '6px',
+                    }}
+                  >
+                    {/* Move to Chapter Button (only once the album actually has chapters) */}
+                    {hasChapters && (
+                      <div style={{ position: 'relative' }} onClick={(e) => e.stopPropagation()}>
+                        <button
+                          onClick={() => setMovePhotoPopoverId(movePhotoPopoverId === photo.id ? null : photo.id)}
+                          style={{
+                            backgroundColor: 'rgba(15, 23, 42, 0.85)', backdropFilter: 'blur(6px)',
+                            border: '1px solid rgba(255,255,255,0.2)', borderRadius: 'var(--radius-full)',
+                            width: '32px', height: '32px', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            color: 'white', cursor: 'pointer', boxShadow: '0 2px 6px rgba(0,0,0,0.5)',
+                          }}
+                          title="Move to a different chapter"
+                        >
+                          <BookImage size={15} />
+                        </button>
+                        {movePhotoPopoverId === photo.id && (
+                          <ChapterPicker
+                            chapters={activeAlbum.chapters || []}
+                            currentChapterId={chapterOfPhoto(photo.id)}
+                            onPick={(chapterId) => handleMovePhotoToChapter(photo.id, chapterId)}
+                            onCreateNew={(title) => handleCreateChapterAndMove(photo.id, title)}
+                            onClose={() => setMovePhotoPopoverId(null)}
+                            anchorStyle={{ top: '38px', right: 0 }}
+                          />
+                        )}
+                      </div>
+                    )}
+
+                    {/* Set Cover Button */}
+                    {!isCover && (
                       <button
-                        onClick={(e) => handleRemovePhotoFromAlbum(photo.id, e)}
+                        onClick={(e) => handleSetCoverPhoto(photo.id, e)}
                         style={{
                           backgroundColor: 'rgba(15, 23, 42, 0.85)',
                           backdropFilter: 'blur(6px)',
-                          border: '1px solid rgba(239, 68, 68, 0.5)',
+                          border: '1px solid rgba(255,255,255,0.2)',
                           borderRadius: 'var(--radius-full)',
                           width: '32px',
                           height: '32px',
                           display: 'flex',
                           alignItems: 'center',
                           justifyContent: 'center',
-                          color: '#f87171',
+                          color: 'white',
                           cursor: 'pointer',
                           boxShadow: '0 2px 6px rgba(0,0,0,0.5)',
                         }}
-                        title="Remove photo from this album"
+                        title="Set as Album Cover Photo"
                       >
-                        <X size={16} />
+                        <Star size={15} />
                       </button>
-                    </div>
+                    )}
 
-                    {/* Bottom File Info */}
-                    <div
+                    {/* Remove from Album Button */}
+                    <button
+                      onClick={(e) => handleRemovePhotoFromAlbum(photo.id, e)}
                       style={{
-                        position: 'absolute',
-                        bottom: 0,
-                        left: 0,
-                        right: 0,
-                        padding: '8px 10px',
-                        background: 'linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.85) 100%)',
-                        fontSize: '0.75rem',
-                        color: 'white',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
+                        backgroundColor: 'rgba(15, 23, 42, 0.85)',
+                        backdropFilter: 'blur(6px)',
+                        border: '1px solid rgba(239, 68, 68, 0.5)',
+                        borderRadius: 'var(--radius-full)',
+                        width: '32px',
+                        height: '32px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        color: '#f87171',
+                        cursor: 'pointer',
+                        boxShadow: '0 2px 6px rgba(0,0,0,0.5)',
                       }}
+                      title="Remove photo from this album"
                     >
-                      {photo.fileName}
-                    </div>
+                      <X size={16} />
+                    </button>
                   </div>
-                );
-              }}
-            />
-          )}
+
+                  {/* Bottom File Info */}
+                  <div
+                    style={{
+                      position: 'absolute',
+                      bottom: 0,
+                      left: 0,
+                      right: 0,
+                      padding: '8px 10px',
+                      background: 'linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.85) 100%)',
+                      fontSize: '0.75rem',
+                      color: 'white',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {photo.fileName}
+                  </div>
+                </div>
+              );
+            };
+
+            const chapters = activeAlbum.chapters || [];
+            const unchapteredIds = libraryStore.getUnchapteredPhotoIds(activeAlbum);
+            const unchapteredPhotos = unchapteredIds.map((id) => photoMap.get(id)).filter((p): p is Photo => !!p);
+            const gridProps = {
+              scrollRef: albumScrollRef,
+              rowHeight: Math.round(ALBUM_GRID_SIZE_PX[albumGridSize] * 1.05),
+              minColWidth: ALBUM_GRID_SIZE_PX[albumGridSize],
+              gap: albumGridSize === 'very_small' ? 10 : 16,
+            };
+
+            if (chapters.length === 0) {
+              return <VirtualCardGrid items={albumPhotos} getKey={(p) => p.id} renderItem={(photo) => renderPhotoTile(photo, null)} {...gridProps} />;
+            }
+
+            return (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '36px' }}>
+                {chapters.map((chapter, idx) => (
+                  <AlbumChapterSection
+                    key={chapter.id}
+                    chapter={chapter}
+                    photos={chapter.photoIds.map((id) => photoMap.get(id)).filter((p): p is Photo => !!p)}
+                    renderTile={(photo) => renderPhotoTile(photo, chapter.id)}
+                    onRename={(title) => libraryStore.renameChapter(activeAlbum.id, chapter.id, title)}
+                    onDelete={() => {
+                      if (window.confirm(`Delete the chapter "${chapter.title}"? Its photos stay in the album.`)) {
+                        libraryStore.deleteChapter(activeAlbum.id, chapter.id);
+                      }
+                    }}
+                    onMoveUp={idx > 0 ? () => libraryStore.reorderChapters(activeAlbum.id, [
+                      ...chapters.slice(0, idx - 1).map((c) => c.id), chapter.id, chapters[idx - 1].id, ...chapters.slice(idx + 1).map((c) => c.id),
+                    ]) : undefined}
+                    onMoveDown={idx < chapters.length - 1 ? () => libraryStore.reorderChapters(activeAlbum.id, [
+                      ...chapters.slice(0, idx).map((c) => c.id), chapters[idx + 1].id, chapter.id, ...chapters.slice(idx + 2).map((c) => c.id),
+                    ]) : undefined}
+                    onDropPhotoIds={(e) => handleDropOnChapter(chapter.id, e)}
+                    {...gridProps}
+                  />
+                ))}
+                {/* Once every photo has been sorted into a named chapter, this bucket (and its
+                    drop target) disappears entirely — a photo can still be sent back to "no
+                    chapter" via its move-to-chapter popover even while this section is hidden. */}
+                {unchapteredPhotos.length > 0 && (
+                  <div
+                    onDragOver={(e) => { e.preventDefault(); setDragOverTarget('unchaptered'); }}
+                    onDragLeave={() => setDragOverTarget((t) => (t === 'unchaptered' ? null : t))}
+                    onDrop={(e) => handleDropOnChapter(null, e)}
+                    style={{
+                      borderRadius: 'var(--radius-lg)', padding: dragOverTarget === 'unchaptered' ? '10px' : '0',
+                      border: dragOverTarget === 'unchaptered' ? '2px dashed #10b981' : '2px dashed transparent',
+                      backgroundColor: dragOverTarget === 'unchaptered' ? 'rgba(16, 185, 129, 0.06)' : 'transparent',
+                    }}
+                  >
+                    <h3 style={{ margin: '0 0 14px', fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-muted)' }}>
+                      Other Photos <span style={{ fontWeight: 500, fontSize: '0.82rem' }}>({unchapteredPhotos.length})</span>
+                    </h3>
+                    <VirtualCardGrid items={unchapteredPhotos} getKey={(p) => p.id} renderItem={(photo) => renderPhotoTile(photo, null)} {...gridProps} />
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </div>
+
+        <VideoWizardModal
+          isOpen={showVideoWizard}
+          onClose={() => setShowVideoWizard(false)}
+          album={activeAlbum}
+          photos={photos}
+        />
+
+        <MarqueeBox rect={marquee.marquee} />
+
+        {(() => {
+          const box = albumScrollRef.current?.getBoundingClientRect();
+          if (!box) return null;
+          const anchor = { top: box.top, left: box.left, width: box.width, bottom: box.bottom };
+          const chapters = activeAlbum.chapters || [];
+          if (draggingCount > 0 && chapters.length > 0) {
+            return <ChapterDropBar chapters={chapters} count={draggingCount} anchor={anchor} onDropTo={(id, e) => handleDropOnChapter(id, e)} />;
+          }
+          if (dragSelectedIds.size > 0 && draggingCount === 0) {
+            return (
+              <AlbumSelectionBar
+                count={dragSelectedIds.size}
+                chapters={chapters}
+                anchor={anchor}
+                onMoveTo={(id) => moveIdsToChapter(id, Array.from(dragSelectedIds))}
+                onCreateChapter={(title) => {
+                  libraryStore.createChapter(activeAlbum.id, title, Array.from(dragSelectedIds));
+                  setDragSelectedIds(new Set());
+                }}
+                onClear={() => setDragSelectedIds(new Set())}
+                onRunSmartFlow={onRunSmartFlow ? () => onRunSmartFlow(Array.from(dragSelectedIds).map((id) => photoMap.get(id)).filter((p): p is Photo => !!p)) : undefined}
+              />
+            );
+          }
+          return null;
+        })()}
+
+        {showNewChapterPrompt && (
+          <PromptModal
+            title="New Chapter"
+            message='e.g. "Day 1 — Ceremony"'
+            placeholder="Chapter name"
+            confirmLabel="Create"
+            onSubmit={submitNewChapter}
+            onCancel={() => setShowNewChapterPrompt(false)}
+          />
+        )}
 
         {/* Modal: Add Photos to Album Picker */}
         {showAddPhotosModal && (
@@ -935,7 +1238,21 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
                   {selectedPhotoIdsToAdd.size} photo{selectedPhotoIdsToAdd.size === 1 ? '' : 's'} selected
                 </span>
 
-                <div style={{ display: 'flex', gap: '10px' }}>
+                <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+                  {(activeAlbum?.chapters?.length || 0) > 0 && (
+                    <select
+                      className="input"
+                      value={addToChapterId}
+                      onChange={(e) => setAddToChapterId(e.target.value)}
+                      title="Which chapter to add these photos into"
+                      style={{ height: '38px', fontSize: '0.85rem', maxWidth: '180px' }}
+                    >
+                      <option value="">No chapter</option>
+                      {activeAlbum!.chapters!.map((c) => (
+                        <option key={c.id} value={c.id}>{c.title}</option>
+                      ))}
+                    </select>
+                  )}
                   <button
                     className="btn btn-ghost"
                     onClick={() => setShowAddPhotosModal(false)}

@@ -357,6 +357,27 @@ export interface OrganizeProgress {
   errorMessage?: string;
 }
 
+// Smart Flows' shared per-photo content cache / RAG index (see photoContentCache.ts)
+export interface PhotoContentEntry {
+  caption: string;
+  tags: string[];
+  embedding: number[] | null;
+  verdicts: Record<string, { match: boolean; confidence: number }>;
+  updatedAt: string;
+}
+
+// A named sub-section of an album ("Day 1 — Ceremony", "Day 2 — Reception"). `photoIds` is a
+// subset of the parent Album's own `photoIds` (a photo belongs to at most one chapter at a time,
+// like a folder); a photo in the album but in no chapter is shown in the album's default bucket.
+export interface AlbumChapter {
+  id: string;
+  title: string;
+  photoIds: string[];
+  coverPhotoId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface Album {
   id: string;
   title: string;
@@ -366,6 +387,10 @@ export interface Album {
   createdAt: string;
   updatedAt: string;
   eventDate?: string;
+  /** Undefined/empty means "no chapters" — the album behaves exactly as it did before chapters existed. */
+  chapters?: AlbumChapter[];
+  /** The chapter last added to, so a one-click "add to this album" can default to it instead of asking every time. */
+  lastUsedChapterId?: string;
 }
 
 // ---- Moving photos to another folder (photoRelocation.ts in the main process) ----
@@ -396,6 +421,80 @@ export interface RelocationItemResult {
   newFilePath?: string;
   newOriginalRemotePath?: string;
   newFileName?: string;
+}
+
+// ---- Video export (videoExportService.ts in the main process): the "Create Video" wizard ----
+export type VideoAspectRatio = '16:9' | '9:16' | '1:1' | '4:3';
+export type VideoResolutionTier = '720p' | '1080p';
+export type VideoQuality = 'draft' | 'good' | 'best';
+export type VideoTransition = 'none' | 'fade' | 'wipeleft' | 'wiperight' | 'slideup' | 'slidedown' | 'circleopen' | 'dissolve';
+export type VideoCollageStyle = 'grid' | 'sideBySide' | 'stacked' | 'featured';
+
+export interface VideoSlideInput {
+  kind: 'photo' | 'collage' | 'title' | 'card';
+  /** Readable local file paths — 1 for 'photo', up to 4 for 'collage' (extra ones are ignored), unused for 'title'. */
+  photoPaths?: string[];
+  /** Layout for a 'collage' slide (default 'grid'). */
+  collageStyle?: VideoCollageStyle;
+  /** For 'card': the finished title / end-credits picture from the wizard's designer, as a data: URL. */
+  imageDataUrl?: string;
+  /** How long this slide stays up; overrides the request's seconds-per-slide (used for cards). */
+  seconds?: number;
+  title?: string;
+  subtitle?: string;
+}
+
+/** Music under the video: a file (picked or downloaded), the part of it to use, and whether to repeat it. */
+export interface VideoAudioInput {
+  filePath: string;
+  startSec: number;
+  /** null = to the end of the file. */
+  endSec: number | null;
+  /** Repeat the clip until the video ends. */
+  loop: boolean;
+  fadeOutSec: number;
+  /** 0..1.5 (default 1). */
+  volume?: number;
+}
+
+export interface VideoExportRequest {
+  slides: VideoSlideInput[];
+  audio?: VideoAudioInput;
+  aspectRatio: VideoAspectRatio;
+  resolution: VideoResolutionTier;
+  quality: VideoQuality;
+  /** One transition for every cut, or one entry per cut (slides - 1) for the random / multiple-effects modes. */
+  transition: VideoTransition | VideoTransition[];
+  transitionDurationSec: number;
+  secondsPerItem: number;
+  outputPath: string;
+}
+
+/** A music file the wizard can use: picked from disk or downloaded from YouTube. */
+export interface AudioFileInfo {
+  filePath: string;
+  name: string;
+  durationSec: number | null;
+}
+
+export interface YtDlpStatusInfo {
+  installed: boolean;
+  source?: 'managed' | 'system';
+  version?: string;
+}
+
+export interface VideoExportProgressEvent {
+  stage: 'preparing' | 'encoding';
+  done: number;
+  total: number;
+}
+
+export interface VideoExportResponse {
+  success: boolean;
+  error?: string;
+  skippedSlides: number;
+  outputPath?: string;
+  durationSec?: number;
 }
 export interface RelocationOutcome {
   results: RelocationItemResult[];
@@ -459,6 +558,7 @@ export interface IElectronAPI {
   openOriginalFile: (filePath: string) => Promise<boolean>;
   checkFileExists: (filePath: string) => Promise<boolean>;
   onMirrorProgress: (callback: (progress: MirrorProgress) => void) => () => void;
+  onPhotoRotationFailed: (callback: (info: { originalRemotePath: string; localFilePath?: string; rotationDegrees: number; reason: string }) => void) => () => void;
 
   // New capabilities
   startBackgroundScan: (sourcePath: string, mirrorRoot?: string, storageName?: string) => Promise<{ jobId: string }>;
@@ -517,6 +617,7 @@ export interface IElectronAPI {
   switchLibrary: (targetPath: string) => Promise<{ meta: CatalogMeta; firstPage: Photo[]; albums: Album[] }>;
   getSpriteCoordinate?: (photoPath: string) => Promise<SpriteCoordinate | null>;
   getSpriteCoordinatesBatch?: (photoPaths: string[]) => Promise<Record<string, SpriteCoordinate | null>>;
+  invalidateSpriteCoordinate?: (photoPath: string) => Promise<boolean>;
   getPersonAvatarSprites?: (items: Array<{ personId: string; cacheKey: string }>) => Promise<Record<string, AvatarSpriteCoord | null>>;
   getThumbnailPreCacheStatus?: () => Promise<{
     isRunning: boolean;
@@ -547,6 +648,38 @@ export interface IElectronAPI {
   getPersonAvatarPath?: (personId: string, cacheKey: string) => Promise<string | null>;
   savePersonAvatar?: (personId: string, cacheKey: string, dataUrl: string) => Promise<{ success: boolean; filePath?: string; error?: string }>;
   deletePersonAvatar?: (personId: string) => Promise<boolean>;
+
+  // Smart Flows' shared per-photo content cache / RAG index (see photoContentCache.ts)
+  getPhotoContentEntry?: (photoId: string) => Promise<PhotoContentEntry | null>;
+  getAllPhotoContentEntries?: () => Promise<Record<string, PhotoContentEntry>>;
+  upsertPhotoContentEntry?: (photoId: string, entry: PhotoContentEntry) => Promise<boolean>;
+
+  // Video export wizard (videoExportService.ts, main process)
+  chooseVideoOutputPath?: (suggestedName: string) => Promise<string | null>;
+  exportVideo?: (request: VideoExportRequest) => Promise<VideoExportResponse>;
+  cancelVideoExport?: () => Promise<boolean>;
+  openVideoFile?: (filePath: string) => Promise<boolean>;
+
+  // Video wizard music: local file, short preview clip, and YouTube audio via yt-dlp (ytDlpService.ts)
+  chooseAudioFile?: () => Promise<AudioFileInfo | null>;
+  getAudioPreview?: (filePath: string, startSec: number, endSec: number | null) => Promise<string | null>;
+  getYtDlpStatus?: () => Promise<YtDlpStatusInfo>;
+  installYtDlp?: () => Promise<{ ok: boolean; error?: string; version?: string }>;
+  downloadYouTubeAudio?: (url: string) => Promise<{ ok: boolean; error?: string; file?: AudioFileInfo }>;
+  cancelYouTubeDownload?: () => Promise<boolean>;
+  /** Follows a shortened Google Maps link (maps.app.goo.gl, goo.gl/maps/…) to its real, coordinate-bearing URL. */
+  resolveMapsUrl?: (url: string) => Promise<{ ok: boolean; resolvedUrl?: string; error?: string }>;
+  // Built-in royalty-free tracks (musicCatalog.ts): which are already downloaded, and download-if-needed by id
+  getMusicLibraryCached?: () => Promise<string[]>;
+  fetchMusicTrack?: (trackId: string) => Promise<{ ok: boolean; error?: string; file?: AudioFileInfo }>;
+  onAudioFetchProgress?: (callback: (p: { kind: 'install' | 'download'; pct: number }) => void) => () => void;
+
+  // Local Ollama, called from the main process (a file:// renderer's "Origin: null" gets a 403 from Ollama)
+  ollamaRequest?: (req: { baseUrl: string; path: string; method?: 'GET' | 'POST'; body?: unknown; timeoutMs?: number }) => Promise<{ ok: boolean; status: number; data?: any; error?: string }>;
+  ollamaPull?: (baseUrl: string, model: string) => Promise<{ result: 'success' | 'failed' | 'cancelled'; error?: string }>;
+  ollamaCancelPull?: (model: string) => Promise<boolean>;
+  onOllamaPullProgress?: (callback: (p: { model: string; status: string; completed?: number; total?: number }) => void) => () => void;
+  onVideoExportProgress?: (callback: (p: VideoExportProgressEvent) => void) => () => void;
 
   // OneDrive Files On-Demand space reclaim
   getOneDriveStatus?: () => Promise<{ detectedRoots: string[]; reclaimEnabled: boolean; supported: boolean }>;

@@ -2,7 +2,7 @@ import type { Photo } from '../../../types';
 import { libraryStore } from './libraryStore';
 import { bumpImageVersion } from './imageVersion';
 import { invalidateAvatarSprite } from './avatarSpriteLoader';
-import { evictAndRefreshThumbnail } from './asyncImageLoader';
+import { evictAndRefreshThumbnail, invalidateSpriteCoordinate } from './asyncImageLoader';
 import { notify, notifyError } from './notifications';
 
 /**
@@ -19,6 +19,7 @@ export async function afterPhotoRotated(photo: Photo, degrees: number, thumbSize
   try {
     bumpImageVersion(photo.filePath, photo.thumbnailPath);
     evictAndRefreshThumbnail(photo.thumbnailPath || photo.filePath, photo.originalRemotePath, thumbSize);
+    invalidateSpriteCoordinate(photo.thumbnailPath || photo.filePath);
 
     const { skippedFaces, avatarPersonIds } = libraryStore.applyPhotoRotation(photo.id, degrees);
     if (skippedFaces > 0) {

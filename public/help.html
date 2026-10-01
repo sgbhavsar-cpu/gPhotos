@@ -441,6 +441,14 @@
       <a href="#filtering" class="nav-link">🏷️ Multi-Select & Zoom Wheel</a>
       <a href="#error-handling" class="nav-link">🛡️ Error Handling & Safety</a>
     </div>
+
+    <div class="nav-group">
+      <div class="nav-group-title">Albums & Automation</div>
+      <a href="#album-chapters" class="nav-link">📖 Album Chapters</a>
+      <a href="#smart-flows" class="nav-link">🪄 Smart Flows & Local AI</a>
+      <a href="#video-wizard" class="nav-link">🎬 Create a Video</a>
+      <a href="#ai-photo-search" class="nav-link">🔎 Ask AI</a>
+    </div>
   </aside>
 
   <!-- Main Documentation Content -->
@@ -448,7 +456,7 @@
 
     <!-- Hero Header -->
     <div class="hero-banner">
-      <div class="badge">Comprehensive Reference v1.2</div>
+      <div class="badge">Comprehensive Reference v2.1</div>
       <h1 class="hero-title">How gPhotos Desktop Works</h1>
       <p class="hero-subtitle">
         A private, high-performance, on-device photo manager with zero cloud lock-in. Powered by local AI face recognition, intelligent duplicate clustering, and non-blocking background synchronization.
@@ -691,6 +699,7 @@
         <li><strong>Offline Browsing</strong>: Browse your entire 500,000+ photo collection smoothly even when disconnected from your local network.</li>
         <li><strong>Instant Full-Res On-Demand</strong>: Clicking a photo immediately fetches the original high-resolution camera file from the network share when online.</li>
         <li><strong>Direct Folder Tree Explorer</strong>: Browse folder subtrees directly even before a full background scan completes.</li>
+        <li><strong>Rotating a Mirrored Photo</strong>: the local thumbnail rotates and updates on screen immediately; the full-resolution original always rotates in the background afterward (reachable or not), so it never sits waiting on a slow network write. If the original can't be rotated after a few attempts, you're notified and the thumbnail is automatically rotated back to match.</li>
       </ul>
     </section>
 
@@ -743,7 +752,7 @@
       <ul>
         <li><strong>100% Free OpenStreetMap Tiles</strong>: Powered by <code>tile.openstreetmap.org</code>. Zero API keys, credit cards, or CARTO tokens required.</li>
         <li><strong>Bubble Cluster Pins</strong>: Group nearby photos into circular pins showing the latest thumbnail and photo count.</li>
-        <li><strong>Cluster Location Renaming</strong>: Click a pin to open the bottom photo drawer, click the pencil icon, and assign a custom friendly name (e.g. <em>"Trip to Paris"</em>) to all photos at that spot.</li>
+        <li><strong>Cluster Location Renaming</strong>: Click a pin to open the bottom photo drawer, click the pencil icon, and assign a custom friendly name (e.g. <em>"Trip to Paris"</em>) to all photos at that spot — shown exactly as typed everywhere (Places, "#place" search), with no country automatically appended.</li>
         <li><strong>Assign Locations to Unlocated Photos</strong>: If photos lack GPS EXIF tags, search any city or landmark and apply coordinates in 1 click.</li>
       </ul>
     </section>
@@ -759,9 +768,15 @@
         Quickly correct orientation or crop photos directly inside the Lightbox:
       </p>
       <ul>
+        <li><strong>Fit / Fill / 1:1</strong>: the buttons next to the lightbox zoom controls choose how each photo opens — <em>Fit</em> (shrunk to the window, the classic view), <em>Fill</em> (enlarged to use as much of the screen as its shape allows) or <em>1:1</em> (real pixels, drag to pan). Your choice is remembered.</li>
         <li><strong>Rotate & Flip</strong>: Rotate 90°, 180°, 270°, or flip horizontally.</li>
+        <li><strong>Crop</strong>: click "Crop" to drop a handled frame onto the photo, PowerPoint-style — drag inside the frame to move it, or drag any of its 8 corner/edge handles to resize it. Click "Crop" again to hide the frame without losing it, or "Clear Crop" to remove the selection. Only available at 0°/180° rotation.</li>
         <li><strong>Non-Destructive .bak Protection</strong>: When you overwrite an original file, the engine automatically creates a <code>[filename].jpg.bak</code> backup first.</li>
         <li><strong>Save as Copy</strong>: Choose <em>"Save Copy"</em> to export a new <code>[filename]_edited.jpg</code> file while preserving the original unmodified.</li>
+        <li><strong>Requires the Full-Resolution Photo</strong>: Edit (and Save Changes/Save Copy) stay disabled, with a tooltip explaining why, until the actual full-resolution photo has finished loading — so a OneDrive/cloud mirror still downloading, or one shown as its cached offline thumbnail, can't get permanently baked in at a lower resolution. HEIC is the one exception, since its editor always works on the local cached preview by design.</li>
+        <li><strong>Thumbnails Update Immediately</strong>: saving refreshes the photo's thumbnail right away everywhere it's shown — the gallery grid, albums, People — instead of waiting for a later rebuild.</li>
+        <li><strong>Click a Face Box to Reassign</strong>: In the Lightbox, click directly on a face's bounding box to open Assign / Reassign Person for that face immediately — no need to hunt for the small icon on the name label.</li>
+        <li><strong>Auto-Rotate Upright</strong>: Select multiple photos in the gallery and choose <em>"Auto-Rotate Upright"</em> — faces are used to detect and correct sideways/upside-down orientation automatically.</li>
       </ul>
     </section>
 
@@ -778,8 +793,98 @@
       <ul>
         <li><strong>Portraits Tab</strong>: Filter photos that have at least one recognized face.</li>
         <li><strong>No Faces Tab</strong>: Filter landscape, document, or object photos with zero faces.</li>
+        <li><strong>No Album Tab</strong>: Shows only photos that are not in any album yet — handy for finding what still needs sorting. It updates as you add photos to albums.</li>
         <li><strong>Multi-Select Exclude</strong>: Select multiple photos and click <em>"Exclude from Library"</em>. They are hidden from the application without being deleted from your computer.</li>
-        <li><strong>Dynamic Zoom Wheel</strong>: Hold <kbd>Ctrl</kbd> and scroll your mouse wheel in the gallery to zoom dynamically between Small, Medium, and Large views.</li>
+        <li><strong>Dynamic Zoom Wheel</strong>: Hold <kbd>Ctrl</kbd> and scroll your mouse wheel in the gallery to zoom dynamically between Small, Medium, and Large views — the photo under your pointer stays put; using the toolbar buttons instead keeps the top-left photo put.</li>
+        <li><strong>Explorer-Style Drag Selection</strong>: Press and drag to select a fresh set of photos; hold <kbd>Ctrl</kbd> while dragging to add another set without losing your first selection.</li>
+        <li><strong>Icon-Only Toolbar</strong>: the header shows just your library's name (no duplicate badge next to it); <strong>Select</strong>, <strong>Clean Duplicates</strong>, <strong>Rescan</strong> (network/cloud libraries only) and <strong>Ask AI</strong> are icon-only buttons — hover any of them for a tooltip explaining what it does.</li>
+        <li><strong>Bulk Edit Date/Location</strong>: select photos, then "Edit Date/Location" to set one date/time and/or location on all of them at once. Pinning a location on the map requires naming it there first — "Use This Location" stays disabled (with an amber-highlighted name box and a short note) until you do — so the name you give it always comes back into this dialog's own location box instead of staying blank.</li>
+        <li><strong>Esc Goes Back One Screen</strong>: closes the Lightbox or a modal if one is open, then clears an AI search filter / open folder / open person profile, then — once there's nothing left to close — returns to the previous tab you were actually on, repeatable to walk back through your navigation history one screen at a time.</li>
+      </ul>
+    </section>
+
+    <!-- Album Chapters Section -->
+    <section id="album-chapters">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(99, 102, 241, 0.15); color: var(--indigo);">📖</div>
+        <h2 class="section-title">Album Chapters</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Split a big album (e.g. a wedding, a trip) into named sections — an album with no chapters
+        looks and works exactly as before, nothing changes unless you add one:
+      </p>
+      <ul>
+        <li><strong>Create a Chapter</strong>: Open an album &rarr; <em>"New Chapter"</em> &rarr; give it a name (e.g. "Day 1 — Ceremony", "Day 2 — Reception"). Each chapter gets its own heading and its own photo grid inside the album.</li>
+        <li><strong>Auto-Generated Chapter Cover</strong>: Every chapter shows a live collage of up to 4 of its own photos next to its title — a visual identity generated on the fly, not a saved file, so it never counts as a photo or shows up in your main gallery.</li>
+        <li><strong>Rename, Reorder, Delete</strong>: Click the pencil to rename, or the up/down arrows to reorder chapters. Deleting a chapter never deletes its photos — they simply fall back to the album's "Other Photos" bucket.</li>
+        <li><strong>Adding Photos Asks Which Chapter</strong>: The "Add Photos" picker shows a chapter dropdown, defaulting to whichever chapter you used last.</li>
+        <li><strong>Move a Photo Between Chapters</strong>: Click the small book icon on any photo tile (once the album has at least one chapter) to reassign it — a photo lives in one chapter at a time, like a folder. You can also just <strong>drag</strong> a photo onto a chapter; the moment you start dragging, <strong>every chapter appears as a target in a bar at the top</strong> (plus "Other Photos"), so you never scroll to find the right one.</li>
+        <li><strong>Select Several Photos</strong>: like the main gallery — click a photo's small checkmark, or <strong>press and drag on empty space (or from a checkmark)</strong> to draw a selection box over many photos (Ctrl/Shift adds; the box scrolls the album near the edges). Once photos are selected, clicking a photo toggles it, and dragging any selected photo moves the whole selection to the chapter you drop on. A bar at the bottom offers <em>Move to chapter…</em> (including <em>New chapter</em> with these photos) and works without dragging.</li>
+        <li><strong>Order Photos Inside a Chapter</strong>: drop a photo <em>onto another photo</em> of the same chapter to place it just before that one (works across chapters too). Once every photo is in a named chapter, the "Other Photos" section disappears on its own.</li>
+        <li><strong>One-Click Add from the Photo Viewer</strong>: The lightbox's quick-add buttons show "Add to Album → Chapter" and go straight there in one click; a small arrow next to it opens a picker if you want a different chapter for that one photo.</li>
+        <li><strong>Adding a Gallery Selection to an Album</strong>: select photos and click "Add to Album" — a search-first picker opens (like choosing a person), focused and ready to type, listing every album with its cover photo and name. Type to filter, then Enter (or a click) picks the best match, or creates a new album with that name if nothing matches. Picking (or creating) the album then shows a second step listing that album's chapters — press Enter with nothing typed, or click the pinned "Others" card, to drop the selection into a catch-all "Others" chapter (created the first time, reused after); type a chapter name and Enter to add to it, or type a new name to create one. A back arrow returns to album selection without adding anything.</li>
+      </ul>
+    </section>
+
+    <!-- Smart Flows Section -->
+    <section id="smart-flows">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(192, 132, 252, 0.15); color: var(--purple);">🪄</div>
+        <h2 class="section-title">Smart Flows: Describe a Photo, Automate the Rest</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Open <strong>Smart Flows</strong> from the sidebar to define rules like "a screenshot of a
+        Facebook or LinkedIn post", "a photo of a UPI payment", "a scanned bill" or "a visiting
+        card" — matching photos are automatically added to an album or moved to a folder.
+      </p>
+      <ul>
+        <li><strong>Create a Flow</strong>: Give it a name, a plain-English description of what to look for, and an action — <em>Add to album</em> (name it) or <em>Move to folder</em> (you pick the destination folder when you run it).</li>
+        <li><strong>Consent Required</strong>: Because checking a photo can send it to a cloud AI provider, each flow needs its checkbox ticked once before its first run — there's no default-on path.</li>
+        <li><strong>Run Now, With a Cap</strong>: Click <em>"Run now"</em> and choose how many not-yet-checked photos to send this run (default 200) — a flow never silently classifies your whole library. This opens a run window with the flow's name/description, its source, a progress bar, and a live detail log — one line per photo saying exactly what happened ("already described", "trying the local Ollama model...", "sending to the cloud...", matched/not matched, or why it failed). Closing the window doesn't stop the run.</li>
+        <li><strong>Runs Even With No AI Configured</strong>: a flow isn't blocked just because no cloud key is set — the shared cache and a local Ollama model (if installed) may already answer some or all photos for free. Whatever genuinely needs the cloud and isn't configured shows a clear error in that photo's log line instead of the run being blocked entirely.</li>
+        <li><strong>Three Free/Cheap Passes Before the Cloud</strong>: every photo is checked, in order: (1) a shared local cache — instant, free, remembers photos any flow has ever looked at; (2) a local Ollama vision model, if you have one installed — private and free; only escalating to (3) your configured cloud provider (Gemini/OpenAI, set up under <strong>Settings &rarr; Smart Flow Configuration</strong> — its own, separate settings from AI Search's) when neither of the first two can decide confidently.</li>
+        <li><strong>Smart Flows' Cloud Fallback Is Configured Separately from AI Search</strong>: AI Search and Smart Flows are different jobs — searching your existing library vs. auto-sorting new photos — so each gets its own cloud provider and API key, under <strong>Settings &rarr; AI Search Assistant</strong> and <strong>Settings &rarr; Smart Flow Configuration</strong> respectively. Point Search at one provider and Smart Flows at another (or turn either off and rely on the local model/cache alone) — saving one never touches the other's key.</li>
+        <li><strong>Configuring the Local Ollama Engine</strong>: install <a href="https://ollama.com" target="_blank" rel="noopener">Ollama</a>, then open <strong>Settings &rarr; Smart Flow Configuration</strong> (one section covering both the cloud fallback above and this local model, shared by both AI Search and Smart Flows) — it lists every model Ollama has installed, and if nothing suitable is found yet, shows a "Recommended models to download" list with a one-click <em>Download</em> button (progress bar included, no terminal needed). Pick a vision model and an embedding model from the dropdowns, then <em>"Save & Re-check"</em>. A custom host and a <strong>Context Window (tokens)</strong> field are also available there — see below. If a download fails, the reason is shown under the status line. Model management works from the desktop app only, not from the phone/browser view.</li>
+        <li><strong>Batch Size Adjusts Itself to Your Context Window</strong>: Ollama has no API that reports back what context length you've actually set a running model to use, so the <strong>Context Window</strong> field in Settings is where you tell gPhotos what you configured in Ollama (default 4096, matching Ollama's own default). Before each local run, gPhotos also asks Ollama for that model's own maximum context and uses whichever is smaller, then converts that into a batch size (roughly 360 tokens per photo thumbnail, capped at 20 photos per call). The run log shows the exact numbers at the top of every run. If you've raised Ollama's own context window (e.g. to 32768), set this field to match, or gPhotos will assume the 4096 default and batch more conservatively than your setup allows.</li>
+        <li><strong>Run Against Just One Album — or a Selection</strong>: the "Run against" picker in the modal defaults to the whole library but can be pointed at one album instead, so you can try a flow's wording on a small set of photos first. A <strong>"Run Smart Flow"</strong> button also appears on the selection bar in Photos and inside an Album once you've selected some photos — it opens Smart Flows already scoped to just that selection.</li>
+        <li><strong>AI Info in the Photo Viewer</strong>: once a photo has been checked by any flow, its info panel gets an "AI Info" card — an Overview tab with the cached caption/tags, and (once more than one of your flows has checked it) a Smart Flows tab listing each flow's name, match, and confidence.</li>
+      </ul>
+    </section>
+
+    <!-- Create a Video Section -->
+    <section id="video-wizard">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(236, 72, 153, 0.15); color: #ec4899;">🎬</div>
+        <h2 class="section-title">Create a Video from an Album</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Open an album and click <strong>"Create Video"</strong> to turn its photos into a real MP4 slideshow — rendered with a bundled FFmpeg (nothing to install separately), ready to post to social media. A 6-step wizard:
+      </p>
+      <ul>
+        <li><strong>1. Group Photos</strong>: photos are shown under their chapter headings in album order. Select 2-4 and click <em>"Group as Collage"</em> — a popup previews every style (Grid, Side by Side, Stacked, Featured) using your own photos so you can pick one (ungroup again from the same step if needed).</li>
+        <li><strong>2. Arrange Slides</strong>: every slide (photos and collages) listed in order — drag a row (by its handle) or use the up/down arrows to reorder, and uncheck anything to leave it out.</li>
+        <li><strong>3. Video Settings</strong>: aspect ratio (16:9 landscape, 9:16 reels/stories, 1:1 square, 4:3), resolution (720p/1080p), quality/generation speed (draft/good/best), the transition (one effect for every cut, random per cut, or a set of effects you tick and it picks among) and its duration, seconds-per-photo or a target total length, and where to save the <code>.mp4</code> — pre-filled as <code>&lt;library folder&gt;\videos\&lt;album name&gt;.mp4</code>, changeable with "Change Location".</li>
+        <li><strong>4. Music</strong> (optional): start from the <em>Free music library</em> — 20 royalty-free tracks by Kevin MacLeod (incompetech.com) with cover art, title, artist, mood and length; filter by mood, <em>Preview</em> a track, then <em>Use</em> it (it downloads on first use, about 8&nbsp;MB, and is kept). These are Creative Commons Attribution 4.0, so the required credit is added to your end-credits screen automatically. Or choose an audio file from your computer, or paste a YouTube link on the <em>From YouTube</em> tab (uses the free open-source <strong>yt-dlp</strong>, installed once from the wizard — about 18&nbsp;MB from its official GitHub release, checksum-verified). Set <em>Start at</em> / <em>End at</em> (m:ss) to choose the part of the song, tick <em>Repeat to fill the whole video</em> to loop it, pick a fade-out and volume, and press <em>Preview this section</em> to listen. Use only music you have the right to use.</li>
+        <li><strong>5. Title &amp; Credits</strong> (optional): design the opening title screen and, on the second tab, closing credits, in the same designer. It previews at your video's exact size and keeps all text inside the frame (wrapping or shrinking it, also on vertical video). Choose a gradient, colour or one of the album's photos as the background (with a darken slider), add / edit / remove text lines with their own font, size, colour, bold/italic, alignment, shadow and position (drag on the preview), and set how long the screen shows.</li>
+        <li><strong>6. Review & Generate</strong>: generate with a live progress bar and a cancel button; the finished video opens automatically in your default player (with "Open Video"/"Show in Folder" also available). A photo that can't be read is skipped and reported, not a failure of the whole video.</li>
+      </ul>
+    </section>
+
+    <!-- AI Photo Search ("Ask AI") Section -->
+    <section id="ai-photo-search">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(168, 85, 247, 0.15); color: #a855f7;">🔎</div>
+        <h2 class="section-title">AI Photo Search: "Ask AI"</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Click <strong>"Ask AI"</strong> in the Photos toolbar to ask a plain-English question — "Photo of sachin and monika", "Photo of monika alone" — answered by whichever provider is set up under Settings &rarr; Search with AI. A match applies as a filter on the gallery.
+      </p>
+      <ul>
+        <li><strong>@Mention People, #Mention Places, &amp;Mention Smart Flow Tags</strong>: type <code>@</code> for a dropdown of the people in your library, <code>#</code> for places from your Places map, or <code>&amp;</code> for content tags Smart Flows has already recorded about your photos (e.g. "receipt", "screenshot") — no need to spell any of them exactly, the list matches anywhere in the name (typing "bhavsar" finds both "Sachin Bhavsar" and "Bhavsar Tarun"). Use &uarr;/&darr; and Enter (or click) to pick one, Esc to dismiss the list. Picking an entry drops its plain text into your question, so the sentence still reads naturally. People not yet given a real name aren't offered, since there's nothing to search by yet. A picked place is matched against each photo's actual city and country, even for a combined "City, Country" entry. Tags are stored durably in the library's own database (shared across every Smart Flow, surviving a restart) and only list what a Smart Flow run has actually found — an empty list means run a Smart Flow first; a tagged search only matches photos a Smart Flow has actually analysed.</li>
       </ul>
     </section>
 

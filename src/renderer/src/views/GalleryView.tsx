@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import {
+  Image as ImageIcon,
   Calendar,
   Sliders,
   FolderOpen,
@@ -22,10 +23,13 @@ import {
   Trash2,
   AlertTriangle,
   MoreVertical,
-  RotateCw
+  RotateCw,
+  Wand2
 } from 'lucide-react';
 import { Photo, VirtualStorageConfig, Album } from '../../../types';
 import { PhotoCard } from '../components/PhotoCard';
+import { AlbumPicker } from '../components/AlbumPicker';
+import { ChapterSelectStep } from '../components/ChapterSelectStep';
 import { libraryStore } from '../services/libraryStore';
 import { VirtualizedTimelineGallery, GalleryZoomLevel, ZOOM_LEVELS } from '../components/VirtualizedTimelineGallery';
 import { AiPhotoFilter } from '../services/aiSearchService';
@@ -47,6 +51,10 @@ interface GalleryViewProps {
   virtualStorages?: VirtualStorageConfig[];
   onSelectStorage?: (storage: VirtualStorageConfig) => void;
   onOpenDuplicateCleaner?: (cluster?: any) => void;
+  /** Opens Smart Flows pre-scoped to the currently selected photos. */
+  onRunSmartFlow?: (photos: Photo[]) => void;
+  /** The active library's folder path — its last path segment is shown as the page title. */
+  libraryFolder?: string | null;
   onOpenHelp?: () => void;
   onOpenAiSearch?: () => void;
   activeAiFilter?: AiPhotoFilter | null;
@@ -65,6 +73,8 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   virtualStorages = [],
   onSelectStorage,
   onOpenDuplicateCleaner,
+  onRunSmartFlow,
+  libraryFolder,
   onOpenHelp,
   onOpenAiSearch,
   activeAiFilter,
@@ -73,7 +83,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   totalCount,
 }) => {
   const [zoomLevel, setZoomLevel] = useState<GalleryZoomLevel>('medium');
-  const [filterType, setFilterType] = useState<'all' | 'faces' | 'nofaces' | 'excluded'>('all');
+  const [filterType, setFilterType] = useState<'all' | 'faces' | 'nofaces' | 'noalbum' | 'excluded'>('all');
   const [isSelectMode, setIsSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const isMobile = useIsMobile();
@@ -81,9 +91,10 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
 
   // Album Dialog states
   const [showAlbumDialog, setShowAlbumDialog] = useState(false);
-  const [targetAlbumId, setTargetAlbumId] = useState<string>('new');
-  const [newAlbumTitle, setNewAlbumTitle] = useState('');
   const [albumSuccessToast, setAlbumSuccessToast] = useState<string | null>(null);
+  // Step 2 of the dialog: once an album is picked (or created), which chapter to add into — null
+  // means still on step 1 (picking the album itself).
+  const [albumPendingChapterSelection, setAlbumPendingChapterSelection] = useState<Album | null>(null);
 
   // Bulk date/location edit modal
   const [showBulkEditModal, setShowBulkEditModal] = useState(false);
@@ -109,7 +120,8 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
         setShowBulkEditModal(false);
       } else if (showAlbumDialog) {
         e.stopImmediatePropagation();
-        setShowAlbumDialog(false);
+        if (albumPendingChapterSelection) setAlbumPendingChapterSelection(null); // back to picking the album
+        else setShowAlbumDialog(false);
       } else if (showDeleteConfirmModal) {
         e.stopImmediatePropagation();
         setShowDeleteConfirmModal(false);
@@ -123,7 +135,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
     // capture: true — see PeopleView's matching Escape handler for why.
     window.addEventListener('keydown', handleKeyDown, { capture: true });
     return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [showBulkEditModal, showAlbumDialog, showDeleteConfirmModal, isSelectMode, selectedIds]);
+  }, [showBulkEditModal, showAlbumDialog, albumPendingChapterSelection, showDeleteConfirmModal, isSelectMode, selectedIds]);
 
   // Stable reference so the gallery's near-bottom/bootstrap load-more effects
   // don't re-fire on every unrelated re-render. Loads several pages ahead
@@ -248,6 +260,17 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
     }
   };
 
+  // Which photos are in at least one album. Albums are edited in place (same array, same objects), so the
+  // memo is keyed on a cheap fingerprint — id + updatedAt + size of each album — rather than on the array.
+  const albumsNow = libraryStore.getState().albums || [];
+  const albumFingerprint = albumsNow.map((a) => a.id + ':' + a.updatedAt + ':' + a.photoIds.length).join('|');
+  const photoIdsInAnAlbum = useMemo(() => {
+    const ids = new Set<string>();
+    for (const a of albumsNow) for (const id of a.photoIds) ids.add(id);
+    return ids;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [albumFingerprint]);
+
   const filteredPhotos = useMemo(() => {
     let result = photos;
 
@@ -261,12 +284,14 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       result = result.filter((p) => !p.isExcluded && p.faces && p.faces.length > 0);
     } else if (filterType === 'nofaces') {
       result = result.filter((p) => !p.isExcluded && (!p.faces || p.faces.length === 0));
+    } else if (filterType === 'noalbum') {
+      result = result.filter((p) => !p.isExcluded && !photoIdsInAnAlbum.has(p.id));
     } else if (filterType === 'excluded') {
       result = result.filter((p) => p.isExcluded);
     }
 
     return result;
-  }, [photos, filterFavorite, filterType]);
+  }, [photos, filterFavorite, filterType, photoIdsInAnAlbum]);
 
   // Derived values that used to be recomputed by scanning every photo on each render (each selection toggle).
   const excludedCount = useMemo(() => photos.filter((p) => p.isExcluded).length, [photos]);
@@ -539,32 +564,47 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
     );
   }
 
-  const handleAddSelectedToAlbum = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (selectedIds.size === 0) return;
-    const ids = Array.from(selectedIds);
+  const closeAlbumDialog = () => {
+    setShowAlbumDialog(false);
+    setAlbumPendingChapterSelection(null);
+  };
 
-    let albumName = '';
-    const currentAlbums = libraryStore.getState().albums || [];
-    if (targetAlbumId === 'new') {
-      if (!newAlbumTitle.trim()) return;
-      const created = libraryStore.createAlbum(newAlbumTitle.trim());
-      libraryStore.addPhotosToAlbum(created.id, ids);
-      albumName = created.title;
+  // Step 1: pick (or create) the album — moves to step 2 (chapter selection) rather than adding
+  // right away, so every bulk add goes through a chapter, even an album that doesn't have any yet.
+  const handlePickAlbum = (album: Album) => setAlbumPendingChapterSelection(album);
+  const handleCreateAlbumAndAdd = (title: string) => {
+    const created = libraryStore.createAlbum(title);
+    setAlbumPendingChapterSelection(created);
+  };
+
+  // Step 2: add the selection into a specific chapter of the already-picked album, or — chapterId
+  // null and no newChapterTitle — the "Others" catch-all: reuse it by name if the album already has
+  // one, create it otherwise. Pressing Enter with nothing typed takes this same path.
+  const finishAddToAlbumChapter = (album: Album, chapterId: string | null, newChapterTitle?: string) => {
+    const ids = Array.from(selectedIds);
+    let chapterTitle: string;
+
+    if (newChapterTitle) {
+      const chapter = libraryStore.createChapter(album.id, newChapterTitle, ids);
+      chapterTitle = chapter?.title || newChapterTitle;
     } else {
-      const existing = currentAlbums.find((a) => a.id === targetAlbumId);
-      if (!existing) return;
-      libraryStore.addPhotosToAlbum(existing.id, ids);
-      albumName = existing.title;
+      const targetId = chapterId || (album.chapters || []).find((c) => c.title.trim().toLowerCase() === 'others')?.id;
+      if (targetId) {
+        libraryStore.addPhotosToChapter(album.id, targetId, ids);
+        chapterTitle = album.chapters?.find((c) => c.id === targetId)?.title || '';
+      } else {
+        const chapter = libraryStore.createChapter(album.id, 'Others', ids);
+        chapterTitle = chapter?.title || 'Others';
+      }
     }
 
-    setAlbumSuccessToast(`✓ Added ${ids.length} photo(s) to album "${albumName}"!`);
+    setAlbumSuccessToast(`✓ Added ${ids.length} photo(s) to "${album.title}" → "${chapterTitle}"!`);
     setTimeout(() => setAlbumSuccessToast(null), 3500);
 
     setSelectedIds(new Set());
     setIsSelectMode(false);
     setShowAlbumDialog(false);
-    setNewAlbumTitle('');
+    setAlbumPendingChapterSelection(null);
   };
 
   const existingAlbums = libraryStore.getState().albums || [];
@@ -574,41 +614,25 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   // behind a single "more options" toggle, instead of letting flex-wrap
   // stack Select/Clean Duplicates/Rescan/Ask AI/zoom controls into four or
   // five separate rows that ate roughly half the screen on a phone.
+  // The page header: the library's own name (its folder's last path segment) as a plain title —
+  // not a colored pill/badge like the virtual-storage indicator next to it — with a photo icon.
+  // Favorites keeps its own "Favorite Photos" label instead, since that page context is what tells
+  // it apart from the main Photos tab (both render through this same component).
+  const libraryDisplayName = libraryFolder ? (libraryFolder.split(/[\\/]/).filter(Boolean).pop() || 'Library') : 'Library';
+
   const titleBlock = (
-    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--text-secondary)', minWidth: 0, overflow: 'hidden' }}>
-      <Calendar size={isMobile ? 16 : 18} style={{ flexShrink: 0 }} />
+    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0, overflow: 'hidden' }}>
+      <ImageIcon size={isMobile ? 16 : 18} color="var(--text-primary)" style={{ flexShrink: 0 }} />
       <span style={{
-        fontSize: isMobile ? '0.82rem' : '0.9rem',
-        fontWeight: 600,
+        fontSize: isMobile ? '0.9rem' : '1.05rem',
+        fontWeight: 700,
         color: 'var(--text-primary)',
         whiteSpace: 'nowrap',
         overflow: 'hidden',
         textOverflow: 'ellipsis',
       }}>
-        {filterFavorite ? 'Favorite Photos' : 'Timeline'}
+        {filterFavorite ? 'Favorite Photos' : libraryDisplayName}
       </span>
-      <span style={{ fontSize: isMobile ? '0.72rem' : '0.8rem', color: 'var(--text-muted)', flexShrink: 0 }}>
-        ({filterFavorite || filterType !== 'all' ? filteredPhotos.length : (totalCount || filteredPhotos.length)})
-      </span>
-
-      {!isMobile && hasVirtual && (
-        <span style={{
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: '4px',
-          fontSize: '11px',
-          padding: '2px 8px',
-          borderRadius: 'var(--radius-full)',
-          backgroundColor: 'rgba(6, 182, 212, 0.15)',
-          color: 'var(--accent-cyan)',
-          border: '1px solid rgba(6, 182, 212, 0.3)',
-          fontWeight: 600,
-          marginLeft: '6px',
-        }}>
-          <HardDrive size={12} />
-          {firstVirtualStorageName}
-        </span>
-      )}
     </div>
   );
 
@@ -644,6 +668,15 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       >
         No Faces
       </button>
+      <button
+        className={'btn ' + (filterType === 'noalbum' ? 'btn-primary' : 'btn-ghost')}
+        onClick={() => setFilterType('noalbum')}
+        style={{ padding: '3px 10px', fontSize: '0.75rem', height: '26px' }}
+        title="Photos that are not in any album yet"
+        data-testid="filter-no-album"
+      >
+        No Album
+      </button>
       {excludedCount > 0 && (
         <button
           className={`btn ${filterType === 'excluded' ? 'btn-primary' : 'btn-ghost'}`}
@@ -661,61 +694,58 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
     </div>
   );
 
+  // Icon-only, like the zoom controls below — a tooltip (title) carries the label instead of
+  // text, so four buttons' worth of toolbar width shrinks to four 34px squares and the whole
+  // toolbar stays on one line even on a narrower window.
   const selectButton = (
     <button
-      className={`btn ${isSelectMode ? 'btn-primary' : 'btn-secondary'}`}
+      className={`btn btn-icon ${isSelectMode ? 'btn-primary' : 'btn-secondary'}`}
       onClick={() => {
         setIsSelectMode(!isSelectMode);
         if (isSelectMode) setSelectedIds(new Set());
       }}
-      style={{ padding: '6px 14px', fontSize: '0.82rem', gap: '8px', height: '34px' }}
+      style={{ width: '34px', height: '34px' }}
+      title={isSelectMode ? 'Cancel selection' : 'Select photos'}
     >
       <CheckSquare size={16} />
-      <span>{isSelectMode ? 'Cancel Select' : 'Select'}</span>
     </button>
   );
 
   const cleanDuplicatesButton = onOpenDuplicateCleaner ? (
     <button
-      className="btn btn-secondary"
+      className="btn btn-icon btn-secondary"
       onClick={() => onOpenDuplicateCleaner()} // NOT onClick={onOpenDuplicateCleaner}: that passes the click event in as the `cluster` argument
-      style={{ padding: '6px 14px', fontSize: '0.82rem', gap: '8px', height: '34px', borderColor: 'rgba(99, 102, 241, 0.4)' }}
-      title="Identify duplicate bursts, score best shots, and safely delete inferior copies"
+      style={{ width: '34px', height: '34px', borderColor: 'rgba(99, 102, 241, 0.4)' }}
+      title="Clean Duplicates — identify duplicate bursts, score best shots, and safely delete inferior copies"
     >
       <Layers size={16} color="#818cf8" />
-      <span>Clean Duplicates</span>
     </button>
   ) : null;
 
   const rescanButton = (hasVirtual && onRefreshNetwork) ? (
     <button
-      className="btn btn-secondary"
+      className="btn btn-icon btn-secondary"
       onClick={onRefreshNetwork}
-      style={{ padding: '6px 12px', fontSize: '0.82rem', gap: '8px', height: '34px' }}
-      title="Rescan network location for newly added photos"
+      style={{ width: '34px', height: '34px' }}
+      title="Rescan — check the network location for newly added photos"
     >
       <RefreshCw size={15} />
-      <span>Rescan</span>
     </button>
   ) : null;
 
   const askAiButton = onOpenAiSearch ? (
     <button
-      className="btn btn-secondary"
+      className="btn btn-icon btn-secondary"
       onClick={onOpenAiSearch}
       style={{
-        padding: '6px 14px',
-        fontSize: '0.82rem',
-        gap: '8px',
+        width: '34px',
         height: '34px',
         background: 'linear-gradient(135deg, rgba(99, 102, 241, 0.15) 0%, rgba(168, 85, 247, 0.15) 100%)',
         borderColor: 'rgba(168, 85, 247, 0.4)',
-        fontWeight: 600,
       }}
-      title="Natural language photo search with AI assistant"
+      title="Ask AI — natural language photo search"
     >
       <Sparkles size={16} color="#c084fc" />
-      <span>Ask AI</span>
     </button>
   ) : null;
 
@@ -899,6 +929,19 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
           <FolderPlus size={14} color="var(--accent-primary)" />
           <span>Album</span>
         </button>
+
+        {onRunSmartFlow && (
+          <button
+            className="btn btn-secondary"
+            onClick={() => onRunSmartFlow(photos.filter((p) => selectedIds.has(p.id)))}
+            disabled={selectedIds.size === 0}
+            style={{ fontSize: '0.78rem', gap: '6px', padding: '6px 10px', flexShrink: 0 }}
+            title="Run one of your Smart Flows against just the selected photos"
+          >
+            <Wand2 size={14} color="#c084fc" />
+            <span>Smart Flow</span>
+          </button>
+        )}
 
         <button
           className="btn btn-secondary"
@@ -1163,6 +1206,20 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
               <span>Add to Album</span>
             </button>
 
+            {/* Run a Smart Flow against just the selected photos */}
+            {onRunSmartFlow && (
+              <button
+                className="btn btn-secondary"
+                onClick={() => onRunSmartFlow(photos.filter((p) => selectedIds.has(p.id)))}
+                disabled={selectedIds.size === 0}
+                style={{ fontSize: '0.85rem', gap: '8px', padding: '6px 14px' }}
+                title="Run one of your Smart Flows against just the selected photos"
+              >
+                <Wand2 size={16} color="#c084fc" />
+                <span>Run Smart Flow ({selectedIds.size})</span>
+              </button>
+            )}
+
             {/* Bulk Edit Date/Location Button */}
             <button
               className="btn btn-secondary"
@@ -1357,17 +1414,20 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
             justifyContent: 'center',
             padding: '24px',
           }}
-          onClick={() => setShowAlbumDialog(false)}
+          onClick={closeAlbumDialog}
         >
           <div
             style={{
               width: '100%',
-              maxWidth: '460px',
+              maxWidth: '480px',
+              maxHeight: '80vh',
               backgroundColor: 'var(--bg-surface)',
               border: '1px solid var(--border-subtle)',
               borderRadius: 'var(--radius-lg)',
               boxShadow: '0 24px 64px rgba(0, 0, 0, 0.7)',
               overflow: 'hidden',
+              display: 'flex',
+              flexDirection: 'column',
             }}
             onClick={(e) => e.stopPropagation()}
           >
@@ -1378,6 +1438,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'space-between',
+                flexShrink: 0,
               }}
             >
               <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
@@ -1388,72 +1449,31 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
               </div>
               <button
                 className="btn btn-ghost btn-icon"
-                onClick={() => setShowAlbumDialog(false)}
+                onClick={closeAlbumDialog}
                 style={{ width: '36px', height: '36px' }}
               >
                 <X size={20} />
               </button>
             </div>
 
-            <form onSubmit={handleAddSelectedToAlbum} style={{ padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
-              {existingAlbums.length > 0 && (
-                <div>
-                  <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '6px' }}>
-                    Choose Album
-                  </label>
-                  <select
-                    className="input"
-                    value={targetAlbumId}
-                    onChange={(e) => setTargetAlbumId(e.target.value)}
-                    style={{ height: '40px', width: '100%' }}
-                  >
-                    <option value="new">+ Create New Album...</option>
-                    {existingAlbums.map((a) => (
-                      <option key={a.id} value={a.id}>
-                        {a.title} ({a.photoIds.length} photos)
-                      </option>
-                    ))}
-                  </select>
-                </div>
+            <div style={{ padding: '18px 24px', minHeight: 0, flex: 1, display: 'flex' }}>
+              {albumPendingChapterSelection ? (
+                <ChapterSelectStep
+                  album={albumPendingChapterSelection}
+                  onBack={() => setAlbumPendingChapterSelection(null)}
+                  onPickChapter={(chapterId) => finishAddToAlbumChapter(albumPendingChapterSelection, chapterId)}
+                  onCreateChapter={(title) => finishAddToAlbumChapter(albumPendingChapterSelection, null, title)}
+                />
+              ) : (
+                <AlbumPicker
+                  albums={existingAlbums}
+                  photos={photos}
+                  onPick={handlePickAlbum}
+                  onCreateNew={handleCreateAlbumAndAdd}
+                  listMaxHeight={360}
+                />
               )}
-
-              {targetAlbumId === 'new' && (
-                <div>
-                  <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '6px' }}>
-                    New Album Title <span style={{ color: 'var(--accent-rose)' }}>*</span>
-                  </label>
-                  <input
-                    type="text"
-                    className="input"
-                    placeholder="e.g. Summer Roadtrip, Wedding 2024"
-                    value={newAlbumTitle}
-                    onChange={(e) => setNewAlbumTitle(e.target.value)}
-                    autoFocus
-                    required={targetAlbumId === 'new'}
-                    style={{ height: '40px' }}
-                  />
-                </div>
-              )}
-
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '12px' }}>
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  onClick={() => setShowAlbumDialog(false)}
-                  style={{ height: '40px', padding: '0 18px' }}
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="btn btn-primary"
-                  disabled={targetAlbumId === 'new' && !newAlbumTitle.trim()}
-                  style={{ height: '40px', padding: '0 22px' }}
-                >
-                  Add Photos
-                </button>
-              </div>
-            </form>
+            </div>
           </div>
         </div>
       )}

@@ -10,12 +10,19 @@ export function groupPhotosByPlace(photos: Photo[]): PlaceAlbum[] {
     let placeKey = '';
     let albumName = '';
 
+    // A custom label (set via "rename this location" on the map, or the location picker's own
+    // Label field) is the user's explicit, deliberate name for this spot — it always wins over the
+    // auto-derived "City, Country" string. Without this, renaming a cluster to "Andaman" (which only
+    // touches city/label, never country — country is still correct, geographically) kept showing up
+    // everywhere as "Andaman, India" regardless of what was actually typed, because this function
+    // only ever looked at city/country and never the label meant to override them.
+    const customLabel = loc.label?.trim();
     if (loc.city && loc.country) {
       placeKey = `${loc.city}_${loc.country}`.toLowerCase();
-      albumName = `${loc.city}, ${loc.country}`;
+      albumName = customLabel || `${loc.city}, ${loc.country}`;
     } else if (loc.city) {
       placeKey = loc.city.toLowerCase();
-      albumName = loc.city;
+      albumName = customLabel || loc.city;
     } else {
       // Round to ~12-15km grid so photos from distant regions never collapse into one
       const gridLat = loc.latitude.toFixed(1);

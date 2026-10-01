@@ -18,7 +18,7 @@ import {
 } from '../../types';
 import { libraryStatusService } from './libraryStatusService';
 import { getFaceStatsForLibrary, getTotalPhotoCount } from './libraryRepository';
-import { readJsonSafe, writeJsonAtomic, writeFileAtomic } from './jsonFile';
+import { readJsonSafe, writeJsonAtomic, writeJsonAtomicAsync, writeFileAtomic, writeFileAtomicAsync } from './jsonFile';
 import { addSavedRotation, getHeicSavedRotation } from './heicRotationStore';
 import { getDefaultMirrorRoot } from './pathSecurity';
 import { isPathReachable, isNetworkPath } from './networkReachabilityCache';
@@ -1989,7 +1989,12 @@ export async function rotatePhotoFile(
     let isRawHeic = ext === '.heic' || ext === '.heif';
 
     // Check if the file buffer is actually a JPEG/WebP thumbnail (often named after source photo)
-    const inputBuf = fs.readFileSync(filePath);
+    // Async, not readFileSync: filePath can be on a slow/degraded network mount, and a sync read
+    // there blocks the WHOLE main process — every IPC call, menu action, window repaint — for as
+    // long as that read takes (seen in practice: a 20s+ "MAIN PROCESS STALL" attributed to
+    // photo:rotate). An async read still takes as long for THIS call, but lets everything else
+    // keep running meanwhile.
+    const inputBuf = await fs.promises.readFile(filePath);
     const isJpegBuffer = inputBuf.length > 2 && inputBuf[0] === 0xff && inputBuf[1] === 0xd8;
     const isWebpBuffer = inputBuf.length > 12 && inputBuf.slice(0, 4).toString() === 'RIFF';
 
@@ -2030,9 +2035,10 @@ export async function rotatePhotoFile(
     // Create .bak backup if it doesn't already exist — required: without it
     // a failed/interrupted write would leave no recoverable copy.
     const bakPath = `${filePath}.bak`;
-    if (!fs.existsSync(bakPath)) {
+    const bakAlreadyExists = await fs.promises.access(bakPath).then(() => true, () => false);
+    if (!bakAlreadyExists) {
       try {
-        fs.copyFileSync(filePath, bakPath);
+        await fs.promises.copyFile(filePath, bakPath);
       } catch (bakErr: any) {
         return { success: false, error: `Could not create a backup before rotating (${bakErr?.message || bakErr}); file left unchanged.` };
       }
@@ -2046,7 +2052,7 @@ export async function rotatePhotoFile(
 
     let prevMtime: number | undefined;
     try {
-      prevMtime = fs.statSync(filePath).mtimeMs;
+      prevMtime = (await fs.promises.stat(filePath)).mtimeMs;
     } catch {}
 
     if (sharpLib) {
@@ -2067,7 +2073,7 @@ export async function rotatePhotoFile(
       return { success: false, error: 'Could not process image rotation' };
     }
 
-    writeFileAtomic(filePath, outputBuffer);
+    await writeFileAtomicAsync(filePath, outputBuffer);
 
     // Purge cached thumbnails on disk so fresh orientation displays immediately
     try {
@@ -2087,6 +2093,49 @@ export interface PendingRotationItem {
   localFilePath?: string;
   rotationDegrees: number;
   timestamp: number;
+  /** How many times a reachable-but-failing rotation has actually been attempted (not counted while
+   *  simply offline — that's an expected, indefinite wait, not a failure). Past MAX_ROTATION_ATTEMPTS
+   *  the item is dropped, its local thumbnail reverted, and the user notified instead of retrying forever. */
+  attempts?: number;
+}
+
+export const MAX_ROTATION_ATTEMPTS = 5;
+
+// Told about a queued original rotation that never made it (format unsupported, or persistently
+// failing) after its local mirror thumbnail was already optimistically rotated — main.ts forwards
+// this to the renderer as a toast + a thumbnail refresh, so the UI stops showing pixels the actual
+// file was never able to match. A plain listener set (not a direct Electron import) keeps this file
+// testable without a BrowserWindow, same pattern as thumbnailCacheService's onThumbnailCacheCleared.
+export interface RotationFailureInfo {
+  originalRemotePath: string;
+  localFilePath?: string;
+  rotationDegrees: number;
+  reason: string;
+}
+const rotationFailureListeners = new Set<(info: RotationFailureInfo) => void>();
+export function onRotationFailure(listener: (info: RotationFailureInfo) => void): () => void {
+  rotationFailureListeners.add(listener);
+  return () => rotationFailureListeners.delete(listener);
+}
+function emitRotationFailure(info: RotationFailureInfo): void {
+  for (const l of rotationFailureListeners) {
+    try { l(info); } catch {}
+  }
+}
+
+/** Undoes a local mirror thumbnail's optimistic rotation once its matching original rotation has
+ *  given up for good, so the thumbnail stops disagreeing with the original it was never able to
+ *  update, and tells whoever's listening (the renderer, normally) why. */
+async function revertLocalThumbnailAndNotify(item: PendingRotationItem, reason: string): Promise<void> {
+  if (item.localFilePath) {
+    try {
+      const undoDegrees = (360 - (item.rotationDegrees % 360)) % 360;
+      if (undoDegrees !== 0) await rotatePhotoFile(item.localFilePath, undoDegrees);
+    } catch (err) {
+      console.warn('[OfflineRotationSync] Failed to revert local thumbnail after giving up:', err);
+    }
+  }
+  emitRotationFailure({ originalRemotePath: item.originalRemotePath, localFilePath: item.localFilePath, rotationDegrees: item.rotationDegrees, reason });
 }
 
 export function getPendingRotationsPath(): string {
@@ -2151,6 +2200,7 @@ export function enqueuePendingRotation(
     } else {
       items[existingIdx].rotationDegrees = combinedDegrees;
       items[existingIdx].timestamp = Date.now();
+      items[existingIdx].attempts = 0; // a newly-requested rotation amount gets a fresh retry budget
       if (localFilePath) items[existingIdx].localFilePath = localFilePath;
     }
   } else {
@@ -2160,6 +2210,7 @@ export function enqueuePendingRotation(
       localFilePath,
       rotationDegrees: degrees,
       timestamp: Date.now(),
+      attempts: 0,
     });
   }
 
@@ -2190,29 +2241,50 @@ async function runPendingRotations(): Promise<{ processed: number; remaining: nu
   let processed = 0;
 
   for (const item of items) {
+    if (!(await isPathReachable(item.originalRemotePath))) continue; // still offline — an expected, indefinite wait, not a failure
+
+    let res: { success: boolean; error?: string; unsupported?: boolean };
     try {
-      if (await isPathReachable(item.originalRemotePath)) {
-        console.log(`[OfflineRotationSync] Applying pending rotation (${item.rotationDegrees}°) to reconnected source: ${item.originalRemotePath}`);
-        const res = await rotatePhotoFile(item.originalRemotePath, item.rotationDegrees);
-        // An unsupported format (camera RAW) can never succeed: drop it from the queue instead of retrying forever.
-        if (res.success || res.unsupported) {
-          if (res.success) processed++;
-          else console.warn(`[OfflineRotationSync] Dropping queued rotation, ${res.error}`);
-          // Persist right away (not at the end): a crash later must not re-apply
-          // this rotation. Re-read first — enqueuePendingRotation may have added
-          // more rotation to this same entry while we were awaiting the rotate.
-          const current = getPendingRotations();
-          const idx = current.findIndex((i) => normQueuePath(i.originalRemotePath) === normQueuePath(item.originalRemotePath));
-          if (idx !== -1) {
-            const left = (((current[idx].rotationDegrees - item.rotationDegrees) % 360) + 360) % 360;
-            if (left === 0) current.splice(idx, 1);
-            else current[idx].rotationDegrees = left;
-            if (!savePendingRotations(current)) break; // can't record it -> stop rather than double-apply later
-          }
+      console.log(`[OfflineRotationSync] Applying pending rotation (${item.rotationDegrees}°) to reconnected source: ${item.originalRemotePath}`);
+      res = await rotatePhotoFile(item.originalRemotePath, item.rotationDegrees);
+    } catch (err: any) {
+      res = { success: false, error: err?.message || String(err) };
+    }
+
+    // Re-read first for every outcome below — enqueuePendingRotation may have combined more rotation
+    // into this same entry (or reset its attempts) while we were awaiting the rotate above.
+    const current = getPendingRotations();
+    const idx = current.findIndex((i) => normQueuePath(i.originalRemotePath) === normQueuePath(item.originalRemotePath));
+
+    if (res.success) {
+      processed++;
+    } else if (!res.unsupported) {
+      // A real, reachable-but-failing rotation (lock held by another process, a momentary permission
+      // error, ...) gets a few tries across cycles before giving up, rather than either retrying
+      // forever with the user none the wiser, or giving up on the very first transient hiccup.
+      const attempts = ((idx !== -1 ? current[idx].attempts : item.attempts) ?? 0) + 1;
+      if (attempts < MAX_ROTATION_ATTEMPTS) {
+        if (idx !== -1) {
+          current[idx].attempts = attempts;
+          savePendingRotations(current);
         }
+        continue; // still queued for the next cycle
       }
-    } catch (err) {
-      console.warn(`[OfflineRotationSync] Error applying rotation to ${item.originalRemotePath}:`, err);
+      console.warn(`[OfflineRotationSync] Giving up on ${item.originalRemotePath} after ${attempts} failed attempts: ${res.error}`);
+    } else {
+      // An unsupported format (camera RAW) can never succeed no matter how many times it's retried.
+      console.warn(`[OfflineRotationSync] Dropping queued rotation, ${res.error}`);
+    }
+
+    // Reached for success, an unsupported drop, or giving up after MAX_ROTATION_ATTEMPTS — in the
+    // latter two cases the original was never actually rotated, so the local thumbnail's earlier
+    // optimistic rotation now disagrees with it and must be undone, and the user told why.
+    if (!res.success) await revertLocalThumbnailAndNotify(item, res.error || 'This file could not be rotated.');
+    if (idx !== -1) {
+      const left = (((current[idx].rotationDegrees - item.rotationDegrees) % 360) + 360) % 360;
+      if (left === 0) current.splice(idx, 1);
+      else current[idx].rotationDegrees = left;
+      if (!savePendingRotations(current)) break; // can't record it -> stop rather than double-apply later
     }
   }
 
@@ -2421,12 +2493,12 @@ export async function rotatePhotoWithOfflineQueue(params: {
       const isRawHeic = !isMirrorThumbnail;
 
       const sidecarJson = localFilePath ? localFilePath.replace(/\.[^/.]+$/, '.json') : '';
-      const hasSidecar = !!sidecarJson && fs.existsSync(sidecarJson);
+      const hasSidecar = !!sidecarJson && (await fs.promises.access(sidecarJson).then(() => true, () => false));
 
       let totalRot = degrees;
       let sidecarWarning = '';
 
-      if (isMirrorThumbnail && localFilePath && fs.existsSync(localFilePath)) {
+      if (isMirrorThumbnail && localFilePath && (await fs.promises.access(localFilePath).then(() => true, () => false))) {
         // Physically rotate the real JPEG bytes on disk (also purges
         // derived thumbnail-cache tiers so they regenerate with the new
         // orientation). "Mirror thumbnail" here is a path-based guess — the
@@ -2486,7 +2558,7 @@ export async function rotatePhotoWithOfflineQueue(params: {
       // Update sidecar metadata JSON if present, for either case above.
       if (hasSidecar) {
         try {
-          const meta = JSON.parse(fs.readFileSync(sidecarJson, 'utf-8'));
+          const meta = JSON.parse(await fs.promises.readFile(sidecarJson, 'utf-8'));
           if (degrees === 90 || degrees === 270) {
             const oldW = meta.width;
             meta.width = meta.height;
@@ -2496,7 +2568,7 @@ export async function rotatePhotoWithOfflineQueue(params: {
           meta.isHeicRotated = meta.rotation !== 0;
           meta.heicRotation = meta.rotation;
           if (isMirrorThumbnail) totalRot = meta.rotation;
-          writeJsonAtomic(sidecarJson, meta);
+          await writeJsonAtomicAsync(sidecarJson, meta);
         } catch (sidecarErr: any) {
           console.warn('[rotatePhotoWithOfflineQueue] Failed updating sidecar:', sidecarErr);
           sidecarWarning = ` (Warning: could not update photo metadata file: ${sidecarErr?.message || sidecarErr})`;
@@ -2518,7 +2590,7 @@ export async function rotatePhotoWithOfflineQueue(params: {
     }
 
     // 1. Rotate local thumbnail on disk immediately
-    if (localFilePath && fs.existsSync(localFilePath)) {
+    if (localFilePath && (await fs.promises.access(localFilePath).then(() => true, () => false))) {
       const localRotate = await rotatePhotoFile(localFilePath, degrees);
       if (!localRotate.success) {
         // A local path that is itself on an offline share fails only because it is offline:
@@ -2530,15 +2602,16 @@ export async function rotatePhotoWithOfflineQueue(params: {
       } else {
         // Update sidecar metadata JSON if present
         const sidecarJson = localFilePath.replace(/\.[^/.]+$/, '.json');
-        if (fs.existsSync(sidecarJson)) {
+        const sidecarExists = await fs.promises.access(sidecarJson).then(() => true, () => false);
+        if (sidecarExists) {
           try {
-            const meta = JSON.parse(fs.readFileSync(sidecarJson, 'utf-8'));
+            const meta = JSON.parse(await fs.promises.readFile(sidecarJson, 'utf-8'));
             if (degrees === 90 || degrees === 270) {
               const oldW = meta.width;
               meta.width = meta.height;
               meta.height = oldW;
             }
-            writeJsonAtomic(sidecarJson, meta);
+            await writeJsonAtomicAsync(sidecarJson, meta);
           } catch (sidecarErr) {
             console.warn('[rotatePhotoWithOfflineQueue] Failed updating sidecar:', sidecarErr);
           }
@@ -2546,47 +2619,47 @@ export async function rotatePhotoWithOfflineQueue(params: {
       }
     }
 
-    // 2. Check source file — isPathReachable (not fs.existsSync) so a dead
-    // network share can't block this for its full OS-level timeout.
+    // 2. The remote/original — if there even is a separate one — is NEVER rotated inline here. The
+    // local mirror thumbnail above is already rotated and on screen; re-encoding a possibly-large
+    // original on a possibly-slow network mount here would block this whole request for however long
+    // that takes (the ~20s main-process freeze this exists to prevent), regardless of whether the
+    // source happens to be reachable right now or not. It's always handed to the background queue
+    // instead, which processPendingRotations (already driven periodically by backgroundDaemon.ts)
+    // drains independently of any particular rotate request. If it's still reachable, that happens
+    // on the very next cycle; if it never manages to rotate within its retry budget (see
+    // MAX_ROTATION_ATTEMPTS / revertLocalThumbnailAndNotify), the local thumbnail is reverted and the
+    // user is told why, instead of the two silently disagreeing forever.
     const remoteTarget = originalRemotePath || localFilePath;
-    const isRemoteOnline = remoteTarget && (await isPathReachable(remoteTarget));
+    if (remoteTarget === localFilePath) {
+      // No separate original at all — the one rotation there is to do already happened above.
+      return { success: true, isQueued: false, newPath: localFilePath };
+    }
 
-    if (isRemoteOnline) {
-      // Source file is online: rotate remote file now
-      if (remoteTarget !== localFilePath) {
-        const remoteRes = await rotatePhotoFile(remoteTarget, degrees);
-        if (!remoteRes.success && remoteRes.unsupported) {
-          // Retrying can never succeed for this format, so do not queue it forever: the local thumbnail is rotated.
-          return {
-            success: true,
-            isQueued: false,
-            newPath: localFilePath,
-            message: `${remoteRes.error} The local thumbnail was rotated.`,
-          };
-        }
-        if (!remoteRes.success) {
-          // Source reachable but not writable/rotatable right now: queue it for
-          // retry instead of reporting a rotation that never reached the original.
-          enqueuePendingRotation(remoteTarget, degrees, localFilePath);
-          return {
-            success: true,
-            isQueued: true,
-            newPath: localFilePath,
-            message: `Could not rotate the source file (${remoteRes.error}). Rotation applied locally and queued to retry.`,
-          };
-        }
-      }
-      return { success: true, isQueued: false, newPath: remoteTarget };
-    } else {
-      // Source file is offline: enqueue for background sync
-      enqueuePendingRotation(remoteTarget, degrees, localFilePath);
+    // A RAW extension on the ORIGINAL (unlike the local mirror thumbnail, which is always a JPEG
+    // regardless of the source's real format) is a reliable, zero-I/O signal that this can never
+    // succeed — sharp cannot re-encode a RAW container — so say so immediately instead of queuing
+    // something doomed to fail only after the fact.
+    if (RAW_EXTENSIONS.has(path.extname(remoteTarget).toLowerCase())) {
       return {
         success: true,
-        isQueued: true,
+        isQueued: false,
         newPath: localFilePath,
-        message: 'Source file is currently offline. Rotation applied locally and queued to sync when storage reconnects.',
+        message: `"${path.basename(remoteTarget)}" is a camera RAW file and cannot be rotated in place; the local thumbnail was rotated.`,
       };
     }
+
+    enqueuePendingRotation(remoteTarget, degrees, localFilePath);
+    // Kick the drain now rather than letting it sit until backgroundDaemon's next 30s tick — fire
+    // and forget (never awaited, so this request still returns immediately): a fast/reachable
+    // original then finishes in a second or two instead of up to 30s, while a genuinely slow one
+    // just proceeds exactly as it would have on the next scheduled tick anyway.
+    processPendingRotations().catch(() => {});
+    return {
+      success: true,
+      isQueued: true,
+      newPath: localFilePath,
+      message: 'Rotated locally — the full-resolution original is finishing in the background.',
+    };
   } catch (err: any) {
     return { success: false, isQueued: false, error: err.message };
   }

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   X,
+  ChevronDown,
   Image as ImageIcon,
   ChevronLeft,
   ChevronRight,
@@ -44,12 +45,19 @@ import {
 } from 'lucide-react';
 import { Photo, Person, DetectedFace, LocationMetadata } from '../../../types';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
+import { getEntry as getPhotoContentEntry, ensureLoaded as ensurePhotoContentLoaded } from '../services/photoContentCache';
+import { PhotoAiInfoPanel } from './PhotoAiInfoPanel';
+import { ChapterPicker } from './ChapterPicker';
+import { zoomForViewMode, type LightboxViewMode } from './viewModeZoom';
+import { computeCropDragRect, type CropDragMode } from './cropFrameMath';
 import { FaceAvatar } from './FaceAvatar';
 import { ReassignFaceModal } from './ReassignFaceModal';
 import { PersonNameInput } from './PersonNameInput';
 import { LocationPickerModal } from './LocationPickerModal';
 import { SetCoverPhotoModal } from './SetCoverPhotoModal';
 import { afterPhotoRotated } from '../services/photoRotation';
+import { bumpImageVersion } from '../services/imageVersion';
+import { evictAndRefreshThumbnail, invalidateSpriteCoordinate } from '../services/asyncImageLoader';
 import { authFetch } from '../services/webAuthClient';
 import { isOneDriveBackedPath } from '../services/storageValidation';
 import { logger } from '../services/logger';
@@ -80,6 +88,7 @@ function getExpressionEmoji(expr?: string): string {
       return '';
   }
 }
+
 
 interface PhotoLightboxProps {
   photo: Photo;
@@ -293,8 +302,29 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
 
   // Zoom and Pan states
   const [zoom, setZoom] = useState<number>(1);
+  // How each photo is sized when it opens: "fit" = the picture as it always was (shrunk to fit, never
+  // enlarged); "fill" = enlarged to fill as much of the screen as its shape allows; "original" = real
+  // pixels, 1:1 (pan by dragging). The choice is remembered across photos and sessions.
+  type ViewMode = LightboxViewMode;
+  const [viewMode, setViewModeState] = useState<ViewMode>(() => {
+    try {
+      const saved = localStorage.getItem('gphotos_lightbox_view_mode');
+      return saved === 'fill' || saved === 'original' ? saved : 'fit';
+    } catch {
+      return 'fit';
+    }
+  });
+  const viewModeZoomRef = useRef(1); // the zoom the current mode last produced, to tell whether the user has since zoomed by hand
   const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState<boolean>(false);
+  // The AI Tags panel reads photoContentCache synchronously; warm its in-memory mirror once so
+  // tags from a previous session's Smart Flows runs show up without needing a flow to run first.
+  const [, forcePhotoContentRerender] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    ensurePhotoContentLoaded().then(() => { if (!cancelled) forcePhotoContentRerender((n) => n + 1); });
+    return () => { cancelled = true; };
+  }, []);
   const dragStartRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const markerDownRef = useRef<{ x: number; y: number } | null>(null);
   // While panning, the transform is written straight to the stage element (this component is
@@ -401,10 +431,12 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   const [targetAlbumId, setTargetAlbumId] = useState('new');
   const [newAlbumTitle, setNewAlbumTitle] = useState('');
   const [albumToast, setAlbumToast] = useState<string | null>(null);
+  const [targetChapterId, setTargetChapterId] = useState('');
 
   const handleAddPhotoToAlbum = (e: React.FormEvent) => {
     e.preventDefault();
     let albumName = '';
+    let chapterName: string | undefined;
     const currentAlbums = libraryStore.getState().albums || [];
     if (targetAlbumId === 'new') {
       if (!newAlbumTitle.trim()) return;
@@ -414,10 +446,15 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     } else {
       const existing = currentAlbums.find((a) => a.id === targetAlbumId);
       if (!existing) return;
-      libraryStore.addPhotosToAlbum(existing.id, [photo.id]);
+      if (targetChapterId) {
+        libraryStore.addPhotosToChapter(existing.id, targetChapterId, [photo.id]);
+        chapterName = existing.chapters?.find((c) => c.id === targetChapterId)?.title;
+      } else {
+        libraryStore.addPhotosToAlbum(existing.id, [photo.id]);
+      }
       albumName = existing.title;
     }
-    setAlbumToast(`✓ Added photo to album "${albumName}"!`);
+    setAlbumToast(`✓ Added photo to album "${albumName}"${chapterName ? ` → "${chapterName}"` : ''}!`);
     setTimeout(() => setAlbumToast(null), 3000);
     setShowAddToAlbumModal(false);
     setNewAlbumTitle('');
@@ -434,14 +471,56 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
     .slice(0, 2);
 
-  const handleQuickAddToAlbum = (albumId: string, albumTitle: string) => {
-    libraryStore.addPhotosToAlbum(albumId, [photo.id]);
-    setAlbumToast(`✓ Added to "${albumTitle}"!`);
+  const [quickAddChapterPickerAlbumId, setQuickAddChapterPickerAlbumId] = useState<string | null>(null);
+
+  const showAlbumToast = (message: string) => {
+    setAlbumToast(message);
     setTimeout(() => setAlbumToast(null), 3000);
+  };
+
+  // One click: an album with chapters goes straight into its last-used chapter (falls back to
+  // opening the chapter picker if that chapter was since deleted); a plain album adds flat, as before.
+  const handleQuickAddToAlbum = (albumId: string, albumTitle: string) => {
+    const album = allAlbums.find((a) => a.id === albumId);
+    if (album?.chapters?.length) {
+      if (album.lastUsedChapterId) {
+        libraryStore.addPhotosToChapter(albumId, album.lastUsedChapterId, [photo.id]);
+        const chapterTitle = album.chapters.find((c) => c.id === album.lastUsedChapterId)?.title;
+        showAlbumToast(`✓ Added to "${albumTitle}"${chapterTitle ? ` → "${chapterTitle}"` : ''}!`);
+      } else {
+        setQuickAddChapterPickerAlbumId(albumId);
+      }
+      return;
+    }
+    libraryStore.addPhotosToAlbum(albumId, [photo.id]);
+    showAlbumToast(`✓ Added to "${albumTitle}"!`);
+  };
+
+  const handleQuickAddToChapter = (albumId: string, albumTitle: string, chapterId: string | null) => {
+    if (chapterId) libraryStore.addPhotosToChapter(albumId, chapterId, [photo.id]);
+    else libraryStore.addPhotosToAlbum(albumId, [photo.id]);
+    const chapterTitle = chapterId ? allAlbums.find((a) => a.id === albumId)?.chapters?.find((c) => c.id === chapterId)?.title : null;
+    showAlbumToast(`✓ Added to "${albumTitle}"${chapterTitle ? ` → "${chapterTitle}"` : ''}!`);
+    setQuickAddChapterPickerAlbumId(null);
+  };
+
+  const handleQuickAddNewChapter = (albumId: string, albumTitle: string, title: string) => {
+    const chapter = libraryStore.createChapter(albumId, title, [photo.id]);
+    if (chapter) showAlbumToast(`✓ Added to "${albumTitle}" → "${chapter.title}"!`);
+    setQuickAddChapterPickerAlbumId(null);
   };
 
   // In-App Editing states (Rotate, Crop, Save to Source)
   const isHeic = /\.(heic|heif)$/i.test(photo.fileName || photo.filePath || photo.originalRemotePath || '');
+  // Editing must bake pixels from whatever's currently in imgRef.current — if that's the blurred
+  // placeholder, the downsized OneDrive-offline fallback, or a failed load, a save would silently
+  // and permanently degrade the photo to that resolution. True full-res is only guaranteed once the
+  // image has loaded (isLightboxImgLoaded), didn't error, isn't the explicit "show cached thumbnail"
+  // toggle (fallbackToThumbnail), and the original is actually reachable (isOriginalAvailable).
+  // HEIC is exempt: its editor always bakes onto the local mirror thumbnail by design (see
+  // handleApplyEdit's HEIC branch), so there's no higher-resolution source to wait for.
+  const isFullResDisplayed = isLightboxImgLoaded && !lightboxImgError && !fallbackToThumbnail && isOriginalAvailable !== false;
+  const canEditNow = isHeic || isFullResDisplayed;
   const [isEditing, setIsEditing] = useState(false);
   const [editRotation, setEditRotation] = useState<number>(0);
   const [editFlipH, setEditFlipH] = useState(false);
@@ -452,17 +531,30 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   // overlay's coordinates disagree with the rotated canvas built in handleApplyEdit.
   const [isCropping, setIsCropping] = useState(false);
   const [cropRect, setCropRect] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
-  const [cropDrawBox, setCropDrawBox] = useState<{ startX: number; startY: number; currentX: number; currentY: number } | null>(null);
+  // PowerPoint-style crop: cropRect is always shown as a handled frame (not drawn from
+  // scratch). cropDrag tracks an in-progress move/resize by which handle is held.
+  const [cropDrag, setCropDrag] = useState<{
+    mode: CropDragMode;
+    startX: number;
+    startY: number;
+    startRect: { x: number; y: number; width: number; height: number };
+  } | null>(null);
 
   // A pending 90°/270° rotation invalidates any crop selection's coordinate frame.
   useEffect(() => {
     setCropRect(null);
     setIsCropping(false);
-    setCropDrawBox(null);
+    setCropDrag(null);
   }, [editRotation]);
 
   const handleApplyEdit = async (saveAsCopy: boolean) => {
     if (!imgRef.current) return;
+    // Root-cause guard (not just the toolbar buttons' disabled state): whatever triggers a save,
+    // it must never bake the placeholder/downsized/offline-fallback pixels currently in imgRef.
+    if (!canEditNow) {
+      notify('warning', 'Still loading the full-resolution photo — try again once it finishes.');
+      return;
+    }
     setIsSavingEdit(true);
 
     try {
@@ -524,6 +616,17 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
 
         if (res.success && res.newPhoto) {
           libraryStore.updatePhoto(res.newPhoto);
+          // Recreate the thumbnail immediately rather than leaving the grid to show stale pixels
+          // until some later, unrelated refresh: bump the cache-busting version on every path whose
+          // bytes may have changed (the source itself, and — for a virtual/OneDrive mirror — its
+          // separately-cached local thumbnail file), evict+refetch the grid's in-memory batch
+          // thumbnail, and drop any pre-baked sprite tile so a card falls back to the fresh one.
+          const changedPaths = [...new Set([photo.filePath, res.newPhoto.filePath].filter(Boolean))] as string[];
+          bumpImageVersion(...changedPaths);
+          for (const p of changedPaths) {
+            evictAndRefreshThumbnail(p, res.newPhoto.originalRemotePath, 500);
+            invalidateSpriteCoordinate(p);
+          }
           setScanStatusMessage(
             saveAsCopy
               ? '✓ Saved as new edited photo copy!'
@@ -558,6 +661,17 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
       });
     }
   }, [photo.id, photo.filePath]);
+
+  // Re-apply the chosen view mode once a photo has been laid out (covers an already-cached picture whose
+  // load event fired before the zoom reset for the new photo ran).
+  useEffect(() => {
+    const id = requestAnimationFrame(() => {
+      const img = imgRef.current;
+      if (img && img.complete && img.naturalWidth > 0) applyViewMode(viewMode);
+    });
+    return () => cancelAnimationFrame(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [photo.id]);
 
   // Quick rotate. Clicks made while a rotation is in flight add up and are applied as ONE rotation afterwards.
   // `editRotation` is only a CSS preview of what was requested: the part that is already in the file's pixels
@@ -608,7 +722,11 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
         inFlight = 0;
         await afterPhotoRotated(target, degrees, 500);
         if (res?.isQueued) {
-          setScanStatusMessage('✓ Rotated. The original storage is offline, so it will be rotated when it reconnects.');
+          // The common case now for a virtual-mirror photo: the local thumbnail is already rotated
+          // (what's on screen right now), and the full-resolution original finishes in the
+          // background — rotatePhotoWithOfflineQueue never rotates it inline, online or not, so this
+          // IPC call doesn't sit blocked on a possibly-slow network write.
+          setScanStatusMessage('✓ Rotated. The full-resolution original is finishing in the background.');
         } else {
           setScanStatusMessage('✓ Rotated 90° clockwise');
         }
@@ -794,7 +912,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
 
   // Mouse drag handlers for panning
   const handleMouseDown = (e: React.MouseEvent) => {
-    if (isTaggingMode) return;
+    if (isTaggingMode || isCropping) return;
     if (zoom > 1 && e.button === 0) {
       if ((e.target as HTMLElement).closest('button, .face-tag-label, span')) return;
       setIsDragging(true);
@@ -829,7 +947,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   };
 
   const handleDoubleClick = (e: React.MouseEvent) => {
-    if (isTaggingMode) return;
+    if (isTaggingMode || isCropping) return;
     if ((e.target as HTMLElement).closest('button, .face-tag-label, span')) return;
     if (zoom > 1) {
       setZoom(1);
@@ -848,6 +966,24 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   const handleResetZoom = () => {
     setZoom(1);
     setPan({ x: 0, y: 0 });
+  };
+
+  const applyViewMode = (mode: ViewMode) => {
+    const img = imgRef.current;
+    const box = containerRef.current;
+    const target = img && box
+      ? zoomForViewMode(mode, { shownW: img.clientWidth, shownH: img.clientHeight, naturalW: img.naturalWidth, boxW: box.clientWidth, boxH: box.clientHeight })
+      : 1;
+    viewModeZoomRef.current = target;
+    setZoom(target);
+    setPan({ x: 0, y: 0 });
+    livePanRef.current = null;
+  };
+
+  const chooseViewMode = (mode: ViewMode) => {
+    try { localStorage.setItem('gphotos_lightbox_view_mode', mode); } catch {}
+    setViewModeState(mode);
+    applyViewMode(mode);
   };
 
   const handleZoomIn = () => {
@@ -1213,6 +1349,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
             <button
               className={`btn btn-icon ${isEditing ? 'btn-primary' : 'btn-ghost'}`}
               onClick={() => {
+                if (!isEditing && !canEditNow) return;
                 setIsEditing(!isEditing);
                 if (isEditing) {
                   setEditRotation(0);
@@ -1221,7 +1358,15 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                   setIsCropping(false);
                 }
               }}
-              title={isEditing ? 'Exit photo editor' : 'Edit photo (crop, rotate, flip)'}
+              disabled={!isEditing && !canEditNow}
+              style={{ opacity: !isEditing && !canEditNow ? 0.5 : 1 }}
+              title={
+                isEditing
+                  ? 'Exit photo editor'
+                  : canEditNow
+                    ? 'Edit photo (crop, rotate, flip)'
+                    : 'Waiting for the full-resolution photo to finish loading before editing…'
+              }
             >
               <Edit2 size={18} />
             </button>
@@ -1566,6 +1711,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
               onLoad={() => {
                 setIsLightboxImgLoaded(true);
                 onImageLoad();
+                applyViewMode(viewMode);
                 // The rotated pixels are on screen now: the part of the CSS preview that they already contain
                 // must go, or the picture would be rotated twice.
                 const st = rotateStateRef.current;
@@ -1741,111 +1887,102 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
               </div>
             )}
 
-            {/* Crop Selection Interactive Overlay */}
-            {isCropping && (
-              <div
-                style={{
-                  position: 'absolute',
-                  top: 0,
-                  left: 0,
-                  width: '100%',
-                  height: '100%',
-                  cursor: 'crosshair',
-                  zIndex: 65,
-                  userSelect: 'none',
-                  touchAction: 'none',
-                }}
-                onPointerDown={(e) => {
-                  e.stopPropagation();
-                  try {
-                    (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
-                  } catch {}
-                  const rect = e.currentTarget.getBoundingClientRect();
-                  const x = (e.clientX - rect.left) / zoom;
-                  const y = (e.clientY - rect.top) / zoom;
-                  setCropDrawBox({ startX: x, startY: y, currentX: x, currentY: y });
-                }}
-                onPointerMove={(e) => {
-                  if (!cropDrawBox) return;
-                  e.stopPropagation();
-                  const rect = e.currentTarget.getBoundingClientRect();
-                  const x = (e.clientX - rect.left) / zoom;
-                  const y = (e.clientY - rect.top) / zoom;
-                  setCropDrawBox({ ...cropDrawBox, currentX: x, currentY: y });
-                }}
-                onPointerUp={(e) => {
-                  try {
-                    (e.currentTarget as HTMLDivElement).releasePointerCapture(e.pointerId);
-                  } catch {}
-                  e.stopPropagation();
-                  if (!cropDrawBox || !imgRef.current) {
-                    setCropDrawBox(null);
-                    return;
-                  }
-                  const minX = Math.min(cropDrawBox.startX, cropDrawBox.currentX);
-                  const minY = Math.min(cropDrawBox.startY, cropDrawBox.currentY);
-                  const w = Math.abs(cropDrawBox.currentX - cropDrawBox.startX);
-                  const h = Math.abs(cropDrawBox.currentY - cropDrawBox.startY);
-                  setCropDrawBox(null);
+            {/* Crop Frame — PowerPoint-style: a persistent handled frame, drag its body to
+                move it, drag any corner/edge handle to resize it. Replaces the old
+                draw-a-box-from-scratch overlay (which also conflicted with photo panning). */}
+            {isCropping && cropRect && imgRef.current && (() => {
+              const boxW = imgRef.current!.clientWidth || 0;
+              const boxH = imgRef.current!.clientHeight || 0;
+              const sel = {
+                left: cropRect.x * boxW,
+                top: cropRect.y * boxH,
+                width: cropRect.width * boxW,
+                height: cropRect.height * boxH,
+              };
+              const MIN = 0.04; // smallest allowed crop dimension, normalized 0-1
 
-                  const boxW = imgRef.current.clientWidth || 1;
-                  const boxH = imgRef.current.clientHeight || 1;
+              const beginDrag = (mode: CropDragMode) => (e: React.PointerEvent) => {
+                e.stopPropagation();
+                try { (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId); } catch {}
+                setCropDrag({ mode, startX: e.clientX, startY: e.clientY, startRect: cropRect });
+              };
+              const onDragMove = (e: React.PointerEvent) => {
+                if (!cropDrag) return;
+                e.stopPropagation();
+                const dxN = (e.clientX - cropDrag.startX) / (boxW * zoom || 1);
+                const dyN = (e.clientY - cropDrag.startY) / (boxH * zoom || 1);
+                setCropRect(computeCropDragRect(cropDrag.mode, cropDrag.startRect, dxN, dyN, MIN));
+              };
+              const endDrag = (e: React.PointerEvent) => {
+                try { (e.currentTarget as HTMLDivElement).releasePointerCapture(e.pointerId); } catch {}
+                setCropDrag(null);
+              };
 
-                  if (w > 12 && h > 12) {
-                    setCropRect({
-                      x: Math.max(0, Math.min(1, minX / boxW)),
-                      y: Math.max(0, Math.min(1, minY / boxH)),
-                      width: Math.max(0, Math.min(1, w / boxW)),
-                      height: Math.max(0, Math.min(1, h / boxH)),
-                    });
-                  } else {
-                    setScanStatusMessage('Click and drag on the photo to select a crop area');
-                    setTimeout(() => setScanStatusMessage(null), 3000);
-                  }
-                }}
-              >
-                {(cropDrawBox || cropRect) && (() => {
-                  const boxW = imgRef.current?.clientWidth || 0;
-                  const boxH = imgRef.current?.clientHeight || 0;
-                  const sel = cropDrawBox
-                    ? {
-                        left: Math.min(cropDrawBox.startX, cropDrawBox.currentX),
-                        top: Math.min(cropDrawBox.startY, cropDrawBox.currentY),
-                        width: Math.abs(cropDrawBox.currentX - cropDrawBox.startX),
-                        height: Math.abs(cropDrawBox.currentY - cropDrawBox.startY),
-                      }
-                    : cropRect
-                    ? {
-                        left: cropRect.x * boxW,
-                        top: cropRect.y * boxH,
-                        width: cropRect.width * boxW,
-                        height: cropRect.height * boxH,
-                      }
-                    : null;
-                  if (!sel) return null;
-                  return (
-                    <>
-                      <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: `${sel.top}px`, backgroundColor: 'rgba(0,0,0,0.55)', pointerEvents: 'none' }} />
-                      <div style={{ position: 'absolute', top: `${sel.top + sel.height}px`, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.55)', pointerEvents: 'none' }} />
-                      <div style={{ position: 'absolute', top: `${sel.top}px`, left: 0, width: `${sel.left}px`, height: `${sel.height}px`, backgroundColor: 'rgba(0,0,0,0.55)', pointerEvents: 'none' }} />
-                      <div style={{ position: 'absolute', top: `${sel.top}px`, left: `${sel.left + sel.width}px`, right: 0, height: `${sel.height}px`, backgroundColor: 'rgba(0,0,0,0.55)', pointerEvents: 'none' }} />
-                      <div
-                        style={{
-                          position: 'absolute',
-                          left: `${sel.left}px`,
-                          top: `${sel.top}px`,
-                          width: `${sel.width}px`,
-                          height: `${sel.height}px`,
-                          border: '2px dashed #f59e0b',
-                          boxShadow: '0 0 0 1px rgba(0,0,0,0.4)',
-                          pointerEvents: 'none',
-                        }}
-                      />
-                    </>
-                  );
-                })()}
-              </div>
-            )}
+              const handles: Array<{ mode: CropDragMode; cursor: string; left: number; top: number }> = [
+                { mode: 'nw', cursor: 'nwse-resize', left: sel.left, top: sel.top },
+                { mode: 'n', cursor: 'ns-resize', left: sel.left + sel.width / 2, top: sel.top },
+                { mode: 'ne', cursor: 'nesw-resize', left: sel.left + sel.width, top: sel.top },
+                { mode: 'e', cursor: 'ew-resize', left: sel.left + sel.width, top: sel.top + sel.height / 2 },
+                { mode: 'se', cursor: 'nwse-resize', left: sel.left + sel.width, top: sel.top + sel.height },
+                { mode: 's', cursor: 'ns-resize', left: sel.left + sel.width / 2, top: sel.top + sel.height },
+                { mode: 'sw', cursor: 'nesw-resize', left: sel.left, top: sel.top + sel.height },
+                { mode: 'w', cursor: 'ew-resize', left: sel.left, top: sel.top + sel.height / 2 },
+              ];
+
+              return (
+                <div style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', zIndex: 65 }}>
+                  {/* Dimmed mask outside the crop rect */}
+                  <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: `${sel.top}px`, backgroundColor: 'rgba(0,0,0,0.55)', pointerEvents: 'none' }} />
+                  <div style={{ position: 'absolute', top: `${sel.top + sel.height}px`, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.55)', pointerEvents: 'none' }} />
+                  <div style={{ position: 'absolute', top: `${sel.top}px`, left: 0, width: `${sel.left}px`, height: `${sel.height}px`, backgroundColor: 'rgba(0,0,0,0.55)', pointerEvents: 'none' }} />
+                  <div style={{ position: 'absolute', top: `${sel.top}px`, left: `${sel.left + sel.width}px`, right: 0, height: `${sel.height}px`, backgroundColor: 'rgba(0,0,0,0.55)', pointerEvents: 'none' }} />
+
+                  {/* Frame body — drag to move */}
+                  <div
+                    onPointerDown={beginDrag('move')}
+                    onPointerMove={onDragMove}
+                    onPointerUp={endDrag}
+                    title="Drag to move the crop area"
+                    style={{
+                      position: 'absolute',
+                      left: `${sel.left}px`,
+                      top: `${sel.top}px`,
+                      width: `${sel.width}px`,
+                      height: `${sel.height}px`,
+                      border: '2px solid #f59e0b',
+                      boxShadow: '0 0 0 1px rgba(0,0,0,0.4)',
+                      cursor: 'move',
+                      touchAction: 'none',
+                    }}
+                  />
+
+                  {/* Corner/edge handles — drag to resize */}
+                  {handles.map((h) => (
+                    <div
+                      key={h.mode}
+                      onPointerDown={beginDrag(h.mode)}
+                      onPointerMove={onDragMove}
+                      onPointerUp={endDrag}
+                      title="Drag to resize the crop area"
+                      style={{
+                        position: 'absolute',
+                        left: `${h.left}px`,
+                        top: `${h.top}px`,
+                        width: '14px',
+                        height: '14px',
+                        borderRadius: '50%',
+                        backgroundColor: '#f59e0b',
+                        border: '2px solid white',
+                        boxShadow: '0 1px 4px rgba(0,0,0,0.6)',
+                        transform: 'translate(-50%, -50%)',
+                        cursor: h.cursor,
+                        touchAction: 'none',
+                      }}
+                    />
+                  ))}
+                </div>
+              );
+            })()}
 
             {/* Face Bounding Box Overlays (Locked to transformed stage) */}
             {showFaces && imgRef.current && photo.faces && (
@@ -2035,16 +2172,23 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                 className={`btn ${isCropping ? 'btn-primary' : 'btn-secondary'}`}
                 onClick={() => {
                   if (editRotation % 180 !== 0) return;
-                  setIsCropping((v) => !v);
                   setIsTaggingMode(false);
                   setDrawBox(null);
+                  setIsCropping((v) => {
+                    const next = !v;
+                    // Turning crop on for the first time: seed a centered frame (inset 8%)
+                    // rather than nothing, so handles are immediately there to drag — like
+                    // opening the crop tool in PowerPoint.
+                    if (next && !cropRect) setCropRect({ x: 0.08, y: 0.08, width: 0.84, height: 0.84 });
+                    return next;
+                  });
                 }}
                 disabled={editRotation % 180 !== 0}
                 style={{ fontSize: '0.8rem', gap: '6px', padding: '6px 12px', opacity: editRotation % 180 !== 0 ? 0.5 : 1 }}
                 title={
                   editRotation % 180 !== 0
                     ? 'Save or undo the 90°/270° rotation before cropping'
-                    : 'Drag on the photo to select a crop area'
+                    : 'Drag the frame to move it, or a handle to resize it'
                 }
               >
                 <Frame size={15} />
@@ -2067,9 +2211,9 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
               <button
                 className="btn btn-primary"
                 onClick={() => handleApplyEdit(false)}
-                disabled={isSavingEdit}
+                disabled={isSavingEdit || !canEditNow}
                 style={{ fontSize: '0.8rem', gap: '6px', padding: '6px 14px' }}
-                title="Save changes to source file (keeps safe .bak backup)"
+                title={canEditNow ? 'Save changes to source file (keeps safe .bak backup)' : 'Waiting for the full-resolution photo to finish loading…'}
               >
                 <Save size={15} />
                 <span>{isSavingEdit ? 'Saving...' : 'Save Changes'}</span>
@@ -2077,9 +2221,9 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
               <button
                 className="btn btn-secondary"
                 onClick={() => handleApplyEdit(true)}
-                disabled={isSavingEdit}
+                disabled={isSavingEdit || !canEditNow}
                 style={{ fontSize: '0.8rem', gap: '6px', padding: '6px 14px' }}
-                title="Save as a new copy in same folder"
+                title={canEditNow ? 'Save as a new copy in same folder' : 'Waiting for the full-resolution photo to finish loading…'}
               >
                 <Copy size={15} />
                 <span>Save Copy</span>
@@ -2157,6 +2301,33 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
             >
               <ZoomIn size={16} />
             </button>
+
+            <span style={{ width: '1px', height: '18px', backgroundColor: 'var(--border-subtle)', margin: '0 2px' }} />
+
+            {([
+              ['fit', 'Fit', 'Fit to window — shrunk to fit, never enlarged'],
+              ['fill', 'Fill', 'Fill the screen — enlarge the photo to use as much of the screen as its shape allows'],
+              ['original', '1:1', 'Original size — real pixels (drag to pan)'],
+            ] as Array<[ViewMode, string, string]>).map(([mode, label, tip]) => {
+              const active = mode === 'fit' ? zoom === 1 : viewMode === mode && Math.abs(zoom - viewModeZoomRef.current) < 0.02;
+              return (
+                <button
+                  key={mode}
+                  data-testid={`lightbox-view-${mode}`}
+                  className="btn btn-ghost"
+                  onClick={() => chooseViewMode(mode)}
+                  title={tip}
+                  style={{
+                    height: '28px', padding: '0 10px', fontSize: '0.75rem', fontWeight: 600,
+                    color: active ? 'var(--accent-primary)' : 'var(--text-secondary)',
+                    backgroundColor: active ? 'rgba(59, 130, 246, 0.16)' : 'transparent',
+                    borderRadius: 'var(--radius-full)',
+                  }}
+                >
+                  {label}
+                </button>
+              );
+            })}
 
             {zoom > 1 && (
               <button
@@ -2402,6 +2573,17 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
               )}
             </div>
 
+            {(() => {
+              const contentInfo = getPhotoContentEntry(photo.id);
+              if (!contentInfo) return null;
+              return (
+                <>
+                  <hr style={{ borderColor: 'var(--border-subtle)', margin: 0 }} />
+                  <PhotoAiInfoPanel entry={contentInfo} />
+                </>
+              );
+            })()}
+
             <hr style={{ borderColor: 'var(--border-subtle)', margin: 0 }} />
 
             {/* Location & Map Section with icon on right side */}
@@ -2586,18 +2768,46 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
 
               {quickAddAlbums.length > 0 && (
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
-                  {quickAddAlbums.map((a) => (
-                    <button
-                      key={a.id}
-                      className="btn btn-secondary"
-                      onClick={() => handleQuickAddToAlbum(a.id, a.title)}
-                      style={{ fontSize: '0.75rem', padding: '4px 10px', gap: '4px' }}
-                      title={`Add to your recently-used album "${a.title}"`}
-                    >
-                      <Plus size={12} />
-                      <span>Add to {a.title}</span>
-                    </button>
-                  ))}
+                  {quickAddAlbums.map((a) => {
+                    const hasChapters = (a.chapters?.length || 0) > 0;
+                    const lastChapterTitle = a.chapters?.find((c) => c.id === a.lastUsedChapterId)?.title;
+                    return (
+                      <div key={a.id} style={{ position: 'relative', display: 'inline-flex' }}>
+                        <button
+                          className="btn btn-secondary"
+                          onClick={() => handleQuickAddToAlbum(a.id, a.title)}
+                          style={{
+                            fontSize: '0.75rem', padding: '4px 10px', gap: '4px',
+                            borderTopRightRadius: hasChapters ? 0 : undefined, borderBottomRightRadius: hasChapters ? 0 : undefined,
+                          }}
+                          title={lastChapterTitle ? `Add to "${a.title}" → "${lastChapterTitle}"` : `Add to your recently-used album "${a.title}"`}
+                        >
+                          <Plus size={12} />
+                          <span>Add to {a.title}{lastChapterTitle ? ` → ${lastChapterTitle}` : ''}</span>
+                        </button>
+                        {hasChapters && (
+                          <button
+                            className="btn btn-secondary"
+                            onClick={() => setQuickAddChapterPickerAlbumId(quickAddChapterPickerAlbumId === a.id ? null : a.id)}
+                            style={{ fontSize: '0.75rem', padding: '4px 6px', borderTopLeftRadius: 0, borderBottomLeftRadius: 0, borderLeft: '1px solid var(--border-subtle)' }}
+                            title="Choose a different chapter"
+                          >
+                            <ChevronDown size={12} />
+                          </button>
+                        )}
+                        {quickAddChapterPickerAlbumId === a.id && (
+                          <ChapterPicker
+                            chapters={a.chapters || []}
+                            currentChapterId={a.lastUsedChapterId}
+                            onPick={(chapterId) => handleQuickAddToChapter(a.id, a.title, chapterId)}
+                            onCreateNew={(title) => handleQuickAddNewChapter(a.id, a.title, title)}
+                            onClose={() => setQuickAddChapterPickerAlbumId(null)}
+                            anchorStyle={{ top: '32px', right: 0 }}
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
 
@@ -3074,7 +3284,11 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                   <select
                     className="input"
                     value={targetAlbumId}
-                    onChange={(e) => setTargetAlbumId(e.target.value)}
+                    onChange={(e) => {
+                      setTargetAlbumId(e.target.value);
+                      const album = (libraryStore.getState().albums || []).find((a) => a.id === e.target.value);
+                      setTargetChapterId(album?.lastUsedChapterId || '');
+                    }}
                     style={{ height: '38px', width: '100%' }}
                   >
                     <option value="new">+ Create New Album...</option>
@@ -3086,6 +3300,29 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                   </select>
                 </div>
               )}
+
+              {targetAlbumId !== 'new' && (() => {
+                const album = (libraryStore.getState().albums || []).find((a) => a.id === targetAlbumId);
+                if (!album?.chapters?.length) return null;
+                return (
+                  <div>
+                    <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, marginBottom: '6px' }}>
+                      Chapter
+                    </label>
+                    <select
+                      className="input"
+                      value={targetChapterId}
+                      onChange={(e) => setTargetChapterId(e.target.value)}
+                      style={{ height: '38px', width: '100%' }}
+                    >
+                      <option value="">No chapter</option>
+                      {album.chapters.map((c) => (
+                        <option key={c.id} value={c.id}>{c.title}</option>
+                      ))}
+                    </select>
+                  </div>
+                );
+              })()}
 
               {targetAlbumId === 'new' && (
                 <div>

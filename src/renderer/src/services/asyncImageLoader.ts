@@ -146,6 +146,25 @@ export function useSpriteCoordinate(photoPath: string | undefined | null): Sprit
   return coord;
 }
 
+/**
+ * Drops a photo's cached sprite-sheet coordinate — client cache and the main process's persisted
+ * index — so a mounted card immediately falls back to its live/batch thumbnail instead of a stale
+ * pre-baked tile. Needed after any edit that changes a photo's pixels (crop/rotate/flip save,
+ * quick-rotate): the sprite sheet itself isn't rewritten, so a photo that was already baked into
+ * one would otherwise keep showing its pre-edit thumbnail until some future full rebake.
+ */
+export function invalidateSpriteCoordinate(photoPath: string | undefined | null): void {
+  if (!photoPath) return;
+  const key = photoPath.toLowerCase();
+  if (spriteCoordCache.has(key)) {
+    spriteCoordCache.set(key, null);
+    for (const l of spriteCoordListeners) {
+      try { l(new Set([key])); } catch {}
+    }
+  }
+  Promise.resolve(window.electronAPI?.invalidateSpriteCoordinate?.(photoPath)).catch(() => {});
+}
+
 // ============================================================================
 // 1. GLOBAL BATCH THUMBNAIL STORE & BATCH REQUEST MANAGER
 // ============================================================================

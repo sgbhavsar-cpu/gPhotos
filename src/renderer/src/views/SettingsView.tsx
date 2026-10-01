@@ -1,8 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Settings,
   Server,
   Cpu,
+  Wand2,
   RefreshCw,
   CheckCircle2,
   AlertTriangle,
@@ -29,12 +30,23 @@ import {
   Play,
   Zap,
   Activity,
-  Cloud
+  Cloud,
+  Download,
+  X as XIcon
 } from 'lucide-react';
 import { BackgroundServiceStatus, BackgroundServiceSettings, WebServerStatus, PairedDeviceInfo } from '../../../types';
 import { aiSearchService, AiSearchConfig, AiProvider } from '../services/aiSearchService';
+import {
+  getOllamaConfig,
+  saveOllamaConfig,
+  listModels as listOllamaModels,
+  pullModel as pullOllamaModel,
+  getLastOllamaError,
+  OllamaModelInfo,
+} from '../services/ollamaVisionService';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { notify, notifyError } from '../services/notifications';
+import { TopTabs } from '../components/TopTabs';
 
 interface SettingsViewProps {
   onOpenHelp?: () => void;
@@ -46,6 +58,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onOpenDuplicateCleaner,
 }) => {
   const isMobile = useIsMobile();
+  type SettingsTab = 'sharing' | 'general' | 'duplicates' | 'logs' | 'search' | 'backup';
+  const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>('general');
+  const SETTINGS_TABS: Array<{ id: SettingsTab; label: string; icon: typeof Cpu }> = [
+    { id: 'general', label: 'General', icon: Cpu },
+    { id: 'sharing', label: 'Mobile & Sharing', icon: Smartphone },
+    { id: 'search', label: 'Search with AI', icon: Sparkles },
+    { id: 'duplicates', label: 'Duplicates', icon: Layers },
+    { id: 'backup', label: 'Backup', icon: Archive },
+    { id: 'logs', label: 'Logs', icon: Terminal },
+  ];
   const [serviceStatus, setServiceStatus] = useState<BackgroundServiceStatus | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
@@ -54,6 +76,68 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [syncFeedback, setSyncFeedback] = useState<string | null>(null);
   const [aiConfig, setAiConfig] = useState<AiSearchConfig>(aiSearchService.getConfig());
   const [aiFeedback, setAiFeedback] = useState<string | null>(null);
+  // Smart Flows' own cloud fallback — a separate config from "Search with AI" above, so the two
+  // features can use different providers/keys (or none) independently of one another.
+  const [smartFlowsAiConfig, setSmartFlowsAiConfig] = useState<AiSearchConfig>(aiSearchService.getSmartFlowsConfig());
+  const [smartFlowsAiFeedback, setSmartFlowsAiFeedback] = useState<string | null>(null);
+
+  // Local AI (Ollama) — Smart Flows' local-first classification pass.
+  const [ollamaConfig, setOllamaConfig] = useState(() => getOllamaConfig());
+  const [ollamaFeedback, setOllamaFeedback] = useState<string | null>(null);
+  const [ollamaModels, setOllamaModels] = useState<OllamaModelInfo[]>([]);
+  const [ollamaStatus, setOllamaStatus] = useState<'checking' | 'ready' | 'unavailable'>('checking');
+  const [ollamaProblem, setOllamaProblem] = useState<string | null>(null); // why the last check/download failed, in Ollama's or the network's own words
+  const [pullingModel, setPullingModel] = useState<string | null>(null);
+  const [pullProgress, setPullProgress] = useState<{ status: string; pct: number | null } | null>(null);
+  const pullAbortRef = useRef<AbortController | null>(null);
+
+  const refreshOllamaModels = async () => {
+    setOllamaStatus('checking');
+    const models = await listOllamaModels();
+    setOllamaModels(models);
+    setOllamaProblem(models.length === 0 ? getLastOllamaError() : null); // an empty list is only a *problem* when the call itself failed
+    setOllamaStatus(models.some((m) => m.name === getOllamaConfig().visionModel) ? 'ready' : 'unavailable');
+  };
+  useEffect(() => { refreshOllamaModels(); }, []);
+
+  const RECOMMENDED_VISION_MODELS = [
+    { name: 'qwen2.5vl:7b', note: 'Best OCR/document reading at this size (~6GB) — recommended for bills, receipts, screenshots with text' },
+    { name: 'minicpm-v:8b', note: 'Also strong at OCR, a reasonable alternative (~5.5GB)' },
+    { name: 'moondream:1.8b', note: 'Fast, low VRAM, but noticeably weaker at reading small/dense text (~1.7GB)' },
+  ];
+  const RECOMMENDED_EMBED_MODELS = [
+    { name: 'nomic-embed-text', note: 'Standard general-purpose text embedding (~274MB)' },
+  ];
+
+  // Older Ollama servers don't report `capabilities` at all — if NONE of the installed models
+  // report any capability, filtering strictly by "vision"/"embedding" would hide models that
+  // actually work, so fall back to showing everything installed instead of an empty list.
+  const capabilitiesKnown = ollamaModels.some((m) => m.capabilities.length > 0);
+  const visionModelOptions = capabilitiesKnown ? ollamaModels.filter((m) => m.capabilities.includes('vision')) : ollamaModels;
+  const embedModelOptions = capabilitiesKnown ? ollamaModels.filter((m) => m.capabilities.includes('embedding')) : ollamaModels;
+
+  const handlePullOllamaModel = async (modelName: string) => {
+    setPullingModel(modelName);
+    setPullProgress({ status: 'Starting…', pct: null });
+    const controller = new AbortController();
+    pullAbortRef.current = controller;
+    const result = await pullOllamaModel(
+      modelName,
+      (p) => setPullProgress({ status: p.status, pct: p.total && p.completed ? Math.round((p.completed / p.total) * 100) : null }),
+      controller.signal
+    );
+    pullAbortRef.current = null;
+    setPullingModel(null);
+    setPullProgress(null);
+    if (result === 'success') {
+      notify('success', `Downloaded "${modelName}".`);
+      await refreshOllamaModels();
+    } else if (result === 'failed') {
+      const why = getLastOllamaError();
+      setOllamaProblem(why);
+      notify('error', `Could not download "${modelName}"${why ? `: ${why}` : '. Make sure Ollama is running and the model name is correct.'}`);
+    }
+  };
 
   // Mobile Web Server state
   const [webServerStatus, setWebServerStatus] = useState<WebServerStatus | null>(null);
@@ -516,7 +600,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         )}
 
+        <TopTabs tabs={SETTINGS_TABS} activeId={activeSettingsTab} onChange={(id) => setActiveSettingsTab(id as SettingsTab)} />
+
         {/* Section 0: Mobile Access & Local Web Server (Wi-Fi Sharing) */}
+        {activeSettingsTab === 'sharing' && (
         <div style={{
           backgroundColor: 'var(--bg-surface)',
           border: '1px solid var(--border-subtle)',
@@ -790,8 +877,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           )}
         </div>
+        )}
 
         {/* Section 1: Background Service & Engine Mode */}
+        {activeSettingsTab === 'general' && (
+          <>
         <div style={{
           backgroundColor: 'var(--bg-surface)',
           border: '1px solid var(--border-subtle)',
@@ -1595,8 +1685,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
         </div>
+          </>
+        )}
 
         {/* Section 2: Deduplication & AI Best-Shot Engine */}
+        {activeSettingsTab === 'duplicates' && (
         <div style={{
           backgroundColor: 'var(--bg-surface)',
           border: '1px solid var(--border-subtle)',
@@ -1679,8 +1772,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
         </div>
+        )}
 
         {/* Section 3: Live Service Activity Logs */}
+        {activeSettingsTab === 'logs' && (
         <div style={{
           backgroundColor: 'var(--bg-surface)',
           border: '1px solid var(--border-subtle)',
@@ -1732,8 +1827,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             )}
           </div>
         </div>
+        )}
 
         {/* Card: AI Search Assistant & LLM Configuration */}
+        {activeSettingsTab === 'search' && (
+          <>
         <div style={{
           backgroundColor: 'var(--bg-surface)',
           border: '1px solid var(--border-subtle)',
@@ -1833,7 +1931,311 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         </div>
 
+        {/* Card: Smart Flow Configuration — cloud fallback + the local Ollama model it tries first,
+            merged into one section (they used to be two separate cards). */}
+        <div style={{
+          backgroundColor: 'var(--bg-surface)',
+          border: '1px solid var(--border-subtle)',
+          borderRadius: 'var(--radius-lg)',
+          padding: '24px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '20px',
+        }}>
+          <div>
+            <h2 style={{ fontSize: '1.15rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '10px', margin: '0 0 4px 0' }}>
+              <Wand2 size={20} color="#c084fc" />
+              Smart Flow Configuration
+            </h2>
+            <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', margin: 0 }}>
+              Every photo Smart Flows checks is tried in order: the shared local cache (free, instant),
+              then the local Ollama model below (private, free), and only then — for whatever those two
+              can't decide confidently — the cloud fallback configured here.
+            </p>
+          </div>
+
+          <div>
+            <h3 style={{ fontSize: '0.95rem', fontWeight: 600, margin: '0 0 10px 0', color: 'var(--text-primary)' }}>
+              Cloud Fallback
+            </h3>
+            <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', margin: '0 0 14px 0' }}>
+              Leave it set to "None" to keep Smart Flows entirely local — anything neither local pass
+              can resolve will just show a clear error in that flow's run log instead of being
+              classified.
+            </p>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '16px' }}>
+            <div>
+              <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, marginBottom: '6px' }}>
+                Cloud Provider
+              </label>
+              <select
+                className="input"
+                value={smartFlowsAiConfig.provider}
+                onChange={(e) => setSmartFlowsAiConfig({ ...smartFlowsAiConfig, provider: e.target.value as AiProvider })}
+                style={{ height: '40px', width: '100%' }}
+              >
+                <option value="local">None (local cache + Ollama only)</option>
+                <option value="gemini">Google Gemini API</option>
+                <option value="openai">OpenAI ChatGPT API (GPT-4o mini)</option>
+              </select>
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, marginBottom: '6px' }}>
+                Google Gemini API Key
+              </label>
+              <input
+                type="password"
+                className="input"
+                placeholder="AIzaSy..."
+                value={smartFlowsAiConfig.geminiApiKey}
+                onChange={(e) => setSmartFlowsAiConfig({ ...smartFlowsAiConfig, geminiApiKey: e.target.value })}
+                style={{ height: '40px', width: '100%' }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, marginBottom: '6px' }}>
+                OpenAI API Key
+              </label>
+              <input
+                type="password"
+                className="input"
+                placeholder="sk-proj-..."
+                value={smartFlowsAiConfig.openaiApiKey}
+                onChange={(e) => setSmartFlowsAiConfig({ ...smartFlowsAiConfig, openaiApiKey: e.target.value })}
+                style={{ height: '40px', width: '100%' }}
+              />
+            </div>
+          </div>
+
+          {smartFlowsAiFeedback && (
+            <div style={{
+              padding: '10px 16px',
+              borderRadius: 'var(--radius-md)',
+              backgroundColor: 'rgba(16, 185, 129, 0.15)',
+              border: '1px solid rgba(16, 185, 129, 0.3)',
+              color: 'var(--accent-emerald)',
+              fontSize: '0.85rem',
+              fontWeight: 600,
+            }}>
+              {smartFlowsAiFeedback}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+            <button
+              className="btn btn-primary"
+              onClick={() => {
+                try {
+                  aiSearchService.saveSmartFlowsConfig(smartFlowsAiConfig);
+                } catch (err) {
+                  notifyError('Save Smart Flows cloud settings', err);
+                  return;
+                }
+                setSmartFlowsAiFeedback('✓ Smart Flows cloud settings saved.');
+                setTimeout(() => setSmartFlowsAiFeedback(null), 4000);
+              }}
+              style={{ padding: '8px 24px', fontSize: '0.85rem' }}
+            >
+              Save Smart Flows Settings
+            </button>
+          </div>
+
+          <div style={{ height: '1px', backgroundColor: 'var(--border-subtle)' }} />
+
+          <div>
+            <h3 style={{ fontSize: '0.95rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px', margin: '0 0 4px 0', color: 'var(--text-primary)' }}>
+              <Cpu size={16} color="#10b981" />
+              Local AI Model (Ollama)
+            </h3>
+            <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', margin: 0 }}>
+              Smart Flows checks photos with a locally-running <a href="https://ollama.com" target="_blank" rel="noreferrer" style={{ color: 'var(--accent-primary)' }}>Ollama</a> model before ever using the cloud above — private, free, and entirely optional.
+            </p>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '0.85rem' }}>
+            <span style={{
+              width: '9px', height: '9px', borderRadius: '50%', flexShrink: 0,
+              backgroundColor: ollamaStatus === 'ready' ? '#10b981' : ollamaStatus === 'checking' ? '#f59e0b' : 'var(--text-muted)',
+            }} />
+            <span style={{ flex: 1 }}>
+              {ollamaStatus === 'checking' && 'Checking for Ollama…'}
+              {ollamaStatus === 'ready' && `Ready — using "${ollamaConfig.visionModel}" as the local first pass.`}
+              {ollamaStatus === 'unavailable' && 'No compatible vision model detected — Smart Flows will use the cloud provider for everything.'}
+              {ollamaProblem && (
+                <span data-testid="ollama-problem" style={{ display: 'block', marginTop: '2px', color: '#f59e0b', fontSize: '0.78rem' }}>{ollamaProblem}</span>
+              )}
+            </span>
+            <button className="btn btn-ghost" onClick={refreshOllamaModels} style={{ fontSize: '0.78rem', padding: '4px 12px', gap: '6px' }}>
+              <RefreshCw size={13} />
+              <span>Re-check</span>
+            </button>
+          </div>
+
+          {(window.electronAPI as any)?.isBrowserShim && (
+            <div data-testid="ollama-desktop-only" style={{ fontSize: '0.82rem', color: '#f59e0b' }}>
+              Ollama runs on the computer where gPhotos is installed, and only the desktop app can talk to it — model listing and downloads won't work from this browser/phone view. Use the desktop app's Settings to manage local models.
+            </div>
+          )}
+
+          <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap' }}>
+            <div>
+              <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, marginBottom: '6px' }}>Ollama Host</label>
+              <input
+                className="input"
+                value={ollamaConfig.baseUrl}
+                onChange={(e) => setOllamaConfig({ ...ollamaConfig, baseUrl: e.target.value })}
+                placeholder="http://127.0.0.1:11434"
+                style={{ height: '40px', width: '100%', maxWidth: '360px' }}
+              />
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, marginBottom: '6px' }}>
+                Context Window <span style={{ fontWeight: 400, color: 'var(--text-muted)' }}>(tokens)</span>
+              </label>
+              <input
+                type="number"
+                className="input"
+                min={512}
+                step={512}
+                value={ollamaConfig.contextWindow}
+                onChange={(e) => setOllamaConfig({ ...ollamaConfig, contextWindow: Math.max(512, parseInt(e.target.value, 10) || 512) })}
+                style={{ height: '40px', width: '160px' }}
+              />
+              <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)', marginTop: '4px', maxWidth: '280px' }}>
+                Match whatever you've set Ollama itself to (OLLAMA_CONTEXT_LENGTH or a Modelfile's
+                num_ctx) — Smart Flows' local batch size is computed from this, capped at the
+                model's own real maximum.
+              </div>
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '20px' }}>
+            <div>
+              <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, marginBottom: '6px' }}>
+                Vision Model <span style={{ fontWeight: 400, color: 'var(--text-muted)' }}>(classifies photo content)</span>
+              </label>
+              {visionModelOptions.length > 0 ? (
+                <select
+                  className="input"
+                  value={ollamaConfig.visionModel}
+                  onChange={(e) => setOllamaConfig({ ...ollamaConfig, visionModel: e.target.value })}
+                  style={{ height: '40px', width: '100%' }}
+                >
+                  {!visionModelOptions.some((m) => m.name === ollamaConfig.visionModel) && (
+                    <option value={ollamaConfig.visionModel}>{ollamaConfig.visionModel} (not installed)</option>
+                  )}
+                  {visionModelOptions.map((m) => (
+                    <option key={m.name} value={m.name}>{m.name} ({(m.sizeBytes / 1e9).toFixed(1)} GB)</option>
+                  ))}
+                </select>
+              ) : (
+                <div style={{ fontSize: '0.82rem', color: 'var(--text-muted)', padding: '10px 0' }}>
+                  No vision-capable model detected — download one below.
+                </div>
+              )}
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, marginBottom: '6px' }}>
+                Embedding Model <span style={{ fontWeight: 400, color: 'var(--text-muted)' }}>(for the local match cache)</span>
+              </label>
+              {embedModelOptions.length > 0 ? (
+                <select
+                  className="input"
+                  value={ollamaConfig.embedModel}
+                  onChange={(e) => setOllamaConfig({ ...ollamaConfig, embedModel: e.target.value })}
+                  style={{ height: '40px', width: '100%' }}
+                >
+                  {!embedModelOptions.some((m) => m.name === ollamaConfig.embedModel) && (
+                    <option value={ollamaConfig.embedModel}>{ollamaConfig.embedModel} (not installed)</option>
+                  )}
+                  {embedModelOptions.map((m) => (
+                    <option key={m.name} value={m.name}>{m.name} ({(m.sizeBytes / 1e9).toFixed(2)} GB)</option>
+                  ))}
+                </select>
+              ) : (
+                <div style={{ fontSize: '0.82rem', color: 'var(--text-muted)', padding: '10px 0' }}>
+                  No embedding model detected — download one below.
+                </div>
+              )}
+            </div>
+          </div>
+
+          {(visionModelOptions.length === 0 || embedModelOptions.length === 0) && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <span style={{ fontSize: '0.82rem', fontWeight: 600 }}>Recommended models to download:</span>
+              {[...(visionModelOptions.length === 0 ? RECOMMENDED_VISION_MODELS : []), ...(embedModelOptions.length === 0 ? RECOMMENDED_EMBED_MODELS : [])].map((r) => (
+                <div key={r.name} style={{
+                  display: 'flex', alignItems: 'center', gap: '12px', padding: '10px 14px',
+                  border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-md)',
+                }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 600, fontSize: '0.85rem', fontFamily: 'var(--font-mono)' }}>{r.name}</div>
+                    <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>{r.note}</div>
+                  </div>
+                  {pullingModel === r.name ? (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexShrink: 0 }}>
+                      <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+                        {pullProgress?.status}{pullProgress?.pct != null ? ` — ${pullProgress.pct}%` : ''}
+                      </span>
+                      <button className="btn btn-ghost btn-icon" onClick={() => pullAbortRef.current?.abort()} title="Cancel download" style={{ width: '28px', height: '28px' }}>
+                        <XIcon size={14} />
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      className="btn btn-secondary"
+                      disabled={!!pullingModel}
+                      onClick={() => handlePullOllamaModel(r.name)}
+                      style={{ fontSize: '0.78rem', padding: '6px 14px', gap: '6px', flexShrink: 0 }}
+                    >
+                      <Download size={14} />
+                      <span>Download</span>
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {ollamaFeedback && (
+            <div style={{
+              padding: '10px 16px',
+              borderRadius: 'var(--radius-md)',
+              backgroundColor: 'rgba(16, 185, 129, 0.15)',
+              border: '1px solid rgba(16, 185, 129, 0.3)',
+              color: 'var(--accent-emerald)',
+              fontSize: '0.85rem',
+              fontWeight: 600,
+            }}>
+              {ollamaFeedback}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <button
+              className="btn btn-primary"
+              onClick={async () => {
+                saveOllamaConfig(ollamaConfig);
+                setOllamaFeedback('✓ Local AI settings saved.');
+                setTimeout(() => setOllamaFeedback(null), 4000);
+                await refreshOllamaModels();
+              }}
+              style={{ padding: '8px 24px', fontSize: '0.85rem' }}
+            >
+              Save & Re-check
+            </button>
+          </div>
+        </div>
+          </>
+        )}
+
         {/* Library Data Backup & Export in .zip format Card */}
+        {activeSettingsTab === 'backup' && (
         <div style={{
           backgroundColor: 'var(--bg-surface)',
           border: '1px solid var(--border-subtle)',
@@ -1936,6 +2338,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           )}
         </div>
+        )}
 
       </div>
     </div>
