@@ -2,8 +2,9 @@ import fs from 'fs';
 import path from 'path';
 import sharp from 'sharp';
 import { parsePhotoMetadata } from './exifParser';
-import { isImageFile, scanDirectoryRecursive } from './fileOrganizer';
+import { isImageFile, isVideoFile, scanDirectoryRecursive } from './fileOrganizer';
 import { getOrGenerateHeicThumbnail500 } from './heicService';
+import { probeMedia, grabVideoFrame } from './videoExportService';
 import {
   VirtualStorageConfig,
   SyncVirtualStorageResult,
@@ -74,8 +75,24 @@ try {
  * pixel-rotation loop (also synchronous, also now unnecessary).
  */
 export async function generateThumbnailBuffer(filePath: string, maxDimension = 500): Promise<Buffer | null> {
+  // A video's own bytes never decode as a still image — grab one representative frame via
+  // ffmpeg first (same approach as thumbnailCacheService's main cache path) and feed THAT to
+  // sharp instead. See docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md §2.4.
+  let source: string | Buffer = filePath;
+  if (isVideoFile(filePath)) {
+    try {
+      const info = await probeMedia(filePath);
+      const seekAt = info.durationSec ? Math.min(1, info.durationSec * 0.1) : 0;
+      const frame = await grabVideoFrame(filePath, seekAt);
+      if (!frame) return null; // raw video bytes would never decode below either — give up cleanly
+      source = frame;
+    } catch {
+      return null;
+    }
+  }
+
   try {
-    return await sharp(filePath, { failOn: 'none' })
+    return await sharp(source, { failOn: 'none' })
       .rotate()
       .resize(maxDimension, maxDimension, { fit: 'inside', withoutEnlargement: true })
       .jpeg({ quality: 82 })
@@ -83,6 +100,8 @@ export async function generateThumbnailBuffer(filePath: string, maxDimension = 5
   } catch (err) {
     console.warn(`sharp thumbnail generation failed for ${filePath}:`, err);
   }
+
+  if (source !== filePath) return null; // already a video frame buffer — no raw-bytes fallback makes sense
 
   // Fallback: sharp couldn't process it at all (e.g. an unsupported/corrupt
   // format) — return the raw file bytes rather than nothing.
@@ -1625,7 +1644,7 @@ export async function readFolderPhotos(folderPath: string, mirrorRoot?: string):
 
   try {
     const entries = (await fs.promises.readdir(folderPath, { withFileTypes: true }))
-      .filter((entry) => entry.isFile() && isImageFile(entry.name));
+      .filter((entry) => entry.isFile() && (isImageFile(entry.name) || isVideoFile(entry.name)));
 
     // Up to FOLDER_READ_CONCURRENCY files in flight (each is a stat + EXIF header read, latency-bound
     // on a network folder); results are collected by index so the output order matches readdir order.
@@ -1660,6 +1679,10 @@ export async function readFolderPhotos(folderPath: string, mirrorRoot?: string):
             location: meta.location,
             isVirtual: false,
             originalRemotePath: fullPath,
+            // Duration left unset here deliberately — this path is "instant browsing before the
+            // full scan completes" (see doc comment above), and probing every video with ffmpeg
+            // would defeat that. The thumbnail/preview pipeline probes lazily when it needs it.
+            ...(isVideoFile(entry.name) ? { isVideo: true } : {}),
           };
         } catch {
           // Skip unreadable individual photo

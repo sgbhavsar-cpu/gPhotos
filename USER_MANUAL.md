@@ -40,6 +40,8 @@
     - [Configuring the Local Ollama Engine](#configuring-the-local-ollama-engine)
 17. [Create a Video from an Album](#17-create-a-video-from-an-album)
 18. [AI Photo Search: "Ask AI"](#18-ai-photo-search-ask-ai)
+19. [Auto-Describe & Tag Photos (Background)](#19-auto-describe--tag-photos-background)
+20. [Videos in Your Library](#20-videos-in-your-library)
 
 ---
 
@@ -198,6 +200,9 @@ Clicking any photo thumbnail launches the high-performance **Fullscreen Lightbox
 
 ## 6. AI Face Recognition & People Management
 
+### Finding Someone Quickly:
+Type into the **search box** at the top of the People tab to filter the grid by name as you type.
+
 ### Scanning & Face Detection:
 1. Navigate to the **People** tab from the sidebar.
 2. Click **Detect Faces**. The background worker uses SSD MobileNet / TinyFaceDetector to detect face boxes, extract 128-dimensional biometric embeddings, and group matching faces into people profiles.
@@ -233,6 +238,11 @@ The **Places** tab displays an iOS/Apple Photos-style interactive geographic map
 - Powered by **OpenStreetMap** (`tile.openstreetmap.org`) by default.
 - 100% free with no account registration or CARTO API key required.
 - Toggle between **OpenStreetMap (Free)**, **Satellite**, and **Dark** map layers anytime.
+
+### Finding a Place Quickly:
+Type into the **search box** in the Places header to filter the map down to pins whose city,
+country, or custom label matches what you typed — the map automatically flies to the matching
+pins. Clear the search to see everything again.
 
 ### Bubble Cluster Pins:
 - Photos taken in the same geographic region are grouped into custom circular bubble pins featuring the latest photo thumbnail and a photo count badge.
@@ -643,6 +653,16 @@ question — "Photo of sachin and monika", "Photos of sachin in andaman", "Photo
 by whichever provider is configured under **Settings → Search with AI**. A match applies as a filter on
 the main gallery.
 
+- **Several people together**: "Photo of stavan and stuti" finds photos with both of them in it
+  (and possibly others too).
+- **Only these people, nobody else**: add **"only"** — "Photo of stavan and stuti only" finds photos
+  where it's just the two of them, excluding any photo where a third person also appears. "Only photo
+  of monika" (one name) works the same way as "photo of monika alone".
+- **Excluding someone**: add **"but not NAME"** (also works as "except NAME" / "without NAME") at the
+  end — "Photo of monika but not raji" finds monika's photos with raji nowhere in them.
+- **Combine with a place or tag**: these all stack with a location or Smart Flow tag in the same
+  question — "Only photo of monika at #andaman" finds just-monika photos taken in Andaman.
+
 - **@mention people, #mention places, &mention Smart Flow tags**: type **@** to get a dropdown of the
   people in your library, **#** for places (from your Places map), or **&** for content **tags** —
   the captions/tags Smart Flows has already recorded about your photos (e.g. "receipt", "screenshot",
@@ -663,3 +683,56 @@ the main gallery.
   search, so they survive a restart and don't need re-analysing. A tagged search only matches photos a
   Smart Flow has actually analysed — one never checked by any flow won't match even if it probably
   would qualify.
+
+## 19. Auto-Describe & Tag Photos (Background)
+
+**Settings → Search with AI → "Auto-describe & tag photos in the background"** — off by default. When
+turned on, gPhotos quietly captions and tags every photo in the open library using your local
+**Ollama** model (the same one configured just above it for Smart Flows), without you running a Smart
+Flow against them yourself. It never uses a cloud provider for this, even if one is configured — this
+background pass only ever uses the local model, so nothing leaves your machine.
+
+- Runs in small batches while the app is open and idle, pausing automatically if Ollama isn't
+  reachable and resuming once it is.
+- Backs off while you're running a Smart Flow manually, so the two never compete for the same model
+  at once.
+- Picks up exactly where it left off after a restart — a photo already captioned (by this feature or
+  by any Smart Flow) is never re-sent.
+- The payoff: **"&tag"** autocomplete in [Ask AI](#18-ai-photo-search-ask-ai) fills in for your whole
+  library over time, not just the photos you've manually run a Smart Flow against.
+- The status line under the toggle shows live progress ("Indexing — 120 / 5,000 photos this pass") or
+  why it's idle (waiting for Ollama, or already up to date).
+
+## 20. Videos in Your Library
+
+Video files in a scanned folder (`.mp4`, `.mov`, `.avi`, `.mkv`, `.webm`, `.wmv`, `.m4v`) show up in
+the gallery right alongside your photos — same grid, same albums, same favorites.
+
+- Each video tile shows a small play-icon badge with its length.
+- **Hover** over a video tile for about two seconds and a short silent preview clip plays right in the
+  tile — move the mouse away and it reverts to the still thumbnail. The very first hover on a given
+  video generates that preview (a second or two); every hover after that is instant.
+- **Click** a video to open it full-screen in gPhotos' own player with normal play/pause/seek controls
+  — the same way clicking a photo opens it full-screen.
+- Crop, rotate and the other photo-editing tools don't apply to a video and simply aren't shown for one.
+- Videos are not face-scanned, not sent to Smart Flows, and not included in the background
+  auto-tagging pass above — those all work on still images only.
+
+### Getting videos into a library you already opened before this feature existed
+
+Video support only applies to files a scan actually sees — a library opened for the first time
+scans fresh and picks up videos automatically, but a library you opened **before** video support
+existed won't show its videos until it's told to look again:
+
+- **Network/cloud (virtual mirror) storages**: click **Rescan** — the icon-only toolbar button in
+  Photos (only shown when viewing a network-backed library), the refresh icon next to a storage in
+  the Sidebar, or **"Rescan / Refresh"** / **"Rescan All Network Mirrors"** in Settings → Network
+  Mirrors. This re-walks the source and picks up new videos (and any other new files) immediately —
+  nothing else to do.
+- **A plain local folder**: the same toolbar **Rescan** button (Photos screen) now appears for a
+  local library too — click it to re-walk the folder on disk. It's safe to use anytime: it only adds
+  genuinely new files and removes genuinely deleted ones — your favorites, rotations, and album
+  membership on existing photos are untouched. (Simply reopening the same folder from "Open Folder"
+  or the recent-libraries list does **not** do this — once a folder's been indexed, reopening it just
+  reloads the existing catalog instantly without checking the disk again, which is normally what you
+  want for speed; Rescan is the explicit "check for anything new" action.)

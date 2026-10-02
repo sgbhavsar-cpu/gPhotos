@@ -853,6 +853,51 @@ export class LibraryManager {
   /**
    * Switches the active library in <30ms by reading ONLY the target's 20 KB meta + Page 0.
    */
+  /** Shared by switchLibrary and rescanLibrary — both end up with the exact same
+   *  {meta, firstPage, albums} shape to apply to in-memory state. */
+  private applyLibrarySwitchResult(targetPath: string, result: { meta: CatalogMeta; firstPage: Photo[]; albums?: Album[] }): void {
+    this.state.catalogMeta = result.meta;
+    this.state.totalCount = result.meta.totalPhotos;
+    this.state.places = (result.meta.placesSummary as any) || [];
+    this.state.selectedFolder = targetPath;
+    this.state.currentDirectory = targetPath;
+    this.state.recentLibraries = result.meta.recentLibraries || [];
+
+    // Restore faces from globalFaceCache for firstPage
+    const restoredFirstPage = (result.firstPage || []).map((p) => {
+      const cached = this.getCachedFaces(p);
+      if (cached) {
+        return {
+          ...p,
+          faces: (cached.faces || []).map((f) => ({ ...f, photoId: p.id })),
+          faceScanCompleted: cached.faceScanCompleted,
+        };
+      }
+      return p;
+    });
+
+    this.state.photos = restoredFirstPage;
+    // Stamp the raw DB rows, not the cache-restored copies, so photos
+    // whose restored faces differ from the DB are still re-saved as before.
+    this.stampPersisted(result.firstPage || [], true);
+    this.currentCatalogPage = 0;
+    this.libraryEpoch++;
+    this.loadError = null;
+    this.pendingRemovedIds.clear();
+    // Albums are per-library (unlike people, which are a global
+    // registry) — without repopulating this from the just-switched-to
+    // library's own data, the PREVIOUS library's albums stayed in
+    // memory and the immediate notify(true) save below would overwrite
+    // (or empty, if none had loaded yet) this library's real albums
+    // with that stale data. See replaceAllAlbums' matching guard for
+    // the second layer of protection against this.
+    this.state.albums = result.albums || [];
+    this.reconcilePeopleAndFaces();
+    this.notify(true);
+    // See the matching comment in loadPersistedData's fast-path.
+    this.loadNextCatalogPages(Number.MAX_SAFE_INTEGER);
+  }
+
   public async switchLibrary(targetPath: string): Promise<boolean> {
     try {
       if (typeof window !== 'undefined') {
@@ -875,46 +920,7 @@ export class LibraryManager {
         if (result && result.meta) {
           const tSwitchEnd = performance.now();
           console.log(`[LIBRARY SWITCH] Switched library to "${targetPath}" in ${(tSwitchEnd - tSwitch0).toFixed(1)}ms. Total photos: ${result.meta.totalPhotos}, Page 0 loaded: ${result.firstPage?.length || 0}`);
-          this.state.catalogMeta = result.meta;
-          this.state.totalCount = result.meta.totalPhotos;
-          this.state.places = (result.meta.placesSummary as any) || [];
-          this.state.selectedFolder = targetPath;
-          this.state.currentDirectory = targetPath;
-          this.state.recentLibraries = result.meta.recentLibraries || [];
-
-          // Restore faces from globalFaceCache for firstPage
-          const restoredFirstPage = (result.firstPage || []).map((p) => {
-            const cached = this.getCachedFaces(p);
-            if (cached) {
-              return {
-                ...p,
-                faces: (cached.faces || []).map((f) => ({ ...f, photoId: p.id })),
-                faceScanCompleted: cached.faceScanCompleted,
-              };
-            }
-            return p;
-          });
-
-          this.state.photos = restoredFirstPage;
-          // Stamp the raw DB rows, not the cache-restored copies, so photos
-          // whose restored faces differ from the DB are still re-saved as before.
-          this.stampPersisted(result.firstPage || [], true);
-          this.currentCatalogPage = 0;
-          this.libraryEpoch++;
-          this.loadError = null;
-          this.pendingRemovedIds.clear();
-          // Albums are per-library (unlike people, which are a global
-          // registry) — without repopulating this from the just-switched-to
-          // library's own data, the PREVIOUS library's albums stayed in
-          // memory and the immediate notify(true) save below would overwrite
-          // (or empty, if none had loaded yet) this library's real albums
-          // with that stale data. See replaceAllAlbums' matching guard for
-          // the second layer of protection against this.
-          this.state.albums = result.albums || [];
-          this.reconcilePeopleAndFaces();
-          this.notify(true);
-          // See the matching comment in loadPersistedData's fast-path.
-          this.loadNextCatalogPages(Number.MAX_SAFE_INTEGER);
+          this.applyLibrarySwitchResult(targetPath, result);
           return true;
         }
       }
@@ -922,6 +928,32 @@ export class LibraryManager {
       console.warn('[LibraryStore] switchLibrary failed:', err);
       // Callers fall back to a full rescan on `false`; say why instead of doing it silently.
       notifyError('Could not switch library', err);
+    }
+    return false;
+  }
+
+  /**
+   * Re-walks the CURRENTLY OPEN local library's folder on disk, unlike switchLibrary (which
+   * deliberately skips re-scanning a folder already indexed — see catalogService.switchCatalogLibrary's
+   * doc comment). Needed so an existing local library can pick up newly-supported file types (e.g.
+   * videos, see docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md) added to the folder after it was first opened —
+   * nothing else watches an arbitrary local folder for changes the way a virtual/network mirror's own
+   * sync does. Safe to call anytime: the underlying scan is a non-destructive upsert + diff, not a
+   * wipe-and-rebuild (see rescanLocalLibrary's doc comment in catalogService.ts).
+   */
+  public async rescanLibrary(): Promise<boolean> {
+    const targetPath = this.state.selectedFolder || this.state.currentDirectory;
+    if (!targetPath || !window.electronAPI?.rescanLibrary) return false;
+    try {
+      await this.flushSaveImmediately();
+      const result = await trackBackendCall(window.electronAPI.rescanLibrary(targetPath), 'Rescanning folder for new files...');
+      if (result && result.meta) {
+        this.applyLibrarySwitchResult(targetPath, result);
+        return true;
+      }
+    } catch (err) {
+      console.warn('[LibraryStore] rescanLibrary failed:', err);
+      notifyError('Could not rescan this library', err);
     }
     return false;
   }

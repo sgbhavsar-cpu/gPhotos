@@ -11,6 +11,9 @@ import {
 } from './heicService';
 import { getSavedRotationForContent, addSavedRotation } from './heicRotationStore';
 import { isPathReachable } from './networkReachabilityCache';
+import { grabVideoFrame, probeMedia } from './videoExportService';
+
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm', '.wmv', '.m4v']);
 
 let sharp: any = null;
 try {
@@ -174,6 +177,27 @@ export async function getOrGenerateCachedThumbnail(
       let thumbBuffer: Buffer | null = null;
       const ext = path.extname(sourcePath).toLowerCase();
       const isHeic = ext === '.heic' || ext === '.heif';
+      const isVideo = VIDEO_EXTENSIONS.has(ext);
+
+      // A0. For video files: grab one representative frame via ffmpeg first, then let the SAME
+      // sharp resize/cache pipeline below treat it exactly like any other source buffer — see
+      // docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md §2.4. Seeks to 1s (or 10% in for a very short clip)
+      // rather than frame 0 — a video's very first frame is disproportionately likely to be a
+      // black/blank lead-in.
+      let videoFrameBuffer: Buffer | null = null;
+      if (isVideo) {
+        try {
+          const info = await probeMedia(sourcePath);
+          const seekAt = info.durationSec ? Math.min(1, info.durationSec * 0.1) : 0;
+          videoFrameBuffer = await grabVideoFrame(sourcePath, seekAt);
+        } catch {}
+        if (!videoFrameBuffer) {
+          // Couldn't extract a frame at all (corrupt/unreadable video) — nothing else below can
+          // help either (HEIC/sharp-from-path/nativeImage all expect an actual image file), so
+          // give up cleanly rather than falling through to try to decode the video as an image.
+          return null;
+        }
+      }
 
       // A. For HEIC images
       if (isHeic) {
@@ -209,10 +233,11 @@ export async function getOrGenerateCachedThumbnail(
         }
       }
 
-      // B. High-speed Sharp processing (SIMD C++ libvips)
+      // B. High-speed Sharp processing (SIMD C++ libvips) — from the extracted video frame when
+      // this is a video, otherwise straight from the source file as before.
       if (!thumbBuffer && sharp) {
         try {
-          thumbBuffer = await sharp(sourcePath)
+          thumbBuffer = await sharp(videoFrameBuffer || sourcePath)
             .rotate()
             .resize(targetSize, targetSize, { fit: 'inside', withoutEnlargement: true })
             .jpeg({ quality: targetSize > 500 ? 86 : 82, mozjpeg: true })
@@ -220,6 +245,12 @@ export async function getOrGenerateCachedThumbnail(
         } catch (sharpErr) {
           // Continue to nativeImage fallback
         }
+      }
+
+      // A video's own bytes are never a valid still image — the C/D fallbacks below assume
+      // sourcePath decodes directly as one, so skip straight to giving up once B has had its shot.
+      if (!thumbBuffer && isVideo) {
+        return null;
       }
 
       // C. NativeImage fallback

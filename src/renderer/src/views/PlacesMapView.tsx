@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useMemo, useCallback, useDeferredValue } from 'react';
 import L from 'leaflet';
 import {
   MapPin,
@@ -20,6 +20,7 @@ import {
 import { Photo, PlaceAlbum } from '../../../types';
 import { PhotoCard } from '../components/PhotoCard';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
+import { matchesPlaceQuery } from '../services/placesService';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { notify, notifyError } from '../services/notifications';
 import { VirtualCardGrid } from '../components/VirtualCardGrid';
@@ -88,6 +89,11 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
   const markersLayerRef = useRef<L.LayerGroup | null>(null);
 
   const isMobile = useIsMobile();
+
+  // Filter the map by place name (city/country/custom label) — mirrors PeopleView's name search.
+  // Deferred for the same reason: typing shouldn't jank marker re-clustering/re-render.
+  const [placesSearchQuery, setPlacesSearchQuery] = useState('');
+  const deferredPlacesSearchQuery = useDeferredValue(placesSearchQuery);
   const [showMobileTools, setShowMobileTools] = useState(false);
 
   const [activeTileType, setActiveTileType] = useState<'osm' | 'satellite' | 'dark'>('osm');
@@ -175,7 +181,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
   }, [showAssignModal, assignModalOverridePhotos]);
 
   // All valid geotagged photos
-  const geoPhotos = useMemo(() => {
+  const allGeoPhotos = useMemo(() => {
     return photos.filter(
       (p) =>
         p.location &&
@@ -186,6 +192,14 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
         (p.location.latitude !== 0 || p.location.longitude !== 0)
     );
   }, [photos]);
+
+  // Narrowed by the place search box, if any — every downstream consumer (clustering, marker
+  // rendering, bounds-fitting, the header count) reads this name, so a search box automatically
+  // narrows the whole map to matching pins with no other changes needed.
+  const geoPhotos = useMemo(() => {
+    if (!deferredPlacesSearchQuery.trim()) return allGeoPhotos;
+    return allGeoPhotos.filter((p) => matchesPlaceQuery(p.location, deferredPlacesSearchQuery));
+  }, [allGeoPhotos, deferredPlacesSearchQuery]);
 
   // Dynamic screen-space clustering function
   const computeClusters = useCallback(
@@ -543,6 +557,15 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
     }
   }, [geoPhotos]);
 
+  // Flies to whatever the place search currently matches, so typing a name is a real "find this
+  // place" action, not just a pin filter the user has to go hunting for.
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    if (!map || !deferredPlacesSearchQuery.trim() || geoPhotos.length === 0) return;
+    const bounds = L.latLngBounds(geoPhotos.map((p) => [p.location!.latitude, p.location!.longitude]));
+    if (bounds.isValid()) map.flyToBounds(bounds, { padding: [60, 60], maxZoom: 14, duration: 0.8 });
+  }, [deferredPlacesSearchQuery, geoPhotos]);
+
   const handleFitAllPhotos = () => {
     const map = mapInstanceRef.current;
     if (!map || geoPhotos.length === 0) return;
@@ -642,6 +665,27 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
     </button>
   );
 
+  // Search by place name (city, country, or a custom label) — same pattern as PeopleView's name
+  // search. Shown whenever there's at least one geotagged photo to search through.
+  const placesSearchInput = allGeoPhotos.length > 0 ? (
+    <div style={{ position: 'relative', flex: 1, maxWidth: isMobile ? undefined : '320px' }}>
+      <Search
+        size={14}
+        color="var(--text-muted)"
+        style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}
+      />
+      <input
+        type="text"
+        value={placesSearchQuery}
+        onChange={(e) => setPlacesSearchQuery(e.target.value)}
+        onKeyDown={(e) => e.stopPropagation()}
+        placeholder="Search places..."
+        className="input"
+        style={{ width: '100%', fontSize: '0.82rem', padding: '6px 10px 6px 30px' }}
+      />
+    </div>
+  ) : null;
+
   const assignLocationButton = unlocatedPhotos.length > 0 ? (
     <button
       onClick={() => {
@@ -711,7 +755,9 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                   Photos Map
                 </h2>
                 <p style={{ fontSize: '0.7rem', color: 'var(--text-muted)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                  {geoPhotos.length} geotagged {geoPhotos.length === 1 ? 'photo' : 'photos'}
+                  {placesSearchQuery.trim() && geoPhotos.length === 0
+                    ? `No places match "${placesSearchQuery.trim()}"`
+                    : `${geoPhotos.length} geotagged ${geoPhotos.length === 1 ? 'photo' : 'photos'}`}
                 </p>
               </div>
             </div>
@@ -725,6 +771,14 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
               <MoreVertical size={18} />
             </button>
           </div>
+
+          {/* Search row — always visible (unlike the collapsed tools below), same as PeopleView's
+              mobile layout: a primary filter action shouldn't be behind an extra tap. */}
+          {placesSearchInput && (
+            <div style={{ padding: '0 12px 10px 12px' }}>
+              {placesSearchInput}
+            </div>
+          )}
 
           {/* Collapsed by default: tile selector / Fit All / Assign Location,
               only taking up space when the user actually asks for them. */}
@@ -797,10 +851,14 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                 </span>
               </div>
               <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                {geoPhotos.length} geotagged {geoPhotos.length === 1 ? 'photo' : 'photos'} across {places?.length || 0} locations
+                {placesSearchQuery.trim() && geoPhotos.length === 0
+                  ? `No places match "${placesSearchQuery.trim()}"`
+                  : `${geoPhotos.length} geotagged ${geoPhotos.length === 1 ? 'photo' : 'photos'} across ${places?.length || 0} locations`}
               </p>
             </div>
           </div>
+
+          {placesSearchInput}
 
           {/* Map Controls */}
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>

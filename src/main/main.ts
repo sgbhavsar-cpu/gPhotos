@@ -7,6 +7,7 @@ import os from 'os';
 import { parsePhotoMetadata } from './services/exifParser';
 import {
   scanDirectoryRecursive,
+  isVideoFile,
   generateDryRun,
   executeOrganization
 } from './services/fileOrganizer';
@@ -75,6 +76,7 @@ import {
   getCatalogMeta,
   getCatalogPage,
   switchCatalogLibrary,
+  rescanLocalLibrary,
 } from './services/catalogService';
 import { handleStorageSave, handleStorageLoad } from './services/storageHandlers';
 import {
@@ -93,6 +95,8 @@ import { detectFacesForPhoto, forceRedetectFacesForPhoto, resolveDbForPhoto, get
 import { detectFaceInRegion, terminateFaceDetectionWorker, getFaceDetectionPoolSize } from './services/faceDetectionWorkerClient';
 import { assertPathsAllowed, isPathAllowed, getDefaultMirrorRoot } from './services/pathSecurity';
 import { exportVideo, getFfmpegPath, probeMedia, makeAudioPreview } from './services/videoExportService';
+import { getOrGenerateVideoPreview } from './services/videoPreviewService';
+import { serveFileWithRangeSupport } from './services/rangeFileServer';
 import { resolveYtDlp, installYtDlp, downloadYouTubeAudio } from './services/ytDlpService';
 import { fetchMusicTrack, listCachedTrackIds } from './services/musicLibraryService';
 import { findMusicTrack } from '../types/musicCatalog';
@@ -338,6 +342,19 @@ const IMAGE_MIME: Record<string, string> = {
   '.nef': 'image/jpeg',
 };
 
+// Video library items (see docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md) — served through the SAME
+// gphoto:// protocol as photos, but via the Range-aware branch below (§2.6), never the
+// whole-file-into-memory image branches: a <video> element needs Range support to seek.
+const VIDEO_MIME: Record<string, string> = {
+  '.mp4': 'video/mp4',
+  '.mov': 'video/quicktime',
+  '.mkv': 'video/x-matroska',
+  '.webm': 'video/webm',
+  '.avi': 'video/x-msvideo',
+  '.wmv': 'video/x-ms-wmv',
+  '.m4v': 'video/x-m4v',
+};
+
 function createWindow() {
   isAppReadyFired = false;
   mainWindow = new BrowserWindow({
@@ -508,9 +525,19 @@ function createWindow() {
 
       if (targetPath) {
         const ext = path.extname(targetPath).toLowerCase();
-        // Only image files are ever served: this scheme has bypassCSP + CORS *, so it
+        // Only image/video files are ever served: this scheme has bypassCSP + CORS *, so it
         // must not be usable to read arbitrary files (keys, library.json, ...).
-        if (!IMAGE_MIME[ext]) return new Response('Unsupported file type', { status: 403 });
+        if (!IMAGE_MIME[ext] && !VIDEO_MIME[ext]) return new Response('Unsupported file type', { status: 403 });
+
+        // Video playback — only when the caller actually asked for the original (preferOriginal,
+        // exactly like a full-res photo request), Range-aware so a <video> element can seek
+        // (§2.6 of the feature doc). A plain thumbnail request for a video (preferOriginal
+        // false, the grid's normal getLocalPhotoUrl call) falls through to the SAME cached-
+        // thumbnail branch below as any photo — getOrGenerateCachedThumbnail already knows how
+        // to extract a JPEG frame for a video source — so that branch is unchanged.
+        if (VIDEO_MIME[ext] && preferOriginal) {
+          return serveFileWithRangeSupport(targetPath, VIDEO_MIME[ext], request.headers.get('range'));
+        }
 
         // 1. Raw original full resolution requested
         if (preferOriginal) {
@@ -557,7 +584,9 @@ function createWindow() {
           }
         }
 
-        // 3. Fallback direct file read
+        // 3. Fallback direct file read — image sources only. A video whose thumbnail couldn't be
+        // generated (corrupt file) has no meaningful raw-bytes fallback as a "thumbnail" response.
+        if (!IMAGE_MIME[ext]) return new Response('Thumbnail could not be generated', { status: 404 });
         const buffer = await fs.promises.readFile(targetPath);
         return new Response(buffer as any, {
           headers: {
@@ -728,6 +757,7 @@ ipcMain.handle('scanner:scan-directory', async (_event, dirPath: string): Promis
           } catch {}
         }
 
+        const isVideo = isVideoFile(filePath);
         const photo: Photo = {
           id: Buffer.from(filePath).toString('base64'),
           filePath,
@@ -747,6 +777,17 @@ ipcMain.handle('scanner:scan-directory', async (_event, dirPath: string): Promis
           heicRotation: isHeicRotated ? heicRotation : undefined,
           rotation: isHeicRotated ? heicRotation : undefined,
         };
+        // This handler builds its own Photo objects rather than reusing fileOrganizer's
+        // scanPhotoDirectory (a separate, duplicated implementation — see
+        // docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md for the equivalent fix in that one), so video
+        // support needs the same isVideo/videoDurationSec handling applied here too.
+        if (isVideo) {
+          photo.isVideo = true;
+          try {
+            const info = await probeMedia(filePath);
+            if (info.durationSec != null) photo.videoDurationSec = info.durationSec;
+          } catch {}
+        }
 
         photos.push(photo);
       } catch (err) {
@@ -864,6 +905,24 @@ ipcMain.handle('catalog:switch-library', async (_event, targetPath: string) => {
   } catch (err) {
     console.error('catalog:switch-library error:', err);
     logger.error('Catalog', 'switch-library failed', { err: String((err as any)?.stack || err) });
+    return null;
+  }
+});
+
+// Re-walks an already-indexed local library's folder on disk (see catalogService.rescanLocalLibrary's
+// doc comment) — the local-library counterpart to "Rescan" on a virtual/network mirror, needed so an
+// existing local library can pick up newly-supported file types (e.g. videos) added after it was
+// first opened, since nothing else watches an arbitrary local folder for changes.
+ipcMain.handle('catalog:rescan-library', async (_event, targetPath: string) => {
+  try {
+    const res = await rescanLocalLibrary(targetPath);
+    if (res && res.firstPage && res.firstPage.length > 0) {
+      thumbnailWorker.enqueuePhotos(res.firstPage);
+    }
+    return res;
+  } catch (err) {
+    console.error('catalog:rescan-library error:', err);
+    logger.error('Catalog', 'rescan-library failed', { err: String((err as any)?.stack || err) });
     return null;
   }
 });
@@ -1335,7 +1394,10 @@ ipcMain.handle('video:open-file', async (_event, filePath: string) => {
   }
 });
 
-ipcMain.handle('faces:detect-batch', async (_event, photos: Photo[]) => {
+ipcMain.handle('faces:detect-batch', async (_event, allPhotos: Photo[]) => {
+  // A video file is never face-scanned (see docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md §2.7) — filtered
+  // centrally here rather than at every caller, since every caller routes through this one handler.
+  const photos = allPhotos.filter((p) => !p.isVideo);
   const results: Array<{ photoId: string; ran: boolean; faceCount: number; locked: boolean; skippedReason?: string; faces: any[] }> = [];
   // Keyed by resolved db rather than shared as one cache — a batch can span
   // more than one library/storage (each with its own faces table), and a
@@ -2184,6 +2246,23 @@ ipcMain.handle('service:activity-resume-precache', async () => {
     return { paused: false };
   } catch (err: any) {
     return { paused: true, error: err.message };
+  }
+});
+
+// On-demand video hover-preview generation (see docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md §2.5) —
+// `filePath` is preferred when reachable (same preferOriginal-vs-local precedence as the gphoto://
+// protocol handler above), falling back to `originalRemotePath`.
+ipcMain.handle('video:get-preview', async (_event, filePath: string, originalRemotePath?: string) => {
+  try {
+    const appOwnedRoots = [app.getPath('userData'), getDefaultMirrorRoot()];
+    const source = (originalRemotePath && !(await isPathReachableForServing(filePath, appOwnedRoots)) && (await isPathReachableForServing(originalRemotePath, appOwnedRoots)))
+      ? originalRemotePath
+      : filePath;
+    const previewPath = await getOrGenerateVideoPreview(source);
+    return previewPath ? { path: previewPath } : { error: 'Could not generate a preview for this video.' };
+  } catch (err: any) {
+    console.error('video:get-preview error:', err);
+    return { error: err?.message || String(err) };
   }
 });
 

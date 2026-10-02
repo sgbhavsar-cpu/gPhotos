@@ -48,6 +48,8 @@ function rowToPhoto(row: any): Photo {
     isHeicRotated: toBool(row.is_heic_rotated),
     heicRotation: row.heic_rotation ?? undefined,
     originalMtimeMs: row.original_mtime_ms ?? undefined,
+    isVideo: toBool(row.is_video),
+    videoDurationSec: row.video_duration_sec ?? undefined,
   };
   const exif = parseJson<ExifMetadata | null>(row.exif_json, null);
   if (exif) photo.exif = exif;
@@ -61,12 +63,12 @@ const UPSERT_PHOTO_SQL = `
     id, file_path, file_name, file_size, file_date, date_taken, year, month, day,
     width, height, is_favorite, is_virtual, original_remote_path, storage_name,
     is_excluded, face_scan_completed, faces_locked, sharpness_score, rotation, is_heic_rotated,
-    heic_rotation, exif_json, location_json, original_mtime_ms
+    heic_rotation, exif_json, location_json, original_mtime_ms, is_video, video_duration_sec
   ) VALUES (
     @id, @filePath, @fileName, @fileSize, @fileDate, @dateTaken, @year, @month, @day,
     @width, @height, @isFavorite, @isVirtual, @originalRemotePath, @storageName,
     @isExcluded, @faceScanCompleted, @facesLocked, @sharpnessScore, @rotation, @isHeicRotated,
-    @heicRotation, @exifJson, @locationJson, @originalMtimeMs
+    @heicRotation, @exifJson, @locationJson, @originalMtimeMs, @isVideo, @videoDurationSec
   )
   ON CONFLICT(id) DO UPDATE SET
     file_path=excluded.file_path, file_name=excluded.file_name, file_size=excluded.file_size,
@@ -79,7 +81,8 @@ const UPSERT_PHOTO_SQL = `
     sharpness_score=excluded.sharpness_score, rotation=excluded.rotation,
     is_heic_rotated=excluded.is_heic_rotated, heic_rotation=excluded.heic_rotation,
     exif_json=excluded.exif_json, location_json=excluded.location_json,
-    original_mtime_ms=excluded.original_mtime_ms
+    original_mtime_ms=excluded.original_mtime_ms, is_video=excluded.is_video,
+    video_duration_sec=excluded.video_duration_sec
 `;
 
 function photoToParams(photo: Photo): Record<string, any> {
@@ -109,6 +112,8 @@ function photoToParams(photo: Photo): Record<string, any> {
     exifJson: photo.exif ? JSON.stringify(photo.exif) : null,
     locationJson: photo.location ? JSON.stringify(photo.location) : null,
     originalMtimeMs: photo.originalMtimeMs ?? null,
+    isVideo: fromBool(photo.isVideo),
+    videoDurationSec: photo.videoDurationSec ?? null,
   };
 }
 

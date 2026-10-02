@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Heart, MapPin, Users, Check, EyeOff, Image as ImageIcon, ImageOff, RotateCw } from 'lucide-react';
+import { Heart, MapPin, Users, Check, EyeOff, Image as ImageIcon, ImageOff, RotateCw, Play } from 'lucide-react';
 import { Photo } from '../../../types';
 import { getLocalPhotoUrl, libraryStore } from '../services/libraryStore';
 import { useBatchThumbnail, useSpriteCoordinate, getSpriteUrl, batchThumbnailStore } from '../services/asyncImageLoader';
@@ -19,6 +19,14 @@ interface PhotoCardProps {
   onCardMouseEnter?: (photoId: string, e: React.MouseEvent) => void;
 }
 
+function formatDuration(sec?: number): string | null {
+  if (!sec || !Number.isFinite(sec) || sec <= 0) return null;
+  const total = Math.round(sec);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
 const PhotoCardComponent: React.FC<PhotoCardProps> = ({
   photo,
   onClick,
@@ -32,6 +40,21 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
 }) => {
   const [isHovered, setIsHovered] = useState(false);
   const [imgElementLoaded, setImgElementLoaded] = useState(false);
+
+  // Video hover preview (see docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md §2.5): a short inline clip
+  // plays over the thumbnail once the mouse has rested on a video tile for ~2s. `stillHoveredRef`
+  // guards against a slow (first-ever) generation finishing after the mouse has already left.
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const stillHoveredRef = useRef(false);
+
+  const clearHoverPreviewTimer = () => {
+    if (hoverTimerRef.current) {
+      clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
+  };
+  useEffect(() => clearHoverPreviewTimer, []);
 
   // Instant local visual rotation on thumbnail (0ms latency feedback during clicks)
   const [visualRotation, setVisualRotation] = useState<number>(0);
@@ -193,8 +216,27 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
       onMouseEnter={(e) => {
         setIsHovered(true);
         if (onCardMouseEnter) onCardMouseEnter(photo.id, e);
+        if (photo.isVideo) {
+          stillHoveredRef.current = true;
+          clearHoverPreviewTimer();
+          hoverTimerRef.current = setTimeout(async () => {
+            const api = window.electronAPI as any;
+            if (!stillHoveredRef.current || !api?.getVideoPreview) return;
+            const res = await api.getVideoPreview(photo.filePath, photo.originalRemotePath).catch(() => null);
+            // A slow (first-ever) generation may finish after the mouse already left — only show
+            // it if we're still hovered by then, never pop a preview in on an already-cold tile.
+            if (res?.path && stillHoveredRef.current) {
+              setPreviewUrl(getLocalPhotoUrl(res.path, undefined, true, 0));
+            }
+          }, 2000);
+        }
       }}
-      onMouseLeave={() => setIsHovered(false)}
+      onMouseLeave={() => {
+        setIsHovered(false);
+        stillHoveredRef.current = false;
+        clearHoverPreviewTimer();
+        setPreviewUrl(null);
+      }}
       onDragStart={(e) => e.preventDefault()}
       style={{
         position: 'relative',
@@ -302,6 +344,80 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
             transform: visualRotation ? `rotate(${visualRotation}deg)` : undefined,
           }}
         />
+      )}
+
+      {/* Video hover preview — a short muted clip playing over the static thumbnail (see
+          docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md §2.5). Reverts to the thumbnail on mouse leave
+          regardless of whether this ever finished loading. */}
+      {photo.isVideo && previewUrl && (
+        <video
+          src={previewUrl}
+          autoPlay
+          muted
+          loop
+          playsInline
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            width: '100%',
+            height: '100%',
+            objectFit: 'cover',
+            zIndex: 3,
+          }}
+        />
+      )}
+
+      {/* Video indicators — always visible (not hover-gated), so it's unmistakable at a glance,
+          not just on hover: a centered play circle (like Apple Photos/most gallery apps) plus a
+          corner duration pill (like YouTube), hidden only while the hover-preview clip itself is
+          actually playing (previewUrl set) so the two don't visually stack. */}
+      {photo.isVideo && !previewUrl && (
+        <div
+          style={{
+            position: 'absolute',
+            top: '50%',
+            left: '50%',
+            transform: 'translate(-50%, -50%)',
+            zIndex: 11,
+            width: '44px',
+            height: '44px',
+            borderRadius: '50%',
+            backgroundColor: 'rgba(15, 23, 42, 0.55)',
+            border: '2px solid rgba(255, 255, 255, 0.85)',
+            backdropFilter: 'blur(2px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            pointerEvents: 'none',
+          }}
+        >
+          <Play size={20} color="white" fill="white" style={{ marginLeft: '2px' }} />
+        </div>
+      )}
+      {photo.isVideo && (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: '8px',
+            right: '8px',
+            zIndex: 12,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '4px',
+            padding: '3px 8px',
+            borderRadius: 'var(--radius-full)',
+            backgroundColor: 'rgba(15, 23, 42, 0.8)',
+            backdropFilter: 'blur(6px)',
+            color: 'white',
+            fontSize: '11px',
+            fontWeight: 700,
+          }}
+          title="Video"
+        >
+          <Play size={12} fill="white" />
+          {formatDuration(photo.videoDurationSec) && <span>{formatDuration(photo.videoDurationSec)}</span>}
+        </div>
       )}
 
       {/* Multi-Selection Checkbox */}
@@ -529,6 +645,8 @@ export const PhotoCard = React.memo(PhotoCardComponent, (prev, next) => {
     prev.photo.isExcluded === next.photo.isExcluded &&
     prev.photo.filePath === next.photo.filePath &&
     prev.photo.thumbnailPath === next.photo.thumbnailPath &&
+    prev.photo.isVideo === next.photo.isVideo &&
+    prev.photo.videoDurationSec === next.photo.videoDurationSec &&
     prev.isSelected === next.isSelected &&
     prev.isSelectMode === next.isSelectMode &&
     prev.size === next.size

@@ -298,6 +298,28 @@ export function makeAudioPreview(filePath: string, startSec: number, endSec: num
   });
 }
 
+/**
+ * Grabs a single frame from a video file as a JPEG buffer, via ffmpeg's own seek+decode (no
+ * ffprobe, no temp file — piped straight to stdout). Used for a video's thumbnail/hover-preview
+ * frames (see docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md) — shared so both the main thumbnail cache
+ * and the virtual-mirror thumbnail path use the exact same extraction, not two copies.
+ */
+export function grabVideoFrame(filePath: string, atSec: number): Promise<Buffer | null> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    const proc = spawn(getFfmpegPath(), [
+      '-ss', Math.max(0, atSec).toFixed(3), '-i', filePath,
+      '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1',
+    ], { windowsHide: true });
+    proc.stdout.on('data', (d) => chunks.push(d));
+    proc.on('error', () => resolve(null));
+    proc.on('close', (code) => {
+      const buf = Buffer.concat(chunks);
+      resolve(code === 0 && buf.length > 0 ? buf : null);
+    });
+  });
+}
+
 export interface RunFfmpegResult {
   success: boolean;
   error?: string;

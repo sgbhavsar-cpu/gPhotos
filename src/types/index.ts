@@ -93,6 +93,13 @@ export interface Photo {
   originalMtimeMs?: number;
   // Path of the cached thumbnail file (set by the mirror/thumbnail pipeline).
   thumbnailPath?: string;
+  // True for a video file scanned into the library (see docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md).
+  // Everything else about a Photo applies unchanged — albums, faces (skipped), favorites, location —
+  // only the handful of places that actually decode pixels need to branch on this.
+  isVideo?: boolean;
+  // Probed once via ffmpeg at scan time (videoExportService.probeMedia) — undefined for a photo,
+  // or a video whose duration couldn't be read.
+  videoDurationSec?: number;
 }
 
 export interface FolderTreeNode {
@@ -615,6 +622,9 @@ export interface IElectronAPI {
   getCatalogMeta: (libraryDir?: string) => Promise<CatalogMeta>;
   getCatalogPage: (params: { pageIndex: number; pageSize?: number; libraryDir?: string }) => Promise<{ photos: Photo[]; totalPages: number; totalPhotos: number }>;
   switchLibrary: (targetPath: string) => Promise<{ meta: CatalogMeta; firstPage: Photo[]; albums: Album[] }>;
+  // Re-walks an already-indexed local library's folder (see catalogService.rescanLocalLibrary) —
+  // the local-library counterpart of a virtual/network mirror's "Rescan".
+  rescanLibrary?: (targetPath: string) => Promise<{ meta: CatalogMeta; firstPage: Photo[]; albums: Album[] } | null>;
   getSpriteCoordinate?: (photoPath: string) => Promise<SpriteCoordinate | null>;
   getSpriteCoordinatesBatch?: (photoPaths: string[]) => Promise<Record<string, SpriteCoordinate | null>>;
   invalidateSpriteCoordinate?: (photoPath: string) => Promise<boolean>;
@@ -648,6 +658,9 @@ export interface IElectronAPI {
   getPersonAvatarPath?: (personId: string, cacheKey: string) => Promise<string | null>;
   savePersonAvatar?: (personId: string, cacheKey: string, dataUrl: string) => Promise<{ success: boolean; filePath?: string; error?: string }>;
   deletePersonAvatar?: (personId: string) => Promise<boolean>;
+
+  // Video library items (see docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md) — on-demand hover-preview clip.
+  getVideoPreview?: (filePath: string, originalRemotePath?: string) => Promise<{ path?: string; error?: string }>;
 
   // Smart Flows' shared per-photo content cache / RAG index (see photoContentCache.ts)
   getPhotoContentEntry?: (photoId: string) => Promise<PhotoContentEntry | null>;

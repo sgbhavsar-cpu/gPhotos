@@ -1,4 +1,15 @@
-import { Photo, PlaceAlbum } from '../../../types';
+import { Photo, PlaceAlbum, LocationMetadata } from '../../../types';
+
+/** Does a photo's location (city/country/custom label) match a typed search query? Pure, so it's
+ *  directly unit-testable without mounting PlacesMapView (a Leaflet-backed component with no
+ *  existing test harness). Case-insensitive substring match, same convention as PeopleView's name
+ *  search and the rest of this app's location matching (aiSearchService, etc.). */
+export function matchesPlaceQuery(location: LocationMetadata | undefined, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  if (!location) return false;
+  return [location.city, location.country, location.label].some((v) => v?.toLowerCase().includes(q));
+}
 
 export function groupPhotosByPlace(photos: Photo[]): PlaceAlbum[] {
   const geoPhotos = photos.filter((p) => p.location && p.location.latitude && p.location.longitude);

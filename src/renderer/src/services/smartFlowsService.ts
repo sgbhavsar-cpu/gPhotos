@@ -14,6 +14,7 @@ import { ensureLoaded, tryLocalMatch, recordFinding } from './photoContentCache'
 import { isVisionAvailable, classifyImagesBatchLocal, embedText, getOllamaConfig, resolveEffectiveContext, computeLocalBatchSize } from './ollamaVisionService';
 import { movePhotosToFolder } from './photoRelocationFlow';
 import { notify } from './notifications';
+import { setManualFlowRunning } from './visionJobLock';
 
 // How many photos to send in one vision call — amortizes the fixed prompt cost across the batch
 // instead of paying it per photo. Kept modest so one bad/oversized response only wastes a handful
@@ -190,9 +191,28 @@ export async function runFlow(
     return null;
   }
 
+  // Held for the whole run so the background AI auto-index loop backs off and doesn't double up
+  // on the same local Ollama server while this manual, user-waited-on run is in flight.
+  setManualFlowRunning(true);
+  try {
+    return await runFlowInner(flow, allPhotos, cap, onProgress, onLog);
+  } finally {
+    setManualFlowRunning(false);
+  }
+}
+
+async function runFlowInner(
+  flow: SmartFlow,
+  allPhotos: Photo[],
+  cap: number,
+  onProgress?: (done: number, total: number) => void,
+  onLog?: (line: FlowRunLogLine) => void
+): Promise<RunFlowResult | null> {
   await ensureLoaded(); // warm the shared local cache/RAG mirror for this library before Pass 1
 
-  const candidates = allPhotos.filter((p) => !flow.classifiedIds[p.id]).slice(0, Math.max(1, cap));
+  // A video is never sent to a vision-classify batch call — it expects still images (see
+  // docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md §2.7).
+  const candidates = allPhotos.filter((p) => !flow.classifiedIds[p.id] && !p.isVideo).slice(0, Math.max(1, cap));
   if (candidates.length > 0) {
     notify('info', `"${flow.name}": checking ${candidates.length} photo${candidates.length === 1 ? '' : 's'}...`);
   } else {

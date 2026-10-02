@@ -448,6 +448,8 @@
       <a href="#smart-flows" class="nav-link">🪄 Smart Flows & Local AI</a>
       <a href="#video-wizard" class="nav-link">🎬 Create a Video</a>
       <a href="#ai-photo-search" class="nav-link">🔎 Ask AI</a>
+      <a href="#ai-auto-tagging" class="nav-link">🏷️ Auto-Tag Photos</a>
+      <a href="#video-library" class="nav-link">🎞️ Videos in Your Library</a>
     </div>
   </aside>
 
@@ -595,7 +597,7 @@
       </div>
 
       <p style="color: var(--text-secondary); margin-bottom: 16px;">
-        Our face recognition engine operates 100% locally on your computer, running in the background service itself (via ONNX Runtime) — it keeps working even while the app window is closed:
+        Our face recognition engine operates 100% locally on your computer, running in the background service itself (via ONNX Runtime) — it keeps working even while the app window is closed. Use the <strong>search box</strong> at the top of the People tab to filter the grid down to a name as you type.
       </p>
 
       <div class="grid-3">
@@ -750,6 +752,7 @@
         Explore your photos geographically with Apple Photos / iOS-style bubble pins:
       </p>
       <ul>
+        <li><strong>Search Places</strong>: type into the search box in the header to filter the map down to pins matching that city, country, or custom label — the map flies to the matches automatically.</li>
         <li><strong>100% Free OpenStreetMap Tiles</strong>: Powered by <code>tile.openstreetmap.org</code>. Zero API keys, credit cards, or CARTO tokens required.</li>
         <li><strong>Bubble Cluster Pins</strong>: Group nearby photos into circular pins showing the latest thumbnail and photo count.</li>
         <li><strong>Cluster Location Renaming</strong>: Click a pin to open the bottom photo drawer, click the pencil icon, and assign a custom friendly name (e.g. <em>"Trip to Paris"</em>) to all photos at that spot — shown exactly as typed everywhere (Places, "#place" search), with no country automatically appended.</li>
@@ -885,6 +888,47 @@
       </p>
       <ul>
         <li><strong>@Mention People, #Mention Places, &amp;Mention Smart Flow Tags</strong>: type <code>@</code> for a dropdown of the people in your library, <code>#</code> for places from your Places map, or <code>&amp;</code> for content tags Smart Flows has already recorded about your photos (e.g. "receipt", "screenshot") — no need to spell any of them exactly, the list matches anywhere in the name (typing "bhavsar" finds both "Sachin Bhavsar" and "Bhavsar Tarun"). Use &uarr;/&darr; and Enter (or click) to pick one, Esc to dismiss the list. Picking an entry drops its plain text into your question, so the sentence still reads naturally. People not yet given a real name aren't offered, since there's nothing to search by yet. A picked place is matched against each photo's actual city and country, even for a combined "City, Country" entry. Tags are stored durably in the library's own database (shared across every Smart Flow, surviving a restart) and only list what a Smart Flow run has actually found — an empty list means run a Smart Flow first; a tagged search only matches photos a Smart Flow has actually analysed.</li>
+        <li><strong>Only these people, nobody else</strong>: add the word <strong>"only"</strong> — "Photo of stavan and stuti only" finds photos with just the two of them, excluding any photo where a third person also appears. "Only photo of monika" (one name) works the same as "photo of monika alone".</li>
+        <li><strong>Excluding someone</strong>: add <strong>"but not NAME"</strong> (also "except NAME" / "without NAME") at the end of the question — "Photo of monika but not raji" finds monika's photos with raji nowhere in them.</li>
+        <li><strong>Combining</strong>: "only"/"but not" stack with a place or tag in the same question — "Only photo of monika at #andaman" finds just-monika photos taken in Andaman.</li>
+      </ul>
+    </section>
+
+    <!-- Background AI Auto-Tagging Section -->
+    <section id="ai-auto-tagging">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(168, 85, 247, 0.15); color: #a855f7;">🏷️</div>
+        <h2 class="section-title">Auto-Describe &amp; Tag Photos (Background)</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        <strong>Settings &rarr; Search with AI &rarr; "Auto-describe &amp; tag photos in the background"</strong> — off by default. When on, gPhotos quietly captions and tags every photo using your local Ollama model (the same one configured for Smart Flows), so <strong>&amp;tag</strong> search in Ask AI fills in for your whole library over time — no cloud provider is ever used for this, and nothing leaves your machine.
+      </p>
+      <ul>
+        <li>Runs in small batches while the app is open and idle; pauses automatically if Ollama isn't reachable and resumes once it is.</li>
+        <li>Backs off while a Smart Flow is running manually, so the two never compete for the same model at once.</li>
+        <li>Resumes exactly where it left off after a restart — an already-captioned photo (by this feature or by any Smart Flow) is never re-sent.</li>
+        <li>The status line under the toggle shows live progress or why it's idle.</li>
+      </ul>
+    </section>
+
+    <!-- Video Library Support Section -->
+    <section id="video-library">
+      <div class="section-header">
+        <div class="section-icon" style="background: rgba(59, 130, 246, 0.15); color: #3b82f6;">🎞️</div>
+        <h2 class="section-title">Videos in Your Library</h2>
+      </div>
+
+      <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Video files (.mp4, .mov, .avi, .mkv, .webm, .wmv, .m4v) in a scanned folder show up in the gallery right alongside your photos — same grid, same albums, same favorites.
+      </p>
+      <ul>
+        <li>Each video tile shows a small play-icon badge with its length.</li>
+        <li><strong>Hover</strong> over a video tile for about two seconds and a short silent preview clip plays right in the tile; move the mouse away to revert to the still thumbnail. The first hover on a given video generates that preview — every hover after that is instant.</li>
+        <li><strong>Click</strong> a video to open it full-screen in gPhotos' own player with normal play/pause/seek controls, the same way a photo opens full-screen.</li>
+        <li>Crop, rotate and the other photo-editing tools simply aren't shown for a video.</li>
+        <li>Videos are not face-scanned, not sent to Smart Flows, and not included in the background auto-tagging pass above — those work on still images only.</li>
+        <li><strong>Got an existing library that predates video support?</strong> Click <strong>Rescan</strong> (Photos toolbar) to re-walk the folder and pick up videos — works for both network/cloud storages and plain local folders. It's safe anytime: it only adds new files and removes deleted ones, never touching favorites/rotation/albums on existing photos. Just reopening the same folder does <em>not</em> do this — once indexed, reopening loads the existing catalog instantly without checking the disk again.</li>
       </ul>
     </section>
 

@@ -105,7 +105,9 @@ const SCHEMA_STATEMENTS: string[] = [
     location_json TEXT,
     thumbnail_cached_at TEXT,
     onedrive_released_at TEXT,
-    original_mtime_ms INTEGER
+    original_mtime_ms INTEGER,
+    is_video INTEGER NOT NULL DEFAULT 0,
+    video_duration_sec REAL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_photos_date_taken ON photos(date_taken DESC)`,
   // Matches the (date_taken DESC, id DESC) ordering every whole-library reader uses, so keyset
@@ -308,6 +310,8 @@ function applySchema(db: DatabaseSync): void {
   ensureColumn(db, 'virtual_storages', 'inventory_error', 'TEXT');
   ensureColumn(db, 'virtual_storages', 'last_reachable_at', 'TEXT');
   ensureColumn(db, 'photos', 'original_mtime_ms', 'INTEGER');
+  ensureColumn(db, 'photos', 'is_video', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'photos', 'video_duration_sec', 'REAL');
   dropColumnIfExists(db, 'photos', 'faces_manually_verified');
 
   resetFaceDataIfEngineChanged(db);

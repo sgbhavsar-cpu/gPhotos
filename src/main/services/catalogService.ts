@@ -7,6 +7,7 @@ import {
   getTotalPhotoCount,
   getAllPeople,
   getAllAlbums,
+  getAllPhotos,
   getSetting,
   setSetting,
   replaceAllPhotos,
@@ -444,6 +445,62 @@ export async function switchCatalogLibrary(
   // library and, on its next save, overwrites (or empties) this library's
   // real album_photos rows with that stale data.
   const albums = getAllAlbums(getDbForLibraryPath(targetDir));
+
+  return {
+    meta,
+    firstPage: firstPageResult.photos,
+    albums,
+  };
+}
+
+/**
+ * Re-walks an ALREADY-indexed local library folder on disk, unlike switchCatalogLibrary (which
+ * deliberately skips re-scanning once a folder's database exists — see its doc comment). Needed
+ * whenever the folder has new files switchLibrary would otherwise never discover on its own, e.g.
+ * video files added after this library was first opened, before video support existed (see
+ * docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md — a local library has no other way to pick those up: there
+ * is no background watcher on an arbitrary disk folder, unlike a virtual/network mirror's own sync).
+ *
+ * Safe to call on a library already in active use: replaceAllPhotos is a non-destructive upsert +
+ * diff (see its own doc comment in libraryRepository.ts), not a wipe-and-rebuild — an existing
+ * photo's favorites/rotation/faces/album membership are untouched; only genuinely new files are
+ * added and genuinely deleted files are removed.
+ */
+export async function rescanLocalLibrary(
+  targetDir: string
+): Promise<{ meta: CatalogMeta; firstPage: Photo[]; albums: Album[] }> {
+  setActiveLibrary(targetDir);
+  const targetDb = getDbForLibraryPath(targetDir);
+
+  // A fresh disk scan has no way to know a photo's favorite/rotation/exclusion/face-scan state —
+  // scanPhotoDirectory always starts a Photo object from scratch for every file on disk. Carrying
+  // those fields forward from whatever's already in the DB (keyed by id, which is stable for the
+  // same filePath — see scanPhotoDirectory) is what makes this rescan non-destructive; without it,
+  // every photo still on disk would silently have its favorite/rotation/etc. reset on every rescan.
+  const existingById = new Map(getAllPhotos(targetDb).map((p) => [p.id, p]));
+  const scanned = (await scanPhotoDirectory(targetDir)).map((fresh) => {
+    const prev = existingById.get(fresh.id);
+    if (!prev) return fresh;
+    return {
+      ...fresh,
+      isFavorite: prev.isFavorite,
+      isExcluded: prev.isExcluded,
+      faceScanCompleted: prev.faceScanCompleted,
+      facesLocked: prev.facesLocked,
+      sharpnessScore: prev.sharpnessScore,
+      rotation: prev.rotation,
+      isHeicRotated: prev.isHeicRotated,
+      heicRotation: prev.heicRotation,
+      originalMtimeMs: prev.originalMtimeMs,
+    };
+  });
+  if (scanned.length > 0) {
+    replaceAllPhotos(scanned, targetDb);
+  }
+
+  const meta = await buildMeta(targetDir);
+  const firstPageResult = await getCatalogPage(0, PAGE_SIZE, targetDir);
+  const albums = getAllAlbums(targetDb);
 
   return {
     meta,

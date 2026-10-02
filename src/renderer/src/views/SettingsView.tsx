@@ -44,6 +44,7 @@ import {
   getLastOllamaError,
   OllamaModelInfo,
 } from '../services/ollamaVisionService';
+import { subscribe as subscribeAutoIndex, setAutoIndexEnabled, AiAutoIndexStatus } from '../services/aiAutoIndexService';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { notify, notifyError } from '../services/notifications';
 import { TopTabs } from '../components/TopTabs';
@@ -83,6 +84,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   // Local AI (Ollama) — Smart Flows' local-first classification pass.
   const [ollamaConfig, setOllamaConfig] = useState(() => getOllamaConfig());
+  // Background AI auto-tagging (see docs/FEATURE_AI_AUTO_TAGGING.md) — the service itself is the
+  // source of truth; this just mirrors it for the Settings toggle/status line.
+  const [autoIndexStatus, setAutoIndexStatus] = useState<AiAutoIndexStatus>({ enabled: false, running: false, done: 0, total: 0, waitingForOllama: false });
+  useEffect(() => subscribeAutoIndex(setAutoIndexStatus), []);
   const [ollamaFeedback, setOllamaFeedback] = useState<string | null>(null);
   const [ollamaModels, setOllamaModels] = useState<OllamaModelInfo[]>([]);
   const [ollamaStatus, setOllamaStatus] = useState<'checking' | 'ready' | 'unavailable'>('checking');
@@ -2230,6 +2235,46 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               Save & Re-check
             </button>
           </div>
+        </div>
+
+        <div style={{
+          backgroundColor: 'var(--bg-surface)',
+          border: '1px solid var(--border-subtle)',
+          borderRadius: 'var(--radius-lg)',
+          padding: '24px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '14px',
+        }}>
+          <div>
+            <h3 style={{ fontSize: '0.95rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px', margin: '0 0 4px 0', color: 'var(--text-primary)' }}>
+              <Sparkles size={16} color="#a855f7" />
+              Auto-Describe &amp; Tag Photos (Background)
+            </h3>
+            <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', margin: 0 }}>
+              Keeps every photo captioned and tagged automatically using the local Ollama model above
+              (never the cloud), so "&amp;tag" search works library-wide without running a Smart Flow
+              on every photo yourself. Off by default — see docs/FEATURE_AI_AUTO_TAGGING.md.
+            </p>
+          </div>
+
+          <label style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '0.85rem', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={autoIndexStatus.enabled}
+              onChange={(e) => setAutoIndexEnabled(e.target.checked)}
+            />
+            Automatically describe &amp; tag photos in the background
+          </label>
+
+          {autoIndexStatus.enabled && (
+            <div style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+              {autoIndexStatus.waitingForOllama && 'Waiting for a reachable local Ollama vision model…'}
+              {!autoIndexStatus.waitingForOllama && autoIndexStatus.running &&
+                `Indexing — ${autoIndexStatus.done} / ${autoIndexStatus.total} photos this pass.`}
+              {!autoIndexStatus.waitingForOllama && !autoIndexStatus.running && 'Idle — up to date, or waiting for the next idle check.'}
+            </div>
+          )}
         </div>
           </>
         )}

@@ -21,6 +21,8 @@ export interface AiPhotoFilter {
   peopleMustInclude?: string[];
   peopleMustExclude?: string[];
   alonePersonName?: string;
+  /** "stavan and stuti only" / "only photo of monika" — the photo must show exactly peopleMustInclude, nobody else. */
+  peopleExactOnly?: boolean;
   locationQuery?: string;
   /** Smart Flow content tags (photoContentCache) a matching photo must have — the '&tag' autocomplete. */
   tagsMustInclude?: string[];
@@ -86,6 +88,7 @@ function collectKnownLocationValuesBySpecificity(photos: Photo[]): { specific: s
 const asStringArray = (v: unknown): string[] | undefined =>
   Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : typeof v === 'string' && v ? [v] : undefined;
 const asString = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() ? v : undefined);
+const asBoolean = (v: unknown): boolean | undefined => (typeof v === 'boolean' ? v : undefined);
 // The model may answer { "year": "2024" }: coerce, and keep only finite numbers (else the filter matches nothing).
 const asFiniteNumber = (v: unknown): number | undefined => {
   const n = typeof v === 'string' && !v.trim() ? NaN : Number(v);
@@ -261,8 +264,8 @@ class AiSearchService {
       if (matchedPerson) {
         filter.alonePersonName = matchedPerson.name;
         filter.peopleMustInclude = [matchedPerson.name];
-        filter.explanation = `Showing solo photos of ${matchedPerson.name} alone (no other people in photo).`;
-        return filter;
+        // Don't return here — "alone" can still be combined with a location/date/tag
+        // ("only photo of monika alone at andaman"), detected by the steps below.
       }
     }
 
@@ -277,8 +280,7 @@ class AiSearchService {
       if (matchedPerson) {
         filter.childhoodPersonName = matchedPerson.name;
         filter.peopleMustInclude = [matchedPerson.name];
-        filter.explanation = `Showing childhood & early memory photos of ${matchedPerson.name}.`;
-        return filter;
+        // Don't return here, same reason as the "alone" branch above.
       }
     }
 
@@ -322,13 +324,32 @@ class AiSearchService {
       filter.tagsMustInclude = foundTags;
     }
 
-    // 5. Detect people names mentioned in query (e.g. "sachin and monika", "sachin, monika and rajshree")
+    // 5. Detect excluded people: "photo of monika but not raji", "monika except raji", "without raji".
+    // These clauses are normally trailing, so matching to end-of-string keeps this simple and avoids
+    // the exclusion keyword itself (e.g. "not") being mistaken for part of a name elsewhere.
+    const excludeMatch = q.match(/\b(?:but\s+not|except(?:\s+for)?|excluding|without)\s+([a-z0-9_ ,&]+)$/i);
+    const excludedPeople: Person[] = [];
+    if (excludeMatch) {
+      for (const token of excludeMatch[1].split(/,|&|\band\b/i)) {
+        const matched = this.findBestPersonMatch(token.trim(), people);
+        if (matched && !excludedPeople.includes(matched)) excludedPeople.push(matched);
+      }
+    }
+    if (excludedPeople.length > 0) {
+      filter.peopleMustExclude = excludedPeople.map((p) => p.name);
+    }
+
+    // 6. Detect people names mentioned in query (e.g. "sachin and monika", "sachin, monika and rajshree").
+    // Scanned only up to the exclusion clause above, so "raji" in "but not raji" isn't also picked up
+    // here as someone who must be IN the photo.
+    const qForInclude = excludeMatch ? q.slice(0, excludeMatch.index) : q;
     const foundPeople: Person[] = [];
     for (const person of people) {
+      if (excludedPeople.includes(person)) continue;
       const nameLower = person.name.toLowerCase();
       // Match whole word name
       const regex = new RegExp(`\\b${this.escapeRegExp(nameLower)}\\b`, 'i');
-      if (regex.test(q)) {
+      if (regex.test(qForInclude)) {
         foundPeople.push(person);
       }
     }
@@ -337,34 +358,51 @@ class AiSearchService {
       filter.peopleMustInclude = foundPeople.map((p) => p.name);
     }
 
-    // 6. Detect Year
+    // 7. "only" as an exclusivity marker — "Only photo of monika", "photo of stavan and stuti only" —
+    // means the photo must show exactly these people and no one else. Independent of the
+    // alone/solo/single keywords above (those already imply solo on their own); this covers plain
+    // "only" and also works for a GROUP of names, which alonePersonName can't (it's single-person only).
+    if (/\bonly\b/i.test(q) && foundPeople.length > 0 && !filter.alonePersonName && !filter.childhoodPersonName) {
+      filter.peopleExactOnly = true;
+    }
+
+    // 8. Detect Year
     const yearMatch = q.match(/\b(19\d\d|20\d\d)\b/);
     if (yearMatch) {
       filter.dateRange = { year: parseInt(yearMatch[1], 10) };
     }
 
-    // 7. Detect Favorites
+    // 9. Detect Favorites
     if (/\b(favorite|favorites|starred|best\s+shots?)\b/i.test(q)) {
       filter.isFavorite = true;
     }
 
-    // 8. Detect Portraits vs Scenery
+    // 10. Detect Portraits vs Scenery
     if (/\b(scenery|landscape|nature|no\s+people|without\s+people)\b/i.test(q)) {
       filter.hasFaces = false;
     }
 
     // Build human-friendly explanation
     const parts: string[] = [];
-    if (filter.peopleMustInclude && filter.peopleMustInclude.length > 0) {
+    if (filter.alonePersonName) {
+      parts.push(`solo photos of ${filter.alonePersonName} alone (no other people in photo)`);
+    } else if (filter.childhoodPersonName) {
+      parts.push(`childhood & early memory photos of ${filter.childhoodPersonName}`);
+    } else if (filter.peopleMustInclude && filter.peopleMustInclude.length > 0) {
+      const onlySuffix = filter.peopleExactOnly ? ', and no one else' : '';
       if (filter.peopleMustInclude.length === 1) {
-        parts.push(`photos of ${filter.peopleMustInclude[0]}`);
+        parts.push(`photos of ${filter.peopleMustInclude[0]}${onlySuffix}`);
       } else {
         const names = [...filter.peopleMustInclude];
         const last = names.pop();
-        parts.push(`photos featuring ${names.join(', ')} and ${last} together`);
+        parts.push(`photos featuring ${names.join(', ')} and ${last} together${onlySuffix}`);
       }
     } else {
       parts.push('photos');
+    }
+
+    if (filter.peopleMustExclude && filter.peopleMustExclude.length > 0) {
+      parts.push(`without ${filter.peopleMustExclude.join(', ')}`);
     }
 
     if (filter.locationQuery) {
@@ -412,7 +450,9 @@ Return ONLY valid JSON matching this TypeScript structure:
 {
   "explanation": "Human friendly explanation of what photos are shown",
   "peopleMustInclude": ["List of exact person names from available people who must appear in photo"],
+  "peopleMustExclude": ["List of exact person names who must NOT appear, e.g. 'photo of monika but not raji' -> [\"raji\"]"],
   "alonePersonName": "Exact person name if query specifically asks for them alone/solo",
+  "peopleExactOnly": "true if the query says 'only' these people and nobody else, e.g. 'only photo of monika', 'photo of stavan and stuti only' — false/null otherwise. Works with one name or a group.",
   "childhoodPersonName": "Exact person name if query asks for their childhood/baby/early years",
   "locationQuery": "The MOST SPECIFIC place mentioned (a city/place name), otherwise null. If the query names both a place and its country (e.g. 'Andaman, India'), use the specific place — just 'Andaman' — never the bare country alone, which would match every photo from that whole country instead of the one place meant.",
   "tagsMustInclude": ["List of exact content tags from the list above that the query asks for, otherwise []"],
@@ -451,6 +491,8 @@ Do NOT return markdown fences or other text, ONLY the raw JSON object.`;
       queryText: query,
       explanation: parsed.explanation || `Filtered photos for: "${query}"`,
       peopleMustInclude: asStringArray(parsed.peopleMustInclude),
+      peopleMustExclude: asStringArray(parsed.peopleMustExclude),
+      peopleExactOnly: asBoolean(parsed.peopleExactOnly),
       alonePersonName: asString(parsed.alonePersonName),
       childhoodPersonName: asString(parsed.childhoodPersonName),
       locationQuery: asString(parsed.locationQuery),
@@ -481,7 +523,9 @@ Return ONLY JSON:
 {
   "explanation": "Brief description",
   "peopleMustInclude": string[],
+  "peopleMustExclude": string[], // e.g. "photo of monika but not raji" -> ["raji"]
   "alonePersonName": string | null,
+  "peopleExactOnly": boolean | null, // true if query says "only" these people, nobody else (one name or a group)
   "childhoodPersonName": string | null,
   "locationQuery": string | null, // the MOST SPECIFIC place (a city/place name) — if the query names both a place and its country (e.g. "Andaman, India"), use just "Andaman", never the bare country alone, which would match every photo from that whole country
   "tagsMustInclude": string[],
@@ -522,6 +566,8 @@ Return ONLY JSON:
       queryText: query,
       explanation: parsed.explanation || `Filtered photos for: "${query}"`,
       peopleMustInclude: asStringArray(parsed.peopleMustInclude),
+      peopleMustExclude: asStringArray(parsed.peopleMustExclude),
+      peopleExactOnly: asBoolean(parsed.peopleExactOnly),
       alonePersonName: asString(parsed.alonePersonName),
       childhoodPersonName: asString(parsed.childhoodPersonName),
       locationQuery: asString(parsed.locationQuery),
@@ -678,8 +724,22 @@ Return ONLY JSON:
           if (!photo.faces || photo.faces.length === 0) return false;
           const presentIds = new Set(photo.faces.map((f) => f.personId).filter(Boolean));
           // Photo must have EVERY required person
-          return requiredIds.every((reqId) => presentIds.has(reqId));
+          if (!requiredIds.every((reqId) => presentIds.has(reqId))) return false;
+          // "...only" / "only photo of..." — and no one ELSE in the photo either.
+          if (filter.peopleExactOnly && ![...presentIds].every((id) => requiredIds.includes(id as string))) return false;
+          return true;
         });
+      }
+    }
+
+    // 3b. People who must NOT appear ("but not raji", "except raji") — independent of which of the
+    // branches above matched, so it combines with alone/childhood/group queries too.
+    if (filter.peopleMustExclude && filter.peopleMustExclude.length > 0) {
+      const excludedIds = new Set(
+        filter.peopleMustExclude.map((n) => nameToId.get(n.toLowerCase())).filter((id): id is string => Boolean(id))
+      );
+      if (excludedIds.size > 0) {
+        result = result.filter((photo) => !photo.faces?.some((f) => f.personId && excludedIds.has(f.personId)));
       }
     }
 
@@ -761,7 +821,11 @@ Return ONLY JSON:
     } else if (filter.childhoodPersonName) {
       tags.push(`Childhood: ${filter.childhoodPersonName}`);
     } else if (filter.peopleMustInclude && filter.peopleMustInclude.length > 0) {
-      tags.push(`People: ${filter.peopleMustInclude.join(', ')}`);
+      tags.push(`People: ${filter.peopleMustInclude.join(', ')}${filter.peopleExactOnly ? ' only' : ''}`);
+    }
+
+    if (filter.peopleMustExclude && filter.peopleMustExclude.length > 0) {
+      tags.push(`Without: ${filter.peopleMustExclude.join(', ')}`);
     }
 
     if (filter.locationQuery) {

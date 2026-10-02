@@ -15,6 +15,7 @@ import {
   EyeOff,
   Maximize2,
   HardDrive,
+  PlayCircle,
   ExternalLink,
   CheckCircle2,
   UserX,
@@ -1214,6 +1215,23 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
               <span style={{ fontSize: '0.9rem', fontWeight: 600, color: 'var(--text-primary)' }}>
                 {photo.fileName}
               </span>
+              {photo.isVideo && (
+                <span style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                  fontSize: '11px',
+                  padding: '2px 8px',
+                  borderRadius: 'var(--radius-full)',
+                  backgroundColor: 'rgba(99, 102, 241, 0.2)',
+                  color: '#a5b4fc',
+                  border: '1px solid rgba(99, 102, 241, 0.4)',
+                  fontWeight: 700,
+                }}>
+                  <PlayCircle size={12} />
+                  Video{photo.videoDurationSec ? ` · ${Math.floor(photo.videoDurationSec / 60)}:${String(Math.round(photo.videoDurationSec % 60)).padStart(2, '0')}` : ''}
+                </span>
+              )}
               {photo.isVirtual && (
                 <>
                   <span style={{
@@ -1311,14 +1329,16 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
               }
             : { display: 'none' }
         ) : { display: 'flex', alignItems: 'center', gap: '8px' }}>
-          {/* Quick Rotate button (rotates photo or local HEIC thumbnail) */}
-          <button
-            className="btn btn-ghost btn-icon"
-            onClick={handleQuickRotate}
-            title="Rotate photo 90° clockwise"
-          >
-            <RotateCw size={18} />
-          </button>
+          {/* Quick Rotate button (rotates photo or local HEIC thumbnail) — not for a video */}
+          {!photo.isVideo && (
+            <button
+              className="btn btn-ghost btn-icon"
+              onClick={handleQuickRotate}
+              title="Rotate photo 90° clockwise"
+            >
+              <RotateCw size={18} />
+            </button>
+          )}
 
           {/* Cached thumbnail <-> OneDrive full-resolution toggle. Defaults to
               the cached thumbnail for OneDrive-backed photos (see the reset
@@ -1344,8 +1364,9 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
             </button>
           )}
 
-          {/* Edit photo button (available when local or online source, or virtual mirror) */}
-          {(!photo.isVirtual || isOriginalAvailable || isHeic) && (
+          {/* Edit photo button (available when local or online source, or virtual mirror) —
+              never for a video: rotate/crop/flip don't apply to a video file. */}
+          {!photo.isVideo && (!photo.isVirtual || isOriginalAvailable || isHeic) && (
             <button
               className={`btn btn-icon ${isEditing ? 'btn-primary' : 'btn-ghost'}`}
               onClick={() => {
@@ -1391,17 +1412,19 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
           {/* Remove Unknown / Remove Unconfirmed / Reset Unconfirmed live in the
               People panel (right side) next to the face list they act on, not here */}
 
-          {/* 2. Tag face manually */}
-          <button
-            className={`btn btn-icon ${isTaggingMode ? 'btn-primary' : 'btn-ghost'}`}
-            onClick={() => {
-              setIsTaggingMode(!isTaggingMode);
-              setDrawBox(null);
-            }}
-            title={isTaggingMode ? 'Cancel manual tagging' : 'Manually tag a person by drawing a box on the photo'}
-          >
-            <Crop size={18} />
-          </button>
+          {/* 2. Tag face manually — not for a video */}
+          {!photo.isVideo && (
+            <button
+              className={`btn btn-icon ${isTaggingMode ? 'btn-primary' : 'btn-ghost'}`}
+              onClick={() => {
+                setIsTaggingMode(!isTaggingMode);
+                setDrawBox(null);
+              }}
+              title={isTaggingMode ? 'Cancel manual tagging' : 'Manually tag a person by drawing a box on the photo'}
+            >
+              <Crop size={18} />
+            </button>
+          )}
 
           {photo.faces && photo.faces.length > 0 && (
             <button
@@ -1663,7 +1686,26 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
             </div>
           )}
 
+          {/* A video plays in its own simple element — none of the pan/zoom/crop/face-overlay
+              machinery below applies to it (see docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md §2.6). */}
+          {photo.isVideo && (
+            <video
+              src={getLocalPhotoUrl(photo.filePath, photo.originalRemotePath, true, 0)}
+              controls
+              autoPlay
+              style={{
+                maxWidth: '100%',
+                maxHeight: 'calc(100vh - 120px)',
+                borderRadius: 'var(--radius-sm)',
+                boxShadow: '0 16px 48px rgba(0, 0, 0, 0.7)',
+                display: 'block',
+                backgroundColor: '#000',
+              }}
+            />
+          )}
+
           {/* Transformed Stage holding BOTH Image and Face Overlays in lockstep */}
+          {!photo.isVideo && (
           <div
             ref={stageRef}
             style={{
@@ -2120,9 +2162,10 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
               })
             )}
           </div>
+          )}
 
           {/* Floating Photo Editing Toolbar */}
-          {isEditing && (
+          {isEditing && !photo.isVideo && (
             <div
               style={{
                 position: 'absolute',

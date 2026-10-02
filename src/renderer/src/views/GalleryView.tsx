@@ -47,6 +47,8 @@ interface GalleryViewProps {
   onToggleFavorite: (photoId: string) => void;
   onOpenFolder: () => void;
   onRefreshNetwork?: () => void;
+  /** Local-library counterpart of onRefreshNetwork (see docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md). */
+  onRescanLocalLibrary?: () => void;
   filterFavorite?: boolean;
   virtualStorages?: VirtualStorageConfig[];
   onSelectStorage?: (storage: VirtualStorageConfig) => void;
@@ -69,6 +71,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   onToggleFavorite,
   onOpenFolder,
   onRefreshNetwork,
+  onRescanLocalLibrary,
   filterFavorite = false,
   virtualStorages = [],
   onSelectStorage,
@@ -728,6 +731,15 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       onClick={onRefreshNetwork}
       style={{ width: '34px', height: '34px' }}
       title="Rescan — check the network location for newly added photos"
+    >
+      <RefreshCw size={15} />
+    </button>
+  ) : (!hasVirtual && onRescanLocalLibrary) ? (
+    <button
+      className="btn btn-icon btn-secondary"
+      onClick={onRescanLocalLibrary}
+      style={{ width: '34px', height: '34px' }}
+      title="Rescan — check this folder for new or changed files (e.g. videos added since this library was last indexed)"
     >
       <RefreshCw size={15} />
     </button>

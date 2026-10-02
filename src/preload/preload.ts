@@ -160,6 +160,7 @@ const electronAPI: IElectronAPI = {
   getCatalogMeta: (libraryDir?: string) => ipcRenderer.invoke('catalog:get-meta', libraryDir),
   getCatalogPage: (params) => ipcRenderer.invoke('catalog:get-page', params),
   switchLibrary: (targetPath: string) => ipcRenderer.invoke('catalog:switch-library', targetPath),
+  rescanLibrary: (targetPath: string) => ipcRenderer.invoke('catalog:rescan-library', targetPath),
   getSpriteCoordinate: (photoPath: string) => ipcRenderer.invoke('sprite:get-coordinate', photoPath),
   getSpriteCoordinatesBatch: (photoPaths: string[]) => ipcRenderer.invoke('sprite:get-coordinates-batch', photoPaths),
   invalidateSpriteCoordinate: (photoPath: string) => ipcRenderer.invoke('sprite:invalidate', photoPath),
@@ -188,6 +189,8 @@ const electronAPI: IElectronAPI = {
   savePersonAvatar: (personId: string, cacheKey: string, dataUrl: string) =>
     ipcRenderer.invoke('person:save-avatar', personId, cacheKey, dataUrl),
   deletePersonAvatar: (personId: string) => ipcRenderer.invoke('person:delete-avatar', personId),
+  getVideoPreview: (filePath: string, originalRemotePath?: string) =>
+    ipcRenderer.invoke('video:get-preview', filePath, originalRemotePath),
   getPhotoContentEntry: (photoId: string) => ipcRenderer.invoke('photoContent:get', photoId),
   getAllPhotoContentEntries: () => ipcRenderer.invoke('photoContent:get-all'),
   upsertPhotoContentEntry: (photoId: string, entry: unknown) => ipcRenderer.invoke('photoContent:upsert', photoId, entry),

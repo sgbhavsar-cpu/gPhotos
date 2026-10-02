@@ -24,6 +24,7 @@ import { joinMirrorPath } from './services/pathUtils';
 import { logNavigation } from './services/userActionLogger';
 import { logger } from './services/logger';
 import { faceQueue, isFaceResultFinal } from './services/faceQueue';
+import { runAutoIndexPass } from './services/aiAutoIndexService';
 import { notify, notifyError, runAction } from './services/notifications';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { Photo, DetectedFace, VirtualStorageConfig, BackgroundScanProgress, NetworkStorageProgress, DuplicateCluster } from '../../types';
@@ -161,6 +162,10 @@ export const App: React.FC = () => {
       if (faceQueue.getStatus().isPaused) {
         faceQueue.resume();
       }
+
+      // 3. AI auto-tagging pass (see docs/FEATURE_AI_AUTO_TAGGING.md) — a no-op when the
+      // Settings toggle is off, Ollama isn't reachable, or a pass is already running.
+      void runAutoIndexPass(currentPhotos);
     } catch (e) {
       console.warn('[IdleControl] Error starting background tasks:', e);
     }
@@ -1280,6 +1285,17 @@ export const App: React.FC = () => {
    * from the main process, so this just re-reads them afterward rather than
    * running a separate renderer-side detection pass.
    */
+  /**
+   * Local-library counterpart of handleRefreshNetworkStorage — re-walks the CURRENTLY OPEN local
+   * folder on disk, picking up newly-supported file types (e.g. videos) added since this library
+   * was first indexed. See libraryStore.rescanLibrary's doc comment for why this is a separate,
+   * explicit action rather than something "Open Folder" already does.
+   */
+  const handleRescanLocalLibrary = async () => {
+    const ok = await libraryStore.rescanLibrary();
+    if (ok) notify('success', 'Rescanned this folder for new or changed files.');
+  };
+
   const handleRefreshNetworkStorage = async (targetConfig?: VirtualStorageConfig) => {
     if (!window.electronAPI) return;
 
@@ -1589,6 +1605,7 @@ export const App: React.FC = () => {
             onToggleFavorite={handleToggleFavorite}
             onOpenFolder={handleOpenFolder}
             onRefreshNetwork={() => handleRefreshNetworkStorage()}
+            onRescanLocalLibrary={handleRescanLocalLibrary}
             virtualStorages={virtualStorages}
             onSelectStorage={handleSelectVirtualStorage}
             onOpenDuplicateCleaner={handleOpenDuplicateCleaner}
@@ -1613,6 +1630,7 @@ export const App: React.FC = () => {
             onToggleFavorite={handleToggleFavorite}
             onOpenFolder={handleOpenFolder}
             onRefreshNetwork={() => handleRefreshNetworkStorage()}
+            onRescanLocalLibrary={handleRescanLocalLibrary}
             filterFavorite={true}
             virtualStorages={virtualStorages}
             onSelectStorage={handleSelectVirtualStorage}

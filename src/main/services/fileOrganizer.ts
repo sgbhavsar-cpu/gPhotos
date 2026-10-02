@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { parsePhotoMetadata } from './exifParser';
+import { probeMedia } from './videoExportService';
 import {
   FolderStructure,
   OrganizeOptions,
@@ -15,6 +16,11 @@ const SUPPORTED_EXTENSIONS = new Set([
   '.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif', '.tiff', '.tif', '.dng', '.raw', '.cr2', '.nef'
 ]);
 
+// See docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md — a video is scanned into the library as a Photo row
+// with isVideo:true, so every list/filter/album path downstream is unchanged; only the handful of
+// places that decode pixels (thumbnail generation, the lightbox, the gphoto:// protocol) branch on it.
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm', '.wmv', '.m4v']);
+
 const MONTH_NAMES = [
   'January', 'February', 'March', 'April', 'May', 'June',
   'July', 'August', 'September', 'October', 'November', 'December'
@@ -23,6 +29,11 @@ const MONTH_NAMES = [
 export function isImageFile(filePath: string): boolean {
   const ext = path.extname(filePath).toLowerCase();
   return SUPPORTED_EXTENSIONS.has(ext);
+}
+
+export function isVideoFile(filePath: string): boolean {
+  const ext = path.extname(filePath).toLowerCase();
+  return VIDEO_EXTENSIONS.has(ext);
 }
 
 const IGNORED_DIRECTORY_NAMES = new Set([
@@ -127,7 +138,7 @@ export async function scanDirectoryRecursive(dirPath: string, scanInfo?: { hadEr
             continue;
           }
 
-          if (isImageFile(fullPath)) {
+          if (isImageFile(fullPath) || isVideoFile(fullPath)) {
             dirImages.push(fullPath);
           }
         }
@@ -171,6 +182,7 @@ export async function scanPhotoDirectory(dirPath: string): Promise<Photo[]> {
       const stats = await fs.promises.stat(filePath);
       const meta = await parsePhotoMetadata(filePath);
       const date = new Date(meta.dateTaken);
+      const isVideo = isVideoFile(filePath);
 
       const photo: Photo = {
         id: Buffer.from(filePath).toString('base64'),
@@ -188,6 +200,18 @@ export async function scanPhotoDirectory(dirPath: string): Promise<Photo[]> {
         location: meta.location,
         isFavorite: false,
       };
+
+      // One extra awaited ffmpeg probe per VIDEO file only (no ffprobe binary needed — see
+      // videoExportService.probeMedia) — a library with few/no videos pays nothing extra.
+      if (isVideo) {
+        photo.isVideo = true;
+        try {
+          const info = await probeMedia(filePath);
+          if (info.durationSec != null) photo.videoDurationSec = info.durationSec;
+        } catch {
+          // Duration stays unset — the thumbnail/preview pipeline re-probes lazily when it needs it.
+        }
+      }
 
       photos.push(photo);
     } catch (err) {
