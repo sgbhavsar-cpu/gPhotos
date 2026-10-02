@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Heart, MapPin, Users, Check, EyeOff, Image as ImageIcon, ImageOff, RotateCw, Play } from 'lucide-react';
+import { Heart, MapPin, Users, Check, EyeOff, Image as ImageIcon, ImageOff, RotateCw, Play, Maximize2 } from 'lucide-react';
 import { Photo } from '../../../types';
 import { getLocalPhotoUrl, libraryStore } from '../services/libraryStore';
 import { useBatchThumbnail, useSpriteCoordinate, getSpriteUrl, batchThumbnailStore } from '../services/asyncImageLoader';
@@ -17,6 +17,10 @@ interface PhotoCardProps {
   isSelectMode?: boolean;
   onCardMouseDown?: (photoId: string, e: React.MouseEvent) => void;
   onCardMouseEnter?: (photoId: string, e: React.MouseEvent) => void;
+  /** Always opens the lightbox, regardless of select mode/an active selection — the normal
+   *  `onClick` toggles selection instead whenever any photo is selected, which otherwise leaves no
+   *  way to view a photo full-screen without first clearing the whole selection. */
+  onOpenFullscreen?: (e: React.MouseEvent) => void;
 }
 
 function formatDuration(sec?: number): string | null {
@@ -37,6 +41,7 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
   isSelectMode = false,
   onCardMouseDown,
   onCardMouseEnter,
+  onOpenFullscreen,
 }) => {
   const [isHovered, setIsHovered] = useState(false);
   const [imgElementLoaded, setImgElementLoaded] = useState(false);
@@ -417,6 +422,39 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
         >
           <Play size={12} fill="white" />
           {formatDuration(photo.videoDurationSec) && <span>{formatDuration(photo.videoDurationSec)}</span>}
+        </div>
+      )}
+
+      {/* View Full Screen — only useful (and only shown) once a selection is active, since that's
+          exactly when a plain click toggles selection instead of opening the lightbox, with no
+          other way to see a photo full-screen short of clearing the whole selection first. */}
+      {(isSelectMode || isSelected) && onOpenFullscreen && (
+        <div
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpenFullscreen(e);
+          }}
+          style={{
+            position: 'absolute',
+            bottom: '8px',
+            left: '8px',
+            zIndex: 15,
+            width: '28px',
+            height: '28px',
+            borderRadius: '6px',
+            backgroundColor: 'rgba(15, 23, 42, 0.85)',
+            border: '2px solid rgba(255, 255, 255, 0.9)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.6)',
+            cursor: 'pointer',
+            transition: 'all var(--transition-fast)',
+            color: 'white',
+          }}
+          title="View full screen"
+        >
+          <Maximize2 size={14} />
         </div>
       )}
 

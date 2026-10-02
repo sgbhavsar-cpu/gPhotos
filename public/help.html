@@ -491,6 +491,9 @@
             <li><strong>Identical Face Count</strong>: Equal number of subjects captured within 10 seconds.</li>
             <li><strong>Sequential Burst Filenames</strong>: Numbered sequence (e.g. <code>IMG_0214.jpg</code>, <code>IMG_0215.jpg</code>).</li>
           </ul>
+          <p class="card-desc">
+            This is the <strong>Similar</strong> mode (the default). A second mode, <strong>Exact</strong>, switches to a much narrower match instead — only an identical file size <em>and</em> identical pixel dimensions, with no time window at all. Switch between them with the two buttons in the modal's header; switching re-scans the library immediately.
+          </p>
         </div>
 
         <div class="card">
@@ -701,6 +704,7 @@
         <li><strong>Offline Browsing</strong>: Browse your entire 500,000+ photo collection smoothly even when disconnected from your local network.</li>
         <li><strong>Instant Full-Res On-Demand</strong>: Clicking a photo immediately fetches the original high-resolution camera file from the network share when online.</li>
         <li><strong>Direct Folder Tree Explorer</strong>: Browse folder subtrees directly even before a full background scan completes.</li>
+        <li><strong>Live Status, Three Numbers</strong>: the Network Storage screen shows three always-visible "x / y" rows per storage with a progress bar each — <strong>Caching</strong> (thumbnails), <strong>Face Detection</strong> (photos scanned, plus how many faces were actually found), and <strong>AI Description</strong> (photos captioned by the background auto-tagging feature or a Smart Flow). The left sidebar shows the same three counts compactly as <code>Cache:x/y · Face:x/y · AI:x/y</code> under each storage's name.</li>
         <li><strong>Rotating a Mirrored Photo</strong>: the local thumbnail rotates and updates on screen immediately; the full-resolution original always rotates in the background afterward (reachable or not), so it never sits waiting on a slow network write. If the original can't be rotated after a few attempts, you're notified and the thumbnail is automatically rotated back to match.</li>
       </ul>
     </section>
@@ -800,7 +804,8 @@
         <li><strong>Multi-Select Exclude</strong>: Select multiple photos and click <em>"Exclude from Library"</em>. They are hidden from the application without being deleted from your computer.</li>
         <li><strong>Dynamic Zoom Wheel</strong>: Hold <kbd>Ctrl</kbd> and scroll your mouse wheel in the gallery to zoom dynamically between Small, Medium, and Large views — the photo under your pointer stays put; using the toolbar buttons instead keeps the top-left photo put.</li>
         <li><strong>Explorer-Style Drag Selection</strong>: Press and drag to select a fresh set of photos; hold <kbd>Ctrl</kbd> while dragging to add another set without losing your first selection.</li>
-        <li><strong>Icon-Only Toolbar</strong>: the header shows just your library's name (no duplicate badge next to it); <strong>Select</strong>, <strong>Clean Duplicates</strong>, <strong>Rescan</strong> (network/cloud libraries only) and <strong>Ask AI</strong> are icon-only buttons — hover any of them for a tooltip explaining what it does.</li>
+        <li><strong>Icon-Only Toolbar</strong>: the header shows just your library's name (no duplicate badge next to it); <strong>Select</strong>, <strong>Clean Duplicates</strong>, <strong>Rescan</strong> and <strong>Ask AI</strong> are icon-only buttons — hover any of them for a tooltip explaining what it does.</li>
+        <li><strong>View Full Screen While Selecting</strong>: once anything is selected (or Select mode is on), clicking a tile toggles its selection instead of opening it. A small expand icon in the tile's bottom-left corner appears specifically for this case — click it to open the lightbox without touching your selection.</li>
         <li><strong>Bulk Edit Date/Location</strong>: select photos, then "Edit Date/Location" to set one date/time and/or location on all of them at once. Pinning a location on the map requires naming it there first — "Use This Location" stays disabled (with an amber-highlighted name box and a short note) until you do — so the name you give it always comes back into this dialog's own location box instead of staying blank.</li>
         <li><strong>Esc Goes Back One Screen</strong>: closes the Lightbox or a modal if one is open, then clears an AI search filter / open folder / open person profile, then — once there's nothing left to close — returns to the previous tab you were actually on, repeatable to walk back through your navigation history one screen at a time.</li>
       </ul>

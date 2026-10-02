@@ -20,7 +20,7 @@ import {
   Layers
 } from 'lucide-react';
 import { Photo, DuplicateCluster } from '../../../types';
-import { identifyDuplicateClusters } from '../services/deduplication';
+import { identifyDuplicateClusters, identifyExactDuplicateClusters } from '../services/deduplication';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { notify, notifyError } from '../services/notifications';
 
@@ -49,6 +49,13 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
   const photosRef = useRef(photos);
   photosRef.current = photos;
   const [excludedPhotoIds, setExcludedPhotoIds] = useState<Set<string>>(new Set());
+  // 'similar': the existing fuzzy heuristic (time window + face identity + filename sequence) —
+  // finds bursts and near-duplicate shots. 'exact': only photos with an identical file size AND
+  // identical pixel dimensions — a much narrower, literal "these are probably the same file" match,
+  // with no time window at all (two exact-size/dimension matches months apart still group).
+  const [detectionMode, setDetectionMode] = useState<'similar' | 'exact'>('similar');
+  const runDetection = (list: Photo[]): DuplicateCluster[] =>
+    detectionMode === 'exact' ? identifyExactDuplicateClusters(list) : identifyDuplicateClusters(list);
 
   // Fullscreen photo preview
   const [fullscreenPhoto, setFullscreenPhoto] = useState<Photo | null>(null);
@@ -69,7 +76,7 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
     setIsScanning(true);
     const timer = setTimeout(() => {
       try {
-        const found = identifyDuplicateClusters(photosRef.current);
+        const found = runDetection(photosRef.current);
         setClusters(found);
         setCurrentClusterIdx(0);
 
@@ -205,13 +212,16 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
     setTimeout(() => setStatusMessage(null), 3000);
   };
 
-  // Re-cluster all eligible photos (excluding photos user marked as not duplicates)
-  const handleReclusterAll = () => {
+  // Re-cluster all eligible photos (excluding photos user marked as not duplicates). Shared by the
+  // "Re-cluster" button and the Exact/Similar mode toggle (switching mode always re-scans
+  // everything, the same way Re-cluster already drops a preset `initialCluster` to look at the
+  // whole library — a mode switch mid-review of one preset cluster wouldn't make sense otherwise).
+  const doRecluster = (mode: 'similar' | 'exact') => {
     if (isDeleting) return;
     let found: DuplicateCluster[];
     try {
       const eligible = photos.filter((p) => !excludedPhotoIds.has(p.id));
-      found = identifyDuplicateClusters(eligible);
+      found = mode === 'exact' ? identifyExactDuplicateClusters(eligible) : identifyDuplicateClusters(eligible);
     } catch (err) {
       notifyError('Re-cluster photos', err);
       return;
@@ -227,6 +237,12 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
 
     setStatusMessage(`✓ Re-clustered library: ${found.length} duplicate group(s) identified.`);
     setTimeout(() => setStatusMessage(null), 3500);
+  };
+  const handleReclusterAll = () => doRecluster(detectionMode);
+  const handleModeChange = (mode: 'similar' | 'exact') => {
+    if (mode === detectionMode) return;
+    setDetectionMode(mode);
+    doRecluster(mode);
   };
 
   // Delete duplicates in active cluster (any photos not marked to keep)
@@ -439,6 +455,35 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            {/* Detection mode: fuzzy burst/similar (time+face+filename heuristic) vs exact
+                (identical file size + pixel dimensions, no time window). Switching re-scans
+                the whole library in the new mode immediately. */}
+            <div
+              style={{
+                display: 'flex',
+                border: '1px solid var(--border-subtle)',
+                borderRadius: 'var(--radius-md)',
+                overflow: 'hidden',
+                height: '38px',
+              }}
+              title="Similar: time + face + filename heuristic (finds bursts & near-duplicates). Exact: identical file size and pixel dimensions only."
+            >
+              <button
+                className={`btn ${detectionMode === 'similar' ? 'btn-primary' : 'btn-ghost'}`}
+                onClick={() => handleModeChange('similar')}
+                style={{ padding: '8px 14px', fontSize: '0.82rem', borderRadius: 0, height: '100%' }}
+              >
+                Similar
+              </button>
+              <button
+                className={`btn ${detectionMode === 'exact' ? 'btn-primary' : 'btn-ghost'}`}
+                onClick={() => handleModeChange('exact')}
+                style={{ padding: '8px 14px', fontSize: '0.82rem', borderRadius: 0, height: '100%' }}
+              >
+                Exact
+              </button>
+            </div>
+
             {/* Recluster Button */}
             <button
               className="btn btn-secondary"

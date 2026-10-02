@@ -925,6 +925,7 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
                       e.stopPropagation();
                       onToggleFavorite(photo.id);
                     }}
+                    onOpenFullscreen={() => live.current.onSelectPhoto(photo)}
                   />
                 ))}
               </div>

@@ -18,7 +18,7 @@ import {
   StorageDetails,
 } from '../../types';
 import { libraryStatusService } from './libraryStatusService';
-import { getFaceStatsForLibrary, getTotalPhotoCount } from './libraryRepository';
+import { getFaceStatsForLibrary, getCaptionStatsForLibrary, getTotalPhotoCount } from './libraryRepository';
 import { readJsonSafe, writeJsonAtomic, writeJsonAtomicAsync, writeFileAtomic, writeFileAtomicAsync } from './jsonFile';
 import { addSavedRotation, getHeicSavedRotation } from './heicRotationStore';
 import { getDefaultMirrorRoot } from './pathSecurity';
@@ -309,6 +309,8 @@ function resolveStorageDetails(storageName: string, root: string, liveTotal: num
   let thumbnailCachedCount = liveCached;
   let faceScannedCount = 0;
   let facesDetectedCount = 0;
+  let captionEligibleCount = 0;
+  let captionedCount = 0;
 
   const cp = loadStorageCheckpoint(storageName, root);
   if (totalPhotos === 0 && cp) {
@@ -330,9 +332,18 @@ function resolveStorageDetails(storageName: string, root: string, liveTotal: num
     // after a source folder shrinks, before a sync has pruned stale rows).
     faceScannedCount = Math.min(faceStats.faceScannedCount, totalPhotos);
     facesDetectedCount = faceStats.facesDetectedCount;
+
+    // AI Description progress (docs/FEATURE_AI_AUTO_TAGGING.md) — same SQLite catalog, a separate
+    // table (photo_content) the background auto-tagging pass and Smart Flows both write to.
+    const captionStats = getCaptionStatsForLibrary(mirrorFolder);
+    captionEligibleCount = Math.min(captionStats.captionEligibleCount, totalPhotos);
+    captionedCount = Math.min(captionStats.captionedCount, captionEligibleCount);
   }
 
-  return computeStorageDetails(storageName, totalPhotos, thumbnailCachedCount, faceScannedCount, facesDetectedCount, cp?.phase);
+  return computeStorageDetails(
+    storageName, totalPhotos, thumbnailCachedCount, faceScannedCount, facesDetectedCount,
+    captionEligibleCount, captionedCount, cp?.phase
+  );
 }
 
 /**
@@ -371,6 +382,8 @@ function computeStorageDetails(
   thumbnailCachedCount: number,
   faceScannedCount: number,
   facesDetectedCount: number,
+  captionEligibleCount: number,
+  captionedCount: number,
   checkpointPhase: StorageSyncCheckpoint['phase'] | undefined
 ): StorageDetails {
   let phase: 'completed' | 'thumbnails' | 'faces' | 'interrupted' | 'idle' = 'idle';
@@ -398,6 +411,8 @@ function computeStorageDetails(
     faceScannedCount,
     faceTotalCount: totalPhotos,
     facesDetectedCount,
+    captionedCount,
+    captionTotalCount: captionEligibleCount,
     phase,
     percent,
     canResume: phase === 'interrupted' || (totalPhotos > 0 && phase !== 'completed'),

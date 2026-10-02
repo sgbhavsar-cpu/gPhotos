@@ -260,6 +260,11 @@ export interface NetworkStorageProgress {
   // actually done".
   faceCurrent: number;
   faceTotal: number;
+  // AI Description progress — see the matching fields on StorageDetails. Optional: only known
+  // wherever a StorageDetails poll result is the source; an in-progress live sync update (from the
+  // MirrorProgress push stream, which never carries caption data) just doesn't set these.
+  captionCurrent?: number;
+  captionTotal?: number;
   percent: number;
   message?: string;
   currentFile?: string;
@@ -757,6 +762,13 @@ export interface StorageDetails {
   faceScannedCount: number;
   faceTotalCount: number;
   facesDetectedCount: number;
+  // AI Description progress (docs/FEATURE_AI_AUTO_TAGGING.md) — how many of this storage's
+  // (non-video) photos have an AI caption/tag recorded, from the background auto-tagging pass or
+  // any Smart Flow run. Purely informational: unlike thumbnails/faces, this never affects `phase`/
+  // `percent`/`canResume` below, since auto-tagging is an opt-in, off-by-default feature — a
+  // storage with it still off would otherwise permanently look "incomplete".
+  captionedCount: number;
+  captionTotalCount: number;
   phase: 'completed' | 'thumbnails' | 'faces' | 'interrupted' | 'idle';
   percent: number;
   canResume?: boolean;

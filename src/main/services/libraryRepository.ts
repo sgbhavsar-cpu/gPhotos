@@ -207,6 +207,32 @@ export function getFaceStatsForLibrary(libraryDir: string): {
   }
 }
 
+/**
+ * How many of a library's (non-video) photos have an AI caption/tag recorded (see
+ * photoContentCache.ts / docs/FEATURE_AI_AUTO_TAGGING.md) — either from the background
+ * auto-tagging pass or any Smart Flow run. Used for the "AI Description x/y" status shown per
+ * network storage (VirtualStorageView.tsx / Sidebar.tsx) and in Settings, alongside the existing
+ * thumbnail-cache and face-scan counts from getFaceStatsForLibrary.
+ */
+export function getCaptionStatsForLibrary(libraryDir: string): {
+  captionEligibleCount: number;
+  captionedCount: number;
+} {
+  try {
+    const db = getDbForLibraryPath(libraryDir);
+    const photoRow = db.prepare('SELECT COUNT(*) as c FROM photos WHERE is_video = 0').get() as any;
+    const captionRow = db
+      .prepare(`SELECT COUNT(*) as c FROM photo_content WHERE caption IS NOT NULL AND caption != ''`)
+      .get() as any;
+    return {
+      captionEligibleCount: photoRow?.c ?? 0,
+      captionedCount: captionRow?.c ?? 0,
+    };
+  } catch {
+    return { captionEligibleCount: 0, captionedCount: 0 };
+  }
+}
+
 export function getPhotosPage(pageIndex: number, pageSize: number): Photo[] {
   const db = getDb();
   const rows = db

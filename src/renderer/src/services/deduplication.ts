@@ -78,6 +78,74 @@ export function getPhotoCanonicalKey(p: Photo): string {
   return pathStr || p.id;
 }
 
+/** Scores every photo in a group and packages it into a DuplicateCluster — shared by both
+ *  detection modes (fuzzy burst/similar and exact) and by createClusterFromSelectedPhotos. */
+function buildClusterFromGroup(group: Photo[], id: string, clusterType: DuplicateCluster['clusterType']): DuplicateCluster {
+  const scoresMap: DuplicateCluster['scores'] = {};
+  let bestPhotoId = group[0].id;
+  let highestScore = -1;
+  let bestReasons: string[] = [];
+
+  for (const item of group) {
+    const scoreData = calculatePhotoQualityScore(item);
+    scoresMap[item.id] = {
+      totalScore: scoreData.totalScore,
+      sharpnessScore: scoreData.sharpnessScore,
+      expressionScore: scoreData.expressionScore,
+      eyeOpenScore: scoreData.eyeOpenScore,
+      resolutionScore: scoreData.resolutionScore,
+    };
+
+    if (scoreData.totalScore > highestScore) {
+      highestScore = scoreData.totalScore;
+      bestPhotoId = item.id;
+      bestReasons = scoreData.reasons;
+    }
+  }
+
+  return {
+    id,
+    clusterType,
+    photos: group,
+    bestPhotoId,
+    bestReason: bestReasons.length > 0 ? bestReasons.join(' • ') : '⭐ Best overall quality & sharpness',
+    scores: scoresMap,
+  };
+}
+
+/**
+ * Groups photos that are byte-for-byte-plausible exact duplicates — same file size AND the same
+ * pixel dimensions — rather than the fuzzy "probably the same moment" heuristic identifyDuplicateClusters
+ * uses (time window + face identity + filename sequence). No time window, no face matching: two
+ * photos with identical size+dimensions, taken months apart, are still grouped — that's the point
+ * of "exact" mode. A photo missing width/height (never decoded, or a RAW/video a scan never read
+ * the resolution for) can't be exactly compared and is simply excluded from this mode.
+ */
+export function identifyExactDuplicateClusters(photos: Photo[]): DuplicateCluster[] {
+  const uniquePhotosMap = new Map<string, Photo>();
+  for (const p of photos) {
+    if (p.isExcluded) continue;
+    const key = getPhotoCanonicalKey(p);
+    if (!uniquePhotosMap.has(key)) uniquePhotosMap.set(key, p);
+  }
+
+  const groups = new Map<string, Photo[]>();
+  for (const p of uniquePhotosMap.values()) {
+    if (!p.width || !p.height) continue;
+    const key = `${p.fileSize}:${p.width}:${p.height}`;
+    const arr = groups.get(key);
+    if (arr) arr.push(p);
+    else groups.set(key, [p]);
+  }
+
+  const clusters: DuplicateCluster[] = [];
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    clusters.push(buildClusterFromGroup(group, `cluster_exact_${group[0].id}`, 'identical'));
+  }
+  return clusters;
+}
+
 /**
  * Finds bursts and duplicate photos in the library and groups them into clusters.
  */
@@ -177,39 +245,8 @@ export function identifyDuplicateClusters(
 
     if (group.length >= 2) {
       visitedIds.add(p1.id);
-
-      // Score each photo in the cluster to identify best shot
-      const scoresMap: DuplicateCluster['scores'] = {};
-      let bestPhotoId = group[0].id;
-      let highestScore = -1;
-      let bestReasons: string[] = [];
-
-      for (const item of group) {
-        const scoreData = calculatePhotoQualityScore(item);
-        scoresMap[item.id] = {
-          totalScore: scoreData.totalScore,
-          sharpnessScore: scoreData.sharpnessScore,
-          expressionScore: scoreData.expressionScore,
-          eyeOpenScore: scoreData.eyeOpenScore,
-          resolutionScore: scoreData.resolutionScore,
-        };
-
-        if (scoreData.totalScore > highestScore) {
-          highestScore = scoreData.totalScore;
-          bestPhotoId = item.id;
-          bestReasons = scoreData.reasons;
-        }
-      }
-
       const isBurst = group.length >= 3;
-      clusters.push({
-        id: `cluster_${p1.id}`,
-        clusterType: isBurst ? 'burst' : 'similar',
-        photos: group,
-        bestPhotoId,
-        bestReason: bestReasons.length > 0 ? bestReasons.join(' • ') : '⭐ Best overall quality & sharpness',
-        scores: scoresMap,
-      });
+      clusters.push(buildClusterFromGroup(group, `cluster_${p1.id}`, isBurst ? 'burst' : 'similar'));
     }
   }
 
@@ -239,34 +276,5 @@ export function createClusterFromSelectedPhotos(selectedPhotos: Photo[]): Duplic
   const group = Array.from(uniqueMap.values());
   if (group.length < 2) return null;
 
-  const scoresMap: DuplicateCluster['scores'] = {};
-  let bestPhotoId = group[0].id;
-  let highestScore = -1;
-  let bestReasons: string[] = [];
-
-  for (const item of group) {
-    const scoreData = calculatePhotoQualityScore(item);
-    scoresMap[item.id] = {
-      totalScore: scoreData.totalScore,
-      sharpnessScore: scoreData.sharpnessScore,
-      expressionScore: scoreData.expressionScore,
-      eyeOpenScore: scoreData.eyeOpenScore,
-      resolutionScore: scoreData.resolutionScore,
-    };
-
-    if (scoreData.totalScore > highestScore) {
-      highestScore = scoreData.totalScore;
-      bestPhotoId = item.id;
-      bestReasons = scoreData.reasons;
-    }
-  }
-
-  return {
-    id: `cluster_selected_${Date.now()}`,
-    clusterType: group.length >= 3 ? 'burst' : 'similar',
-    photos: group,
-    bestPhotoId,
-    bestReason: bestReasons.length > 0 ? bestReasons.join(' • ') : '⭐ Best overall quality & sharpness',
-    scores: scoresMap,
-  };
+  return buildClusterFromGroup(group, `cluster_selected_${Date.now()}`, group.length >= 3 ? 'burst' : 'similar');
 }

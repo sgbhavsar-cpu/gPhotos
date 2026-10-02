@@ -610,6 +610,8 @@ export const App: React.FC = () => {
                     thumbnailTotal: details.totalPhotos,
                     faceCurrent: details.faceScannedCount,
                     faceTotal: details.totalPhotos,
+                    captionCurrent: details.captionedCount,
+                    captionTotal: details.captionTotalCount,
                     percent: details.percent,
                   },
                 };
@@ -844,6 +846,8 @@ export const App: React.FC = () => {
                 thumbnailTotal: d.totalPhotos,
                 faceCurrent: d.totalPhotos,
                 faceTotal: d.totalPhotos,
+                captionCurrent: d.captionedCount,
+                captionTotal: d.captionTotalCount,
                 percent: 100,
                 message: '✓ Up to date',
               };
@@ -1343,6 +1347,8 @@ export const App: React.FC = () => {
           thumbnailTotal: details.totalPhotos,
           faceCurrent: details.faceScannedCount,
           faceTotal: details.totalPhotos,
+          captionCurrent: details.captionedCount,
+          captionTotal: details.captionTotalCount,
           percent: details.percent,
           message: `Checking for changes… (${details.thumbnailCachedCount}/${details.totalPhotos} already cached)`,
         };
@@ -1416,6 +1422,8 @@ export const App: React.FC = () => {
           thumbnailTotal: authoritativeTotal,
           faceCurrent: finalDetails?.faceScannedCount ?? res.totalSynced,
           faceTotal: authoritativeTotal,
+          captionCurrent: finalDetails?.captionedCount,
+          captionTotal: finalDetails?.captionTotalCount,
           percent: finalDetails?.percent ?? 100,
           message: facesFullyDone
             ? '✓ Up to date'

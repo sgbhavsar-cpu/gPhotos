@@ -340,6 +340,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       storageNamesWithPhotos.has(storage.name));
                   const prog = storageProgressMap[storage.name] || storageProgressMap[storage.id];
                   const isProgressActive = prog && prog.phase && prog.phase !== 'idle';
+                  // Same fallback the "X photos" line above already uses — so the compact stat
+                  // line's "/y" denominator has a real number even before the first progress poll
+                  // resolves, instead of showing "/0".
+                  const fallbackTotal = (storage.inventoryStatus === 'completed' ? storage.inventoryTotalFiles : undefined) ?? storage.totalItems ?? 0;
 
                   return (
                     <div
@@ -385,6 +389,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
                                   stays far below the real total until that
                                   entire pass finishes end to end. */}
                               {(storage.inventoryStatus === 'completed' ? storage.inventoryTotalFiles : undefined) ?? storage.totalItems ?? 0} photos
+                            </div>
+                            {/* Always-on compact stat line — unlike the "Live progress" block
+                                below (only shown while a sync is actively running), this stays
+                                visible so the card always shows where each background pass
+                                stands, not just mid-sync. */}
+                            <div style={{ fontSize: '0.64rem', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              Cache:{prog?.thumbnailCurrent ?? 0}/{prog?.thumbnailTotal || fallbackTotal}
+                              {' · '}Face:{prog?.faceCurrent ?? 0}/{prog?.faceTotal || fallbackTotal}
+                              {' · '}AI:{prog?.captionCurrent ?? 0}/{prog?.captionTotal || 0}
                             </div>
                           </div>
                         </div>

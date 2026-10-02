@@ -1334,9 +1334,17 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                     const cachedThumbnails = totalPhotos > 0 ? Math.min(rawCached, totalPhotos) : rawCached;
                     const isThumbActive = prog?.phase === 'thumbnails' || (isSyncing && activeSyncStorageId === s.id);
 
-                    // Face stats
+                    // Face stats — how many photos have been SCANNED (x/y), separate from how many
+                    // faces were FOUND across them (z) — the two numbers the old single-count
+                    // "Faces Detected" display conflated.
+                    const faceScanned = details?.faceScannedCount ?? prog?.faceCurrent ?? 0;
                     const facesDetected = details?.facesDetectedCount ?? 0;
                     const isFaceActive = prog?.phase === 'faces';
+
+                    // AI Description progress (docs/FEATURE_AI_AUTO_TAGGING.md) — out of this
+                    // storage's own eligible (non-video) photo count, not the raw total.
+                    const aiCaptioned = details?.captionedCount ?? 0;
+                    const aiTotal = details?.captionTotalCount ?? 0;
 
                     return (
                       <div style={{
@@ -1420,51 +1428,48 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                           </div>
                         )}
 
-                        {/* Single simple status row: total images, cached, faces detected */}
+                        {/* Status rows: caching, face detection, AI description — each its own
+                            "x / y" line with a small progress bar, instead of the old single-number
+                            row that never showed what the count was actually out of. */}
                         <div style={{
                           display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'space-around',
+                          flexDirection: 'column',
+                          gap: '10px',
                           backgroundColor: 'var(--bg-surface-elevated)',
                           borderRadius: 'var(--radius-sm)',
-                          padding: '12px 8px',
+                          padding: '12px 14px',
                           border: '1px solid rgba(255, 255, 255, 0.04)',
                         }}>
-                          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--text-secondary)' }}>
-                              <Layers size={14} />
-                              <span style={{ fontSize: '0.72rem', fontWeight: 600, textTransform: 'uppercase' }}>Total Images</span>
-                            </div>
-                            <span style={{ fontFamily: 'var(--font-mono)', fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-primary)' }}>
-                              {totalPhotos.toLocaleString()}
-                            </span>
+                          <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                            <Layers size={12} style={{ verticalAlign: '-2px', marginRight: '4px' }} />
+                            {totalPhotos.toLocaleString()} total image{totalPhotos === 1 ? '' : 's'}
                           </div>
 
-                          <div style={{ width: '1px', alignSelf: 'stretch', backgroundColor: 'rgba(255, 255, 255, 0.08)' }} />
-
-                          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--accent-cyan)' }}>
-                              <Image size={14} />
-                              <span style={{ fontSize: '0.72rem', fontWeight: 600, textTransform: 'uppercase' }}>Cached</span>
-                            </div>
-                            <span style={{ fontFamily: 'var(--font-mono)', fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-primary)' }}>
-                              {cachedThumbnails.toLocaleString()}
-                              {isThumbActive && <RefreshCw size={12} className="animate-spin" style={{ marginLeft: '6px', verticalAlign: 'middle' }} />}
-                            </span>
-                          </div>
-
-                          <div style={{ width: '1px', alignSelf: 'stretch', backgroundColor: 'rgba(255, 255, 255, 0.08)' }} />
-
-                          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#ec4899' }}>
-                              <Users size={14} />
-                              <span style={{ fontSize: '0.72rem', fontWeight: 600, textTransform: 'uppercase' }}>Faces Detected</span>
-                            </div>
-                            <span style={{ fontFamily: 'var(--font-mono)', fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-primary)' }}>
-                              {facesDetected.toLocaleString()}
-                              {isFaceActive && <RefreshCw size={12} className="animate-spin" style={{ marginLeft: '6px', verticalAlign: 'middle' }} />}
-                            </span>
-                          </div>
+                          <StorageStatRow
+                            icon={<Image size={14} />}
+                            color="var(--accent-cyan)"
+                            label="Caching"
+                            current={cachedThumbnails}
+                            total={totalPhotos}
+                            active={isThumbActive}
+                          />
+                          <StorageStatRow
+                            icon={<Users size={14} />}
+                            color="#ec4899"
+                            label="Face Detection"
+                            current={faceScanned}
+                            total={totalPhotos}
+                            active={isFaceActive}
+                            suffix={`${facesDetected.toLocaleString()} face${facesDetected === 1 ? '' : 's'} found`}
+                          />
+                          <StorageStatRow
+                            icon={<Sparkles size={14} />}
+                            color="#a855f7"
+                            label="AI Description"
+                            current={aiCaptioned}
+                            total={aiTotal}
+                            active={false}
+                          />
                         </div>
                       </div>
                     );
@@ -1726,6 +1731,40 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
           onClose={() => setStorageToDelete(null)}
           onConfirmDelete={confirmDeleteStorage}
         />
+      )}
+    </div>
+  );
+};
+
+/** One "label  x / y  [progress bar]  optional-suffix" line — caching/face-detection/AI-description
+ *  all share this exact shape, so the three stats read consistently at a glance. */
+const StorageStatRow: React.FC<{
+  icon: React.ReactNode;
+  color: string;
+  label: string;
+  current: number;
+  total: number;
+  active?: boolean;
+  suffix?: string;
+}> = ({ icon, color, label, current, total, active, suffix }) => {
+  const pct = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0;
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color, width: '150px', flexShrink: 0 }}>
+        {icon}
+        <span style={{ fontSize: '0.78rem', fontWeight: 600 }}>{label}</span>
+        {active && <RefreshCw size={11} className="animate-spin" />}
+      </div>
+      <div style={{ flex: 1, height: '6px', borderRadius: 'var(--radius-full)', backgroundColor: 'rgba(255,255,255,0.08)', overflow: 'hidden' }}>
+        <div style={{ width: `${pct}%`, height: '100%', backgroundColor: color, borderRadius: 'var(--radius-full)', transition: 'width 0.3s ease' }} />
+      </div>
+      <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem', fontWeight: 700, color: 'var(--text-primary)', whiteSpace: 'nowrap', flexShrink: 0 }}>
+        {current.toLocaleString()}/{total.toLocaleString()}
+      </span>
+      {suffix && (
+        <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', whiteSpace: 'nowrap', flexShrink: 0 }}>
+          · {suffix}
+        </span>
       )}
     </div>
   );

@@ -136,11 +136,17 @@ The **Photos** gallery presents your collection in a chronological, zoomable tim
 
 ### Toolbar:
 The header shows just your library's name (no duplicate badge next to it). **Select**, **Clean
-Duplicates**, **Rescan** (network/cloud libraries only) and **Ask AI** are icon-only buttons —
-hover any of them for a tooltip explaining what it does. Once you've selected one or more photos
-(**Select** mode, or a press-and-drag selection), a selection toolbar appears with **Album**,
-**Edit Date/Location** (set one date/time and/or location on every selected photo at once — the
-same map picker described above opens from its "Pin on Map" button), and **Delete**.
+Duplicates**, **Rescan**, and **Ask AI** are icon-only buttons — hover any of them for a tooltip
+explaining what it does. Once you've selected one or more photos (**Select** mode, or a
+press-and-drag selection), a selection toolbar appears with **Album**, **Edit Date/Location** (set
+one date/time and/or location on every selected photo at once — the same map picker described
+above opens from its "Pin on Map" button), and **Delete**.
+
+### Viewing a photo full-screen while a selection is active:
+Normally, once anything is selected (or Select mode is on), clicking a photo tile toggles its
+selection instead of opening it. A small **expand icon** (bottom-left of the tile) appears
+whenever a selection is active specifically so you can still view that photo full-screen without
+first clearing your whole selection — click it to open the lightbox; your selection is untouched.
 
 ---
 
@@ -296,6 +302,18 @@ Before changing any files on disk, click **"Run Dry-Run Analysis"**:
 
 Smartphones frequently take rapid bursts or multiple identical shots of the same scene. The **Duplicate Cleaner** automatically identifies and resolves them:
 
+### Detection Mode: Similar vs. Exact:
+Two buttons in the modal header switch how duplicates are found:
+- **Similar** (default): the original heuristic — groups photos taken close together in time that
+  also share the same people or a sequential filename (catches bursts and near-duplicate shots,
+  even if the files themselves differ slightly).
+- **Exact**: groups photos with an **identical file size AND identical pixel dimensions** — a much
+  narrower, literal match, with no time window at all (two exact matches taken months apart are
+  still grouped). Use this when you specifically want byte-for-byte-plausible duplicate files, not
+  just visually similar shots.
+
+Switching modes immediately re-scans the whole library in the new mode.
+
 ### Multi-Criteria Quality Scoring:
 Every photo in a duplicate cluster is scored from 0 to 100 points:
 - **Sharpness & Focus (0–40 pts)**: Penalizes blurry or out-of-focus shots.
@@ -326,11 +344,17 @@ If you store photos on a network-attached storage (NAS), remote SMB share, or ex
 4. **Instant Startup & Non-Blocking First Paint**:
    - The application launches instantly (<10ms) by populating your library from cache.
    - Remote network checks and orphan pruning are deferred to background slices with event loop yields, guaranteeing the first screen renders immediately without frozen windows or white screens.
-5. **Live Dual-Stage Progress in Network Storage List**:
-   - Both the **left sidebar** and the **Network Storage view** display live real-time progress for each network share:
-     - **Stage 1 (Thumbnails)**: Displays live count and progress bar: `Thumbnails: X/Y (Z%)` with active file indicator.
-     - **Stage 2 (Face Recognition)**: Displays live AI detection: `Faces: A/B (C%)` with dedicated progress bar.
-     - **Stage 3 (Complete)**: Displays `✓ Up to date` badge when all sync and face processing tasks are finished.
+5. **Live Progress in Network Storage List**:
+   - The **Network Storage view** shows three always-visible stat rows per storage, each its own
+     "x / y" count with a progress bar: **Caching** (thumbnails cached), **Face Detection**
+     (photos scanned, plus how many faces were actually found), and **AI Description** (photos
+     captioned by the background auto-tagging pass or a Smart Flow — see
+     [§19](#19-auto-describe--tag-photos-background)).
+   - The **left sidebar** shows the same three counts in a compact one-line form under each
+     storage's name: `Cache:x/y · Face:x/y · AI:x/y`.
+   - A `✓ Up to date` badge appears once syncing and face processing finish (AI Description is a
+     separate, opt-in background pass and never blocks this — a storage can show "up to date" with
+     AI Description still at 0/y if you haven't turned that feature on).
 6. **Smooth Responsiveness & Non-Blocking Execution**:
    - Background scanning and face detection process in small batches with automated event loop yields (`setTimeout(..., 4ms)`).
    - The user interface remains 100% responsive at 60 FPS at all times—you can browse, zoom, organize, and edit photos without any UI stutter or Windows "Not Responding" prompts.
