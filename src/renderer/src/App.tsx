@@ -55,6 +55,11 @@ export const App: React.FC = () => {
   const [virtualStorages, setVirtualStorages] = useState<VirtualStorageConfig[]>([]);
   const [storageProgressMap, setStorageProgressMap] = useState<Record<string, NetworkStorageProgress>>({});
   const [switchingLibraryLabel, setSwitchingLibraryLabel] = useState<string | null>(null);
+  // Drives the Rescan button's own spinner/disabled state for a local library — on top of the
+  // global top-right "please wait" pill (trackBackendCall, inside libraryStore.rescanLibrary),
+  // the button people actually clicked should visibly change too, and should refuse a second
+  // click while the first rescan is still running.
+  const [isRescanningLocal, setIsRescanningLocal] = useState(false);
   const [selectedFolderForTree, setSelectedFolderForTree] = useState<string | null>(null);
   const [showDuplicateCleaner, setShowDuplicateCleaner] = useState(false);
   const [duplicateCleanerCluster, setDuplicateCleanerCluster] = useState<DuplicateCluster | null>(null);
@@ -1218,6 +1223,11 @@ export const App: React.FC = () => {
     // Automatically re-scan the organized target folder
     if (window.electronAPI) {
       libraryStore.setScanning(true);
+      // setScanning alone only shows feedback when the gallery is already empty (see
+      // GalleryView's empty-state check) — with photos already loaded (the common case, since
+      // this runs right after organizing an existing library), there was previously no visible
+      // feedback at all while the re-scan ran.
+      setSwitchingLibraryLabel(`Scanning ${targetDir}...`);
       try {
         const organizedPhotos = await window.electronAPI.scanDirectory(targetDir);
         libraryStore.setPhotos(organizedPhotos, targetDir);
@@ -1227,6 +1237,7 @@ export const App: React.FC = () => {
       } finally {
         // Was skipped when the scan threw, leaving the whole app stuck in "scanning".
         libraryStore.setScanning(false);
+        setSwitchingLibraryLabel(null);
       }
     }
   };
@@ -1235,10 +1246,12 @@ export const App: React.FC = () => {
     if (window.electronAPI) {
       cancelFaceSweep();
       libraryStore.setScanning(true);
+      setSwitchingLibraryLabel(`Scanning ${mirrorRootPath}...`);
       try {
         const mirroredPhotos = await window.electronAPI.scanVirtualMirror(mirrorRootPath);
         const enriched = libraryStore.setPhotos(mirroredPhotos, mirrorRootPath);
         navigateToTab('photos');
+        setSwitchingLibraryLabel(null);
 
         // Auto-run face detection on any remaining unscanned photos
         await runFaceDetectionForPhotos(enriched, false);
@@ -1246,6 +1259,7 @@ export const App: React.FC = () => {
         notifyError('Could not load the mirrored photos', err);
       } finally {
         libraryStore.setScanning(false);
+        setSwitchingLibraryLabel(null);
       }
     }
   };
@@ -1296,8 +1310,14 @@ export const App: React.FC = () => {
    * explicit action rather than something "Open Folder" already does.
    */
   const handleRescanLocalLibrary = async () => {
-    const ok = await libraryStore.rescanLibrary();
-    if (ok) notify('success', 'Rescanned this folder for new or changed files.');
+    if (isRescanningLocal) return; // guard against a double-click re-triggering a second rescan
+    setIsRescanningLocal(true);
+    try {
+      const ok = await libraryStore.rescanLibrary();
+      if (ok) notify('success', 'Rescanned this folder for new or changed files.');
+    } finally {
+      setIsRescanningLocal(false);
+    }
   };
 
   const handleRefreshNetworkStorage = async (targetConfig?: VirtualStorageConfig) => {
@@ -1614,6 +1634,7 @@ export const App: React.FC = () => {
             onOpenFolder={handleOpenFolder}
             onRefreshNetwork={() => handleRefreshNetworkStorage()}
             onRescanLocalLibrary={handleRescanLocalLibrary}
+            isRescanningLocal={isRescanningLocal}
             virtualStorages={virtualStorages}
             onSelectStorage={handleSelectVirtualStorage}
             onOpenDuplicateCleaner={handleOpenDuplicateCleaner}
@@ -1639,6 +1660,7 @@ export const App: React.FC = () => {
             onOpenFolder={handleOpenFolder}
             onRefreshNetwork={() => handleRefreshNetworkStorage()}
             onRescanLocalLibrary={handleRescanLocalLibrary}
+            isRescanningLocal={isRescanningLocal}
             filterFavorite={true}
             virtualStorages={virtualStorages}
             onSelectStorage={handleSelectVirtualStorage}

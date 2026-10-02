@@ -22,7 +22,7 @@ const FOLDER_CARD_HEIGHT = 216;
 
 interface FolderTreeViewProps {
   onSelectPhoto: (photo: Photo) => void;
-  onStartBackgroundScan?: (path: string, storageName?: string) => void;
+  onStartBackgroundScan?: (path: string, storageName?: string) => void | Promise<void>;
   storages?: VirtualStorageConfig[];
   initialFolderPath?: string | null;
   onPhotosDiscovered?: (photos: Photo[]) => void;
@@ -156,6 +156,10 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
   const isMobile = useIsMobile();
   const [folderPhotos, setFolderPhotos] = useState<Photo[]>([]);
   const [isLoadingPhotos, setIsLoadingPhotos] = useState(false);
+  // "Scan in Background" registers the folder as a tracked storage and starts the full sync
+  // pipeline — this can take a while on a large folder, and previously gave zero feedback at all
+  // (the button just sat there, clickable, looking inert).
+  const [isStartingScan, setIsStartingScan] = useState(false);
   const [folderError, setFolderError] = useState<string | null>(null);
   // Only the most recent folder click may write results (slow shares answer out of order).
   const selectRequestRef = useRef(0);
@@ -362,14 +366,21 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
           {selectedFolderPath && (
             <button
               className="btn btn-primary"
-              onClick={() => {
-                onStartBackgroundScan?.(selectedFolderPath);
+              onClick={async () => {
+                if (isStartingScan) return;
+                setIsStartingScan(true);
+                try {
+                  await onStartBackgroundScan?.(selectedFolderPath);
+                } finally {
+                  setIsStartingScan(false);
+                }
               }}
-              style={{ fontSize: '0.82rem', gap: '6px', flexShrink: 0 }}
-              title="Start non-blocking background index & thumbnail mirroring for this entire directory"
+              disabled={isStartingScan}
+              style={{ fontSize: '0.82rem', gap: '6px', flexShrink: 0, opacity: isStartingScan ? 0.6 : 1 }}
+              title={isStartingScan ? 'Starting the scan...' : 'Start non-blocking background index & thumbnail mirroring for this entire directory'}
             >
-              <Play size={14} />
-              <span>Scan in Background</span>
+              {isStartingScan ? <RefreshCw size={14} className="animate-spin" /> : <Play size={14} />}
+              <span>{isStartingScan ? 'Starting Scan...' : 'Scan in Background'}</span>
             </button>
           )}
         </div>

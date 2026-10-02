@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import L from 'leaflet';
-import { X, Search, Check, MapPin, Link2 } from 'lucide-react';
+import { X, Search, Check, MapPin, Link2, ExternalLink } from 'lucide-react';
 import { notify, notifyError } from '../services/notifications';
 import { isGoogleMapsUrl, isShortGoogleMapsUrl, parseGoogleMapsUrl } from '../services/googleMapsUrl';
 
@@ -157,6 +157,21 @@ export const LocationPickerModal: React.FC<LocationPickerModalProps> = ({
     mapInstanceRef.current?.flyTo([coords.lat, coords.lng], 16, { duration: 0.8 });
   };
 
+  // Opens Google Maps in the user's actual browser, pre-searched for whatever name is currently
+  // typed above — so the user can find the exact right place on the full Google Maps site, then
+  // come back and paste its link into "Use Link" above.
+  const handleSearchOnGoogleMaps = async () => {
+    const query = label.trim();
+    if (!query) return;
+    const url = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
+    try {
+      const opened = await window.electronAPI?.openExternal?.(url);
+      if (!opened) window.open(url, '_blank');
+    } catch {
+      window.open(url, '_blank');
+    }
+  };
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -275,6 +290,17 @@ export const LocationPickerModal: React.FC<LocationPickerModalProps> = ({
             >
               <Link2 size={14} />
               <span>{isResolvingMapsUrl ? 'Resolving...' : 'Use Link'}</span>
+            </button>
+            <button
+              className="btn btn-secondary"
+              onClick={handleSearchOnGoogleMaps}
+              disabled={!label.trim()}
+              title={label.trim() ? `Open Google Maps in your browser, searching for "${label.trim()}"` : 'Type a name above first'}
+              style={{ fontSize: '0.8rem' }}
+              data-testid="open-google-maps"
+            >
+              <ExternalLink size={14} />
+              <span>Search on Google Maps</span>
             </button>
           </div>
           {mapsUrlError && (

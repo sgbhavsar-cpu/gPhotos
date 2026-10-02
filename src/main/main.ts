@@ -2287,6 +2287,21 @@ ipcMain.handle('help:open-in-browser', async () => {
   }
 });
 
+// Opens an arbitrary https:// URL in the user's default browser — e.g. a Google Maps search link
+// from LocationPickerModal's "Search on Google Maps" button. Restricted to http(s) so this can
+// never be used to launch an arbitrary local file/protocol handler from renderer-controlled input.
+ipcMain.handle('shell:open-external', async (_event, url: string) => {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    await shell.openExternal(url);
+    return true;
+  } catch (err) {
+    console.error('shell:open-external error:', err);
+    return false;
+  }
+});
+
 // Library Backup (.zip) & File Explorer Handlers
 ipcMain.handle('backup:export-zip', async (_event, customTargetZipPath?: string) => {
   try {

@@ -42,6 +42,7 @@ describe('LocationPickerModal: paste a Google Maps link for exact coordinates', 
   };
   const urlInput = () => host.querySelector('[data-testid="maps-url-input"]') as HTMLInputElement;
   const useLinkBtn = () => host.querySelector('[data-testid="maps-url-use"]') as HTMLButtonElement;
+  const searchOnGoogleMapsBtn = () => host.querySelector('[data-testid="open-google-maps"]') as HTMLButtonElement;
   const labelInput = () => host.querySelector('[data-testid="location-label-input"]') as HTMLInputElement;
   const confirmBtn = () => Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes('Use This Location')) as HTMLButtonElement;
   const typeInto = (input: HTMLInputElement, value: string) => {
@@ -172,6 +173,31 @@ describe('LocationPickerModal: paste a Google Maps link for exact coordinates', 
       mount({ initialLat: 24.5, initialLng: 73.6, initialLabel: 'Old Label' });
       expect(confirmBtn().disabled).toBe(false);
       expect(host.querySelector('[role="alert"]')).toBeNull();
+    });
+  });
+
+  describe('"Search on Google Maps" — opens a browser search for the current name', () => {
+    it('is disabled until a name is typed', async () => {
+      mount();
+      expect(searchOnGoogleMapsBtn().disabled).toBe(true);
+      typeInto(labelInput(), 'Lake Palace');
+      expect(searchOnGoogleMapsBtn().disabled).toBe(false);
+    });
+
+    it('opens Google Maps search for the current name via the desktop bridge when available', async () => {
+      const openExternal = vi.fn(async () => true);
+      (window as any).electronAPI = { openExternal };
+      mount({ initialLabel: 'Lake Palace' });
+      await act(async () => { searchOnGoogleMapsBtn().click(); });
+      expect(openExternal).toHaveBeenCalledWith('https://www.google.com/maps/search/?api=1&query=Lake%20Palace');
+    });
+
+    it('falls back to window.open when no desktop bridge is available', async () => {
+      const openSpy = vi.spyOn(window, 'open').mockImplementation(() => null);
+      mount({ initialLabel: "Grandma's House" });
+      await act(async () => { searchOnGoogleMapsBtn().click(); });
+      expect(openSpy).toHaveBeenCalledWith(expect.stringContaining(encodeURIComponent("Grandma's House")), '_blank');
+      openSpy.mockRestore();
     });
   });
 });

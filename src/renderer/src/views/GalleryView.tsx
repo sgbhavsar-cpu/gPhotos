@@ -49,6 +49,8 @@ interface GalleryViewProps {
   onRefreshNetwork?: () => void;
   /** Local-library counterpart of onRefreshNetwork (see docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md). */
   onRescanLocalLibrary?: () => void;
+  /** Drives the Rescan button's own spinner/disabled state while a local rescan is in flight. */
+  isRescanningLocal?: boolean;
   filterFavorite?: boolean;
   virtualStorages?: VirtualStorageConfig[];
   onSelectStorage?: (storage: VirtualStorageConfig) => void;
@@ -72,6 +74,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   onOpenFolder,
   onRefreshNetwork,
   onRescanLocalLibrary,
+  isRescanningLocal = false,
   filterFavorite = false,
   virtualStorages = [],
   onSelectStorage,
@@ -738,10 +741,11 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
     <button
       className="btn btn-icon btn-secondary"
       onClick={onRescanLocalLibrary}
-      style={{ width: '34px', height: '34px' }}
-      title="Rescan — check this folder for new or changed files (e.g. videos added since this library was last indexed)"
+      disabled={isRescanningLocal}
+      style={{ width: '34px', height: '34px', opacity: isRescanningLocal ? 0.6 : 1 }}
+      title={isRescanningLocal ? 'Rescanning...' : 'Rescan — check this folder for new or changed files (e.g. videos added since this library was last indexed)'}
     >
-      <RefreshCw size={15} />
+      <RefreshCw size={15} className={isRescanningLocal ? 'animate-spin' : ''} />
     </button>
   ) : null;
 

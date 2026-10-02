@@ -687,6 +687,9 @@ export interface IElectronAPI {
   cancelYouTubeDownload?: () => Promise<boolean>;
   /** Follows a shortened Google Maps link (maps.app.goo.gl, goo.gl/maps/…) to its real, coordinate-bearing URL. */
   resolveMapsUrl?: (url: string) => Promise<{ ok: boolean; resolvedUrl?: string; error?: string }>;
+  // Opens an http(s) URL in the user's default browser (e.g. a Google Maps search link) — see
+  // LocationPickerModal's "Search on Google Maps" button.
+  openExternal?: (url: string) => Promise<boolean>;
   // Built-in royalty-free tracks (musicCatalog.ts): which are already downloaded, and download-if-needed by id
   getMusicLibraryCached?: () => Promise<string[]>;
   fetchMusicTrack?: (trackId: string) => Promise<{ ok: boolean; error?: string; file?: AudioFileInfo }>;

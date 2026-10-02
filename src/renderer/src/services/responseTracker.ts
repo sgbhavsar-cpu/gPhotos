@@ -99,12 +99,27 @@ class ResponseTrackerService {
     const opId = this.nextOpId++;
     const now = Date.now();
 
-    // Auto-timeout safety so an unhandled or hung request never keeps the wait icon stuck
-    const safetyTimer = setTimeout(() => {
-      if (this.activeOperations.has(opId)) {
-        endOp();
-      }
-    }, this.OP_SAFETY_TIMEOUT_MS);
+    // Auto-timeout safety so an unhandled or hung request never keeps the wait icon stuck — but
+    // ONLY when there's an abortController, and only by actually calling .abort() on it, so the
+    // indicator disappearing matches reality instead of lying about it. The previous version just
+    // called `endOp()` here regardless — which only ever hid the indicator, never cancelled
+    // anything (nothing in this file called .abort() from the timer) — so for the common case (no
+    // controller at all, e.g. every plain `trackBackendCall(ipcPromise, label)` site in this
+    // codebase) a genuinely long-but-finite operation (a 30s library rescan, say) had its "please
+    // wait" pill vanish at 5s while the rescan kept running underneath, silently swallowing its
+    // real completion too (this `endOp` closure's own `ended` flag was already set by then, so
+    // trackPromise's `finally` call became a no-op) — looking exactly like nothing was happening,
+    // the opposite of the intended safety net. Without an abortController there is nothing
+    // meaningful to time out, so the op is now left tracked for as long as its promise actually
+    // takes.
+    const safetyTimer = abortController
+      ? setTimeout(() => {
+          if (this.activeOperations.has(opId)) {
+            try { abortController.abort(); } catch {}
+            endOp();
+          }
+        }, this.OP_SAFETY_TIMEOUT_MS)
+      : null;
 
     this.activeOperations.set(opId, { label, startTime: now, safetyTimer, abortController });
     this.state.activeCount = this.activeOperations.size;

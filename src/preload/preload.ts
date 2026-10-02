@@ -205,6 +205,7 @@ const electronAPI: IElectronAPI = {
   downloadYouTubeAudio: (url: string) => ipcRenderer.invoke('audio:youtube-download', url),
   cancelYouTubeDownload: () => ipcRenderer.invoke('audio:youtube-cancel'),
   resolveMapsUrl: (url: string) => ipcRenderer.invoke('location:resolve-maps-url', url),
+  openExternal: (url: string) => ipcRenderer.invoke('shell:open-external', url),
   getMusicLibraryCached: () => ipcRenderer.invoke('music:cached'),
   fetchMusicTrack: (trackId: string) => ipcRenderer.invoke('music:fetch-track', trackId),
   onAudioFetchProgress: (callback: (p: { kind: 'install' | 'download'; pct: number }) => void) => {

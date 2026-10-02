@@ -172,7 +172,10 @@ Clicking any photo thumbnail launches the high-performance **Fullscreen Lightbox
   **"Pin on Map"** for the map picker, which now also has a **"Paste a Google Maps link"** box — paste
   a link copied from Google Maps (a full `google.com/maps/...` link, or a share link like
   `maps.app.goo.gl/...`) and it drops the pin at the *exact* coordinates from that link, instead of
-  searching OpenStreetMap for a name match. The picker also has its own **Label** field — always
+  searching OpenStreetMap for a name match. Next to that box, **"Search on Google Maps"** opens
+  Google Maps in your actual browser, pre-searched for whatever name you've already typed in the
+  Label field below — handy for finding the exact right place on the full Google Maps site first,
+  then coming back to paste its link into the box. The picker also has its own **Label** field — always
   editable, independent of how the pin got there — so you can give the spot a name you'll actually
   recognise later (e.g. *"Grandma's House"*) rather than whatever the map search returned.
   **"Use This Location" stays disabled until you've named the pin** — an amber-bordered label box
@@ -262,6 +265,13 @@ pins. Clear the search to see everything again.
    (Places, the "#place" search autocomplete) exactly as typed, with no country automatically
    appended. The city/country already recorded on those photos is kept, just no longer used for the
    displayed name — renaming to "Andaman" shows as "Andaman", not "Andaman, India".
+
+### Correcting a Cluster's GPS Coordinates:
+If a cluster's location is just plain wrong (not merely renamed, but genuinely in the wrong place),
+click the **pin icon** (next to the pencil) in the bottom drawer. This opens the same map-picker
+dialog used everywhere else in the app (the Lightbox's "Pin on Map", bulk Edit Date/Location) — drop
+a pin, paste a Google Maps link, or search a place name — and confirming applies the new
+coordinates and name to every photo in the cluster at once.
 
 ### Assigning Locations to Unlocated Photos:
 If photos lack EXIF GPS coordinates:
@@ -439,6 +449,9 @@ The application is engineered with defensive fault tolerance:
 ---
 
 ## 15. Albums & Chapters
+
+Type into the **search box** at the top of the Albums screen to filter the grid down to albums
+whose title matches as you type.
 
 An album can be split into named **chapters** — e.g. a wedding album into "Day 1 — Ceremony" and
 "Day 2 — Reception" — for a large event with several distinct parts. An album with no chapters

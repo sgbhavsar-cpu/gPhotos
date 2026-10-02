@@ -80,6 +80,13 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
   }, [resetTrigger]);
 
   const [showCreateModal, setShowCreateModal] = useState(false);
+  // Albums-grid search by title — same pattern as PeopleView's name search / PlacesMapView's place search.
+  const [albumSearchQuery, setAlbumSearchQuery] = useState('');
+  const deferredAlbumSearchQuery = useDeferredValue(albumSearchQuery);
+  const filteredAlbums = useMemo(() => {
+    const q = deferredAlbumSearchQuery.trim().toLowerCase();
+    return q ? albums.filter((a) => a.title.toLowerCase().includes(q)) : albums;
+  }, [albums, deferredAlbumSearchQuery]);
   const [showAddPhotosModal, setShowAddPhotosModal] = useState(false);
   const [photoSearchQuery, setPhotoSearchQuery] = useState('');
   const [selectedPhotoIdsToAdd, setSelectedPhotoIdsToAdd] = useState<Set<string>>(new Set());
@@ -1341,19 +1348,40 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
           </div>
         </div>
 
-        <button
-          className="btn btn-primary"
-          onClick={() => setShowCreateModal(true)}
-          style={{
-            gap: '8px',
-            padding: isMobile ? '0 14px' : '10px 20px',
-            height: isMobile ? '36px' : '42px',
-            fontSize: isMobile ? '0.82rem' : '0.9rem',
-          }}
-        >
-          <FolderPlus size={isMobile ? 16 : 18} />
-          <span>New Album</span>
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flex: isMobile ? '1 1 100%' : undefined }}>
+          {albums.length > 0 && (
+            <div style={{ position: 'relative', flex: 1, maxWidth: isMobile ? undefined : '280px' }}>
+              <Search
+                size={14}
+                color="var(--text-muted)"
+                style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}
+              />
+              <input
+                type="text"
+                value={albumSearchQuery}
+                onChange={(e) => setAlbumSearchQuery(e.target.value)}
+                onKeyDown={(e) => e.stopPropagation()}
+                placeholder="Search albums..."
+                className="input"
+                style={{ width: '100%', fontSize: '0.82rem', padding: '6px 10px 6px 30px' }}
+              />
+            </div>
+          )}
+          <button
+            className="btn btn-primary"
+            onClick={() => setShowCreateModal(true)}
+            style={{
+              gap: '8px',
+              padding: isMobile ? '0 14px' : '10px 20px',
+              height: isMobile ? '36px' : '42px',
+              fontSize: isMobile ? '0.82rem' : '0.9rem',
+              flexShrink: 0,
+            }}
+          >
+            <FolderPlus size={isMobile ? 16 : 18} />
+            <span>New Album</span>
+          </button>
+        </div>
       </div>
 
       {/* Albums Grid */}
@@ -1428,6 +1456,13 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
               </button>
             </div>
           )
+        ) : filteredAlbums.length === 0 ? (
+          <div style={{ height: '50%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', textAlign: 'center', gap: '10px', paddingTop: '60px' }}>
+            <Search size={28} color="var(--text-muted)" />
+            <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+              No albums match "{albumSearchQuery}".
+            </span>
+          </div>
         ) : (
           <div
             style={{
@@ -1436,7 +1471,7 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
               gap: '24px',
             }}
           >
-            {albums.map((album) => {
+            {filteredAlbums.map((album) => {
               const coverPhoto =
                 (album.coverPhotoId && photoMap.get(album.coverPhotoId)) ||
                 (album.photoIds.length > 0 && photoMap.get(album.photoIds[0])) ||

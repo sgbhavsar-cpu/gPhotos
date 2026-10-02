@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import { Photo, PlaceAlbum } from '../../../types';
 import { PhotoCard } from '../components/PhotoCard';
+import { LocationPickerModal } from '../components/LocationPickerModal';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { matchesPlaceQuery } from '../services/placesService';
 import { useIsMobile } from '../hooks/useIsMobile';
@@ -521,6 +522,31 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
     if (map) {
       map.flyTo([chosenLocation.lat, chosenLocation.lon], 12, { duration: 1 });
     }
+    refreshMarkers();
+  };
+
+  /** "Correct Location" (the override path) — same apply logic as handleApplyAssignedLocation,
+   *  but fed by LocationPickerModal's pin-on-a-map picker (the same dialog the Lightbox/bulk-edit
+   *  use) instead of the plain OpenStreetMap text search, and applied to every photo in the
+   *  cluster at once (unlike LocationPickerModal's own single-photo call site in PhotoLightbox). */
+  const handleCorrectLocationConfirm = (lat: number, lng: number, label: string) => {
+    if (!assignModalOverridePhotos || assignModalOverridePhotos.length === 0) return;
+    const cleanLabel = label.trim();
+    const updated = assignModalOverridePhotos.map((p) => ({
+      ...p,
+      location: { latitude: lat, longitude: lng, label: cleanLabel || p.location?.label, city: cleanLabel || p.location?.city },
+    }));
+    try {
+      libraryStore.updatePhotos(updated);
+    } catch (err) {
+      notifyError('Correct location', err);
+      return;
+    }
+    setShowAssignModal(false);
+    setAssignModalOverridePhotos(null);
+
+    const map = mapInstanceRef.current;
+    if (map) map.flyTo([lat, lng], 12, { duration: 1 });
     refreshMarkers();
   };
 
@@ -1128,8 +1154,24 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
           </div>
         )}
 
-        {/* Assign Location Modal for Unlocated Photos */}
-        {showAssignModal && (
+        {/* Correct Location (override mode) now reuses the SAME map-picker dialog the Lightbox and
+            bulk-edit use, instead of this view's own separate text-search-only dialog below —
+            applied to every photo in the cluster at once via handleCorrectLocationConfirm. */}
+        {showAssignModal && isLocationOverrideMode && (
+          <LocationPickerModal
+            initialLat={assignModalOverridePhotos?.[0]?.location?.latitude}
+            initialLng={assignModalOverridePhotos?.[0]?.location?.longitude}
+            initialLabel={assignModalOverridePhotos?.[0]?.location?.label || assignModalOverridePhotos?.[0]?.location?.city}
+            onConfirm={handleCorrectLocationConfirm}
+            onClose={() => {
+              setShowAssignModal(false);
+              setAssignModalOverridePhotos(null);
+            }}
+          />
+        )}
+
+        {/* Assign Location Modal for Unlocated Photos (plain, non-override case only — see above) */}
+        {showAssignModal && !isLocationOverrideMode && (
           <div
             style={{
               position: 'fixed',
@@ -1179,9 +1221,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                   <MapPin size={20} color="#f43f5e" />
                   <h3 style={{ fontSize: '1.05rem', fontWeight: 700, margin: 0, color: 'var(--text-primary)' }}>
-                    {isLocationOverrideMode
-                      ? `Correct Location (${photosForAssignModal.length} photos)`
-                      : `Assign Location (${photosForAssignModal.length} unlocated)`}
+                    Assign Location ({photosForAssignModal.length} unlocated)
                   </h3>
                 </div>
                 <button
@@ -1197,21 +1237,6 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
 
               {/* Modal Body */}
               <div style={{ padding: '20px', display: 'flex', flexDirection: 'column', gap: '16px', overflowY: 'auto' }}>
-                {isLocationOverrideMode && (
-                  <div
-                    style={{
-                      padding: '10px 14px',
-                      borderRadius: '8px',
-                      backgroundColor: 'rgba(244, 63, 94, 0.12)',
-                      border: '1px solid rgba(244, 63, 94, 0.35)',
-                      fontSize: '0.8rem',
-                      color: 'var(--text-secondary)',
-                    }}
-                  >
-                    These photos already have a location. Applying a new one below will
-                    <strong> overwrite their existing GPS coordinates and place name.</strong> This cannot be undone automatically.
-                  </div>
-                )}
                 {/* Search / Pick Location */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '6px' }}>
@@ -1422,7 +1447,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
                   style={{ fontSize: '0.85rem', gap: '6px', padding: '6px 18px' }}
                 >
                   <Check size={15} />
-                  <span>{isLocationOverrideMode ? 'Overwrite' : 'Assign to'} {selectedUnlocatedIds.size} Photos</span>
+                  <span>Assign to {selectedUnlocatedIds.size} Photos</span>
                 </button>
               </div>
             </div>
