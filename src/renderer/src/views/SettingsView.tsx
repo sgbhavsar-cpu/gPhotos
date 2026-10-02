@@ -2112,8 +2112,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               />
               <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)', marginTop: '4px', maxWidth: '280px' }}>
                 Match whatever you've set Ollama itself to (OLLAMA_CONTEXT_LENGTH or a Modelfile's
-                num_ctx) — Smart Flows' local batch size is computed from this, capped at the
-                model's own real maximum.
+                num_ctx), capped at the model's own real maximum. The local pass always checks one
+                photo per call — never batched — so a caption or tag is never accidentally mixed up
+                with a different photo.
               </div>
             </div>
           </div>

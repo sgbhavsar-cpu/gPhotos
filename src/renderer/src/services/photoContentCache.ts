@@ -132,6 +132,34 @@ export function recordFinding(
 }
 
 /**
+ * Directly replaces a photo's caption/tags — unlike recordFinding (which MERGES a fresh vision
+ * result into whatever's already there, tags accumulating and never shrinking), this is a plain
+ * overwrite for a user manually editing or clearing what the AI recorded (see PhotoAiInfoPanel.tsx
+ * and BulkEditModal.tsx). An empty caption or an empty tags array is a deliberate "delete this" —
+ * not treated as "nothing to change" the way recordFinding's falsy-caption fallback does. Embedding
+ * and verdicts are left untouched: an edited caption shouldn't silently invalidate the semantic
+ * cache other Smart Flows rely on, and a manual edit isn't itself a verdict on any flow's description.
+ */
+export function setCaptionAndTags(photoId: string, caption: string, tags: string[]): void {
+  const prev = mirror[photoId];
+  const cleanTags = Array.from(new Set(tags.map((t) => t.toLowerCase().trim()).filter(Boolean)));
+  const entry: PhotoContentEntry = {
+    caption: caption.trim(),
+    tags: cleanTags,
+    embedding: prev?.embedding || null,
+    verdicts: prev?.verdicts || {},
+    updatedAt: new Date().toISOString(),
+  };
+  mirror[photoId] = entry;
+
+  if (hasRealApi()) {
+    (window as any).electronAPI.upsertPhotoContentEntry(photoId, entry).catch((e: unknown) => console.warn('Failed to save photo content entry:', e));
+  } else {
+    saveFallback(currentLibraryKey(), mirror);
+  }
+}
+
+/**
  * Best-effort match using only what's already cached for this photo — no API call. `descriptionEmbedding`
  * is the CURRENT flow's description, embedded once per run (see ollamaVisionService.embedText) and
  * passed in here rather than computed per photo. Returns null ("unsure") when there isn't enough

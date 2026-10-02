@@ -51,6 +51,10 @@ export const App: React.FC = () => {
   // lightbox is open is reflected immediately, the same way the album view
   // itself stays in sync.
   const [activeLightboxContextIds, setActiveLightboxContextIds] = useState<string[] | null>(null);
+  // When the lightbox was opened from a person's page, which person to highlight (in a distinct
+  // color) among that photo's face markers — so the face you came to look at is never lost among
+  // the others. Cleared alongside activeLightboxContextIds.
+  const [activeLightboxHighlightPersonId, setActiveLightboxHighlightPersonId] = useState<string | null>(null);
   const [selectedPersonIdForView, setSelectedPersonIdForView] = useState<string | null>(null);
   const [virtualStorages, setVirtualStorages] = useState<VirtualStorageConfig[]>([]);
   const [storageProgressMap, setStorageProgressMap] = useState<Record<string, NetworkStorageProgress>>({});
@@ -188,6 +192,7 @@ export const App: React.FC = () => {
       if (activeLightboxPhoto) {
         setActiveLightboxPhoto(null);
         setActiveLightboxContextIds(null);
+        setActiveLightboxHighlightPersonId(null);
         return;
       }
 
@@ -1690,7 +1695,11 @@ export const App: React.FC = () => {
             photos={libraryState.photos}
             onUpdatePersonName={handleUpdatePersonName}
             onMergePeople={handleMergePeople}
-            onSelectPhoto={(p) => setActiveLightboxPhoto(p)}
+            onSelectPhoto={(p, contextPhotos, highlightPersonId) => {
+              setActiveLightboxPhoto(p);
+              setActiveLightboxContextIds(contextPhotos ? contextPhotos.map((cp) => cp.id) : null);
+              setActiveLightboxHighlightPersonId(highlightPersonId || null);
+            }}
             onToggleFavorite={handleToggleFavorite}
             onTriggerFaceDetection={handleTriggerFaceDetection}
             onResetAndRescan={handleResetAndRescan}
@@ -1764,15 +1773,18 @@ export const App: React.FC = () => {
             onReset={() => {
               setActiveLightboxPhoto(null);
               setActiveLightboxContextIds(null);
+              setActiveLightboxHighlightPersonId(null);
             }}
           >
             <PhotoLightbox
               photo={libraryState.photos.find((p) => p.id === activeLightboxPhoto.id) || activeLightboxPhoto}
               allPhotos={activeLightboxPhotoList}
               people={libraryState.people}
+              highlightPersonId={activeLightboxHighlightPersonId}
               onClose={() => {
                 setActiveLightboxPhoto(null);
                 setActiveLightboxContextIds(null);
+                setActiveLightboxHighlightPersonId(null);
               }}
               onSelectPhoto={(p) => setActiveLightboxPhoto(p)}
               onToggleFavorite={handleToggleFavorite}

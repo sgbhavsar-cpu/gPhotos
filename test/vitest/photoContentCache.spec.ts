@@ -65,6 +65,37 @@ describe('photoContentCache', () => {
     expect(entry.verdicts[cache.normalizeDescription('a phone screenshot')]).toEqual({ match: false, confidence: 0.8 });
   });
 
+  describe('setCaptionAndTags — a plain overwrite, unlike recordFinding\'s merge', () => {
+    const setup = async () => {
+      await load({ isBrowserShim: true });
+      await cache.ensureLoaded();
+    };
+
+    it('replaces caption and tags outright, not merging with what recordFinding already wrote', async () => {
+      await setup();
+      cache.recordFinding('p1', 'x', { match: true, confidence: 0.9, caption: 'old caption', tags: ['old', 'tags'] });
+      cache.setCaptionAndTags('p1', 'new caption', ['new']);
+      expect(cache.getEntry('p1')).toMatchObject({ caption: 'new caption', tags: ['new'] });
+    });
+
+    it('an empty caption/tags is a deliberate delete, not a no-op', async () => {
+      await setup();
+      cache.recordFinding('p1', 'x', { match: true, confidence: 0.9, caption: 'old caption', tags: ['old'] });
+      cache.setCaptionAndTags('p1', '', []);
+      expect(cache.getEntry('p1')).toMatchObject({ caption: '', tags: [] });
+    });
+
+    it('dedupes and lowercases tags, and leaves embedding/verdicts untouched', async () => {
+      await setup();
+      cache.recordFinding('p1', 'a scanned bill', { match: true, confidence: 0.9, caption: 'x', tags: [], embedding: [1, 0, 0] });
+      cache.setCaptionAndTags('p1', 'edited', ['Cat', 'cat', ' Dog ']);
+      const entry = cache.getEntry('p1');
+      expect(entry.tags.sort()).toEqual(['cat', 'dog']);
+      expect(entry.embedding).toEqual([1, 0, 0]);
+      expect(entry.verdicts[cache.normalizeDescription('a scanned bill')]).toEqual({ match: true, confidence: 0.9 });
+    });
+  });
+
   describe('tryLocalMatch', () => {
     const setup = async () => {
       await load({ isBrowserShim: true });

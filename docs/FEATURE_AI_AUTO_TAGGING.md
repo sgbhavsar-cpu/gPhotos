@@ -37,7 +37,20 @@ Smart Flows escalates an unsure local answer to the cloud because a *user-run, c
 - A single shared in-process flag defers the auto-index loop whenever a **manual** Smart Flow run is in flight (`setManualFlowRunning`/`isManualFlowRunning` in a tiny shared module) — both features hit the same local Ollama server, and letting them collide doubles the load exactly when the user is actively waiting on a manual run.
 - Settings panel shows a live `done / total` status line and a Pause/Resume control; closing Settings does not stop the loop (same convention as thumbnail pre-caching).
 
-### 2.5 Non-goals / explicitly out of scope
+### 2.5 One photo per local vision call — never batched
+
+`computeLocalBatchSize` (`ollamaVisionService.ts`) is pinned to `1`, so "batch them" above is, in
+practice, one photo per call. This wasn't the original design (local batch size used to scale with
+the configured context window, up to 20) — it was changed after a real, confirmed report: a small
+(7B-class) local model, given more than one image in a single request, can return a well-formed,
+correctly-sized, *plausibly self-indexed* response that nevertheless conflates which photo is which —
+the model's own reported `"image"` index (see `docs/CODE_REVIEW_2026-09-26.md` §45) can itself be a
+confident, consistent lie, which no amount of response-shape validation can catch after the fact. One
+photo per call makes that entire class of bug structurally impossible, at the cost of throughput —
+correctness wins for data recorded with zero human review. See §48 of the code review doc for the
+full writeup. `smartFlowsService.ts`'s local pass is pinned the same way, for the identical reason.
+
+### 2.6 Non-goals / explicitly out of scope
 
 - No new UI search feature (`&tag` matching already reads from the same cache — it benefits automatically, zero `aiSearchService.ts` changes needed).
 - No per-photo progress persisted outside the cache (no separate checkpoint JSON — see §2.1).

@@ -177,13 +177,25 @@ const TOKENS_PER_IMAGE = 360;
 const FIXED_PROMPT_TOKENS = 350;
 // Reserve headroom rather than sizing right to the edge of the context.
 const CONTEXT_SAFETY_MARGIN = 0.9;
-// Independent of how much context is available: a batch bigger than this risks the request timeout
-// (which scales with it — see classifyImagesBatchLocal; 20 photos is already a 4-minute allowance)
-// and, separately, small (7B-class) local models get noticeably less reliable at keeping a long
-// JSON array well-formed and correctly ordered well before this.
-const MAX_LOCAL_BATCH_SIZE = 20;
+// Pinned to 1 — multi-image local batches are NOT reliable enough to trust the caption/tags this
+// writes silently into the shared cache (photoContentCache), which every Smart Flow and the AI Info
+// panel then display as fact with no human review in between. This used to be up to 20, with a
+// self-reported per-image "image" index (visionClassify.parseBatchClassifyResponse) meant to catch a
+// scrambled response order — but that mitigation only works when the model's self-reported indices
+// are themselves correct. Confirmed via a real user report (two adjacent photos, each showing a
+// caption that actually described a DIFFERENT photo in the same run) that a small (7B-class) local
+// model can return a well-formed, correctly-sized, plausibly-indexed response that is nevertheless
+// wrong — conflating which photo is which. One photo per local call makes that entire class of bug
+// structurally impossible: there is no second image in the request for the model to confuse the
+// first one with. The real cost is throughput (N calls instead of one batched call); correctness
+// clearly outweighs it for data this is trusted at face value. See docs/FEATURE_AI_AUTO_TAGGING.md.
+const MAX_LOCAL_BATCH_SIZE = 1;
 
-/** How many photos fit in one local classify call at the given context window. Always at least 1. */
+/** How many photos fit in one local classify call at the given context window. Pinned to 1 — see
+ *  MAX_LOCAL_BATCH_SIZE's doc comment for why. The context-window-based math below is kept (rather
+ *  than deleted) as the sizing this would use again if a future, more reliable local model warrants
+ *  re-enabling batching; for now `effectiveContext` only affects the single call's own token budget
+ *  (resolveEffectiveContext / num_ctx), not how many photos go into it. */
 export function computeLocalBatchSize(effectiveContext: number): number {
   const usable = effectiveContext * CONTEXT_SAFETY_MARGIN - FIXED_PROMPT_TOKENS;
   const byContext = Math.floor(usable / TOKENS_PER_IMAGE);

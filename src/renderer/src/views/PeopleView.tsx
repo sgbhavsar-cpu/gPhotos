@@ -20,7 +20,9 @@ import {
   ZoomIn,
   ZoomOut,
   Search,
-  MoreVertical
+  MoreVertical,
+  Maximize2,
+  FolderOpen
 } from 'lucide-react';
 import { Person, Photo, DetectedFace } from '../../../types';
 import { PhotoCard } from '../components/PhotoCard';
@@ -71,7 +73,7 @@ interface PeopleViewProps {
   photos: Photo[];
   onUpdatePersonName: (personId: string, newName: string) => void;
   onMergePeople: (targetPersonId: string, sourcePersonId: string) => void;
-  onSelectPhoto: (photo: Photo) => void;
+  onSelectPhoto: (photo: Photo, contextPhotos?: Photo[], highlightPersonId?: string) => void;
   onToggleFavorite: (photoId: string) => void;
   onTriggerFaceDetection: () => void;
   isDetectingFaces: boolean;
@@ -98,6 +100,10 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
   const peopleScrollRef = useRef<HTMLDivElement>(null);
   const [selectedPersonId, setSelectedPersonId] = useState<string | null>(initialSelectedPersonId || null);
   const [removedFaceIds, setRemovedFaceIds] = useState<Set<string>>(new Set());
+  // Faces-curation grid: which view the card's image shows (default is the cropped face thumbnail,
+  // same as before this existed), and which card is currently hovered (drives the corner overlay).
+  const [faceViewModes, setFaceViewModes] = useState<Record<string, 'zoomedThumb' | 'fullThumb' | 'zoomedOriginal' | 'fullOriginal'>>({});
+  const [hoveredFaceCardId, setHoveredFaceCardId] = useState<string | null>(null);
 
   useEffect(() => {
     if (initialSelectedPersonId) {
@@ -331,6 +337,28 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
     setTimeout(() => {
       setLearningNotification((curr) => curr?.startsWith('✕') ? null : curr);
     }, 3500);
+  };
+
+  // "Mark all as correct/not correct" — the same per-face actions above, applied to every
+  // currently-shown (not yet removed) match at once, for a person with many matches to curate.
+  const handleMarkAllCorrect = () => {
+    if (!selectedPerson) return;
+    const toConfirm = personPhotoItems.filter(({ face }) => !face.isConfirmed);
+    if (toConfirm.length === 0) return;
+    if (!window.confirm(`Mark all ${toConfirm.length} unconfirmed photo${toConfirm.length === 1 ? '' : 's'} as ${selectedPerson.name}?`)) return;
+    for (const { face } of toConfirm) libraryStore.confirmFace(face.id);
+    setLearningNotification(`✓ Confirmed ${toConfirm.length} photo${toConfirm.length === 1 ? '' : 's'} of ${selectedPerson.name}.`);
+    setTimeout(() => setLearningNotification((curr) => curr?.startsWith('✓') ? null : curr), 4500);
+  };
+
+  const handleMarkAllIncorrect = () => {
+    if (!selectedPerson || personPhotoItems.length === 0) return;
+    if (!window.confirm(`Remove all ${personPhotoItems.length} photo${personPhotoItems.length === 1 ? '' : 's'} from ${selectedPerson.name}'s album? This can't be undone in one step.`)) return;
+    const ids = personPhotoItems.map(({ face }) => face.id);
+    setRemovedFaceIds((prev) => new Set([...prev, ...ids]));
+    for (const id of ids) libraryStore.unassignFaceFromPerson(id);
+    setLearningNotification(`✕ Removed ${ids.length} photo${ids.length === 1 ? '' : 's'} from ${selectedPerson.name}'s album.`);
+    setTimeout(() => setLearningNotification((curr) => curr?.startsWith('✕') ? null : curr), 3500);
   };
 
   const handleDeleteDetection = (faceId: string, e?: React.MouseEvent) => {
@@ -570,6 +598,27 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
       </div>
     );
 
+    const markAllButtonsBlock = viewMode === 'faces' && personPhotoItems.length > 0 ? (
+      <div style={{ display: 'flex', alignItems: 'center', gap: '4px', borderLeft: isMobile ? 'none' : '1px solid var(--border-subtle)', paddingLeft: isMobile ? 0 : '8px' }}>
+        <button
+          className="btn btn-ghost btn-icon"
+          onClick={handleMarkAllCorrect}
+          title={`Mark all ${personPhotoItems.length} as correct (confirm all as ${selectedPerson.name})`}
+          style={{ color: '#10b981' }}
+        >
+          <UserCheck size={18} />
+        </button>
+        <button
+          className="btn btn-ghost btn-icon"
+          onClick={handleMarkAllIncorrect}
+          title={`Mark all ${personPhotoItems.length} as not correct (remove all from ${selectedPerson.name}'s album)`}
+          style={{ color: '#ef4444' }}
+        >
+          <UserX size={18} />
+        </button>
+      </div>
+    ) : null;
+
     const zoomControlsBlock = (
       <div style={{ display: 'flex', alignItems: 'center', gap: '4px', borderLeft: isMobile ? 'none' : '1px solid var(--border-subtle)', paddingLeft: isMobile ? 0 : '8px' }}>
         <button
@@ -674,6 +723,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                 </div>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
                   {viewModeSwitcher}
+                  {markAllButtonsBlock}
                 </div>
                 {viewMode === 'photos' && (
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
@@ -706,6 +756,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
               {findMorePhotosButton}
               {mergePersonButton}
               {viewModeSwitcher}
+              {markAllButtonsBlock}
               {viewMode === 'photos' && zoomControlsBlock}
             </div>
           </div>
@@ -757,7 +808,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
             photos={personPhotos}
             zoomLevel={zoomLevel}
             onZoomChange={setZoomLevel}
-            onSelectPhoto={onSelectPhoto}
+            onSelectPhoto={(p) => onSelectPhoto(p, personPhotos, selectedPerson.id)}
             onToggleFavorite={onToggleFavorite}
             emptyMessage={`No photos found for ${selectedPerson.name}.`}
           />
@@ -788,50 +839,121 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                   }}
                 >
                   {/* Zoomed Face Container */}
-                  <div
-                    onClick={() => onSelectPhoto(photo)}
-                    style={{
-                      height: '210px',
-                      cursor: 'pointer',
-                      position: 'relative',
-                      overflow: 'hidden',
-                      backgroundColor: '#0f172a',
+                  {(() => {
+                    const mode = faceViewModes[face.id] || 'zoomedThumb';
+                    const showOriginal = mode === 'fullOriginal' || mode === 'zoomedOriginal';
+                    const showBox = mode === 'zoomedThumb' || mode === 'zoomedOriginal' ? face.box : undefined;
+                    const isHovered = hoveredFaceCardId === face.id;
+                    const overlayBtnStyle = (active: boolean): React.CSSProperties => ({
+                      width: '24px',
+                      height: '24px',
+                      borderRadius: 'var(--radius-sm)',
+                      border: 'none',
+                      background: active ? 'rgba(59, 130, 246, 0.85)' : 'rgba(15, 23, 42, 0.75)',
+                      color: 'white',
                       display: 'flex',
                       alignItems: 'center',
                       justifyContent: 'center',
-                    }}
-                  >
-                    <FaceAvatar
-                      photo={photo}
-                      face={face}
-                      box={face.box}
-                      size={210}
-                      borderRadius="0px"
-                    />
-
-                    {face.isConfirmed && (
+                      cursor: 'pointer',
+                      padding: 0,
+                    });
+                    return (
                       <div
+                        onClick={() => onSelectPhoto(photo, personPhotos, selectedPerson.id)}
+                        onMouseEnter={() => setHoveredFaceCardId(face.id)}
+                        onMouseLeave={() => setHoveredFaceCardId((curr) => (curr === face.id ? null : curr))}
                         style={{
-                          position: 'absolute',
-                          top: '8px',
-                          left: '8px',
-                          background: 'rgba(16, 185, 129, 0.9)',
-                          color: 'white',
-                          padding: '2px 8px',
-                          borderRadius: 'var(--radius-full)',
-                          fontSize: '11px',
-                          fontWeight: 700,
+                          height: '210px',
+                          cursor: 'pointer',
+                          position: 'relative',
+                          overflow: 'hidden',
+                          backgroundColor: '#0f172a',
                           display: 'flex',
                           alignItems: 'center',
-                          gap: '4px',
-                          boxShadow: '0 2px 6px rgba(0,0,0,0.4)',
+                          justifyContent: 'center',
                         }}
                       >
-                        <CheckCircle2 size={12} />
-                        <span>Verified</span>
+                        <FaceAvatar
+                          photo={photo}
+                          face={face}
+                          box={showBox}
+                          preferOriginal={showOriginal}
+                          size={210}
+                          borderRadius="0px"
+                        />
+
+                        {face.isConfirmed && (
+                          <div
+                            style={{
+                              position: 'absolute',
+                              top: '8px',
+                              left: '8px',
+                              background: 'rgba(16, 185, 129, 0.9)',
+                              color: 'white',
+                              padding: '2px 8px',
+                              borderRadius: 'var(--radius-full)',
+                              fontSize: '11px',
+                              fontWeight: 700,
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '4px',
+                              boxShadow: '0 2px 6px rgba(0,0,0,0.4)',
+                            }}
+                          >
+                            <CheckCircle2 size={12} />
+                            <span>Verified</span>
+                          </div>
+                        )}
+
+                        {/* Hover overlay: pick what this card shows, or set it as the cover photo */}
+                        {isHovered && (
+                          <div
+                            style={{ position: 'absolute', top: '8px', right: '8px', display: 'flex', flexDirection: 'column', gap: '4px' }}
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <button
+                              style={overlayBtnStyle(mode === 'fullThumb')}
+                              title="Full thumbnail (whole photo, cached size)"
+                              onClick={() => setFaceViewModes((m) => ({ ...m, [face.id]: 'fullThumb' }))}
+                            >
+                              <ImageIcon size={13} />
+                            </button>
+                            <button
+                              style={overlayBtnStyle(mode === 'zoomedThumb')}
+                              title="Zoomed thumbnail (face crop, cached size) — default"
+                              onClick={() => setFaceViewModes((m) => ({ ...m, [face.id]: 'zoomedThumb' }))}
+                            >
+                              <Crop size={13} />
+                            </button>
+                            <button
+                              style={overlayBtnStyle(mode === 'fullOriginal')}
+                              title="Full original photo (whole photo, full resolution)"
+                              onClick={() => setFaceViewModes((m) => ({ ...m, [face.id]: 'fullOriginal' }))}
+                            >
+                              <Maximize2 size={13} />
+                            </button>
+                            <button
+                              style={overlayBtnStyle(mode === 'zoomedOriginal')}
+                              title="Zoomed original photo (face crop, full resolution)"
+                              onClick={() => setFaceViewModes((m) => ({ ...m, [face.id]: 'zoomedOriginal' }))}
+                            >
+                              <ZoomIn size={13} />
+                            </button>
+                            <button
+                              style={overlayBtnStyle(selectedPerson.coverFaceId === face.id)}
+                              title={`Set as cover photo for ${selectedPerson.name}`}
+                              onClick={() => {
+                                libraryStore.setPersonCover(selectedPerson.id, photo.id, face.id);
+                                notify('success', `Set as cover photo for ${selectedPerson.name}.`);
+                              }}
+                            >
+                              <Camera size={13} />
+                            </button>
+                          </div>
+                        )}
                       </div>
-                    )}
-                  </div>
+                    );
+                  })()}
 
                   {/* Card Curation Footer: YES / NO Buttons */}
                   <div
@@ -845,6 +967,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                     }}
                   >
                     <div
+                      onClick={() => window.electronAPI?.openItemInFolder?.(photo.filePath)}
                       style={{
                         fontSize: '0.78rem',
                         color: 'var(--text-muted)',
@@ -852,10 +975,17 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                         textOverflow: 'ellipsis',
                         whiteSpace: 'nowrap',
                         flex: 1,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '4px',
+                        cursor: 'pointer',
                       }}
-                      title={photo.fileName}
+                      title={`Open ${photo.fileName} in File Explorer`}
+                      onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--accent-primary)')}
+                      onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-muted)')}
                     >
-                      {photo.fileName}
+                      <FolderOpen size={12} style={{ flexShrink: 0 }} />
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{photo.fileName}</span>
                     </div>
 
                     <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>

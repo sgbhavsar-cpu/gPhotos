@@ -964,10 +964,10 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
           onClick={() => setShowBulkEditModal(true)}
           disabled={selectedIds.size === 0}
           style={{ fontSize: '0.78rem', gap: '6px', padding: '6px 10px', flexShrink: 0 }}
-          title="Set date/time or location on all selected photos at once"
+          title="Set date/time, location, or AI caption/tags on all selected photos at once"
         >
           <Calendar size={14} color="var(--accent-cyan)" />
-          <span>Edit Date/Location</span>
+          <span>Edit Info</span>
         </button>
 
         <button
@@ -1236,16 +1236,16 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
               </button>
             )}
 
-            {/* Bulk Edit Date/Location Button */}
+            {/* Bulk Edit Info Button */}
             <button
               className="btn btn-secondary"
               onClick={() => setShowBulkEditModal(true)}
               disabled={selectedIds.size === 0}
               style={{ fontSize: '0.85rem', gap: '8px', padding: '6px 14px' }}
-              title="Set date/time or location on all selected photos at once"
+              title="Set date/time, location, or AI caption/tags on all selected photos at once"
             >
               <Calendar size={16} color="var(--accent-cyan)" />
-              <span>Edit Date/Location ({selectedIds.size})</span>
+              <span>Edit Info ({selectedIds.size})</span>
             </button>
 
             {/* Permanently Delete Selected Button */}

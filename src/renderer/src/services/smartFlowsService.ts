@@ -21,11 +21,13 @@ import { setManualFlowRunning } from './visionJobLock';
 // of calls, not the whole run. Local and cloud are sized separately: they have very different
 // context budgets, so what's safe for one says nothing about the other.
 //
-// The LOCAL batch size is not a fixed constant — it's computed per run from Ollama's actual context
-// window (checked once, right below, before the local pass starts — see resolveEffectiveContext /
-// computeLocalBatchSize in ollamaVisionService.ts for the sizing math), so a bigger context window
-// (Settings → Local AI Model → Context Window) genuinely sends more photos per call, and a small
-// one doesn't get overrun.
+// The LOCAL pass sends exactly ONE photo per call (see computeLocalBatchSize /
+// MAX_LOCAL_BATCH_SIZE in ollamaVisionService.ts) — a real user report confirmed a small local
+// model can silently conflate which photo a caption/tags belong to once more than one image is in
+// the same request, which is unacceptable for data recorded with no human review. The context
+// window (Settings → Local AI Model → Context Window) still matters — it's resolved once per run,
+// right below, before the local pass starts — but now only sizes each single-image call's own
+// token budget (num_ctx), not how many photos go into it.
 //
 // Cloud providers' own context windows are orders of magnitude larger than any local model's, so
 // their batch size is unrelated and stays a fixed constant — nothing reported an issue with it, and
@@ -264,7 +266,7 @@ async function runFlowInner(
     // the two can never drift apart.
     const effectiveContext = await resolveEffectiveContext(getOllamaConfig());
     const localBatchSize = computeLocalBatchSize(effectiveContext);
-    onLog?.({ index: 0, total, photoId: '', fileName: '', level: 'info', message: `Local model context: ${effectiveContext} tokens — sending up to ${localBatchSize} photos per call.` });
+    onLog?.({ index: 0, total, photoId: '', fileName: '', level: 'info', message: `Local model context: ${effectiveContext} tokens — ${localBatchSize === 1 ? 'one photo per call (for accurate per-photo results)' : `sending up to ${localBatchSize} photos per call`}.` });
 
     for (let i = 0; i < afterCache.length; i += localBatchSize) {
       const chunk = afterCache.slice(i, i + localBatchSize);

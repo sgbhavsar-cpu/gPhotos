@@ -138,9 +138,9 @@ The **Photos** gallery presents your collection in a chronological, zoomable tim
 The header shows just your library's name (no duplicate badge next to it). **Select**, **Clean
 Duplicates**, **Rescan**, and **Ask AI** are icon-only buttons — hover any of them for a tooltip
 explaining what it does. Once you've selected one or more photos (**Select** mode, or a
-press-and-drag selection), a selection toolbar appears with **Album**, **Edit Date/Location** (set
-one date/time and/or location on every selected photo at once — the same map picker described
-above opens from its "Pin on Map" button), and **Delete**.
+press-and-drag selection), a selection toolbar appears with **Album**, **Edit Info** (set one
+date/time, location, and/or AI caption/tags on every selected photo at once — the same map picker
+described above opens from its "Pin on Map" button), and **Delete**.
 
 ### Viewing a photo full-screen while a selection is active:
 Normally, once anything is selected (or Select mode is on), clicking a photo tile toggles its
@@ -180,7 +180,7 @@ Clicking any photo thumbnail launches the high-performance **Fullscreen Lightbox
   recognise later (e.g. *"Grandma's House"*) rather than whatever the map search returned.
   **"Use This Location" stays disabled until you've named the pin** — an amber-bordered label box
   and a short note tell you a name is still needed — so the spot you just pinned always comes back
-  into whichever screen opened the map picker (including the bulk **Edit Date/Location** dialog
+  into whichever screen opened the map picker (including the bulk **Edit Info** dialog
   below) instead of silently staying blank there.
 
 ### In-App Photo Editing:
@@ -237,6 +237,25 @@ If you want to clear all recognized faces and re-index everything from scratch:
 - Click **"AI Best Face"** to let the engine pick the clearest, highest-resolution smiling portrait.
 - Confirmed faces receive a **2.5× centroid weight bonus**, automatically pulling similar photos of that person into their album.
 
+### Curating a Person's Photos (Zoomed Faces grid):
+Open a person, switch to **"Zoomed Faces"**, and for each match:
+- **Yes / No**: confirm it's really them, or remove it from their album.
+- **Mark all as correct / Mark all as not correct**: two buttons next to the view switcher
+  (visible only in this "Zoomed Faces" view) confirm or remove every match shown at once — each
+  asks you to confirm the count first, since "mark all as not correct" clears the whole album in
+  one step.
+- **Hover a face card** for a small icon overlay in its top-right corner: switch what the card
+  shows — **Full Thumbnail** (whole photo, cached size), **Zoomed Thumbnail** (face crop, cached
+  size — the default), **Full Original Photo**, or **Zoomed Original Photo** (face crop at full
+  resolution) — or click the **camera icon** to set that exact photo as this person's cover
+  without leaving the grid.
+- **Click the filename** at the bottom of a card to open that photo directly in File
+  Explorer/Finder.
+- **Opening a photo full-screen** from either "Full Photos" or "Zoomed Faces" highlights that
+  person's own face box in **amber** among the photo's other face markers, so you immediately see
+  which face you came here to check — distinct from the blue highlight a mouse hover gives any
+  face box.
+
 ---
 
 ## 7. Places Interactive Map (OpenStreetMap & Geotagging)
@@ -269,7 +288,7 @@ pins. Clear the search to see everything again.
 ### Correcting a Cluster's GPS Coordinates:
 If a cluster's location is just plain wrong (not merely renamed, but genuinely in the wrong place),
 click the **pin icon** (next to the pencil) in the bottom drawer. This opens the same map-picker
-dialog used everywhere else in the app (the Lightbox's "Pin on Map", bulk Edit Date/Location) — drop
+dialog used everywhere else in the app (the Lightbox's "Pin on Map", bulk Edit Info) — drop
 a pin, paste a Google Maps link, or search a place name — and confirming applies the new
 coordinates and name to every photo in the cluster at once.
 
@@ -564,6 +583,13 @@ matching photo is automatically collected into an album or moved to a folder.
   an **"AI Info"** card with its cached caption and tags on an **Overview** tab; if the photo has
   been checked by more than one of your Smart Flows, a second **Smart Flows** tab lists each flow's
   name, whether it matched, and its confidence.
+  - Click the **pencil icon** on the AI Info card to correct or delete what the AI got wrong:
+    edit the caption, remove a tag chip, or add your own. Clearing the caption or removing every
+    tag and saving deletes it outright — it doesn't bring back the AI's original guess later. This
+    is a plain correction, separate from the Smart Flows tab's match verdicts.
+  - To do the same across many photos at once, select them in the gallery and use the **Edit
+    Info** button on the selection toolbar (see [§4](#4-timeline-gallery--dynamic-zoom)) — it has
+    its own "Set AI Description & Tags" section alongside date/location.
 
 ### Smart Flows' Cloud Fallback is configured separately from AI Search
 
@@ -603,19 +629,17 @@ too:
    default `http://127.0.0.1:11434` (e.g. a different machine on your network), next to a
    **Context Window (tokens)** field — see below.
 
-**Batch size adjusts itself to your context window**: Ollama has no API that reports back what
-context length (`num_ctx` / `OLLAMA_CONTEXT_LENGTH`) you've actually set a running model to use, so
-the **Context Window** field in Settings is where you tell gPhotos what you configured in Ollama
-(default 4096, matching Ollama's own out-of-the-box default). Before each local run, gPhotos also
-asks Ollama for that model's own maximum architectural context (via `/api/show`) and uses whichever
-is smaller, so a typo or a too-high number here can never overrun what the model itself supports.
-That effective context is then converted into a batch size — each photo's 512px thumbnail costs
-roughly 360 tokens of context, so a bigger window means more photos per call (and fewer, faster
-round-trips), capped at 20 photos per call for reliability. The run window's log shows the exact
-numbers it resolved to at the top of every run (e.g. *"Local model context: 32768 tokens — sending
-up to 20 photos per call"*). **If you've set Ollama's own context window to 32768** (or raised the
-`OLLAMA_CONTEXT_LENGTH` environment variable), set this field to match — otherwise gPhotos will
-assume the 4096-token default and batch far more conservatively than your setup actually allows.
+**The local pass always checks one photo per call — never batched**: Ollama has no API that reports
+back what context length (`num_ctx` / `OLLAMA_CONTEXT_LENGTH`) you've actually set a running model
+to use, so the **Context Window** field in Settings is where you tell gPhotos what you configured
+in Ollama (default 4096, matching Ollama's own out-of-the-box default). Before each local run,
+gPhotos also asks Ollama for that model's own maximum architectural context (via `/api/show`) and
+uses whichever is smaller, so a typo or a too-high number here can never overrun what the model
+itself supports. That effective context no longer changes how many photos go in one call, though —
+sending more than one photo at a time let a small local model return a confident but wrong
+caption/tag for the wrong photo in the batch, so every local call now covers exactly one photo,
+however large the context window is. The run window's log still shows the resolved context at the
+top of every run.
 
 ---
 
@@ -720,6 +744,13 @@ the main gallery.
   search, so they survive a restart and don't need re-analysing. A tagged search only matches photos a
   Smart Flow has actually analysed — one never checked by any flow won't match even if it probably
   would qualify.
+- **"OR" between tags**: mention two or more tags together with the word **"or"** — "&bird or
+  &birds" matches a photo tagged with *either* one, not only photos tagged with both. Without "or",
+  multiple tags still mean **AND** (a photo must carry every one of them) — "&sunset and &beach"
+  only matches photos tagged with both.
+- **Excluding a tag**: add **"but not &TAG"** (also "except &TAG" / "without &TAG") at the end —
+  "&cat but not &dog" finds cat-tagged photos with no dog tag. A photo no Smart Flow has ever
+  analysed trivially has no tags to exclude, so it isn't filtered out by this alone.
 
 ## 19. Auto-Describe & Tag Photos (Background)
 

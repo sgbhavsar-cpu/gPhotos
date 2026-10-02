@@ -99,6 +99,9 @@ interface PhotoLightboxProps {
   onSelectPhoto: (photo: Photo) => void;
   onToggleFavorite: (photoId: string) => void;
   onNavigateToPerson?: (personId: string) => void;
+  /** Came here from a person's page — highlight that person's face marker (a distinct color from
+   *  the normal hover highlight) so it's never lost among a photo's other faces. */
+  highlightPersonId?: string | null;
 }
 
 export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
@@ -109,6 +112,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   onSelectPhoto,
   onToggleFavorite,
   onNavigateToPerson,
+  highlightPersonId,
 }) => {
   const isMobile = useIsMobile();
   // On mobile the info panel is a full-width overlay on top of the photo
@@ -2055,6 +2059,10 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                 // since a person chip hover has no native CSS :hover on the marker itself.
                 const isDimmedByHover = hoveredFaceId !== null && hoveredFaceId !== face.id;
                 const isHighlighted = hoveredFaceId === face.id;
+                // Came into the lightbox from this person's page — mark their face in this photo
+                // with a persistent, distinct (amber, not the hover blue) highlight so it's never
+                // lost among the photo's other faces.
+                const isFromPerson = !!highlightPersonId && face.personId === highlightPersonId;
 
                 return (
                   <div
@@ -2077,6 +2085,14 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                       height: `${height}px`,
                       opacity: isDimmedByHover ? 0 : 1,
                       pointerEvents: isDimmedByHover ? 'none' : undefined,
+                      ...(isFromPerson
+                        ? {
+                            borderColor: '#f59e0b',
+                            borderWidth: '3px',
+                            background: 'rgba(245, 158, 11, 0.2)',
+                            boxShadow: '0 0 14px rgba(245, 158, 11, 0.65)',
+                          }
+                        : null),
                       ...(isHighlighted
                         ? {
                             borderColor: '#60a5fa',
@@ -2622,7 +2638,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
               return (
                 <>
                   <hr style={{ borderColor: 'var(--border-subtle)', margin: 0 }} />
-                  <PhotoAiInfoPanel entry={contentInfo} />
+                  <PhotoAiInfoPanel photoId={photo.id} entry={contentInfo} />
                 </>
               );
             })()}

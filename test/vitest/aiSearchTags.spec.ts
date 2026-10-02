@@ -98,4 +98,80 @@ describe('AI search: "&tag" Smart Flow content-tag matching', () => {
       expect(res.filter.tagsMustInclude).toEqual([tag]);
     });
   });
+
+  // Reported bug: "&bird or &birds" returned zero results, because two tags mentioned together were
+  // always treated as AND (must have BOTH) — a photo tagged just "bird" was never also tagged
+  // "birds", so nothing could ever match. "or" between tags should mean "has at least one of them".
+  describe('"OR" between tags: "&bird or &birds" means either tag, not both', () => {
+    it('smartLocalNlp puts multiple "or"-joined tags in tagsMatchAny, not tagsMustInclude', () => {
+      const bird = `${uid(1)}_bird`, birds = `${uid(1)}_birds`;
+      recordFinding(uid(1), 'x', { match: true, confidence: 0.9, tags: [bird] });
+      recordFinding(uid(2), 'x', { match: true, confidence: 0.9, tags: [birds] });
+      const filter = aiSearchService.smartLocalNlp(`Photo ${bird} or ${birds}`, people, [photo(uid(1)), photo(uid(2))]);
+      expect(filter.tagsMatchAny?.sort()).toEqual([bird, birds].sort());
+      expect(filter.tagsMustInclude).toBeUndefined();
+    });
+
+    it('applyFilter with tagsMatchAny matches a photo with EITHER tag, not just one tagged with both', () => {
+      const bird = `${uid(1)}_bird`, birds = `${uid(1)}_birds`;
+      recordFinding(uid(1), 'x', { match: true, confidence: 0.9, tags: [bird] });
+      recordFinding(uid(2), 'x', { match: true, confidence: 0.9, tags: [birds] });
+      recordFinding(uid(3), 'x', { match: true, confidence: 0.9, tags: ['cat'] }); // neither
+      const result = aiSearchService.applyFilter(
+        { queryText: '', explanation: '', tagsMatchAny: [bird, birds] },
+        [photo(uid(1)), photo(uid(2)), photo(uid(3))],
+        people
+      );
+      expect(result.map((p) => p.id).sort()).toEqual([uid(1), uid(2)].sort());
+    });
+
+    it('end-to-end: "&bird or &birds" no longer returns zero results', async () => {
+      const bird = `${uid(1)}_bird`, birds = `${uid(1)}_birds`;
+      recordFinding(uid(1), 'x', { match: true, confidence: 0.9, tags: [bird] });
+      const photos = [photo(uid(1))];
+      const res = await aiSearchService.search(`${bird} or ${birds}`, photos, people);
+      expect(res.matchedPhotos.map((p) => p.id)).toEqual([uid(1)]);
+    });
+
+    it('without "or", multiple tags are still AND (unchanged default behavior)', () => {
+      const a = `${uid(1)}_a`, b = `${uid(1)}_b`;
+      recordFinding(uid(1), 'x', { match: true, confidence: 0.9, tags: [a, b] });
+      const filter = aiSearchService.smartLocalNlp(`Photo ${a} and ${b}`, people, [photo(uid(1))]);
+      expect(filter.tagsMustInclude?.sort()).toEqual([a, b].sort());
+      expect(filter.tagsMatchAny).toBeUndefined();
+    });
+  });
+
+  describe('"but not &tag": excluding a tag', () => {
+    it('smartLocalNlp detects an excluded tag separately from required tags', () => {
+      const cat = `${uid(1)}_cat`, dog = `${uid(1)}_dog`;
+      recordFinding(uid(1), 'x', { match: true, confidence: 0.9, tags: [cat] });
+      recordFinding(uid(2), 'x', { match: true, confidence: 0.9, tags: [dog] });
+      const filter = aiSearchService.smartLocalNlp(`Photo ${cat} but not ${dog}`, people, [photo(uid(1)), photo(uid(2))]);
+      expect(filter.tagsMustInclude).toEqual([cat]);
+      expect(filter.tagsMustExclude).toEqual([dog]);
+    });
+
+    it('applyFilter excludes any photo carrying the excluded tag', () => {
+      const cat = `${uid(1)}_cat`, dog = `${uid(1)}_dog`;
+      recordFinding(uid(1), 'x', { match: true, confidence: 0.9, tags: [cat] });
+      recordFinding(uid(2), 'x', { match: true, confidence: 0.9, tags: [cat, dog] });
+      const result = aiSearchService.applyFilter(
+        { queryText: '', explanation: '', tagsMustInclude: [cat], tagsMustExclude: [dog] },
+        [photo(uid(1)), photo(uid(2))],
+        people
+      );
+      expect(result.map((p) => p.id)).toEqual([uid(1)]);
+    });
+
+    it('a photo never analysed by any flow trivially satisfies a tag exclusion (nothing to exclude)', () => {
+      const dog = `${uid(1)}_dog`;
+      const result = aiSearchService.applyFilter(
+        { queryText: '', explanation: '', tagsMustExclude: [dog] },
+        [photo(uid(1))],
+        people
+      );
+      expect(result.map((p) => p.id)).toEqual([uid(1)]);
+    });
+  });
 });

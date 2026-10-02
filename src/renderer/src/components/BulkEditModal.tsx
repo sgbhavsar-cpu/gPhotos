@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
-import { X, Calendar, MapPin, Check, Sparkles } from 'lucide-react';
+import { X, Calendar, MapPin, Check, Sparkles, Wand2, Plus } from 'lucide-react';
 import { Photo, LocationMetadata } from '../../../types';
 import { libraryStore } from '../services/libraryStore';
 import { notify, notifyError } from '../services/notifications';
 import { LocationPickerModal } from './LocationPickerModal';
+import { setCaptionAndTags } from '../services/photoContentCache';
 
 interface BulkEditModalProps {
   photos: Photo[];
@@ -11,11 +12,14 @@ interface BulkEditModalProps {
 }
 
 /**
- * Applies a single date/time and/or location to every selected photo at
- * once. Each field has its own "apply" checkbox so the user can change just
- * one without touching the other. Date writes also try to update each
- * photo's actual file (EXIF for JPEG, mtime for everything) — same
- * best-effort behavior as the single-photo editor in PhotoLightbox.
+ * Applies a single date/time, location, and/or AI caption/tags to every
+ * selected photo at once ("Edit Info" in the gallery toolbar). Each section
+ * has its own "apply" checkbox so the user can change just one without
+ * touching the others. Date writes also try to update each photo's actual
+ * file (EXIF for JPEG, mtime for everything) — same best-effort behavior as
+ * the single-photo editor in PhotoLightbox. AI caption/tags go through
+ * setCaptionAndTags (a plain overwrite into the per-library photo_content
+ * cache), the same path PhotoAiInfoPanel's single-photo editor uses.
  */
 export const BulkEditModal: React.FC<BulkEditModalProps> = ({ photos, onClose }) => {
   const [applyDate, setApplyDate] = useState(false);
@@ -24,11 +28,22 @@ export const BulkEditModal: React.FC<BulkEditModalProps> = ({ photos, onClose })
   const [locationInput, setLocationInput] = useState('');
   const [pickedLatLng, setPickedLatLng] = useState<{ lat: number; lng: number } | null>(null);
   const [showLocationPicker, setShowLocationPicker] = useState(false);
+  const [applyAiInfo, setApplyAiInfo] = useState(false);
+  const [aiCaption, setAiCaption] = useState('');
+  const [aiTags, setAiTags] = useState<string[]>([]);
+  const [newAiTagInput, setNewAiTagInput] = useState('');
   const [isSaving, setIsSaving] = useState(false);
   const [resultMessage, setResultMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const canApply = (applyDate && !!dateInput) || (applyLocation && !!locationInput.trim());
+  const addAiTag = () => {
+    const clean = newAiTagInput.trim().toLowerCase();
+    if (clean && !aiTags.includes(clean)) setAiTags([...aiTags, clean]);
+    setNewAiTagInput('');
+  };
+  const removeAiTag = (tag: string) => setAiTags(aiTags.filter((t) => t !== tag));
+
+  const canApply = (applyDate && !!dateInput) || (applyLocation && !!locationInput.trim()) || applyAiInfo;
 
   const handleApply = async () => {
     if (!canApply || isSaving) return;
@@ -69,7 +84,7 @@ export const BulkEditModal: React.FC<BulkEditModalProps> = ({ photos, onClose })
       }
 
       // Nothing to apply (e.g. invalid date and no resolvable place): say so instead of "Updated N photos".
-      if (!newDateIso && !newLocation) {
+      if (!newDateIso && !newLocation && !applyAiInfo) {
         setErrorMessage(
           applyLocation && locationInput.trim() && !applyDate
             ? (lookupFailed
@@ -78,6 +93,15 @@ export const BulkEditModal: React.FC<BulkEditModalProps> = ({ photos, onClose })
             : 'Nothing to apply — enter a valid date or location.'
         );
         return;
+      }
+
+      // AI caption/tags live in the per-library photo_content cache, not on the Photo object — a
+      // plain overwrite per photo (setCaptionAndTags), separate from the date/location write paths
+      // above. An empty caption/tags here is a deliberate "clear it", same as the single-photo editor.
+      if (applyAiInfo) {
+        const cleanCaption = aiCaption.trim();
+        const cleanTags = Array.from(new Set(aiTags.map((t) => t.toLowerCase().trim()).filter(Boolean)));
+        for (const p of photos) setCaptionAndTags(p.id, cleanCaption, cleanTags);
       }
 
       // Write the files with a small worker pool (one IPC per photo, but never thousands at once).
@@ -221,6 +245,64 @@ export const BulkEditModal: React.FC<BulkEditModalProps> = ({ photos, onClose })
                   {pickedLatLng
                     ? `Pinned at ${pickedLatLng.lat.toFixed(5)}°, ${pickedLatLng.lng.toFixed(5)}°`
                     : 'Type a name (auto-located) or pin it precisely on the map'}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* AI Description & Tags section */}
+          <div>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.85rem', fontWeight: 600, marginBottom: '8px', cursor: 'pointer' }}>
+              <input type="checkbox" checked={applyAiInfo} onChange={(e) => setApplyAiInfo(e.target.checked)} />
+              <Wand2 size={14} />
+              <span>Set AI Description &amp; Tags</span>
+            </label>
+            {applyAiInfo && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                <textarea
+                  value={aiCaption}
+                  onChange={(e) => setAiCaption(e.target.value)}
+                  placeholder="Caption (leave empty to clear it on all selected photos)"
+                  rows={2}
+                  className="input"
+                  style={{ fontSize: '0.85rem', resize: 'vertical', width: '100%' }}
+                />
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                  {aiTags.map((tag) => (
+                    <span key={tag} style={{
+                      display: 'inline-flex', alignItems: 'center', gap: '5px',
+                      fontSize: '0.75rem', padding: '3px 6px 3px 10px', borderRadius: 'var(--radius-full)',
+                      background: 'rgba(192, 132, 252, 0.12)', border: '1px solid rgba(192, 132, 252, 0.3)', color: '#c084fc',
+                    }}>
+                      {tag}
+                      <span onClick={() => removeAiTag(tag)} title={`Remove "${tag}"`} style={{ cursor: 'pointer', display: 'flex', alignItems: 'center' }}>
+                        <X size={11} />
+                      </span>
+                    </span>
+                  ))}
+                </div>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  <input
+                    type="text"
+                    value={newAiTagInput}
+                    onChange={(e) => setNewAiTagInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        addAiTag();
+                      }
+                    }}
+                    placeholder="Add a tag..."
+                    className="input"
+                    style={{ flex: 1, fontSize: '0.8rem' }}
+                  />
+                  <button className="btn btn-secondary" onClick={addAiTag} disabled={!newAiTagInput.trim()} style={{ fontSize: '0.78rem', padding: '4px 10px', gap: '4px' }}>
+                    <Plus size={13} />
+                    <span>Add</span>
+                  </button>
+                </div>
+                <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                  Replaces each selected photo's own caption/tags — it doesn't merge with what's already there.
                 </div>
               </div>
             )}

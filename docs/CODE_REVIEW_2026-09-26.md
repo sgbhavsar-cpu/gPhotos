@@ -1733,3 +1733,63 @@ the fix didn't disturb that equivalence property. Typecheck clean; `build:ui`, `
 the Windows installer (`electron-builder --win`) all rebuilt successfully with this fix included —
 the v2.2.0 artifacts built moments earlier (before this fix) were discarded and rebuilt fresh. Full
 suite re-run clean: 838 passing, 3 skipped (unrelated), 0 failures.
+
+## 48. Follow-up to §45: the self-reported "image" index wasn't enough — local batching removed entirely
+
+Reported (with screenshots): two adjacent photos in the library each showed an AI Info caption that
+actually described a *different* photo from the same run — not each other's (not a simple swap),
+each one's displayed caption belonged to some other photo entirely. This is the exact failure mode
+§45 was meant to fix, now observed again after that fix shipped — via the new always-on background
+auto-tagging feature (`aiAutoIndexService.ts`, docs/FEATURE_AI_AUTO_TAGGING.md), which sends far more
+local vision calls than manual Smart Flow runs ever did, and (unlike Smart Flows' human-reviewed
+match/no-match verdicts) writes its caption/tags straight into the shared cache with zero review —
+exactly where a mismatch is both more likely to occur and least likely to be caught before the user
+sees it.
+
+**Root cause: §45's fix narrows the failure, it doesn't close it.** `parseBatchClassifyResponse`
+trusts a model's self-reported `"image"` index over array position — but only ever checked that the
+indices were *present, distinct, and in range*, never that they were *correct*. A small (7B-class)
+local model can return a well-formed, correctly-sized response where every entry carries a valid,
+distinct, in-range `"image"` value that is nonetheless a confident, consistent lie — e.g.
+consistently reporting "image: 1" for content that's actually about the second photo it was shown.
+There is no way to detect this from the response's shape alone; by the time the array comes back,
+whatever confusion happened inside the model's own attention over multiple images in one prompt has
+already corrupted the mapping, index field included. §45's fix genuinely helps when the model gets
+the *position* wrong while still tracking *which photo is which* correctly — it does nothing when
+the model loses track of which photo is which in the first place.
+
+**Fix: stop asking a local model to track more than one photo per request at all.**
+`ollamaVisionService.ts`'s `MAX_LOCAL_BATCH_SIZE` (previously 20, sized from the context window via
+`computeLocalBatchSize`) is now pinned to `1`. One photo per local vision call makes cross-photo
+attribution confusion structurally impossible — there is no second image in the request for the
+model to conflate the first one with. This applies everywhere `computeLocalBatchSize` is used:
+`smartFlowsService.ts`'s local pass and `aiAutoIndexService.ts`'s background loop both now send
+exactly one image per call, with no change to either's own calling code (both already compute their
+batch size by calling this one function). Cloud providers are unaffected — their fixed
+`CLOUD_BATCH_SIZE` batching stays as-is; nothing reported an issue there, and §45's index-based fix
+still covers them as a second line of defense regardless.
+
+The honest tradeoff: this is strictly slower (N local vision calls instead of batched ones) for both
+the local Smart Flows pass and the background auto-tagging feature. Correctness clearly outweighs
+throughput for data that's displayed as fact with no human review — Settings' Context Window help
+text and the in-run log line were both updated to stop advertising "more photos per call" for a
+bigger context window, since that's no longer true (the context window now only sizes a single call's
+own token budget). The `computeLocalBatchSize` function and its token-budget math were kept rather
+than deleted, as the sizing a future, more reliable local model might reintroduce batching with.
+
+**What this does NOT fix**: photos already mis-captioned by a run before this fix shipped keep their
+wrong caption/tags — `aiAutoIndexService`'s "already done" check is "has any non-empty caption",
+which doesn't distinguish a correct caption from a wrong one, so an already-corrupted entry is never
+automatically retried. The practical workaround with existing features: running any Smart Flow
+against the affected photos re-sends them to vision (Smart Flows' own skip-check is per-flow-
+description, not "has a caption"), overwriting the bad caption with a fresh, now-single-image,
+correct one. No new "clear/retag" UI was built for this — not requested, and the existing Smart
+Flow workaround already covers it.
+
+**Verification.** New test in `ollamaVisionService.spec.ts`: `computeLocalBatchSize` returns `1`
+regardless of context window size (512 through 128,000 tokens) — a direct regression lock on the
+constant itself, which no prior test covered. `aiAutoIndexService.spec.ts` (8 tests) and
+`smartFlows.spec.ts` (19 tests) both re-run clean unchanged — neither asserted a specific batch size
+or call count that this affects (T1/T2/T7/T9 in the former all remain correct whether the local pass
+makes one call or several, since the test fixtures size their mocked responses to however many
+images an actual call carries). Typecheck clean. Full suite re-run clean (see below).

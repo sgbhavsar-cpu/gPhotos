@@ -21,6 +21,20 @@ describe('ollamaVisionService', () => {
     expect(mod.getOllamaConfig()).toEqual({ baseUrl: 'http://127.0.0.1:11434', visionModel: 'qwen2.5vl:7b', embedModel: 'nomic-embed-text', contextWindow: 4096 });
   });
 
+  describe('computeLocalBatchSize — pinned to 1 (see MAX_LOCAL_BATCH_SIZE doc comment)', () => {
+    // Regression test for a real, confirmed bug: a small local vision model given more than one
+    // image in a single request can return a well-formed, correctly-sized, plausibly-indexed
+    // response that nevertheless conflates which photo is which — a user reported two adjacent
+    // photos each showing a caption that actually described a DIFFERENT photo from the same run.
+    // Sending exactly one photo per local call makes that class of bug structurally impossible.
+    it('is always 1, regardless of how large the context window is', async () => {
+      await load();
+      expect(mod.computeLocalBatchSize(512)).toBe(1);
+      expect(mod.computeLocalBatchSize(4096)).toBe(1);
+      expect(mod.computeLocalBatchSize(128000)).toBe(1);
+    });
+  });
+
   it('saveOllamaConfig persists a partial override, merged with the rest of the defaults, surviving a reload', async () => {
     await load();
     mod.saveOllamaConfig({ visionModel: 'llava:13b' });

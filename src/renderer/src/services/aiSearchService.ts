@@ -24,8 +24,12 @@ export interface AiPhotoFilter {
   /** "stavan and stuti only" / "only photo of monika" — the photo must show exactly peopleMustInclude, nobody else. */
   peopleExactOnly?: boolean;
   locationQuery?: string;
-  /** Smart Flow content tags (photoContentCache) a matching photo must have — the '&tag' autocomplete. */
+  /** Smart Flow content tags (photoContentCache) a matching photo must have ALL of (AND) — the '&tag' autocomplete. */
   tagsMustInclude?: string[];
+  /** "&bird or &birds" — a matching photo must have AT LEAST ONE of these tags, not all of them. */
+  tagsMatchAny?: string[];
+  /** "but not &tag" / "except &tag" — a matching photo must have NONE of these tags. */
+  tagsMustExclude?: string[];
   childhoodPersonName?: string;
   dateRange?: {
     start?: string;
@@ -315,34 +319,57 @@ class AiSearchService {
       }
     }
 
-    // 4. Detect Smart Flow content tags mentioned in the query — what the "&tag" autocomplete
-    // inserts verbatim (e.g. "Photo of a receipt tagged bill"), same approach as the "#place" known-
-    // value loop above: only tags this library has actually recorded (photoContentCache) are
-    // recognised, so a random word never gets misread as a tag filter.
-    const foundTags = getAllKnownTags().filter((tag) => new RegExp(`\\b${this.escapeRegExp(tag.toLowerCase())}\\b`, 'i').test(q));
-    if (foundTags.length > 0) {
-      filter.tagsMustInclude = foundTags;
-    }
-
-    // 5. Detect excluded people: "photo of monika but not raji", "monika except raji", "without raji".
-    // These clauses are normally trailing, so matching to end-of-string keeps this simple and avoids
-    // the exclusion keyword itself (e.g. "not") being mistaken for part of a name elsewhere.
+    // 4. Detect excluded people/tags: "photo of monika but not raji", "&cat but not &dog",
+    // "monika except raji", "without raji". These clauses are normally trailing, so matching to
+    // end-of-string keeps this simple and avoids the exclusion keyword itself (e.g. "not") being
+    // mistaken for part of a name/tag elsewhere. Checked before inclusion detection below, so a
+    // person/tag named in the exclusion clause is never ALSO picked up as something that must be
+    // present — resolved against known tags first since the "&tag" autocomplete always inserts an
+    // exact, unambiguous tag name, falling back to a person-name match otherwise.
     const excludeMatch = q.match(/\b(?:but\s+not|except(?:\s+for)?|excluding|without)\s+([a-z0-9_ ,&]+)$/i);
     const excludedPeople: Person[] = [];
+    const excludedTags: string[] = [];
     if (excludeMatch) {
+      const knownTagsLower = new Map(getAllKnownTags().map((t) => [t.toLowerCase(), t]));
       for (const token of excludeMatch[1].split(/,|&|\band\b/i)) {
-        const matched = this.findBestPersonMatch(token.trim(), people);
+        const clean = token.trim().toLowerCase();
+        if (!clean) continue;
+        const tagMatch = knownTagsLower.get(clean);
+        if (tagMatch) {
+          if (!excludedTags.includes(tagMatch)) excludedTags.push(tagMatch);
+          continue;
+        }
+        const matched = this.findBestPersonMatch(clean, people);
         if (matched && !excludedPeople.includes(matched)) excludedPeople.push(matched);
       }
     }
     if (excludedPeople.length > 0) {
       filter.peopleMustExclude = excludedPeople.map((p) => p.name);
     }
+    if (excludedTags.length > 0) {
+      filter.tagsMustExclude = excludedTags;
+    }
+
+    // Everything from here on only looks at the part of the query BEFORE the exclusion clause
+    // (if any), so a name/tag mentioned there is never also picked up as something required.
+    const qForInclude = excludeMatch ? q.slice(0, excludeMatch.index) : q;
+
+    // 5. Detect Smart Flow content tags mentioned in the query — what the "&tag" autocomplete
+    // inserts verbatim (e.g. "Photo of a receipt tagged bill"), same approach as the "#place" known-
+    // value loop above: only tags this library has actually recorded (photoContentCache) are
+    // recognised, so a random word never gets misread as a tag filter. "&bird or &birds" means
+    // EITHER tag (tagsMatchAny); with no "or" between multiple tags, every one is required (AND,
+    // the original/default behavior) — "&bird and &cat" or just "&bird &cat" both still mean both.
+    const foundTags = getAllKnownTags().filter((tag) => new RegExp(`\\b${this.escapeRegExp(tag.toLowerCase())}\\b`, 'i').test(qForInclude));
+    if (foundTags.length > 1 && /\bor\b/i.test(qForInclude)) {
+      filter.tagsMatchAny = foundTags;
+    } else if (foundTags.length > 0) {
+      filter.tagsMustInclude = foundTags;
+    }
 
     // 6. Detect people names mentioned in query (e.g. "sachin and monika", "sachin, monika and rajshree").
     // Scanned only up to the exclusion clause above, so "raji" in "but not raji" isn't also picked up
     // here as someone who must be IN the photo.
-    const qForInclude = excludeMatch ? q.slice(0, excludeMatch.index) : q;
     const foundPeople: Person[] = [];
     for (const person of people) {
       if (excludedPeople.includes(person)) continue;
@@ -412,6 +439,12 @@ class AiSearchService {
     if (filter.tagsMustInclude && filter.tagsMustInclude.length > 0) {
       parts.push(`tagged "${filter.tagsMustInclude.join('", "')}"`);
     }
+    if (filter.tagsMatchAny && filter.tagsMatchAny.length > 0) {
+      parts.push(`tagged "${filter.tagsMatchAny.join('" or "')}"`);
+    }
+    if (filter.tagsMustExclude && filter.tagsMustExclude.length > 0) {
+      parts.push(`not tagged "${filter.tagsMustExclude.join('", "')}"`);
+    }
 
     if (filter.dateRange?.year) {
       parts.push(`from year ${filter.dateRange.year}`);
@@ -455,7 +488,9 @@ Return ONLY valid JSON matching this TypeScript structure:
   "peopleExactOnly": "true if the query says 'only' these people and nobody else, e.g. 'only photo of monika', 'photo of stavan and stuti only' — false/null otherwise. Works with one name or a group.",
   "childhoodPersonName": "Exact person name if query asks for their childhood/baby/early years",
   "locationQuery": "The MOST SPECIFIC place mentioned (a city/place name), otherwise null. If the query names both a place and its country (e.g. 'Andaman, India'), use the specific place — just 'Andaman' — never the bare country alone, which would match every photo from that whole country instead of the one place meant.",
-  "tagsMustInclude": ["List of exact content tags from the list above that the query asks for, otherwise []"],
+  "tagsMustInclude": ["List of exact content tags from the list above the query requires ALL of (AND) — the default when multiple tags are named with no 'or' between them"],
+  "tagsMatchAny": ["List of exact content tags from the list above where the query only needs ONE of them, e.g. 'bird or birds' -> [\"bird\", \"birds\"]. Only used when the query says 'or' between tags — otherwise leave this empty and use tagsMustInclude."],
+  "tagsMustExclude": ["List of exact content tags that must NOT be present, e.g. 'photo tagged cat but not dog' -> [\"dog\"]"],
   "dateRange": { "year": 2024 } // or null if no year mentioned
 }
 Do NOT return markdown fences or other text, ONLY the raw JSON object.`;
@@ -497,6 +532,8 @@ Do NOT return markdown fences or other text, ONLY the raw JSON object.`;
       childhoodPersonName: asString(parsed.childhoodPersonName),
       locationQuery: asString(parsed.locationQuery),
       tagsMustInclude: asStringArray(parsed.tagsMustInclude),
+      tagsMatchAny: asStringArray(parsed.tagsMatchAny),
+      tagsMustExclude: asStringArray(parsed.tagsMustExclude),
       dateRange: asDateRange(parsed.dateRange),
     };
   }
@@ -528,7 +565,9 @@ Return ONLY JSON:
   "peopleExactOnly": boolean | null, // true if query says "only" these people, nobody else (one name or a group)
   "childhoodPersonName": string | null,
   "locationQuery": string | null, // the MOST SPECIFIC place (a city/place name) — if the query names both a place and its country (e.g. "Andaman, India"), use just "Andaman", never the bare country alone, which would match every photo from that whole country
-  "tagsMustInclude": string[],
+  "tagsMustInclude": string[], // ALL of these tags required (AND) — the default when no "or" is used
+  "tagsMatchAny": string[], // ANY ONE of these tags — only when the query says "or" between tags, e.g. "bird or birds"
+  "tagsMustExclude": string[], // e.g. "tagged cat but not dog" -> ["dog"]
   "dateRange": { "year": number } | null
 }`;
 
@@ -572,6 +611,8 @@ Return ONLY JSON:
       childhoodPersonName: asString(parsed.childhoodPersonName),
       locationQuery: asString(parsed.locationQuery),
       tagsMustInclude: asStringArray(parsed.tagsMustInclude),
+      tagsMatchAny: asStringArray(parsed.tagsMatchAny),
+      tagsMustExclude: asStringArray(parsed.tagsMustExclude),
       dateRange: asDateRange(parsed.dateRange),
     };
   }
@@ -771,6 +812,29 @@ Return ONLY JSON:
       });
     }
 
+    // 5b. "&bird or &birds" — a photo must have AT LEAST ONE of these tags, not all.
+    if (filter.tagsMatchAny && filter.tagsMatchAny.length > 0) {
+      const anyTags = filter.tagsMatchAny.map((t) => t.toLowerCase());
+      result = result.filter((p) => {
+        const photoTags = getPhotoContentEntry(p.id)?.tags;
+        if (!photoTags || photoTags.length === 0) return false;
+        const present = new Set(photoTags.map((t) => t.toLowerCase()));
+        return anyTags.some((t) => present.has(t));
+      });
+    }
+
+    // 5c. "but not &tag" — a photo must have NONE of these tags. A photo with no content-cache
+    // entry at all trivially satisfies this (nothing to exclude), unlike the must-include filters.
+    if (filter.tagsMustExclude && filter.tagsMustExclude.length > 0) {
+      const excludedTags = filter.tagsMustExclude.map((t) => t.toLowerCase());
+      result = result.filter((p) => {
+        const photoTags = getPhotoContentEntry(p.id)?.tags;
+        if (!photoTags || photoTags.length === 0) return true;
+        const present = new Set(photoTags.map((t) => t.toLowerCase()));
+        return !excludedTags.some((t) => present.has(t));
+      });
+    }
+
     // 6. Date / Year filter
     const yr = asFiniteNumber(filter.dateRange?.year);
     if (yr) {
@@ -834,6 +898,12 @@ Return ONLY JSON:
 
     if (filter.tagsMustInclude && filter.tagsMustInclude.length > 0) {
       tags.push(`Tags: ${filter.tagsMustInclude.join(', ')}`);
+    }
+    if (filter.tagsMatchAny && filter.tagsMatchAny.length > 0) {
+      tags.push(`Tags (any): ${filter.tagsMatchAny.join(', ')}`);
+    }
+    if (filter.tagsMustExclude && filter.tagsMustExclude.length > 0) {
+      tags.push(`Without tags: ${filter.tagsMustExclude.join(', ')}`);
     }
 
     if (filter.dateRange?.year) {
