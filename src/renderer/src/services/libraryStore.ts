@@ -12,7 +12,9 @@ import {
   cosineDistance,
   computeQualityWeightedCentroid,
   DEFAULT_MATCH_THRESHOLD,
+  type SlimPhotoForMatching,
 } from './clustering';
+import { clusterFacesAsync, matchUnassignedFacesToCentroidAsync } from './clusterWorkerClient';
 
 export interface LibraryState {
   photos: Photo[];
@@ -286,11 +288,76 @@ export class LibraryManager {
     if (photo) this.sigEntries.delete(photo);
   }
 
-  /** clusterFaces edits face objects in place, and those objects are shared with photo.faces. */
-  private cluster(...args: Parameters<typeof clusterFaces>): ReturnType<typeof clusterFaces> {
-    const result = clusterFaces(...args);
+  /**
+   * Runs clusterFaces off the renderer's UI thread (see clusterWorkerClient.ts) — a synchronous
+   * in-process call here was confirmed (hang-watchdog.log, real use, a large library) to freeze the
+   * whole app for 10+ seconds on every single face confirm/reassign.
+   *
+   * The original synchronous clusterFaces edited face objects IN PLACE, and those same objects were
+   * shared by reference between state.faces and every photo.faces array — so every caller's
+   * `this.state.faces = updatedFaces` automatically kept photo.faces in sync for free, just by
+   * object identity. The worker instead returns structured-clone COPIES (a message-passing boundary
+   * can't preserve object identity), so without the resync loop below, every photo.faces array would
+   * silently go stale the instant state.faces was replaced — exactly the class of bug fixed in §49/
+   * the appendCatalogPage fix, reintroduced by this change if not handled here. Resyncing once here
+   * (not in each of this method's ~13 callers) is what keeps that invariant true for all of them.
+   */
+  private async cluster(...args: Parameters<typeof clusterFaces>): Promise<ReturnType<typeof clusterFaces>> {
+    const [faces, people, threshold, allowNewClusters] = args;
+    const result = await clusterFacesAsync(faces, people, threshold, allowNewClusters);
     this.forceFullResign = true;
+
+    const byId = new Map(result.updatedFaces.map((f) => [f.id, f]));
+    for (const photo of this.state.photos) {
+      if (!photo.faces || photo.faces.length === 0) continue;
+      let changed = false;
+      const next = photo.faces.map((f) => {
+        const fresh = byId.get(f.id);
+        if (fresh && fresh !== f) {
+          changed = true;
+          return fresh;
+        }
+        return f;
+      });
+      if (changed) {
+        photo.faces = next;
+        this.touch(photo);
+      }
+    }
+
     return result;
+  }
+
+  // Serializes the "background" half of reassignFaceToPerson/mergePeople (see
+  // queueBackgroundRecluster) so overlapping calls never race: each link only reads
+  // this.state.faces/people once it's actually its turn to run, by which point every earlier
+  // link's results are already applied — same reasoning as saveChain above, for the same kind of
+  // bug (a stale snapshot overwriting a newer one).
+  private backgroundClusterChain: Promise<void> = Promise.resolve();
+
+  /**
+   * Re-clusters the whole library and (optionally) propagates the result to other dangling faces,
+   * WITHOUT making the caller wait for either — both are pure refinements of state that's already
+   * correct the moment the caller's own synchronous edit + notify() ran (this only reconsiders
+   * whether that new ground truth should also reshuffle OTHER faces/people). Used to be awaited
+   * inline, which made reassigning a face to a person show a multi-second "please wait" spinner
+   * before the modal could close — see CODE_REVIEW §58. Still runs on the clusterWorker thread
+   * (never the main process), just no longer blocks the UI action that triggered it.
+   */
+  private queueBackgroundRecluster(propagateForPersonId?: string): void {
+    const run = async () => {
+      const { people, updatedFaces } = await this.cluster(this.state.faces, this.state.people);
+      this.state.people = people;
+      this.state.faces = updatedFaces;
+      this.notify();
+      if (propagateForPersonId) {
+        await this.propagateLearnedFaces(propagateForPersonId);
+      }
+    };
+    // A previous link's rejection must not break the chain for every reassignment queued after it.
+    this.backgroundClusterChain = this.backgroundClusterChain.catch(() => {}).then(run).catch((err) => {
+      console.warn('[LibraryStore] background re-cluster failed:', err);
+    });
   }
 
   public getCachedFaces(photo: { id?: string; filePath?: string; originalRemotePath?: string }): CachedFaceRecord | null {
@@ -409,7 +476,7 @@ export class LibraryManager {
    * clusters unassigned faces, synchronizes state.faces with photo.faces,
    * and updates accurate face/photo counts.
    */
-  public reconcilePeopleAndFaces(): boolean {
+  public async reconcilePeopleAndFaces(): Promise<boolean> {
     let modified = false;
 
     // 1. Gather all faces from all photos and state.faces
@@ -495,7 +562,7 @@ export class LibraryManager {
     if (peopleMap.size === 0 && allFaces.length > 0) {
       const facesWithDesc = allFaces.filter((f) => f.descriptor && f.descriptor.length > 0);
       if (facesWithDesc.length > 0) {
-        const { people, updatedFaces } = this.cluster(allFaces, [], DEFAULT_MATCH_THRESHOLD, true);
+        const { people, updatedFaces } = await this.cluster(allFaces, [], DEFAULT_MATCH_THRESHOLD, true);
         for (const p of people) {
           const registered = this.globalPeopleRegistry.get(p.id);
           if (registered && !/^Person(\s+\d+)?$/i.test(registered.name)) {
@@ -509,7 +576,7 @@ export class LibraryManager {
       }
     } else if (unassignedFaces.length > 0 && peopleMap.size > 0) {
       // If we have some unassigned faces, cluster them matching to existing people or create new clusters
-      const { people, updatedFaces } = this.cluster(allFaces, Array.from(peopleMap.values()), DEFAULT_MATCH_THRESHOLD, true);
+      const { people, updatedFaces } = await this.cluster(allFaces, Array.from(peopleMap.values()), DEFAULT_MATCH_THRESHOLD, true);
       for (const p of people) {
         const registered = this.globalPeopleRegistry.get(p.id);
         if (registered && !/^Person(\s+\d+)?$/i.test(registered.name)) {
@@ -694,7 +761,7 @@ export class LibraryManager {
                 }
               }
 
-              this.reconcilePeopleAndFaces();
+              await this.reconcilePeopleAndFaces();
               this.state.isInitialized = true;
               this.notifyListeners();
               // Screen 1 is already painted from Page 0 above — everything
@@ -747,7 +814,7 @@ export class LibraryManager {
                       }
                     }
                   } catch {}
-                  this.reconcilePeopleAndFaces();
+                  await this.reconcilePeopleAndFaces();
                   this.state.isInitialized = true;
                   this.notifyListeners();
                   // See the matching comment in the Electron fast-path above.
@@ -804,7 +871,7 @@ export class LibraryManager {
         this.state.places = groupPhotosByPlace(this.state.photos);
         
         // Auto-reconcile people and faces if missing or unassigned
-        this.reconcilePeopleAndFaces();
+        await this.reconcilePeopleAndFaces();
 
         // Immediate paint for UI responsiveness
         this.notifyListeners();
@@ -837,7 +904,7 @@ export class LibraryManager {
           }, 1200);
         }
       } else if (this.state.photos.length > 0) {
-        this.reconcilePeopleAndFaces();
+        await this.reconcilePeopleAndFaces();
         this.notifyListeners();
       }
     } catch (err) {
@@ -875,6 +942,11 @@ export class LibraryManager {
       }
       return p;
     });
+    // Every entry belongs to the library we're leaving (or one left even earlier this session) —
+    // firstPage above already carries faces straight from THIS library's own SQLite (attachFacesToPhotos),
+    // so nothing downstream still needs the old entries. Left uncleared, this grows by ~3 entries per
+    // photo (with full face descriptor arrays) on every single switch, for the rest of the session.
+    this.globalFaceCache.clear();
 
     this.state.photos = restoredFirstPage;
     // Stamp the raw DB rows, not the cache-restored copies, so photos
@@ -892,7 +964,7 @@ export class LibraryManager {
     // with that stale data. See replaceAllAlbums' matching guard for
     // the second layer of protection against this.
     this.state.albums = result.albums || [];
-    this.reconcilePeopleAndFaces();
+    void this.reconcilePeopleAndFaces();
     this.notify(true);
     // See the matching comment in loadPersistedData's fast-path.
     this.loadNextCatalogPages(Number.MAX_SAFE_INTEGER);
@@ -1073,6 +1145,16 @@ export class LibraryManager {
    * deduplicatePhotoList when the page actually collides with what's loaded.
    */
   private appendCatalogPage(newPhotos: Photo[]) {
+    // A page's embedded photo.faces must also land in the flat state.faces list — reassignFaceToPerson
+    // (and clustering) only ever look there, never at photo.faces directly. Without this, any face on
+    // a photo loaded past page 1 (the vast majority of a large library) was never added to state.faces
+    // at all — not stale, just never there — so naming an "Unknown Person" face failed on EVERY
+    // attempt for such a photo, not just occasionally after a rescan (see reassignFaceToPerson's
+    // staleIdFallback, which only helps once the face exists there to begin with).
+    for (const p of newPhotos) {
+      if (p.faces && p.faces.length > 0) this.state.faces.push(...p.faces);
+    }
+
     const keyOf = (p: Photo) => (p.originalRemotePath || p.filePath || '').toLowerCase().replace(/\\/g, '/');
     const cache = this.photoKeyCache;
     const keys = cache && cache.arr === this.state.photos ? cache.keys : new Set(this.state.photos.map(keyOf));
@@ -1168,7 +1250,7 @@ export class LibraryManager {
     try {
       // Safety guard: if photos contain faces but people is empty, reconcile first
       if (this.state.people.length === 0 && this.state.photos.some((p) => p.faces && p.faces.length > 0)) {
-        this.reconcilePeopleAndFaces();
+        await this.reconcilePeopleAndFaces();
       }
 
       // When the SQLite catalog fast-path is active, this.state.photos is
@@ -1414,7 +1496,7 @@ export class LibraryManager {
       this.addRecentLibrary(folderPath);
     }
     this.state.places = groupPhotosByPlace(finalDeduped);
-    this.reconcilePeopleAndFaces();
+    void this.reconcilePeopleAndFaces();
     this.notify();
 
     if (typeof window !== 'undefined' && window.electronAPI?.startThumbnailPreCache) {
@@ -1442,7 +1524,7 @@ export class LibraryManager {
     this.state.photos = deduped;
     this.photoKeyCache = null;
     this.state.places = groupPhotosByPlace(deduped);
-    this.reconcilePeopleAndFaces();
+    void this.reconcilePeopleAndFaces();
     this.notify();
 
     if (typeof window !== 'undefined' && window.electronAPI?.startThumbnailPreCache && newPhotos.length > 0) {
@@ -1672,10 +1754,10 @@ export class LibraryManager {
     this.notify(true);
   }
 
-  public propagateLearnedFaces(
+  public async propagateLearnedFaces(
     personId: string,
     options?: { matchThreshold?: number }
-  ): { newlyAssignedCount: number; affectedPhotosCount: number } {
+  ): Promise<{ newlyAssignedCount: number; affectedPhotosCount: number }> {
     // 1. Gather all faces belonging to this person across state.faces and photo.faces
     const personFaces: DetectedFace[] = [];
     const seenFaceIds = new Set<string>();
@@ -1722,54 +1804,47 @@ export class LibraryManager {
     if (!centroid || centroid.length === 0) return { newlyAssignedCount: 0, affectedPhotosCount: 0 };
 
     const threshold = options?.matchThreshold ?? 0.42;
+
+    // Scanning every photo's faces against this person's centroid (two vector-distance computations
+    // each) was the single most expensive step in confirming/reassigning a face — confirmed via
+    // hang-watchdog.log (real use, a large library) to freeze the renderer's one UI thread solid for
+    // 10+ seconds, triggering Electron's own "RENDERER UNRESPONSIVE" detection. A per-chunk yield
+    // here helped but wasn't enough on its own (see CODE_REVIEW §54/§55) — delegated to
+    // clusterWorkerClient instead, which runs the actual computation on a real Web Worker (falling
+    // back to an in-process call only where Worker isn't available at all, e.g. tests), so the main
+    // thread can never block on this regardless of library size.
+    const slimPhotos: SlimPhotoForMatching[] = this.state.photos
+      .filter((p) => p.faces && p.faces.length > 0)
+      .map((p) => ({
+        id: p.id,
+        faces: p.faces!.map((f) => ({ id: f.id, personId: f.personId, isConfirmed: f.isConfirmed, descriptor: f.descriptor })),
+      }));
+    const matches = await matchUnassignedFacesToCentroidAsync(slimPhotos, personId, centroid, threshold);
+
     let newlyAssignedCount = 0;
     const affectedPhotoIds = new Set<string>();
+    for (const { photoId, faceId } of matches) {
+      newlyAssignedCount++;
+      affectedPhotoIds.add(photoId);
 
-    for (const photo of this.state.photos) {
-      if (!photo.faces || photo.faces.length === 0) continue;
-
-      // RULE: Single-photo uniqueness! If personId already in photo, skip
-      const alreadyInPhoto = photo.faces.some((f) => f.personId === personId);
-      if (alreadyInPhoto) continue;
-
-      let bestCandidate: DetectedFace | null = null;
-      let minDistance = Infinity;
-
-      for (const face of photo.faces) {
-        // Only evaluate unassigned faces (or unconfirmed auto-detections)
-        if (face.personId && face.isConfirmed) continue;
-        if (!face.descriptor || face.descriptor.length === 0) continue;
-
-        const cosDist = cosineDistance(face.descriptor, centroid);
-        const euclDist = euclideanDistance(face.descriptor, centroid);
-        const dist = Math.min(cosDist, euclDist);
-
-        if (dist < minDistance) {
-          minDistance = dist;
-          if (dist < threshold) {
-            bestCandidate = face;
-          }
-        }
+      const photo = this.state.photos.find((p) => p.id === photoId);
+      const photoFace = photo?.faces?.find((f) => f.id === faceId);
+      if (photoFace) {
+        photoFace.personId = personId;
+        photoFace.isConfirmed = false;
       }
 
-      if (bestCandidate) {
-        bestCandidate.personId = personId;
-        bestCandidate.isConfirmed = false;
-        newlyAssignedCount++;
-        affectedPhotoIds.add(photo.id);
-
-        const globalFace = this.state.faces.find((f) => f.id === bestCandidate!.id);
-        if (globalFace) {
-          globalFace.personId = personId;
-          globalFace.isConfirmed = false;
-        } else {
-          this.state.faces.push(bestCandidate);
-        }
+      const globalFace = this.state.faces.find((f) => f.id === faceId);
+      if (globalFace) {
+        globalFace.personId = personId;
+        globalFace.isConfirmed = false;
+      } else if (photoFace) {
+        this.state.faces.push(photoFace);
       }
     }
 
     if (newlyAssignedCount > 0) {
-      const { people, updatedFaces } = this.cluster(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
+      const { people, updatedFaces } = await this.cluster(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
       this.state.people = people;
       this.state.faces = updatedFaces;
       this.notify();
@@ -1778,7 +1853,7 @@ export class LibraryManager {
     return { newlyAssignedCount, affectedPhotosCount: affectedPhotoIds.size };
   }
 
-  public mergePeople(targetPersonId: string, sourcePersonId: string, preferredName?: string): boolean {
+  public async mergePeople(targetPersonId: string, sourcePersonId: string, preferredName?: string): Promise<boolean> {
     if (targetPersonId === sourcePersonId) return false;
 
     const check = this.canMergePeople(targetPersonId, sourcePersonId);
@@ -1812,14 +1887,14 @@ export class LibraryManager {
       }
     }
 
-    // Re-cluster / recalculate
-    const { people, updatedFaces } = this.cluster(
-      this.state.faces,
-      this.state.people.filter((p) => p.id !== sourcePersonId)
-    );
-    this.state.people = people;
-    this.state.faces = updatedFaces;
+    // Drop the merged-away person right away so the UI (person list, counts) reflects the merge
+    // immediately — cluster() used to be the only thing that filtered sourcePersonId out, which
+    // meant awaiting it (and the multi-second library-wide re-cluster that comes with it) before
+    // the merge was visible at all. See queueBackgroundRecluster's doc comment / CODE_REVIEW §58.
+    this.state.people = this.state.people.filter((p) => p.id !== sourcePersonId);
     this.notify();
+
+    this.queueBackgroundRecluster();
     return true;
   }
 
@@ -1839,13 +1914,47 @@ export class LibraryManager {
     return newPerson;
   }
 
-  public reassignFaceToPerson(
+  /** Fraction of two boxes' areas that overlap (IoU) — same formula used to match a fresh
+   *  detection against a preserved face in detectAndMatchFacesForPhoto. */
+  private static boxOverlap(a: { x: number; y: number; width: number; height: number }, b: { x: number; y: number; width: number; height: number }): number {
+    const xA = Math.max(a.x, b.x);
+    const yA = Math.max(a.y, b.y);
+    const xB = Math.min(a.x + a.width, b.x + b.width);
+    const yB = Math.min(a.y + a.height, b.y + b.height);
+    const interArea = Math.max(0, xB - xA) * Math.max(0, yB - yA);
+    const aArea = a.width * a.height;
+    const bArea = b.width * b.height;
+    return interArea / (aArea + bArea - interArea);
+  }
+
+  public async reassignFaceToPerson(
     faceId: string,
-    targetPersonIdOrName: string
-  ): { success: boolean; error?: string; propagation?: { newlyAssignedCount: number; affectedPhotosCount: number } } {
-    const face = this.state.faces.find((f) => f.id === faceId);
+    targetPersonIdOrName: string,
+    // Only an UNCONFIRMED face's id survives a rescan of its photo (see detectAndMatchFacesForPhoto /
+    // applyServerDetectedFaces: confirmed/manual faces are preserved as-is, everything else is
+    // replaced with freshly-detected faces under new ids) — so a face that was on screen as "Unknown
+    // Person" a moment ago can have its id go stale while the UI showing it hasn't refreshed yet.
+    // When the id lookup below misses, re-resolve by the same photo + screen position instead of
+    // just failing, so a rescan that happened to run in the background doesn't block naming someone.
+    staleIdFallback?: { photoId: string; box: { x: number; y: number; width: number; height: number } }
+  ): Promise<{ success: boolean; error?: string }> {
+    let face = this.state.faces.find((f) => f.id === faceId);
+    if (!face && staleIdFallback) {
+      let bestOverlap = 0;
+      for (const f of this.state.faces) {
+        if (f.photoId !== staleIdFallback.photoId || !f.box) continue;
+        const overlap = LibraryManager.boxOverlap(f.box, staleIdFallback.box);
+        if (overlap > bestOverlap) { bestOverlap = overlap; face = f; }
+      }
+      if (bestOverlap < 0.5) face = undefined; // too different a position to be confident it's the same face
+    }
     if (!face) {
-      return { success: false, error: 'Face detection not found' };
+      return {
+        success: false,
+        error: staleIdFallback
+          ? 'This face was refreshed by a recent scan — please reopen the photo and try again.'
+          : 'Face detection not found',
+      };
     }
 
     const photo = this.state.photos.find((p) => p.id === face.photoId);
@@ -1903,20 +2012,21 @@ export class LibraryManager {
       }
     }
 
-    // Re-cluster and recalculate face and photo counts
-    const { people, updatedFaces } = this.cluster(this.state.faces, this.state.people);
-    this.state.people = people;
-    this.state.faces = updatedFaces;
+    // The assignment itself is already fully applied above (face.personId/isConfirmed, photo.faces,
+    // the new person if one was created) — notify right away so the caller (e.g. ReassignFaceModal)
+    // can close immediately instead of waiting on the library-wide work below.
     this.recomputeFacesLockedForPhoto(face.photoId);
     this.notify();
 
-    // Propagate learned manual input to improve face detection across other photos!
-    const propagation = this.propagateLearnedFaces(targetPerson.id);
+    // Re-clustering (do other dangling faces/people need reshuffling given this new ground truth?)
+    // and propagating this face to other matching photos are both O(whole library) and don't change
+    // whether THIS reassignment succeeded — see queueBackgroundRecluster's doc comment / CODE_REVIEW §58.
+    this.queueBackgroundRecluster(targetPerson.id);
 
-    return { success: true, propagation };
+    return { success: true };
   }
 
-  public unassignFaceFromPerson(faceId: string): { success: boolean; photoName?: string; personName?: string } {
+  public async unassignFaceFromPerson(faceId: string): Promise<{ success: boolean; photoName?: string; personName?: string }> {
     let unassigned = false;
     let photoName: string | undefined;
     let personName: string | undefined;
@@ -1960,7 +2070,7 @@ export class LibraryManager {
 
     if (unassigned) {
       // Re-calculate people without creating unwanted new clusters for unassigned faces
-      const { people, updatedFaces } = this.cluster(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
+      const { people, updatedFaces } = await this.cluster(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
       this.state.people = people;
       this.state.faces = updatedFaces;
       if (affectedPhotoId) {
@@ -1973,7 +2083,7 @@ export class LibraryManager {
     return { success: unassigned, photoName, personName };
   }
 
-  public confirmFace(faceId: string): { newlyAssignedCount: number; affectedPhotosCount: number } {
+  public async confirmFace(faceId: string): Promise<{ newlyAssignedCount: number; affectedPhotosCount: number }> {
     let face = this.state.faces.find((f) => f.id === faceId);
     if (!face) {
       for (const photo of this.state.photos) {
@@ -2002,7 +2112,7 @@ export class LibraryManager {
       // Active learning: User confirmation anchors ground truth with 2.5x weight in centroid.
       // Automatically scan unassigned/unconfirmed library photos to improve recognition!
       if (face.personId) {
-        propagation = this.propagateLearnedFaces(face.personId);
+        propagation = await this.propagateLearnedFaces(face.personId);
       }
     }
     return propagation;
@@ -2143,7 +2253,7 @@ export class LibraryManager {
     return byOld.size;
   }
 
-  public deleteFaceDetection(faceId: string) {
+  public async deleteFaceDetection(faceId: string) {
     const removedFace = this.state.faces.find((f) => f.id === faceId);
     this.state.faces = this.state.faces.filter((f) => f.id !== faceId);
     for (const photo of this.state.photos) {
@@ -2151,7 +2261,7 @@ export class LibraryManager {
         photo.faces = photo.faces.filter((f) => f.id !== faceId);
       }
     }
-    const { people, updatedFaces } = this.cluster(this.state.faces, this.state.people);
+    const { people, updatedFaces } = await this.cluster(this.state.faces, this.state.people);
     this.state.people = people;
     this.state.faces = updatedFaces;
     if (removedFace) {
@@ -2170,7 +2280,7 @@ export class LibraryManager {
    * through a re-sync — until the user explicitly re-runs "Scan Faces" on
    * this specific photo (detectAndMatchFacesForPhoto clears the flag).
    */
-  public removeUnknownFacesFromPhoto(photoId: string): { removedCount: number } {
+  public async removeUnknownFacesFromPhoto(photoId: string): Promise<{ removedCount: number }> {
     const photo = this.state.photos.find((p) => p.id === photoId);
     if (!photo) return { removedCount: 0 };
 
@@ -2191,7 +2301,7 @@ export class LibraryManager {
           p.faces = p.faces.filter((f) => !idsToRemove.has(f.id));
         }
       }
-      const { people, updatedFaces } = this.cluster(this.state.faces, this.state.people);
+      const { people, updatedFaces } = await this.cluster(this.state.faces, this.state.people);
       this.state.people = people;
       this.state.faces = updatedFaces;
     }
@@ -2235,7 +2345,7 @@ export class LibraryManager {
    * Also locks the photo from auto-rescanning, since the same face
    * embedding would otherwise immediately reproduce the same guess.
    */
-  public removeUnconfirmedFacesFromPhoto(photoId: string): { removedCount: number } {
+  public async removeUnconfirmedFacesFromPhoto(photoId: string): Promise<{ removedCount: number }> {
     const photo = this.state.photos.find((p) => p.id === photoId);
     if (!photo) return { removedCount: 0 };
 
@@ -2248,7 +2358,7 @@ export class LibraryManager {
           p.faces = p.faces.filter((f) => !idsToRemove.has(f.id));
         }
       }
-      const { people, updatedFaces } = this.cluster(this.state.faces, this.state.people);
+      const { people, updatedFaces } = await this.cluster(this.state.faces, this.state.people);
       this.state.people = people;
       this.state.faces = updatedFaces;
     }
@@ -2265,7 +2375,7 @@ export class LibraryManager {
    * removeUnconfirmedFacesFromPhoto, nothing is deleted so the faces remain
    * available to be manually re-tagged or re-matched on a future scan.
    */
-  public resetUnconfirmedFacesToUnknown(photoId: string): { resetCount: number } {
+  public async resetUnconfirmedFacesToUnknown(photoId: string): Promise<{ resetCount: number }> {
     const photo = this.state.photos.find((p) => p.id === photoId);
     if (!photo) return { resetCount: 0 };
 
@@ -2287,7 +2397,7 @@ export class LibraryManager {
         }
         return p;
       });
-      const { people, updatedFaces } = this.cluster(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
+      const { people, updatedFaces } = await this.cluster(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
       this.state.people = people;
       this.state.faces = updatedFaces;
       this.notify(true);
@@ -2296,7 +2406,7 @@ export class LibraryManager {
     return { resetCount: idsToReset.size };
   }
 
-  public updateFacesAndPeople(newFaces: DetectedFace[]) {
+  public async updateFacesAndPeople(newFaces: DetectedFace[]) {
     // Merge new faces
     const faceMap = new Map(this.state.faces.map((f) => [f.id, f]));
     for (const f of newFaces) {
@@ -2304,7 +2414,7 @@ export class LibraryManager {
     }
     const mergedFaces = Array.from(faceMap.values());
 
-    const { people, updatedFaces } = this.cluster(mergedFaces, this.state.people);
+    const { people, updatedFaces } = await this.cluster(mergedFaces, this.state.people);
     this.state.faces = updatedFaces;
     this.state.people = people;
 
@@ -2408,7 +2518,7 @@ export class LibraryManager {
     this.notifyListeners();
   }
 
-  public deletePerson(personId: string): boolean {
+  public async deletePerson(personId: string): Promise<boolean> {
     const person = this.state.people.find((p) => p.id === personId);
     if (!person) return false;
 
@@ -2435,7 +2545,7 @@ export class LibraryManager {
     const remainingPeople = this.state.people.filter((p) => p.id !== personId);
 
     // 3. Recalculate people and faces without creating new clusters for unassigned faces
-    const { people, updatedFaces } = this.cluster(this.state.faces, remainingPeople, DEFAULT_MATCH_THRESHOLD, false);
+    const { people, updatedFaces } = await this.cluster(this.state.faces, remainingPeople, DEFAULT_MATCH_THRESHOLD, false);
     this.state.people = people;
     this.state.faces = updatedFaces;
     this.notify();
@@ -2461,7 +2571,18 @@ export class LibraryManager {
       box,
       imageWidth,
       imageHeight,
-      descriptor: descriptor && descriptor.length === 128 ? descriptor : new Array(128).fill(0),
+      // A real descriptor (512-d ArcFace/MobileFaceNet — faceDetectionEngine.ts) is only available
+      // when the drawn box actually contained a detectable face; computeDescriptorForRegion returns
+      // null otherwise (e.g. tagging someone shown from behind — see CODE_REVIEW §59). An EMPTY array
+      // here, not a fake same-length-as-nothing-in-particular zero vector, is what every distance/
+      // centroid function already treats as "no exemplar" (the `length > 0` guard used everywhere
+      // else in this file and in clustering.ts) — this used to default to a 128-length zero array,
+      // but the real model is 512-d, so that mismatch made computeQualityWeightedCentroid skip this
+      // person's every REAL exemplar instead of just this one fake one, whenever the fake one sorted
+      // first. An empty array can't trigger that: it fails the `length > 0` check immediately and is
+      // never counted as an exemplar at all, while the face itself still carries personId, so it's
+      // still taggable/searchable (PeopleView/albums/AI search all filter by personId alone).
+      descriptor: descriptor && descriptor.length > 0 ? descriptor : [],
       confidence: 1.0,
       isConfirmed: true,
       isManual: true,
@@ -2475,11 +2596,11 @@ export class LibraryManager {
     return newFace;
   }
 
-  public detectAndMatchFacesForPhoto(
+  public async detectAndMatchFacesForPhoto(
     photoId: string,
     newDetections: DetectedFace[],
     precisionThreshold = 0.48
-  ): Photo {
+  ): Promise<Photo> {
     const photo = this.state.photos.find((p) => p.id === photoId);
     if (!photo) throw new Error(`Photo ${photoId} not found`);
 
@@ -2493,7 +2614,10 @@ export class LibraryManager {
     }
 
     for (const face of this.state.faces) {
-      if (face.personId && personAllFaces.has(face.personId) && face.descriptor && face.descriptor.length === 128) {
+      // Same magic-number bug as addManualFace above: real descriptors are 512-d, not 128 — fixed to
+      // the same `length > 0` check used everywhere else (clustering.ts, this file's own
+      // facesWithDesc/propagateLearnedFaces checks) rather than a specific dimension.
+      if (face.personId && personAllFaces.has(face.personId) && face.descriptor && face.descriptor.length > 0) {
         personAllFaces.get(face.personId)!.push(face);
         if (face.isConfirmed || face.isManual) {
           personConfirmedFaces.get(face.personId)!.push(face);
@@ -2591,7 +2715,7 @@ export class LibraryManager {
 
     this.state.faces = this.state.faces.filter((f) => f.photoId !== photoId).concat(finalFaces);
 
-    const { people, updatedFaces } = this.cluster(this.state.faces, this.state.people);
+    const { people, updatedFaces } = await this.cluster(this.state.faces, this.state.people);
     this.state.people = people;
     this.state.faces = updatedFaces;
     photo.faces = updatedFaces.filter((f) => f.photoId === photoId);

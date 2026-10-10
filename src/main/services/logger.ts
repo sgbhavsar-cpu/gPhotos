@@ -108,6 +108,32 @@ function resolveDefaultLevel(): LogLevel {
   return 'debug';
 }
 
+/**
+ * Mirrors plain console.log/warn/error/info/debug calls into the same file — several main-process
+ * services (thumbnailWorkerService.ts, etc.) call console.* directly rather than this module's
+ * logger, so without this, anything they print only ever reaches the live terminal and is gone the
+ * moment that terminal is closed, exactly the gap that made a reported hang untraceable after the
+ * fact. Mirrors renderer.ts's existing console-message -> main.log bridge for the same reason.
+ */
+function patchGlobalConsole(): void {
+  const original = {
+    log: console.log.bind(console),
+    info: console.info.bind(console),
+    warn: console.warn.bind(console),
+    error: console.error.bind(console),
+    debug: console.debug.bind(console),
+  };
+  const mirror = (level: LogLevel, orig: (...a: unknown[]) => void) => (...args: unknown[]) => {
+    orig(...args);
+    try { log[level](...args); } catch { /* never let logging itself break the real console call */ }
+  };
+  console.log = mirror('debug', original.log);
+  console.info = mirror('info', original.info);
+  console.warn = mirror('warn', original.warn);
+  console.error = mirror('error', original.error);
+  console.debug = mirror('debug', original.debug);
+}
+
 /** Must be called once, as early as possible in main process startup. */
 export function initLogger(): void {
   if (initialized) return;
@@ -120,6 +146,7 @@ export function initLogger(): void {
   log.transports.file.maxSize = 0; // disable electron-log's own size-based rotation — see rotateLogsOnStartup
   log.transports.file.level = resolveDefaultLevel();
   log.transports.console.level = resolveDefaultLevel();
+  patchGlobalConsole();
 }
 
 /**

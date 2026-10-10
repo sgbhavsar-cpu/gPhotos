@@ -396,10 +396,12 @@ export function deletePhotos(ids: string[], db: DatabaseSync = getDb()): void {
     const deletePhotoStmt = db.prepare('DELETE FROM photos WHERE id = ?');
     const deleteFacesStmt = db.prepare('DELETE FROM faces WHERE photo_id = ?');
     const deleteAlbumLinksStmt = db.prepare('DELETE FROM album_photos WHERE photo_id = ?');
+    const deleteContentStmt = db.prepare('DELETE FROM photo_content WHERE photo_id = ?');
     for (const id of ids) {
       deletePhotoStmt.run(id);
       deleteFacesStmt.run(id);
       deleteAlbumLinksStmt.run(id);
+      deleteContentStmt.run(id);
     }
   }, db);
 }

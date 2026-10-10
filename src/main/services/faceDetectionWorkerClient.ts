@@ -90,6 +90,10 @@ function dropWorker(worker: Worker): void {
 function terminateWorker(worker: Worker): void {
   intentionalExit.add(worker);
   dropWorker(worker);
+  // A retiring worker (setFaceDetectionPoolSize) whose last in-flight request times out, rather
+  // than completing or crash-exiting, took this path — the other two already clear `retiring` (see
+  // the message/exit handlers) but this one didn't, leaking the Worker object forever.
+  retiring.delete(worker);
   worker.terminate().catch(() => {});
 }
 
@@ -101,6 +105,22 @@ function scheduleIdleTerminate(worker: Worker): void {
   }, IDLE_TERMINATE_MS);
   t.unref?.();
   idleTimers.set(worker, t);
+}
+
+/**
+ * Terminates every worker with no request currently in flight right away, instead of waiting out
+ * IDLE_TERMINATE_MS — each holds its own ONNX sessions (~100+MB), so this is what actually frees
+ * that memory back up the moment the user returns to active use. A worker mid-request is left
+ * alone (its own idle timer, re-armed as usual once it finishes, will catch it); never aborts
+ * in-flight work just to save memory a few seconds sooner.
+ */
+export function terminateIdleWorkersNow(): void {
+  for (const w of [...workers]) {
+    if (pendingCountFor(w) === 0) {
+      clearIdleTimer(w);
+      terminateWorker(w);
+    }
+  }
 }
 
 /**

@@ -18,6 +18,7 @@ import {
   ChevronRight,
   PauseCircle,
   Wand2,
+  Columns2,
 } from 'lucide-react';
 import { LibraryState } from '../services/libraryStore';
 import { VirtualStorageConfig, NetworkStorageProgress } from '../../../types';
@@ -32,6 +33,7 @@ export type ActiveTab =
   | 'virtual_storage'
   | 'favorites'
   | 'folders'
+  | 'explorer'
   | 'settings';
 
 interface SidebarProps {
@@ -83,6 +85,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: 'favorites' as ActiveTab, label: 'Favorites', icon: Heart, count: favoriteCount },
     { id: 'virtual_storage' as ActiveTab, label: 'Network Mirrors', icon: HardDrive },
     { id: 'folders' as ActiveTab, label: 'Folder Tree', icon: FolderTree },
+    { id: 'explorer' as ActiveTab, label: 'Two-Pane Explorer', icon: Columns2 },
     { id: 'organize' as ActiveTab, label: 'Organize by Date', icon: FolderSync },
     { id: 'settings' as ActiveTab, label: 'Settings', icon: Settings },
   ];

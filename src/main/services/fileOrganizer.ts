@@ -3,6 +3,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { parsePhotoMetadata } from './exifParser';
 import { probeMedia } from './videoExportService';
+import { isPathReachable, isKnownOfflineStorage } from './networkReachabilityCache';
 import {
   FolderStructure,
   OrganizeOptions,
@@ -260,6 +261,15 @@ export function formatTargetDirectory(targetBase: string, date: Date, structure:
   return path.join(targetBase, relFolder);
 }
 
+async function existsAsync(p: string): Promise<boolean> {
+  try {
+    await fs.promises.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** `reserved` (optional) holds lower-cased targets already claimed earlier in the same run but not yet on disk. */
 export function getUniqueTargetFilePath(targetFolder: string, originalFileName: string, reserved?: Set<string>): string {
   const ext = path.extname(originalFileName);
@@ -278,7 +288,17 @@ export function getUniqueTargetFilePath(targetFolder: string, originalFileName: 
 export async function generateDryRun(
   options: OrganizeOptions,
   onProgress?: (current: number, total: number) => void
-): Promise<DryRunSummary> {
+): Promise<DryRunSummary & { errors: string[] }> {
+  // Bail out up front if the whole source is unreachable (offline network storage) — no point
+  // walking a dead share file by file, and the per-file fs calls below have no timeout of their
+  // own, so a hang here would freeze the whole app for the OS's full network timeout, repeatedly.
+  if (!(await isPathReachable(options.sourceDir))) {
+    return {
+      totalFiles: 0, items: [], totalSize: 0, duplicateCount: 0, targetFolders: [],
+      errors: [`Source folder is not reachable (is its network storage offline?): ${options.sourceDir}`],
+    };
+  }
+
   const files = await scanDirectoryRecursive(options.sourceDir);
   const items: DryRunItem[] = [];
   const targetFolderSet = new Set<string>();
@@ -294,8 +314,16 @@ export async function generateDryRun(
     const src = files[i];
     if (onProgress) onProgress(i + 1, files.length);
 
+    // The source can go offline mid-scan on a large batch — isKnownOfflineStorage is a pure,
+    // synchronous cache read (no I/O), cheap enough to check per file; skip rather than let the
+    // stat below hang on a now-dead share for the OS's full network timeout.
+    if (isKnownOfflineStorage(src)) {
+      analysisErrors.push(`Skipped ${src}: its source storage went offline during the scan.`);
+      continue;
+    }
+
     try {
-      const stats = fs.statSync(src);
+      const stats = await fs.promises.stat(src);
       totalSize += stats.size;
       const meta = await parsePhotoMetadata(src);
       const date = new Date(meta.dateTaken);
@@ -310,8 +338,8 @@ export async function generateDryRun(
       let conflictAction: DryRunItem['conflictAction'] = options.mode;
       let finalTarget = expectedTarget;
 
-      if (fs.existsSync(expectedTarget)) {
-        const targetStats = fs.statSync(expectedTarget);
+      if (await existsAsync(expectedTarget)) {
+        const targetStats = await fs.promises.stat(expectedTarget);
         if (targetStats.size === stats.size) {
           // Verify with hash
           const srcHash = await computeFileHash(src);
@@ -404,10 +432,18 @@ export async function executeOrganization(
       continue;
     }
 
+    // The source may have gone offline since the dry run (or mid-batch, on a large run) —
+    // isKnownOfflineStorage is a pure, synchronous cache read (no I/O); skip this item rather
+    // than let renameSync/copyFileSync below hang on a dead share.
+    if (isKnownOfflineStorage(item.sourceFile)) {
+      errors.push(`Skipped ${item.sourceFile}: its source storage is offline.`);
+      continue;
+    }
+
     try {
       const targetDir = path.dirname(item.targetFile);
-      if (!fs.existsSync(targetDir)) {
-        fs.mkdirSync(targetDir, { recursive: true });
+      if (!(await existsAsync(targetDir))) {
+        await fs.promises.mkdir(targetDir, { recursive: true });
       }
 
       // Re-check right before writing: the target may have appeared since
@@ -415,7 +451,7 @@ export async function executeOrganization(
       // renameSync/copyFileSync silently replace an existing file.
       let targetFile = item.targetFile;
       const overwrite = options.conflictResolution === 'overwrite';
-      if (!overwrite && fs.existsSync(targetFile)) {
+      if (!overwrite && await existsAsync(targetFile)) {
         if (options.conflictResolution === 'skip') continue;
         targetFile = getUniqueTargetFilePath(path.dirname(targetFile), path.basename(targetFile));
       }
@@ -423,31 +459,35 @@ export async function executeOrganization(
 
       if (options.mode === 'move') {
         try {
-          fs.renameSync(item.sourceFile, targetFile);
+          await fs.promises.rename(item.sourceFile, targetFile);
         } catch (renameErr: any) {
           // If moving across drives, fallback to copy + verify + unlink
           if (renameErr.code === 'EXDEV') {
-            // Only a copy that actually created the target may be cleaned up: if copyFileSync
+            // Only a copy that actually created the target may be cleaned up: if copyFile
             // itself failed (e.g. EEXIST because another writer got there first), the file at
             // targetFile belongs to someone else and must not be deleted.
             let created = false;
             try {
-              fs.copyFileSync(item.sourceFile, targetFile, copyFlags);
+              await fs.promises.copyFile(item.sourceFile, targetFile, copyFlags);
               created = true;
-              if (fs.statSync(targetFile).size !== fs.statSync(item.sourceFile).size) {
+              const [targetStat, sourceStat] = await Promise.all([
+                fs.promises.stat(targetFile),
+                fs.promises.stat(item.sourceFile),
+              ]);
+              if (targetStat.size !== sourceStat.size) {
                 throw new Error('copy size mismatch');
               }
             } catch (copyErr) {
-              try { if (created && !overwrite) fs.unlinkSync(targetFile); } catch {}
+              try { if (created && !overwrite) await fs.promises.unlink(targetFile); } catch {}
               throw copyErr;
             }
-            fs.unlinkSync(item.sourceFile);
+            await fs.promises.unlink(item.sourceFile);
           } else {
             throw renameErr;
           }
         }
       } else {
-        fs.copyFileSync(item.sourceFile, targetFile, copyFlags);
+        await fs.promises.copyFile(item.sourceFile, targetFile, copyFlags);
       }
 
       movedCount++;

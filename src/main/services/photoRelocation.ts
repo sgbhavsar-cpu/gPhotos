@@ -9,7 +9,7 @@ import { moveHeicSavedRotation } from './heicRotationStore';
 import { photoIdForSidecar } from './pipelineOrchestrator';
 import { getPendingRotations, savePendingRotations, getPendingMetadata, savePendingMetadata } from './virtualMirrorService';
 import { purgeCachedThumbnailsForFile } from './thumbnailCacheService';
-import { writeJsonAtomic, writeFileAtomic } from './jsonFile';
+import { writeJsonAtomic, writeFileAtomic, readJsonSafe } from './jsonFile';
 import type { VirtualStorageConfig } from '../../types';
 
 /**
@@ -502,6 +502,128 @@ export function relocatePhotos(params: {
   const run = runChain.then(() => relocateImpl(params), () => relocateImpl(params));
   runChain = run.catch(() => undefined);
   return run;
+}
+
+// ---------------------------------------------------------------------------
+// offline commit queue (two-pane explorer "Commit" button) — same flat-JSON-file
+// pattern as pending_rotations.json / pending_metadata.json in virtualMirrorService.ts
+// ---------------------------------------------------------------------------
+
+export interface PendingMoveItem {
+  id: string;
+  photos: RelocationPhotoInput[];
+  targetDir: string;
+  label?: string;
+  timestamp: number;
+}
+
+export function getPendingMovesPath(): string {
+  try {
+    const electron = require('electron');
+    if (electron.app) {
+      return path.join(electron.app.getPath('userData'), 'pending_moves.json');
+    }
+  } catch {}
+  const fallback = process.env.APPDATA ? path.join(process.env.APPDATA, 'gPhotos') : path.join(process.cwd(), '.temp');
+  if (!fs.existsSync(fallback)) {
+    try { fs.mkdirSync(fallback, { recursive: true }); } catch {}
+  }
+  return path.join(fallback, 'pending_moves.json');
+}
+
+export function getPendingMoves(): PendingMoveItem[] {
+  try {
+    const items = readJsonSafe<PendingMoveItem[]>(getPendingMovesPath(), []);
+    return Array.isArray(items) ? items : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Returns false if the queue could not be persisted. */
+export function savePendingMoves(items: PendingMoveItem[]): boolean {
+  try {
+    writeJsonAtomic(getPendingMovesPath(), items);
+    return true;
+  } catch (err) {
+    console.warn('[OfflineMoveQueue] Failed to save pending moves:', err);
+    return false;
+  }
+}
+
+function enqueuePendingMove(photos: RelocationPhotoInput[], targetDir: string, label?: string): void {
+  const items = getPendingMoves();
+  items.push({ id: queueId(`${targetDir}|${Date.now()}|${Math.random()}`), photos, targetDir, label, timestamp: Date.now() });
+  savePendingMoves(items);
+}
+
+// A batch that was actually applied from the queue (not asked for directly) is reported here so the
+// renderer — which otherwise only learns about a commit's outcome from the IPC call that started it —
+// can patch its photo list and tell the user, mirroring onRotationFailure's forwarding pattern.
+export interface PendingMoveAppliedInfo {
+  targetDir: string;
+  label?: string;
+  results: RelocationItemResult[];
+}
+const pendingMoveAppliedListeners = new Set<(info: PendingMoveAppliedInfo) => void>();
+export function onPendingMoveApplied(listener: (info: PendingMoveAppliedInfo) => void): () => void {
+  pendingMoveAppliedListeners.add(listener);
+  return () => pendingMoveAppliedListeners.delete(listener);
+}
+
+/**
+ * Commits a two-pane-explorer move batch now. If every photo's home root (or the destination) is
+ * unreachable, the whole batch is queued in pending_moves.json instead of being reported as failed,
+ * and is retried automatically (by the background daemon and right after any storage reconnects)
+ * until it goes through — see processPendingMoves below.
+ */
+export async function relocatePhotosWithOfflineQueue(params: {
+  photos: RelocationPhotoInput[];
+  targetDir: string;
+  label?: string;
+  onProgress?: (done: number, total: number) => void;
+}): Promise<{ results: RelocationItemResult[]; root: RelocationRoot | null; error?: string; queued?: boolean }> {
+  const outcome = await relocatePhotos(params);
+  if (outcome.error) {
+    enqueuePendingMove(params.photos, params.targetDir, params.label);
+    return { ...outcome, queued: true };
+  }
+  return outcome;
+}
+
+let pendingMovesRun: Promise<{ processed: number; remaining: number }> | null = null;
+
+export function processPendingMoves(): Promise<{ processed: number; remaining: number }> {
+  if (!pendingMovesRun) {
+    pendingMovesRun = runPendingMoves().finally(() => {
+      pendingMovesRun = null;
+    });
+  }
+  return pendingMovesRun;
+}
+
+async function runPendingMoves(): Promise<{ processed: number; remaining: number }> {
+  const items = getPendingMoves();
+  if (items.length === 0) return { processed: 0, remaining: 0 };
+
+  let processed = 0;
+  const stillQueued: PendingMoveItem[] = [];
+
+  for (const item of items) {
+    const outcome = await relocatePhotos({ photos: item.photos, targetDir: item.targetDir });
+    if (outcome.error) {
+      stillQueued.push(item); // still offline — an expected, indefinite wait, not a failure
+      continue;
+    }
+    processed++;
+    console.log(`[OfflineMoveQueue] Applied queued move of ${item.photos.length} photo(s) to reconnected target: ${item.targetDir}`);
+    for (const l of pendingMoveAppliedListeners) {
+      try { l({ targetDir: item.targetDir, label: item.label, results: outcome.results }); } catch {}
+    }
+  }
+
+  if (!savePendingMoves(stillQueued)) return { processed, remaining: items.length }; // can't record it -> don't double-apply later
+  return { processed, remaining: stillQueued.length };
 }
 
 async function relocateImpl(params: {

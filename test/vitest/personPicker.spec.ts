@@ -55,10 +55,16 @@ function typeInto(input: HTMLInputElement, value: string) {
     input.dispatchEvent(new Event('input', { bubbles: true }));
   });
 }
+// async act: reassignFaceToPerson/mergePeople are async now (see CODE_REVIEW §55 — moved off the
+// renderer's UI thread onto a Web Worker), so the handlers these events trigger have a microtask to
+// resolve before onSuccess/onClose/etc fire. A sync act() would return before that happened — every
+// caller awaits this (and the equivalent raw click() acts below), even where the mock resolves
+// "instantly", since the await itself is what lets that resolution's continuation actually run.
 const pressEnter = (el: Element) =>
-  act(() => {
+  act(async () => {
     el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
   });
+const clickAsync = (el: Element) => act(async () => { el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); });
 const $ = (host: ParentNode, sel: string) => host.querySelector(sel) as HTMLElement;
 const $$ = (host: ParentNode, sel: string) => Array.from(host.querySelectorAll(sel)) as HTMLElement[];
 
@@ -78,7 +84,7 @@ describe('rankPeopleByQuery', () => {
 });
 
 describe('PersonPicker', () => {
-  it('Enter picks the first match, a click picks that person, and the first match is marked', () => {
+  it('Enter picks the first match, a click picks that person, and the first match is marked', async () => {
     const onPick = vi.fn();
     const host = mount(React.createElement(PersonPicker, { people: PEOPLE, photos: [], onPick }));
     const input = $(host, '[data-testid="person-picker-input"]') as HTMLInputElement;
@@ -86,40 +92,40 @@ describe('PersonPicker', () => {
     typeInto(input, 'ali');
     expect($(host, '[data-first-match="true"]').textContent).toContain('Alice Smith');
     expect($(host, '[data-testid="person-picker-hint"]').textContent).toContain('Alice Smith');
-    pressEnter(input);
+    await pressEnter(input);
     expect(onPick).toHaveBeenCalledTimes(1);
     expect(onPick.mock.calls[0][0].id).toBe('p_alice');
 
-    act(() => $$(host, '[data-testid="person-picker-card"]')[1].click()); // "Alicia"
+    await clickAsync($$(host, '[data-testid="person-picker-card"]')[1]); // "Alicia"
     expect(onPick.mock.calls[1][0].id).toBe('p_alicia');
   });
 
-  it('with no match Enter creates a new person (when allowed) and does nothing otherwise', () => {
+  it('with no match Enter creates a new person (when allowed) and does nothing otherwise', async () => {
     const onPick = vi.fn();
     const onCreateNew = vi.fn();
     const host = mount(React.createElement(PersonPicker, { people: PEOPLE, photos: [], onPick, onCreateNew }));
     const input = $(host, '[data-testid="person-picker-input"]') as HTMLInputElement;
     typeInto(input, 'Zed');
-    pressEnter(input);
+    await pressEnter(input);
     expect(onCreateNew).toHaveBeenCalledWith('Zed');
     expect(onPick).not.toHaveBeenCalled();
 
     const host2 = mount(React.createElement(PersonPicker, { people: PEOPLE, photos: [], onPick }));
     const input2 = $(host2, '[data-testid="person-picker-input"]') as HTMLInputElement;
     typeInto(input2, 'Zed');
-    pressEnter(input2);
+    await pressEnter(input2);
     expect(onPick).not.toHaveBeenCalled();
   });
 
-  it('a partial match still picks the first match on Enter, and offers "Create new" as a click target', () => {
+  it('a partial match still picks the first match on Enter, and offers "Create new" as a click target', async () => {
     const onPick = vi.fn();
     const onCreateNew = vi.fn();
     const host = mount(React.createElement(PersonPicker, { people: PEOPLE, photos: [], onPick, onCreateNew }));
     const input = $(host, '[data-testid="person-picker-input"]') as HTMLInputElement;
     typeInto(input, 'Ali');
-    act(() => $(host, '[data-testid="person-picker-create"]').click());
+    await clickAsync($(host, '[data-testid="person-picker-create"]'));
     expect(onCreateNew).toHaveBeenCalledWith('Ali');
-    pressEnter(input);
+    await pressEnter(input);
     expect(onPick.mock.calls[0][0].id).toBe('p_alice');
     // an exact name already exists -> no create row
     typeInto(input, 'Bob');
@@ -130,6 +136,9 @@ describe('PersonPicker', () => {
 describe('ReassignFaceModal: assigning a face', () => {
   const face = { id: 'face1', personId: 'p_current', photoId: 'ph1', box: { x: 0, y: 0, width: 1, height: 1 } } as any;
   const photo = { id: 'ph1', fileName: 'a.jpg', faces: [face] } as any;
+  // reassignFaceToPerson's 3rd arg: lets it re-resolve by photo+position if this exact face id has
+  // gone stale (see libraryStore.ts) — always passed since `face.box` is set in this fixture.
+  const staleIdFallback = { photoId: 'ph1', box: face.box };
   const props = () => ({
     face,
     photo,
@@ -139,50 +148,50 @@ describe('ReassignFaceModal: assigning a face', () => {
     onSuccess: vi.fn(),
   });
 
-  it('typing a partial name and pressing Enter assigns to the first matching person, without any confirm button', () => {
+  it('typing a partial name and pressing Enter assigns to the first matching person, without any confirm button', async () => {
     const p = props();
     const host = mount(React.createElement(ReassignFaceModal, p));
     expect(host.textContent).not.toContain('Confirm Reassignment');
     typeInto($(host, '[data-testid="person-picker-input"]') as HTMLInputElement, 'ali');
-    pressEnter($(host, '[data-testid="person-picker-input"]'));
-    expect(store.reassignFaceToPerson).toHaveBeenCalledWith('face1', 'p_alice');
+    await pressEnter($(host, '[data-testid="person-picker-input"]'));
+    expect(store.reassignFaceToPerson).toHaveBeenCalledWith('face1', 'p_alice', staleIdFallback);
     expect(p.onSuccess).toHaveBeenCalled();
     expect(p.onClose).toHaveBeenCalled();
   });
 
-  it('clicking a person assigns immediately (one click, no confirmation step)', () => {
+  it('clicking a person assigns immediately (one click, no confirmation step)', async () => {
     const p = props();
     const host = mount(React.createElement(ReassignFaceModal, p));
     const bob = $$(host, '[data-testid="person-picker-card"]').find((c) => c.textContent?.includes('Bob'))!;
-    act(() => bob.click());
-    expect(store.reassignFaceToPerson).toHaveBeenCalledWith('face1', 'p_bob');
+    await clickAsync(bob);
+    expect(store.reassignFaceToPerson).toHaveBeenCalledWith('face1', 'p_bob', staleIdFallback);
     expect(p.onClose).toHaveBeenCalled();
   });
 
-  it('a name matching nobody creates a new person on Enter', () => {
+  it('a name matching nobody creates a new person on Enter', async () => {
     const p = props();
     const host = mount(React.createElement(ReassignFaceModal, p));
     typeInto($(host, '[data-testid="person-picker-input"]') as HTMLInputElement, 'Zed');
-    pressEnter($(host, '[data-testid="person-picker-input"]'));
-    expect(store.reassignFaceToPerson).toHaveBeenCalledWith('face1', 'Zed');
+    await pressEnter($(host, '[data-testid="person-picker-input"]'));
+    expect(store.reassignFaceToPerson).toHaveBeenCalledWith('face1', 'Zed', staleIdFallback);
   });
 
-  it('"merge the whole person" (set before picking) merges instead of moving one face', () => {
+  it('"merge the whole person" (set before picking) merges instead of moving one face', async () => {
     const p = props();
     const host = mount(React.createElement(ReassignFaceModal, p));
-    act(() => $(host, '[data-testid="reassign-merge-toggle"]').click());
+    await clickAsync($(host, '[data-testid="reassign-merge-toggle"]'));
     typeInto($(host, '[data-testid="person-picker-input"]') as HTMLInputElement, 'bob');
-    pressEnter($(host, '[data-testid="person-picker-input"]'));
+    await pressEnter($(host, '[data-testid="person-picker-input"]'));
     expect(store.mergePeople).toHaveBeenCalledWith('p_bob', 'p_current');
     expect(store.reassignFaceToPerson).not.toHaveBeenCalled();
   });
 
-  it('shows the reason and stays open when the assignment is refused', () => {
+  it('shows the reason and stays open when the assignment is refused', async () => {
     store.reassignFaceToPerson.mockReturnValue({ success: false, error: 'Already in this photo' } as any);
     const p = props();
     const host = mount(React.createElement(ReassignFaceModal, p));
     typeInto($(host, '[data-testid="person-picker-input"]') as HTMLInputElement, 'bob');
-    pressEnter($(host, '[data-testid="person-picker-input"]'));
+    await pressEnter($(host, '[data-testid="person-picker-input"]'));
     expect(host.textContent).toContain('Already in this photo');
     expect(p.onClose).not.toHaveBeenCalled();
   });
@@ -199,7 +208,7 @@ describe('MergePeopleModal: choosing the second person', () => {
     onSuccess: vi.fn(),
   });
 
-  it('is searchable like assigning: Enter selects the first match; Enter again merges', () => {
+  it('is searchable like assigning: Enter selects the first match; Enter again merges', async () => {
     const p = base();
     const host = mount(React.createElement(MergePeopleModal, p));
     const input = $(host, '[data-testid="person-picker-input"]') as HTMLInputElement;
@@ -207,34 +216,34 @@ describe('MergePeopleModal: choosing the second person', () => {
     expect($(host, 'button[type="submit"]').hasAttribute('disabled')).toBe(true);
 
     typeInto(input, 'be');
-    pressEnter(input);
+    await pressEnter(input);
     expect(store.mergePeople).not.toHaveBeenCalled();
     expect(host.textContent).toContain('Valid merge');
     expect(host.textContent).toContain('Keep: Beatrice');
 
-    pressEnter(input); // the first match is now the selected person -> confirm
+    await pressEnter(input); // the first match is now the selected person -> confirm
     expect(store.mergePeople).toHaveBeenCalledWith('p_a', 'p_bea', 'Anna');
     expect(p.onClose).toHaveBeenCalled();
   });
 
-  it('a click selects the person; the merge still needs the Confirm button', () => {
+  it('a click selects the person; the merge still needs the Confirm button', async () => {
     const p = base();
     const host = mount(React.createElement(MergePeopleModal, p));
     const bob = $$(host, '[data-testid="person-picker-card"]').find((c) => c.textContent?.includes('Bob'))!;
-    act(() => bob.click());
+    await clickAsync(bob);
     expect(store.mergePeople).not.toHaveBeenCalled();
-    act(() => $(host, 'button[type="submit"]').click());
+    await clickAsync($(host, 'button[type="submit"]'));
     expect(store.mergePeople).toHaveBeenCalledWith('p_a', 'p_bob', 'Anna');
   });
 
-  it('Enter does not merge when the two people appear in the same photo', () => {
+  it('Enter does not merge when the two people appear in the same photo', async () => {
     store.canMergePeople.mockReturnValue({ canMerge: false, conflictPhotoName: 'x.jpg' } as any);
     const p = base();
     const host = mount(React.createElement(MergePeopleModal, p));
     const input = $(host, '[data-testid="person-picker-input"]') as HTMLInputElement;
     typeInto(input, 'bob');
-    pressEnter(input);
-    pressEnter(input);
+    await pressEnter(input);
+    await pressEnter(input);
     expect(store.mergePeople).not.toHaveBeenCalled();
     expect(host.textContent).toContain('Cannot merge');
   });
@@ -244,5 +253,28 @@ describe('MergePeopleModal: choosing the second person', () => {
     const host = mount(React.createElement(MergePeopleModal, p));
     expect($(host, '[data-testid="person-picker-input"]')).toBeNull();
     expect(host.textContent).toContain('Keep: Bob');
+  });
+
+  // Same class of bug as ReassignFaceModal (§56): mergePeople now genuinely takes real wall-clock
+  // time (the worker-backed cluster() call — see §55), so a second submit click while the first is
+  // still pending must not fire a second real merge.
+  it('a second submit click while the first merge is still in flight does not fire a second mergePeople call', async () => {
+    let resolveFirst!: (v: boolean) => void;
+    store.mergePeople.mockImplementation(() => new Promise<boolean>((resolve) => { resolveFirst = resolve; }));
+
+    const p = { ...base(), personB: others[0] };
+    const host = mount(React.createElement(MergePeopleModal, p));
+    const submitBtn = () => $(host, 'button[type="submit"]') as HTMLButtonElement;
+
+    await clickAsync(submitBtn());
+    expect(store.mergePeople).toHaveBeenCalledTimes(1);
+    expect(submitBtn().disabled).toBe(true);
+    expect(host.textContent).toContain('Merging...');
+
+    await clickAsync(submitBtn()); // confused second click while still pending
+    expect(store.mergePeople).toHaveBeenCalledTimes(1);
+
+    await act(async () => resolveFirst(true));
+    expect(p.onClose).toHaveBeenCalledTimes(1);
   });
 });

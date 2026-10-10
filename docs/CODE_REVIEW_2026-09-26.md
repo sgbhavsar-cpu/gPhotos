@@ -1793,3 +1793,510 @@ constant itself, which no prior test covered. `aiAutoIndexService.spec.ts` (8 te
 or call count that this affects (T1/T2/T7/T9 in the former all remain correct whether the local pass
 makes one call or several, since the test fixtures size their mocked responses to however many
 images an actual call carries). Typecheck clean. Full suite re-run clean (see below).
+
+## 49. "Face detection not found" when naming an "Unknown Person" face
+
+**Reported**: assigning a name to a face shown as "Unknown Person" sometimes fails with the error
+"Face detection not found", even though the face is still visibly on screen.
+
+**Root cause**: the app keeps two copies of face data — `photo.faces` (what the UI reads to render
+the "Unknown Person" chip) and `libraryStore`'s own flat `state.faces` (what `reassignFaceToPerson`
+looks the id up in before applying the name). They normally agree, but an UNCONFIRMED face's id does
+not survive a rescan of its photo: `detectAndMatchFacesForPhoto`/`applyServerDetectedFaces` preserve
+only `isConfirmed`/`isManual` faces as-is across a rescan (`preservedFaces` at
+`libraryStore.ts:2505`) — every other face on that photo, including any "Unknown Person" (unconfirmed
+by definition), is discarded and replaced by a freshly-detected face under a brand-new id. If a
+background rescan (Reset & Rescan, a storage re-sync, the auto-detect sweep revisiting a photo) does
+this for a photo the user still has open, the screen keeps showing the old, now-gone id until it next
+re-renders — submitting a name against that id then fails.
+
+**Fix**: `reassignFaceToPerson(faceId, name, staleIdFallback?)` takes an optional
+`{ photoId, box }` fallback. When the id lookup misses and a fallback was given, it re-resolves the
+face by IoU box-overlap (≥ 0.5) against every other face on the same photo — the same overlap formula
+`detectAndMatchFacesForPhoto` already uses to match a fresh detection against a preserved face — and
+applies the name to whatever it finds instead of failing outright. `ReassignFaceModal` (the only
+caller) now always passes `{ photoId: photo.id, box: face.box }`. A fallback that still finds nothing
+confident (box moved too far, or points at a different photo) gets a clearer message — "This face
+was refreshed by a recent scan — please reopen the photo and try again." — instead of the bare
+"Face detection not found", so a genuine miss is now distinguishable from this recoverable case.
+
+**Tests**: `reassignFaceStaleId.spec.ts` (new, 5 tests) — a live id still reassigns normally with no
+fallback used; a stale id is recovered via the box-overlap fallback and the name is applied; the
+same stale id without a fallback still fails with the original error (unchanged behavior for any
+other caller); a fallback box far from every face on the photo fails with the clearer message; a
+fallback naming a different photo entirely is never mistaken for a match. `personPicker.spec.ts`'s
+four `reassignFaceToPerson` call-site assertions updated to expect the new third argument
+`ReassignFaceModal` now always passes. Typecheck clean; both files re-run clean (18/18).
+
+## 50. Lightbox defaults, Duplicate Cleaner delete UX, and a photo-delete cleanup gap
+
+Three unrelated fixes requested together:
+
+**a) Lightbox opening defaults** (`PhotoLightbox.tsx`):
+- `showFaces` (face marker box overlay) now defaults to `false`, not `true` — it's an opt-in
+  inspection tool, not something every photo should open with.
+- `viewMode`'s fallback (when nothing is saved in `localStorage['gphotos_lightbox_view_mode']` yet,
+  or an invalid value is found there) changed from `'fit'` to `'fill'`. An explicit prior choice of
+  "Fit" is still honored — this only changes what a user who has never touched the toggle sees.
+- "If disk is not a cloud drive, show full resolution" — checked this was **already** the behavior:
+  `fallbackToThumbnail` only defaults to `true` for `isOneDriveBacked` photos; any purely local photo
+  (`photo.isVirtual` false) gets `isOriginalAvailable=true` and `fallbackToThumbnail=false`
+  immediately, so `preferOriginal` is already `true` with no delay. No code change needed here —
+  verified by reading the actual condition chain (PhotoLightbox.tsx ~360-433), not just the report
+  that surfaced it.
+
+**b) Duplicate Cleaner delete UX** (`DuplicateCleanerModal.tsx`):
+- "Deleting via AI best shot stalls the app" — `handleDeleteRemaining`'s `window.electronAPI.trashFiles(...)`
+  call is a single await with zero progress feedback; for a bigger cluster this looks exactly like a
+  hang. Wrapped it in the already-existing `trackBackendCall` (`responseTracker.ts`) — the same
+  "please wait" pill used by the rescan/library-switch flows — with the label
+  `` `Moving ${count} photo(s) to the Recycle Bin...` ``. No new UI component; this is a one-line fix
+  reusing established infrastructure.
+- "Find Best Shot" (`GalleryView.tsx`'s `openBestShotForSelection` → `onOpenDuplicateCleaner(cluster)`)
+  opens `DuplicateCleanerModal` with a single `initialCluster` and never closed it again after the
+  delete — the modal fell through to its "Your library is clean!" success screen and stayed open
+  until the user manually hit the X. Fixed by tracking whether the active cluster was fully resolved
+  by this delete (`groupFullyResolved`) and, **only when `initialCluster` was passed** (i.e. this is
+  the single-selection "Find Best Shot" entry, not the general whole-library cleaner — which still
+  has more groups worth reviewing and should keep its own success screen), calling `onClose()` after
+  a short delay (1.2s normal / 2.5s if some photos failed, so the final status message is readable
+  first).
+
+**c) Photo-delete cleanup gap** — a delete anywhere in the app (normal delete, Duplicate Cleaner, "Find
+Best Shot") was missing two cleanups:
+  - `deletePhotos()` (`libraryRepository.ts`) deleted rows from `photos`, `faces`, and
+    `album_photos`, but never `photo_content` — a deleted photo's AI caption/tags/embedding row was
+    orphaned forever. Added `DELETE FROM photo_content WHERE photo_id = ?` to the same transaction.
+  - `trashFiles`/`deleteFilesPermanently` (`virtualMirrorService.ts`) never purged the thumbnail
+    cache for a deleted file — `purgeCachedThumbnailsForFile(fp)` (already used by the rename/relocate
+    path) is now called immediately before the file is trashed/unlinked in both functions (it stats
+    the file to key the cache entry, so it must run *before* the file disappears — calling it after
+    would find nothing to purge). Best-effort, wrapped in its own try/catch so a cache-purge failure
+    never blocks the actual delete.
+  - Face-avatar cache files (`getPersonAvatarPath`/`savePersonAvatar`) are NOT cleaned up by this fix
+    — only relevant if the deleted photo was a person's cover photo, a narrower case than what was
+    asked for; left as a known gap rather than speculatively built.
+
+**Tests**: `deletePhotosCleanup.spec.ts` (new, 2 tests) — deleting a photo removes its row, faces,
+album link, and `photo_content` row while leaving an untouched sibling photo's own rows intact; a
+photo with no `photo_content` row (never analysed) deletes cleanly with no error. No dedicated test
+added for the `purgeCachedThumbnailsForFile` call-site wiring — it follows the exact same established,
+untested dynamic-`require` pattern already shipped at this call site's sibling in the rename/relocate
+path (`photoRelocation.ts`), and the module's own cache-dir resolution depends on `electron.app`,
+which would need its own mocking investigation disproportionate to this fix. Typecheck clean.
+Re-ran every vitest spec that imports `virtualMirrorService` (11 files) plus `photoContentStore.spec.ts`
+and the new file: 1 failure (`backgroundSyncUnified.spec.ts`'s bandwidth-timing assertion, the same
+system-load flakiness documented in §§ above) confirmed to pass cleanly in isolation (4/4) — not a
+regression.
+
+## 51. Closing the remaining "offline storage hangs the app" gaps
+
+**Request**: "when storage is offline, we should keep that flag at global level and check in each
+function which works on storage to skip or queue that operation so that application do not hang on
+that line."
+
+**The global flag already existed** — `networkReachabilityCache.ts`'s `rootStatus` Map (per
+configured network storage root, 5-minute TTL), read synchronously and for free via
+`isKnownOfflineStorage(path)`, or probed (timeout-bounded, 1500ms) and cached via
+`isPathReachable(path)`. No new global state was needed; the actual gap was that several real,
+user-reachable code paths never consulted it at all and used a raw synchronous `fs.*Sync` call
+instead — which has no timeout and can block the main process for the OS's full SMB/network timeout
+(20s+), once per file, freezing the whole app rather than just the one operation. A thorough sweep
+(main.ts + every src/main/services/*.ts file) found these real gaps and fixed each:
+
+- **`fileOrganizer.ts` — `generateDryRun`**: added an upfront `isPathReachable(options.sourceDir)`
+  check (bail out immediately with a clear error instead of walking a dead share file by file), a
+  per-file `isKnownOfflineStorage(src)` check in the scan loop (skip a file whose storage went
+  offline mid-scan, log it as an analysis error, keep going), and converted every per-file
+  `fs.statSync`/`fs.existsSync` in the loop to `fs.promises.stat`/an async `existsAsync` helper.
+- **`fileOrganizer.ts` — `executeOrganization`**: same per-item `isKnownOfflineStorage` skip check
+  (the source may have gone offline since the dry run, or mid-batch on a large one), and converted
+  every sync call touching `item.sourceFile`/`item.targetFile`
+  (`existsSync`/`mkdirSync`/`renameSync`/`copyFileSync`/`statSync`/`unlinkSync`, including the EXDEV
+  cross-drive fallback) to its `fs.promises.*` equivalent.
+- **`main.ts` — `scanner:scan-directory`**: same pattern — upfront `isPathReachable(dirPath)` bail-out,
+  per-file `isKnownOfflineStorage` skip, `fs.statSync` → `fs.promises.stat`.
+- **`main.ts` — `mirror:open-original` and `shell:show-item-in-folder`**: both did a bare
+  `fs.existsSync(filePath)` before `shell.showItemInFolder` — swapped for `await
+  isPathReachable(filePath)`. These are the "reveal in Explorer" handlers used throughout the app
+  (including the People page's "open in Explorer" link from an earlier session), and `filePath` can
+  be a network/virtual-storage-backed photo.
+
+**Deliberately left unchanged** (verified each is not actually a gap, rather than assumed from the
+initial sweep's flags, to avoid adding speculative/costly checks with no real payoff):
+- `thumbnailCacheService.ts`'s `getOrGenerateCachedThumbnail` and `videoPreviewService.ts`'s
+  `getOrGenerateVideoPreview` have no *internal* reachability check, but their only real production
+  callers (the `gphoto://` protocol handler and the `video:get-preview` IPC handler, respectively)
+  already gate with `isPathReachableForServing` before calling them — adding a redundant probe
+  inside `getOrGenerateCachedThumbnail` specifically was tried and reverted: it's by far the
+  highest-frequency call in the app (every visible gallery tile), and `isPathReachable` leaves a
+  dangling ~1.5s timer behind on every call even for the common, always-safe local-photo case (the
+  `Promise.race` timeout isn't cancelled when the `fs.access` side wins) — not worth paying on every
+  thumbnail for a path that's already protected one level up.
+- `videoExportService.ts`'s `prepareSlideImage`/`renderCollageImage` (`sharp(sourcePath)` with no
+  reachability check) looked like a gap from the sweep alone, but `VideoWizardModal.tsx` always
+  passes `photo.filePath` (the local, always-cached mirror copy), never `originalRemotePath` — so
+  `sourcePath` here is never actually a network path in practice.
+- `mirror:start-bg-scan` (main.ts) has the same `fs.statSync` gap as `scanner:scan-directory`, but
+  grepping the renderer and preload found no live call site for it at all (`App.tsx` only mentions it
+  in a comment describing what it used to do before `syncVirtualStorage`'s unified pipeline replaced
+  it) — left alone rather than hardening dead code.
+
+**Tests**: `fileOrganizerOffline.spec.ts` (new, 2 tests, mocking `networkReachabilityCache`) —
+`generateDryRun` returns zero items with a clear error when the whole source is unreachable, and
+skips just the one file that went offline mid-scan while still processing the rest. The existing
+`test/test_organizer_e2e.ts` manual script (real file I/O, copy mode) re-run clean after converting
+every sync call to async, confirming the conversion didn't change normal (online) behavior. No new
+test added for the three `main.ts` IPC handlers (`scanner:scan-directory`, `mirror:open-original`,
+`shell:show-item-in-folder`) — consistent with this codebase's existing practice of not
+unit-testing main.ts's ~100+ thin IPC handlers directly (none of them have a test today); the
+service-level logic they delegate to is what's covered. Typecheck clean.
+
+## 52. Found via the new browser-console log bridge: face detection freezing the app for up to 67s
+
+With file logging + the new `console-message` bridge (§ above) actually running during a real
+manual-testing session, `hang-watchdog.log` (300ms-lag watchdog, pre-existing — see
+`hangWatchdog.ts`) caught hard evidence instead of a guess: **4,774 main-process stalls in one
+session**, 71% while `mirror:sync-storage` was in flight, 25% while `ollama:request` was, and a
+smaller number (70) while `faces:detect-batch` was — but those were by far the most severe:
+```
+blocked for ~66766ms — faces:detect-batch (running 66278ms)
+blocked for ~66992ms — faces:detect-batch (running 67102ms)
+blocked for ~58894ms — faces:detect-batch (running 58948ms) [also mirror:sync-storage, 104min in flight]
+```
+Up to 67 seconds of the entire app — every window, every click — frozen solid.
+
+**Root cause**: face *detection* itself is correctly offloaded to a real `worker_thread`
+(`faceDetectionWorkerClient.ts`), so that part can't block the main process. The freeze is
+*clustering*, which runs immediately after on the main thread with no `await` of its own:
+`faces:detect-batch` (main.ts) → `detectFacesForPhoto` (`pipelineOrchestrator.ts`) → `clusterFaces`
+(`faceClustering.ts:463-475`), a synchronous loop that — when the per-photo "fast path" session
+cache doesn't apply — is fed `getAllFaces(db)` (pipelineOrchestrator.ts:370), i.e. **every face in
+the whole library**, with zero yield points. `mirror:sync-storage`'s and the embedded web server's
+own per-file face-detection steps (`runFaceDetectionStep`, `forceRedetectFacesForPhoto`) all route
+through the exact same `detectFacesForPhoto`, so they hit the identical bottleneck — explaining the
+`mirror:sync-storage` correlation without needing a second root cause.
+
+**Fix**: one `await new Promise((resolve) => setImmediate(resolve))` at the end of
+`detectFacesForPhoto`'s successful path (pipelineOrchestrator.ts, right after the clustering +
+`upsertPhoto` write, before the OneDrive-reclaim branch) — placed here specifically because this is
+the one function every caller (`faces:detect-batch`'s batch loop, `syncVirtualStorage`'s per-file
+loop via `runFaceDetectionStep`, `forceRedetectFacesForPhoto`, the embedded web server) already
+routes through, so fixing it once here fixes it for all of them instead of patching each caller's
+own loop separately. This can't reduce total clustering CPU time, but it turns one 60-second solid
+block into many small ones — the main thread (and therefore every IPC handler, every window) gets a
+turn back after each photo instead of only after the whole batch/sync finishes.
+
+**Deliberately not done**: moving clustering itself off the main thread (into the same worker
+already doing detection, or a dedicated one) would cut total time too, not just break it up — a
+real improvement, but a much larger change (clustering reads/writes via `DatabaseSync`, which is
+main-thread-only) left for if the yield alone isn't enough in practice.
+
+**Tests**: no new test added for this specific one-line change — `faceClusterPipelineIncremental.spec.ts`,
+`faceClusteringEquivalence.spec.ts` (equivalence-fuzzed against an oracle on libraries up to 20,000/8,000
+faces), `pipelineDbScoping.spec.ts`, and `pipelineOrchestrator.spec.ts` (32 tests, 1 pre-existing skip)
+all re-run clean, confirming the added tick changes nothing about `detectFacesForPhoto`'s return
+value or the faces/people it persists. Typecheck clean.
+
+## 53. Activity-resume now also stops AI auto-tagging and unloads local models
+
+Follow-up to §51/§52: the idle-activity system paused thumbnail pre-caching and face-detection
+*enqueueing* when the user became active again, but left two things running: the AI auto-tagging
+pass (`aiAutoIndexService.ts`), and whatever local models were already loaded in memory (face
+detection's ONNX worker sessions, ~100+MB each; Ollama's vision/embedding models, routinely several
+GB for a vision model) — both kept consuming CPU/RAM for no benefit once nobody was idle to benefit
+from the background work finishing sooner.
+
+**Fix**:
+- `aiAutoIndexService.ts` gained a transient `activityPaused` flag (`pauseAutoIndexForActivity()` /
+  `resumeAutoIndexFromActivity()`) — separate from the `enabled` flag (the user's own Settings
+  toggle) the same way `thumbnailWorkerService.ts`'s `activityPaused` is separate from its own
+  manual pause, so becoming active never clears a deliberate "AI tagging is off" choice, and
+  resuming from idle never re-enables a feature the user turned off. Checked once at entry and once
+  per batch inside `runAutoIndexPass`'s loop (mirroring the existing `!enabled` check).
+- `faceDetectionWorkerClient.ts` gained `terminateIdleWorkersNow()` — the exact body
+  `scheduleIdleTerminate`'s own 60-second timer already runs (`if (pendingCountFor(w) === 0)
+  terminateWorker(w)`), just triggered immediately instead of waited out, and only for workers with
+  nothing in flight (a worker mid-request is never aborted just to free memory a few seconds
+  sooner — its own idle timer, re-armed once it finishes, catches it instead). Exposed via a new
+  `faces:unload-idle-workers` IPC handler.
+- `ollamaVisionService.ts` gained `unloadLocalModels()` — hits `/api/generate` and `/api/embed`
+  (the same endpoints the vision/embedding models are normally invoked through) with `keep_alive: 0`
+  and no real prompt/input, which Ollama treats as "unload this now" rather than a real inference
+  call, instead of waiting out Ollama's own ~5-minute default keep_alive. Best-effort or already-unloaded
+  model, or an unreachable Ollama, is silently ignored either way.
+- All three wired into `App.tsx`'s existing `stopBackgroundTasksImmediately()` (already called on
+  any qualifying activity — click, keypress, scroll, Escape) and `startBackgroundTasks()`'s existing
+  resume path (idle for `idleResumeSeconds`, default 15s) resumes auto-tagging before calling
+  `runAutoIndexPass` again, or it would immediately bail on the still-set pause flag.
+
+**Also fixed in passing** (found while diagnosing §51's "resumed" message, which turned out not to
+be in `main.log` at all): `logger.ts`'s `initLogger()` now also monkey-patches global
+`console.log/info/warn/error/debug` to mirror into the same file electron-log already writes to.
+Several main-process services (`thumbnailWorkerService.ts` among them) call plain `console.*`
+directly rather than this module's own `logger.debug/info/...` wrapper, so anything they printed
+previously only ever reached the live terminal — gone the moment that terminal closed, which is
+exactly what made the reported hang untraceable after the fact. Verified empirically (not just by
+reading electron-log's source) that this can't recurse: electron-log's console transport captures
+its own reference to the *original* `console.error/warn/.../log` at module-load time (before
+`initLogger()` ever runs), so it never calls through the patched version — confirmed with a
+standalone script hitting the real `electron-log` package before relying on it in the real app.
+
+**Tests**: `aiAutoIndexService.spec.ts` (+4 tests) — a pass started while activity-paused makes no
+Ollama calls at all; pausing mid-run (detected on the first `/api/chat` call) stops before any
+further batch; `resumeAutoIndexFromActivity` lets a later pass run normally; activity-pausing while
+the user's own Settings toggle is already off changes nothing observable. `ollamaVisionService.spec.ts`
+(+2 tests) — `unloadLocalModels` sends `keep_alive: 0` for both configured models, and never throws
+when Ollama is unreachable. `logger.spec.ts` (+1 test) — a plain `console.log` call after
+`initLogger()` still produces real console output (proving the original isn't replaced, only
+mirrored) and the same message lands in `main.log`. No test added for
+`terminateIdleWorkersNow()` — it's a thin wrapper around `terminateWorker`/`pendingCountFor`, both
+already exercised in practice by the pre-existing idle-timer path, and this codebase has no
+precedent for testing the real `worker_threads` lifecycle (the one existing spec that touches this
+module mocks it out entirely) — meaningfully testing it would mean mocking `worker_threads.Worker`
+from scratch, disproportionate to a 7-line function. Typecheck clean; all touched/dependent spec
+files re-run clean (40 tests across the three main files touched).
+
+## 54. Fixed §49's root cause, exposed a second, worse freeze: renderer-side clustering
+
+§49 fixed `reassignFaceToPerson`'s stale-id fallback; §54 (this one, on a live `hang-watchdog.log`
+from real use) found the user was hitting that fallback's failure message on **every** attempt, not
+occasionally — and the real root cause was neither a rescan race nor the fallback logic.
+
+**Actual root cause**: `libraryStore.ts`'s `appendCatalogPage()` — called for every 100-photo page
+loaded after the first (the vast majority of a 23,000+ photo library) — only ever appended to
+`state.photos`. It never appended that page's `photo.faces` into the separate, flat `state.faces`
+array that `reassignFaceToPerson` (and clustering) actually search. Not stale — never there at all.
+So naming an "Unknown Person" face failed on **every** photo loaded past page 1, confirmed first
+via a screenshot showing the exact fallback message, then via a second screenshot showing the same
+freeze on an *already-named* person too (ruling out anything specific to "Unknown Person").
+
+**Fix**: `appendCatalogPage()` now also pushes each new page's `photo.faces` into `state.faces`.
+New regression test in `saveScan.spec.ts` confirms a photo loaded on page 2 has its faces actually
+present in `state.faces`, not just on the `Photo` object.
+
+**Fixing that exposed a second, worse bug**: once `state.faces` correctly contains the *entire*
+library's faces (previously it silently didn't, for most photos — accidentally "hiding" this), every
+`reassignFaceToPerson`/`confirmFace` call's `propagateLearnedFaces()` step — which scans **every
+photo in the library**, two vector-distance computations per face, synchronously, to find more
+matches for the newly-confirmed person — became proportional to the real library size instead of
+whatever fraction of it happened to be in `state.faces` due to the bug above. For a 23,000+ photo
+library this froze the **renderer's one UI thread** solid for 10+ seconds on every single face
+assignment — confirmed from `hang-watchdog.log`: the main process logged *nothing* (no stalls, no
+in-flight IPC) for the entire freeze window, right up to Electron's own `RENDERER UNRESPONSIVE`
+event — proof the renderer's JS thread itself was stuck, not any IPC call, which is also why this
+was invisible to every main-process fix so far (§51/§52/§53 all target main-process blocking).
+
+**Fix**: `propagateLearnedFaces()` (`libraryStore.ts`) is now `async`, yielding
+(`await new Promise(resolve => setTimeout(resolve, 0))`) every 300 photos during its scan. This
+can't reduce total work, but — same reasoning as §52's main-process fix — it turns one solid
+multi-second block into many small ones, so clicks/repaints/the "please wait" indicator all get a
+turn between chunks instead of only after the whole scan finishes. Converting it to `async` ripples
+to its two callers inside `libraryStore.ts` (`reassignFaceToPerson`, `confirmFace` — both now also
+`async`) and their five external call sites (`ReassignFaceModal.tsx`, `PhotoLightbox.tsx`,
+`PeopleView.tsx` ×3, including the "Mark All Correct" bulk action, which now awaits each
+`confirmFace` sequentially rather than firing them all synchronously back-to-back).
+
+**Tests**: `propagateLearnedFacesYield.spec.ts` (new, 3 tests) — a scan crossing the 300-photo yield
+boundary schedules at least one real yield (spying on `setTimeout` for 0ms calls, not just "doesn't
+throw"); a scan small enough to fit one chunk needs no yield at all; the yielded version returns the
+exact same `{newlyAssignedCount, affectedPhotosCount}` and mutates the exact same face as before —
+proving the yield changes timing only, not behavior. `reassignFaceStaleId.spec.ts`'s 5 tests updated
+for the new `async` signature (all still pass unchanged otherwise). `saveScan.spec.ts` +1 test for
+the `appendCatalogPage` fix. Typecheck clean; 19 tests across the three directly-touched files pass,
+plus `faceClusterCache.spec.ts`/`faceClusterPipelineIncremental.spec.ts` (unaffected call paths)
+re-verified clean.
+
+**Not changed**: `confirmFace`'s own O(photos) bookkeeping loop (syncing `isConfirmed` across
+`photo.faces`) and the `cluster()`/`clusterFaces` re-clustering calls themselves are still
+unchunked synchronous passes — cheaper per-item than `propagateLearnedFaces`'s vector math (a field
+assignment vs. two distance computations), so a lower priority left for a follow-up if still
+noticeable after this fix.
+
+## 55. §54's yield wasn't enough either — moved clustering off the main thread onto a Web Worker
+
+User, reasonably: *"can't we make this work in background rather than in main thread?"* — after
+hitting the §54 freeze again (hang-watchdog.log: another 17-second main-process silence right up to
+`RENDERER UNRESPONSIVE`, same signature, different click — this time on an *already-named* person,
+proving it was never specific to "Unknown Person"). §54's per-chunk yield in `propagateLearnedFaces`
+helped but didn't fix it: `cluster()` (the actual `clusterFaces` re-clustering call, used by
+`propagateLearnedFaces` *and* 12 other `libraryStore.ts` methods — reassign, confirm-adjacent,
+unassign, merge, delete person, delete/reset/remove face(s) from a photo, startup reconciliation)
+was still one unchunked synchronous pass, and for a library with tens of thousands of faces that
+alone is enough to freeze the renderer's one thread for several seconds — no yield point can fix a
+single computation that doesn't yield internally; only moving it off that thread can.
+
+**What changed**: `clusterFaces` and a newly-extracted `matchUnassignedFacesToCentroid` (the pure
+matching logic `propagateLearnedFaces` used to run inline — see `clustering.ts`) are pure,
+environment-free functions — no `window`/`electronAPI`/DOM dependency, just numeric math on plain
+data. That makes them a clean fit for a real Web Worker:
+- **`clusterWorker.ts`** (new) — the worker entry point; receives `{type: 'cluster'|'match', ...}`
+  messages, calls the pure function, posts back the result.
+- **`clusterWorkerClient.ts`** (new) — the main-thread client. Lazily creates ONE persistent
+  `Worker` (via Vite's native `?worker` import — confirmed bundled as its own chunk,
+  `dist/assets/clusterWorker-*.js`, ~4.7kB, not inlined into the main bundle), posts a
+  request/response pair per call, and **falls back to calling the pure functions directly,
+  synchronously**, whenever `typeof Worker === 'undefined'` (the vitest/jsdom test environment has
+  no `Worker` global) or if the worker ever errors/crashes — so a wedged worker degrades to the old
+  (still-correct, just blocking) behavior for the rest of the session instead of breaking clustering
+  outright.
+- `libraryStore.ts`'s private `cluster()` wrapper now `await`s `clusterFacesAsync` instead of
+  calling `clusterFaces` directly — the single place all 13 of its callers route through, so fixing
+  it there fixes it everywhere at once (the same "fix once" reasoning as §52's main-process yield).
+  `propagateLearnedFaces` similarly now builds a slim `{id, faces: [...]}` view of every photo and
+  calls `matchUnassignedFacesToCentroidAsync` instead of scanning inline.
+
+**The identity-sharing trap this almost reintroduced**: the original synchronous `clusterFaces`
+edited face objects **in place**, and those same objects were shared by reference between
+`state.faces` and every `photo.faces` array — so `this.state.faces = updatedFaces` always kept
+`photo.faces` in sync for free, just by object identity. A Worker boundary can't preserve object
+identity (structured-clone always produces copies), so without a fix, every `photo.faces` array
+would have silently gone stale the instant `state.faces` was reassigned — reintroducing the exact
+class of bug §49/the `appendCatalogPage` fix (§54) had just closed, this time for every single
+cluster/reassign/confirm/merge action instead of just paginated photos. Fixed inside `cluster()`
+itself: after the worker (or fallback) returns, it re-walks `state.photos` and swaps in the fresh
+clone wherever a `photo.faces` entry's id matches one the clustering touched, calling the existing
+`touch()` (same mechanism `confirmFace`'s own in-place mutations already used) so the save-scan
+cache knows that photo changed. One fix, inside the one function every caller already goes through.
+
+**All 13 `this.cluster(...)` call sites converted** to `await this.cluster(...)`, their enclosing
+methods made `async`, and every external caller across `ReassignFaceModal.tsx`, `PhotoLightbox.tsx`,
+`PeopleView.tsx`, and `MergePeopleModal.tsx` updated to `await` (or, where the return value was
+already discarded — `App.tsx`'s `handleMergePeople`, `PhotoLightbox.tsx`'s `handleUnassignFace` —
+left as fire-and-forget, unchanged behavior). `reconcilePeopleAndFaces` (the startup/library-load
+reconciliation pass, 2 of the 13 sites) is called from 8 places inside `libraryStore.ts` itself, no
+external callers — 5 already inside `async` methods got `await`; the 3 inside synchronous public
+methods (`applyLibrarySwitchResult`, `setPhotos`, `addPhotos`) got `void` (fire-and-forget,
+identical to today's behavior, since none of them use reconciliation's return value or need it to
+finish before returning).
+
+**Tests**: `clusterWorkerClient.spec.ts` (new, 3 tests) — the fallback path produces identical
+results to calling the pure functions directly, for both `clusterFacesAsync` and
+`matchUnassignedFacesToCentroidAsync`; an empty request round-trips cleanly. §54's
+`propagateLearnedFacesYield.spec.ts` renamed to `propagateLearnedFacesWorker.spec.ts` and rewritten
+— the old "schedules a `setTimeout(0)`" assertions tested a mechanism that no longer exists;
+replaced with assertions that `propagateLearnedFaces`/`reassignFaceToPerson` actually delegate
+through `clusterWorkerClient` (spying on its exports), plus a result-correctness test extended to
+also check `photo.faces` stays in sync with `state.faces` post-cluster (the identity-trap check
+above). `personPicker.spec.ts` (13 tests) needed its `pressEnter`/click test helpers converted to
+`async act()` + `await`, since the handlers they trigger now have a real microtask (the worker
+round-trip, or the fallback's own `await`) before `onSuccess`/`onClose` fire — a sync `act()`
+returned before that continuation ran, failing 4 tests that asserted on it. Every other
+face/clustering spec (`reassignFaceStaleId`, `saveScan`, `faceClusterCache`,
+`faceClusterPipelineIncremental`, `faceClusteringEquivalence`, `photoRotation`,
+`duplicateCleanerGuard` — 9 files, 54 tests) re-run clean unchanged, since jsdom's lack of a
+`Worker` global means they all exercise the synchronous fallback path, which calls the exact same
+pure functions as before this change. Typecheck clean. Verified via `npm run build:ui` that Vite
+actually bundles the worker as its own chunk (`dist/assets/clusterWorker-*.js`, confirmed present
+only once `clusterWorkerClient.ts` was actually imported — an unused worker file is correctly
+tree-shaken out, which is why the first build attempt, before wiring, showed no new chunk at all).
+
+## 56. §55's worker surfaced a THIRD bug: no loading state → confused double-submit → stray person
+
+Confirmed live via two screenshots: searching "mis" correctly showed "Misti Parimal" as a match; a
+moment later, same session, the query had become "misti" and the picker showed "No match — press
+Enter to create a new person" — **with "Misti Parimal" gone from the list entirely**, and the
+"Merge the whole person" line's photo count for the still-unknown source person dropped from 59 to
+2 between the two screenshots. That combination — a real person vanishing from the list, and an
+unrelated person's count collapsing — means the first Enter press had already kicked off
+`reassignFaceToPerson`, whose own `cluster()` step (`allowNewClusters` defaults to `true`) can
+reshuffle/merge/reassign *unrelated* people as a side effect, and that step's `notify()` fires
+**before** the whole async chain (worker round-trip + `propagateLearnedFaces`) finishes — so the
+still-open modal re-rendered mid-operation against a library that hadn't settled yet. With no
+loading indicator anywhere, the user reasonably assumed the first Enter hadn't registered and
+pressed it again — which, now matching the "no match" state, triggered `onCreateNew('misti')`
+instead, creating a stray new person.
+
+Reproduced this exactly before fixing it (not just inferred it): `reassignModalDoubleSubmit.spec.ts`
+mocks `reassignFaceToPerson` with a controllable pending Promise (simulating the worker's real
+wall-clock delay), presses Enter once, then again before the first resolves, and asserts the store
+method was only ever called once — this failed (`called 2 times`) against the pre-fix code,
+confirming the bug, then passed once the fix below was in place.
+
+**Fix** — `ReassignFaceModal.tsx`: `assign()` now guards against re-entry (`if (pendingLabel)
+return;`) and, while a submission is in flight, the entire `PersonPicker` + merge-checkbox section
+is replaced (not just disabled) with a plain "Assigning this face to 'X'... this re-checks the
+library for other matching photos, which can take a few seconds" message + spinner — replaced
+rather than merely disabled specifically so a live-updating `people` list can never flicker under
+the user mid-operation. `MergePeopleModal.tsx` got the equivalent, lighter-weight fix (it has an
+explicit Confirm button rather than a live search-and-submit flow): `submitMerge()` guards on a new
+`isMerging` flag, and the Confirm button disables itself and shows "Merging..." with a spinner while
+pending. Cancel/Esc are deliberately left working in both — the underlying `libraryStore` call isn't
+cancellable anyway (it keeps running and completes safely whether or not the modal is still
+mounted), so letting the user dismiss and keep working is strictly better than forcing them to wait.
+
+**Also fixed in passing**: `className="animate-spin"` was already used by loading spinners in
+`BulkEditModal.tsx`/`DuplicateCleanerModal.tsx` (and now this fix's two modals) — but no
+`.animate-spin` CSS class was ever actually defined anywhere in the app, so none of those spinners
+have ever actually spun. Added the missing `@keyframes spin` / `.animate-spin` to `index.css` once,
+fixing it everywhere at once rather than just for the two modals touched here.
+
+**Tests**: `reassignModalDoubleSubmit.spec.ts` (new, 1 test, described above — the actual
+reproduction). `personPicker.spec.ts` +1 test for `MergePeopleModal`'s equivalent guard (second
+submit click while pending fires `mergePeople` only once, button shows disabled + "Merging..." in
+the meantime). Typecheck clean; both new/touched test files re-run clean (`reassignModalDoubleSubmit.spec.ts`
+1/1, `personPicker.spec.ts` 14/14 including the 13 pre-existing cases). Both `dist/`/`dist-electron/`
+rebuilt with this fix live.
+
+**Not changed / known follow-up**: the underlying `cluster()` reshuffling (Person 11141 dropping
+from 59 to 2 photos from a single face reassignment) may itself be intended behavior — a
+quality-weighted re-cluster legitimately reconsidering other photos' assignments once given new
+ground truth — or it may be overly aggressive for what the user asked for ("move this one face").
+Not investigated further this pass since the immediate, concrete, reproduced bug (double-submit
+creating a stray person) is what got fixed; worth a dedicated look if large, surprising reshuffles
+after a single-face reassignment keep getting reported once this fix is live and double-submits are
+no longer possible to confuse the picture.
+
+## 57. OOM survey — 7 unbounded-growth leaks found and fixed
+
+Surveyed every memory-sensitive subsystem touched this session (plus the obvious adjacent ones —
+DB connection lifecycle, thumbnail/avatar/sprite caches, both Web Worker clients) for anything that
+grows without bound across a session. Two were genuinely severe; the rest were real but smaller.
+Fixed all seven rather than just the top two, since none required a design change — each is either
+"close/clear on switch" or "cap with oldest-first eviction," both patterns already used elsewhere in
+this codebase (`resetAllPeopleAndFaces`'s `globalFaceCache.clear()`, `batchThumbnailStore`'s
+`MAX_BATCH_THUMBNAILS`).
+
+**1. Main process — DB connections, and the ~100MB face-cluster cache riding on them, never released across library switches** (`src/main/services/db.ts`). `openConnections: Map<string, DatabaseSync>` is deliberately cached ("so flipping between a handful of recently-used libraries doesn't reopen/re-migrate a connection on every switch" — its own comment) but had no eviction at all: `setActiveLibrary`/`switchLibrary` only repoint a pointer, never close the library being left. Worse, `pipelineOrchestrator.ts`'s `sharedFaceClusterCaches` is a `WeakMap<DatabaseSync, FaceClusterCache>` holding ~100MB+ of face descriptors per library — its own comment already flagged this ("holds ~100+MB... drop the WeakMap entry if that ever matters") but nothing ever did, because the `DatabaseSync` key was never eligible for GC in the first place. Fixed by actually capping `openConnections` at `MAX_OPEN_LIBRARY_CONNECTIONS = 3` with oldest-first (LRU, via Map re-insertion-on-access) eviction that `.close()`s the evicted connection — once that `DatabaseSync` is actually collectible, the WeakMap entry rides along for free, no extra code needed in pipelineOrchestrator.ts beyond updating its comment. The active library is never evicted even if it happens to be the oldest entry. New test: `dbConnectionCap.spec.ts` (2 tests — cap enforced across 5 opened libraries; active library survives even when opened first).
+
+**2. Renderer — `libraryStore.globalFaceCache` never cleared across library switches** (`libraryStore.ts`). Already downgraded from a persisted ~390MB blob to a "per-session, in-memory cache only" (see the comment at `loadGlobalCache`), but within a session it still only ever grew — `applyLibrarySwitchResult` reads it to pre-populate the first page's faces, but never clears entries from the library just left. In practice redundant for that very call: `getCatalogPage`'s `firstPage` already carries faces straight from SQLite (`attachFacesToPhotos`), so the cache restore there is a fallback, not the primary path. Fixed with `this.globalFaceCache.clear()` right after that restore, in `applyLibrarySwitchResult` — same pattern `resetAllPeopleAndFaces` already uses.
+
+**3. Main process — `thumbnailWorkerService.confirmedCachedPaths`/`failedPaths` persist for process lifetime** (`thumbnailWorkerService.ts`). Both are explicitly documented as intentionally surviving re-enqueues of the same library (their own comments describe real prior bugs from clearing/recounting too eagerly), so a blind clear-on-switch would have reintroduced exactly those bugs. Instead capped both (200k / 20k entries — cheap, since these hold path strings, not descriptors) with oldest-first trimming folded into the existing 2-second `updateResourceMetrics` tick rather than touched at every insert site. New test: `thumbnailPathCacheCap.spec.ts` (2 tests, via new test-only accessors on the singleton).
+
+**4/5. Renderer — `asyncImageLoader.spriteCoordCache` and `avatarSpriteLoader.cache` had no cap at all** (`asyncImageLoader.ts`, `avatarSpriteLoader.ts`). The sibling `batchThumbnailStore` was already capped at `MAX_BATCH_THUMBNAILS = 6000` specifically because unbounded dataURL caching caused a real prior OOM crash (per its own comment) — that fix was never mirrored to these two. Added the same oldest-first `Map` eviction: `MAX_SPRITE_COORD_CACHE = 100_000` (coordinate objects, not image data, so a much higher cap than dataURLs is fine) and `MAX_AVATAR_SPRITE_CACHE = 20_000` (bounded by people count in practice, capped anyway since it's free).
+
+**6. Renderer — `clusterWorkerClient`'s `pending` Map could leak forever after a worker crash** (`clusterWorkerClient.ts`). On `onerror`, `failAllPending()` correctly rejected everything *currently* pending, but the module-level `worker` reference was never reset — every `getWorker()` call for the rest of the session kept handing out the same dead worker, so every clustering/matching call made after a crash would `postMessage` into it and sit in `pending` forever (never resolving, rejecting, or being removed). Fixed by terminating and resetting `worker` to `undefined` inside `onerror`, so the next call spins up a fresh one. (Not separately tested — Vitest's jsdom environment has no real `Worker` global to simulate a crash against; the existing `clusterWorkerClient.spec.ts` already covers the fallback path this change doesn't touch.)
+
+**7. Main process — `faceDetectionWorkerClient`'s `retiring` Set had one narrow leak path** (`faceDetectionWorkerClient.ts`). A pool-size change retires a worker still running a request; two of the three paths that can finish that request (`message` handler, `exit` handler) already removed it from `retiring`, but the request-timeout path in `dispatch()` called `terminateWorker()` directly without that cleanup. Fixed in `terminateWorker()` itself (the one place all three paths funnel through) rather than patching the timeout path alone — same one-fix-covers-every-caller reasoning as the `appendCatalogPage` fix in §49. Edge-case severity: one leaked `Worker` handle per {pool-size change} × {that worker's last request timing out instead of finishing}, not a per-photo or per-session leak.
+
+Typecheck clean. New/relevant test suites re-run clean: `dbConnectionCap.spec.ts` (new, 2), `thumbnailPathCacheCap.spec.ts` (new, 2), plus `perLibraryDb`, `pipelineDbScoping`, `catalogService`, `thumbnailFastForward`, `incrementalSave`, `storageHandlers`, `saveScan`, `clusterWorkerClient`, `propagateLearnedFacesWorker`, `reassignFaceStaleId` (all pre-existing, all still passing — 90 tests total across this round). `dist/`/`dist-electron/` rebuilt with every fix above live.
+
+**Not a finding / confirmed clean**: `pipelineOrchestrator.ts`'s face-detection buffer and `transientFailureCounts` (already capped at 5000), `fileOrganizer.ts`'s per-scan arrays, `libraryStore.listeners`, `avatarSpriteLoader`/`asyncImageLoader`'s listener Sets (all paired with `useEffect` cleanup), and the one `URL.createObjectURL` call site in `asyncImageLoader.ts` (already capped at `MAX_BLOB_CACHE = 250` with revoke-on-evict) — all reviewed, none leak. No periodic RSS/heap logging exists in `main.ts`/`logger.ts` — a diagnostic gap, not a leak, and not addressed here since nothing currently needs it to act on these fixes.
+
+## 58. Reassigning/merging a face still "took too long" — moved the re-cluster itself to the background instead of just hiding it behind a spinner
+
+§56 made the wait visible (a loading state instead of a frozen-looking modal) but didn't make it shorter — the user's next report was that it's still slow, and asked directly: does the heavy part need to run in the foreground at all? It doesn't. `cluster()` already runs off the renderer's UI thread (a Web Worker, since §55) — that was never the bottleneck being felt here. The bottleneck is that `reassignFaceToPerson`/`mergePeople` **awaited** that worker round-trip (plus, for reassign, a second one for `propagateLearnedFaces`) before returning, and `ReassignFaceModal`/`MergePeopleModal` awaited THAT before closing — so the modal stayed open and the spinner kept spinning for however long the full-library re-cluster actually took, regardless of which thread it ran on.
+
+Looked at what the awaited work actually does in both methods: in `reassignFaceToPerson`, every success/failure check (face found, photo found, name non-empty, "already in this photo" conflict) happens *before* the `cluster()` call — by that point `face.personId`, `photo.faces`, and (for a new name) the new `Person` record are already written directly into `this.state`. The `cluster()` + `propagateLearnedFaces` calls after that are pure refinement: do other dangling faces/people need reshuffling now that this is known, and should other matching photos get the same name. Neither can change whether the reassignment itself succeeded. Same story in `mergePeople` — faces are already repointed to `targetPersonId` before `cluster()` runs; the only thing `cluster()` was doing for the caller was filtering `sourcePersonId` out of `this.state.people` (done directly now, synchronously).
+
+**Fix**: both methods now do their direct mutation, call `notify()` so the UI reflects it immediately, and return `{ success: true }` / `true` right away — the modal closes as soon as the edit itself is valid, not after the library finishes reconsidering everything else. The re-cluster (+ propagation, for reassign) is hop off to a new `queueBackgroundRecluster()` helper, which chains onto a `backgroundClusterChain: Promise<void>` so overlapping calls (the user reassigning several faces in quick succession, no longer forced to wait between them) run one at a time rather than racing on a stale snapshot — same reasoning, and same pattern, as the existing `saveChain` serializes saves. A failed link in that chain is caught and logged rather than breaking every background re-cluster queued after it.
+
+Net effect: naming/reassigning a face is now just an in-memory array write + one `notify()` — milliseconds, not seconds — with the actual library-wide reconciliation genuinely happening in the background, exactly as asked ("either show a waiting dialog... or everything should be transferred to background process"). The `pendingLabel`/`isMerging` guards from §56 are kept (cheap insurance against a double Enter/click landing inside the now much shorter await), but the "this re-checks the library... can take a few seconds" copy in `ReassignFaceModal` was removed since it's no longer true.
+
+**Scope**: limited to `reassignFaceToPerson` and `mergePeople` — the two paths behind the modals the user was actually describing. `unassignFaceFromPerson`, `confirmFace`, `deleteFaceDetection`, `deletePerson`, and the bulk photo-curation methods (`removeUnknownFacesFromPhoto`, etc.) still await their `cluster()` call inline; none of them were reported as slow, and they don't have a modal sitting open waiting on them the way reassign/merge do. Same pattern (`queueBackgroundRecluster`) is there to extend to any of them later if they turn out to need it too.
+
+**Tests**: `propagateLearnedFacesWorker.spec.ts`'s "reassignFaceToPerson calls clusterFacesAsync" test updated to `await store.backgroundClusterChain` after the call, since that call is no longer what triggers the worker call synchronously. All other suites touching these two methods (`reassignFaceStaleId.spec.ts`, `personPicker.spec.ts`, `reassignModalDoubleSubmit.spec.ts`) needed no changes — they only assert on the parts that are still synchronous (the direct state mutation) or go through a fully-mocked store. Typecheck clean; `reassignFaceStaleId` (5), `propagateLearnedFacesWorker` (3), `reassignModalDoubleSubmit` (1), `personPicker` (14), `clusterWorkerClient` (3), `saveScan` (11) all re-run clean (37 tests). `dist/`/`dist-electron/` rebuilt with this live.
+
+## 59. Tagging an unrecognizable person (back turned to camera) — answered the product question, found and fixed a real bug along the way
+
+User asked how to tag a known person in a photo where no face is visible (back to camera) without that tag being used as recognition training data, and whether a "hidden face" / body-recognition feature was needed for it to be searchable. Investigated what already exists before answering (manual face tagging: `PhotoLightbox.tsx`'s "draw a box" tool → `addManualFace` → `ReassignFaceModal`; search/filter by person: `PeopleView.tsx`, `AlbumsView.tsx`, `aiSearchService.ts`).
+
+**Answer given**: no new feature needed — draw a box over the person (anywhere on them is fine, a real face isn't required) and assign them to their *existing* Person identity via the same manual-tag flow already in `PhotoLightbox`. Confirmed that every person-browsing/search path (`PeopleView.tsx:213,306`, `AlbumsView.tsx:171`, `aiSearchService.ts:732,742`) filters purely by `personId` — no descriptor, no confirmed-face requirement — so a tag like this already shows up correctly everywhere the user would look for it. A separate "recognize people from behind/by clothing" feature would be a much larger ML undertaking for a problem the tagging system already solves at the search/browse layer.
+
+**Bug found while checking whether it's actually *safe* to recommend this today**: `addManualFace` (`libraryStore.ts`) defaulted a face with no computable descriptor (exactly the "back turned" case — `computeDescriptorForRegion` returns `null` when the drawn box has no detectable face) to `new Array(128).fill(0)`. But the real recognition model (`faceDetectionEngine.ts`, MobileFaceNet/ArcFace) produces **512-d** embeddings, not 128 — every other length check in this codebase (`clustering.ts`, `faceClustering.ts`, and `libraryStore.ts`'s own `facesWithDesc`/`propagateLearnedFaces` checks) already uses a plain `descriptor.length > 0` guard instead of a specific number; `addManualFace` and one spot in the now-dead `detectAndMatchFacesForPhoto` were the sole two outliers hardcoding `128`.
+
+That mismatch was actively dangerous for the exact workflow being recommended: `computeQualityWeightedCentroid` derives `dim` from whichever face happens to be first in a person's face list and **skips every face whose descriptor length doesn't match it** (clustering.ts:59,64). A real, recognized person who *also* gets one of these no-visible-face tags risked that 128-length fake sorting first and silently excluding every one of their real 512-d exemplars from the centroid — producing a degenerate, permanently-unmatchable centroid for a real person, triggered by nothing more than tagging one back-turned photo of them.
+
+**Fix**: `addManualFace` now stores an **empty array** (`[]`) when no real descriptor was computed, not a wrong-length fake one. Every distance/centroid function already treats `length > 0` as "this is a real exemplar" — an empty array fails that check immediately and is never counted, with no dependency on array ordering. The face still carries `personId`, so it's still fully taggable and searchable (per the "answer" above). Also fixed the matching `=== 128` check in `detectAndMatchFacesForPhoto` for consistency, though that function is unused dead code (per earlier review). A real 512-d descriptor computed from a box that *did* happen to catch a usable face is now also kept correctly — previously it was discarded by the same `=== 128` check and silently replaced with the fake zero array even on success.
+
+**Tests**: new `manualFaceNoDescriptor.spec.ts` (3 tests) — confirms `addManualFace` without a descriptor yields `[]` (not a 128-zero array), confirms a real 512-d descriptor is kept as-is, and reproduces the exact "no-descriptor tag sorts first" ordering against `computeQualityWeightedCentroid` directly, confirming the centroid still comes out correct (512-dim, pointed at the real exemplar) instead of degenerate. Typecheck clean; `saveScan.spec.ts` (which already calls `addManualFace`) re-run clean. `dist/`/`dist-electron/` rebuilt with this live.

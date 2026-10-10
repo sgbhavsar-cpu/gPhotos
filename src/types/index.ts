@@ -541,6 +541,7 @@ export interface IElectronAPI {
   isBrowserShim?: boolean;
   isElectron?: boolean;
   selectDirectory: () => Promise<string | null>;
+  selectFile?: (options?: { filters?: { name: string; extensions: string[] }[]; title?: string }) => Promise<string | null>;
   scanDirectory: (dirPath: string) => Promise<Photo[]>;
   readExif: (filePath: string) => Promise<{ exif?: ExifMetadata; location?: LocationMetadata; dateTaken?: string }>;
   analyzeDryRun: (options: OrganizeOptions) => Promise<DryRunSummary>;
@@ -549,6 +550,9 @@ export interface IElectronAPI {
   readFileAsBase64?: (filePath: string) => Promise<string>;
   planPhotoRelocation?: (photos: RelocationPhotoInput[]) => Promise<RelocationPlan>;
   relocatePhotos?: (params: { photos: RelocationPhotoInput[]; targetDir: string }) => Promise<RelocationOutcome>;
+  commitRelocation?: (params: { photos: RelocationPhotoInput[]; targetDir: string; label?: string }) => Promise<RelocationOutcome & { queued?: boolean }>;
+  getPendingMovesCount?: () => Promise<number>;
+  onPendingMoveApplied?: (callback: (info: { targetDir: string; label?: string; results: RelocationItemResult[] }) => void) => () => void;
   onPhotoRelocationProgress?: (callback: (progress: { done: number; total: number }) => void) => () => void;
   detectPhotoOrientation?: (photos: OrientationInput[]) => Promise<OrientationResult[]>;
   onOrientationProgress?: (callback: (progress: { done: number; total: number }) => void) => () => void;
@@ -610,6 +614,7 @@ export interface IElectronAPI {
     error?: string;
   }>;
   openItemInFolder: (filePath: string) => Promise<boolean>;
+  openFile: (filePath: string, programPath?: string) => Promise<boolean>;
   getWebServerStatus: () => Promise<WebServerStatus>;
   setWebServerSettings: (settings: { enabled: boolean; port: number }) => Promise<WebServerStatus>;
   getWebServerPin?: () => Promise<{ pin: string; error?: string }>;
@@ -647,6 +652,7 @@ export interface IElectronAPI {
    pauseThumbnailPreCache?: () => Promise<{ paused: boolean }>;
    pauseThumbnailPreCacheForActivity?: () => Promise<{ paused: boolean }>;
    resumeThumbnailPreCacheForActivity?: () => Promise<{ paused: boolean }>;
+   unloadIdleFaceWorkers?: () => Promise<{ ok: boolean; error?: string }>;
   getStorageCheckpoints?: () => Promise<Record<string, StorageSyncCheckpoint>>;
   getLibraryStatus?: (libraryPath: string) => Promise<LibraryScanStatus | null>;
   saveLibraryStatus?: (status: Partial<LibraryScanStatus> & { libraryPath: string }) => Promise<LibraryScanStatus>;

@@ -102,6 +102,14 @@ interface PhotoLightboxProps {
   /** Came here from a person's page — highlight that person's face marker (a distinct color from
    *  the normal hover highlight) so it's never lost among a photo's other faces. */
   highlightPersonId?: string | null;
+  /** Opened via an explicit "Edit" action elsewhere (e.g. the two-pane explorer) — jump straight
+   *  into the editor once the full-resolution photo is actually ready, instead of making the user
+   *  open the lightbox and then press Edit themselves. */
+  autoEdit?: boolean;
+  /** This photo was browsed to (e.g. the two-pane explorer's free-form folder/album browsing), not
+   *  necessarily part of the tracked library catalog — a saved edit must stay a plain file
+   *  operation: no library catalog entry, no thumbnail-cache generation for it. */
+  skipLibrarySync?: boolean;
 }
 
 export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
@@ -113,6 +121,8 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   onToggleFavorite,
   onNavigateToPerson,
   highlightPersonId,
+  autoEdit,
+  skipLibrarySync,
 }) => {
   const isMobile = useIsMobile();
   // On mobile the info panel is a full-width overlay on top of the photo
@@ -121,7 +131,8 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   // behind the panel the instant the lightbox opens, so mobile starts closed.
   const [showInfo, setShowInfo] = useState(!isMobile);
   const [showMobileActions, setShowMobileActions] = useState(false);
-  const [showFaces, setShowFaces] = useState(true);
+  // Default off: face marker boxes are an opt-in overlay, not something every photo should open with.
+  const [showFaces, setShowFaces] = useState(false);
   const [hoveredFaceId, setHoveredFaceId] = useState<string | null>(null);
   const [reassignFace, setReassignFace] = useState<{
     face: DetectedFace;
@@ -314,9 +325,9 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   const [viewMode, setViewModeState] = useState<ViewMode>(() => {
     try {
       const saved = localStorage.getItem('gphotos_lightbox_view_mode');
-      return saved === 'fill' || saved === 'original' ? saved : 'fit';
+      return saved === 'fit' || saved === 'fill' || saved === 'original' ? saved : 'fill';
     } catch {
-      return 'fit';
+      return 'fill';
     }
   });
   const viewModeZoomRef = useRef(1); // the zoom the current mode last produced, to tell whether the user has since zoomed by hand
@@ -527,6 +538,17 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   const isFullResDisplayed = isLightboxImgLoaded && !lightboxImgError && !fallbackToThumbnail && isOriginalAvailable !== false;
   const canEditNow = isHeic || isFullResDisplayed;
   const [isEditing, setIsEditing] = useState(false);
+  // autoEdit fires once canEditNow actually becomes true (not on mount) — opening straight into the
+  // editor on a photo that isn't ready yet would show the same placeholder/offline pixels canEditNow
+  // exists to keep Save from baking in. A ref (not state) so exiting edit mode manually afterward
+  // doesn't make this effect re-fire and reopen it.
+  const autoEditFiredRef = useRef(false);
+  useEffect(() => {
+    if (autoEdit && canEditNow && !autoEditFiredRef.current && !photo.isVideo) {
+      autoEditFiredRef.current = true;
+      setIsEditing(true);
+    }
+  }, [autoEdit, canEditNow, photo.isVideo]);
   const [editRotation, setEditRotation] = useState<number>(0);
   const [editFlipH, setEditFlipH] = useState(false);
   const [isSavingEdit, setIsSavingEdit] = useState(false);
@@ -620,17 +642,27 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
         });
 
         if (res.success && res.newPhoto) {
-          libraryStore.updatePhoto(res.newPhoto);
+          // skipLibrarySync (two-pane explorer's free-form browsing): this file may not be part of
+          // the tracked library/mirror catalog at all, so a save must stay a plain file operation —
+          // no catalog entry, no cache thumbnail generated for it.
+          if (!skipLibrarySync) {
+            libraryStore.updatePhoto(res.newPhoto);
+          }
           // Recreate the thumbnail immediately rather than leaving the grid to show stale pixels
           // until some later, unrelated refresh: bump the cache-busting version on every path whose
           // bytes may have changed (the source itself, and — for a virtual/OneDrive mirror — its
           // separately-cached local thumbnail file), evict+refetch the grid's in-memory batch
           // thumbnail, and drop any pre-baked sprite tile so a card falls back to the fresh one.
+          // bumpImageVersion always runs — this lightbox's own <img> must show the new bytes on an
+          // in-place overwrite whether or not the photo is catalog-tracked; the rest is cache
+          // generation for the (library-only) grid/people views, which skipLibrarySync opts out of.
           const changedPaths = [...new Set([photo.filePath, res.newPhoto.filePath].filter(Boolean))] as string[];
           bumpImageVersion(...changedPaths);
-          for (const p of changedPaths) {
-            evictAndRefreshThumbnail(p, res.newPhoto.originalRemotePath, 500);
-            invalidateSpriteCoordinate(p);
+          if (!skipLibrarySync) {
+            for (const p of changedPaths) {
+              evictAndRefreshThumbnail(p, res.newPhoto.originalRemotePath, 500);
+              invalidateSpriteCoordinate(p);
+            }
           }
           setScanStatusMessage(
             saveAsCopy
@@ -1006,9 +1038,9 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     });
   };
 
-  const handleConfirmFace = (faceId: string, e: React.MouseEvent) => {
+  const handleConfirmFace = async (faceId: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    const res = libraryStore.confirmFace(faceId);
+    const res = await libraryStore.confirmFace(faceId);
     if (res && res.newlyAssignedCount > 0) {
       setScanStatusMessage(`✓ Face verified! 2.5x weighted centroid discovered ${res.newlyAssignedCount} additional photo(s).`);
       setTimeout(() => setScanStatusMessage(null), 4500);
@@ -1046,8 +1078,8 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     return face.isConfirmed ? 0 : 1;
   };
 
-  const handleRemoveUnknownFaces = () => {
-    const { removedCount } = libraryStore.removeUnknownFacesFromPhoto(photo.id);
+  const handleRemoveUnknownFaces = async () => {
+    const { removedCount } = await libraryStore.removeUnknownFacesFromPhoto(photo.id);
     setScanStatusMessage(
       removedCount > 0
         ? `✓ Removed ${removedCount} unknown face${removedCount === 1 ? '' : 's'}. This photo is locked from auto face-scanning until you click Scan Faces again.`
@@ -1056,8 +1088,8 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     setTimeout(() => setScanStatusMessage(null), 4500);
   };
 
-  const handleRemoveUnconfirmedFaces = () => {
-    const { removedCount } = libraryStore.removeUnconfirmedFacesFromPhoto(photo.id);
+  const handleRemoveUnconfirmedFaces = async () => {
+    const { removedCount } = await libraryStore.removeUnconfirmedFacesFromPhoto(photo.id);
     setScanStatusMessage(
       removedCount > 0
         ? `✓ Removed ${removedCount} unconfirmed face${removedCount === 1 ? '' : 's'}. This photo is locked from auto face-scanning until you click Scan Faces again.`
@@ -1066,8 +1098,8 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     setTimeout(() => setScanStatusMessage(null), 4500);
   };
 
-  const handleResetUnconfirmedFaces = () => {
-    const { resetCount } = libraryStore.resetUnconfirmedFacesToUnknown(photo.id);
+  const handleResetUnconfirmedFaces = async () => {
+    const { resetCount } = await libraryStore.resetUnconfirmedFacesToUnknown(photo.id);
     setScanStatusMessage(
       resetCount > 0
         ? `✓ Reset ${resetCount} unconfirmed face${resetCount === 1 ? '' : 's'} to unknown.`
@@ -1133,6 +1165,12 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
           setCropRect(null);
           setIsCropping(false);
         } else {
+          // Every sibling branch above stops the event here so Escape closes one level at a
+          // time instead of leaking to whatever's underneath — this one must too, or closing
+          // the lightbox lets the SAME keypress also reach the tab behind it (e.g. a capture-
+          // phase Escape handler on the two-pane explorer or folder tree), which can look like
+          // "closing the photo also navigated away" even though nothing here asked it to.
+          e.stopImmediatePropagation();
           onClose();
         }
       } else if (e.key === 'ArrowLeft' && !isTaggingMode) {

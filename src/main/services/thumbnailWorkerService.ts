@@ -75,6 +75,13 @@ export async function isThumbnailCached(sourcePath: string, size: number = 250):
 
 const FAILED_RETRY_AFTER_MS = 10 * 60 * 1000;
 const FAILED_MAX_ATTEMPTS = 3;
+// confirmedCachedPaths/failedPaths are deliberately NOT cleared on library switch (see their own
+// comments — the whole point is staying idempotent across repeated re-enqueues of the same
+// library), so over a long enough multi-library session they otherwise grow forever. Cheap to cap
+// since entries are just path strings, not descriptors/buffers — trimmed in insertion order
+// (oldest first) from updateResourceMetrics' existing periodic tick rather than at every add site.
+const MAX_CONFIRMED_CACHED_PATHS = 200_000;
+const MAX_FAILED_PATHS = 20_000;
 
 class ThumbnailWorkerService {
   private queue: Photo[] = [];
@@ -194,6 +201,17 @@ class ThumbnailWorkerService {
     this.loadCheckpoint();
   }
 
+  /** Test-only: exercise the unbounded-growth cap (see MAX_CONFIRMED_CACHED_PATHS/MAX_FAILED_PATHS) directly. */
+  public trimUnboundedPathCachesForTests(): void {
+    this.trimUnboundedPathCaches();
+  }
+  public getConfirmedCachedPathsSizeForTests(): number {
+    return this.confirmedCachedPaths.size;
+  }
+  public seedConfirmedCachedPathForTests(path: string): void {
+    this.confirmedCachedPaths.add(path);
+  }
+
   public loadCheckpoint(targetLibraryPath?: string): void {
     try {
       // 1. Check per-library status first if available
@@ -307,7 +325,25 @@ class ThumbnailWorkerService {
       }
     }
 
+    this.trimUnboundedPathCaches();
     this.notifyStatus();
+  }
+
+  private trimUnboundedPathCaches(): void {
+    let excess = this.confirmedCachedPaths.size - MAX_CONFIRMED_CACHED_PATHS;
+    if (excess > 0) {
+      for (const key of this.confirmedCachedPaths) {
+        if (excess-- <= 0) break;
+        this.confirmedCachedPaths.delete(key);
+      }
+    }
+    excess = this.failedPaths.size - MAX_FAILED_PATHS;
+    if (excess > 0) {
+      for (const key of this.failedPaths.keys()) {
+        if (excess-- <= 0) break;
+        this.failedPaths.delete(key);
+      }
+    }
   }
 
   public getStatus(): WorkerStatus {

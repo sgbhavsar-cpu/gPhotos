@@ -76,6 +76,7 @@ const originalInvoke = ipcRenderer.invoke.bind(ipcRenderer);
 
 const electronAPI: IElectronAPI = {
   selectDirectory: () => ipcRenderer.invoke('dialog:select-directory'),
+  selectFile: (options?: { filters?: { name: string; extensions: string[] }[]; title?: string }) => ipcRenderer.invoke('dialog:select-file', options),
   scanDirectory: (dirPath: string) => ipcRenderer.invoke('scanner:scan-directory', dirPath),
   readExif: (filePath: string) => ipcRenderer.invoke('scanner:read-exif', filePath),
   analyzeDryRun: (options: OrganizeOptions): Promise<DryRunSummary> =>
@@ -147,6 +148,7 @@ const electronAPI: IElectronAPI = {
   openHelpInBrowser: () => ipcRenderer.invoke('help:open-in-browser'),
   createLibraryBackupZip: (customPath?: string) => ipcRenderer.invoke('backup:export-zip', customPath),
   openItemInFolder: (filePath: string) => ipcRenderer.invoke('shell:show-item-in-folder', filePath),
+  openFile: (filePath: string, programPath?: string) => ipcRenderer.invoke('shell:open-file', filePath, programPath),
   getWebServerStatus: () => ipcRenderer.invoke('webserver:get-status'),
   setWebServerSettings: (settings) => ipcRenderer.invoke('webserver:set-settings', settings),
   getWebServerPin: () => ipcRenderer.invoke('webserver:get-pin'),
@@ -170,6 +172,7 @@ const electronAPI: IElectronAPI = {
   pauseThumbnailPreCache: () => ipcRenderer.invoke('service:pause-precache'),
   pauseThumbnailPreCacheForActivity: () => ipcRenderer.invoke('service:activity-pause-precache'),
   resumeThumbnailPreCacheForActivity: () => ipcRenderer.invoke('service:activity-resume-precache'),
+  unloadIdleFaceWorkers: () => ipcRenderer.invoke('faces:unload-idle-workers'),
   getStorageCheckpoints: () => ipcRenderer.invoke('mirror:get-storage-checkpoints'),
   getLibraryStatus: (libraryPath: string) => ipcRenderer.invoke('library:get-status', libraryPath),
   saveLibraryStatus: (status: any) => ipcRenderer.invoke('library:save-status', status),
@@ -251,6 +254,15 @@ const electronAPI: IElectronAPI = {
     ipcRenderer.send('logger:write', level, scope, message, meta),
   planPhotoRelocation: (photos) => ipcRenderer.invoke('photos:plan-relocation', photos),
   relocatePhotos: (params) => ipcRenderer.invoke('photos:relocate', params),
+  commitRelocation: (params) => ipcRenderer.invoke('photos:commit-relocation', params),
+  getPendingMovesCount: () => ipcRenderer.invoke('photos:get-pending-moves-count'),
+  onPendingMoveApplied: (callback) => {
+    const subscription = (_event: any, info: { targetDir: string; label?: string; results: any[] }) => callback(info);
+    ipcRenderer.on('photos:pending-move-applied', subscription);
+    return () => {
+      ipcRenderer.removeListener('photos:pending-move-applied', subscription);
+    };
+  },
   onPhotoRelocationProgress: (callback) => {
     const subscription = (_event: any, progress: { done: number; total: number }) => callback(progress);
     ipcRenderer.on('photos:relocate-progress', subscription);

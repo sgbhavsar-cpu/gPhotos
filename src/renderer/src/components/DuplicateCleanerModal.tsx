@@ -23,6 +23,7 @@ import { Photo, DuplicateCluster } from '../../../types';
 import { identifyDuplicateClusters, identifyExactDuplicateClusters } from '../services/deduplication';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { notify, notifyError } from '../services/notifications';
+import { trackBackendCall } from '../services/responseTracker';
 
 interface DuplicateCleanerModalProps {
   photos: Photo[];
@@ -278,7 +279,10 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
       // Only remove photos that were actually trashed — a photo whose network
       // storage is offline is skipped by trashFiles rather than attempted, so
       // it must stay in the library instead of silently disappearing from view.
-      const result = await window.electronAPI.trashFiles(deletePaths);
+      const result = await trackBackendCall(
+        window.electronAPI.trashFiles(deletePaths),
+        `Moving ${count} photo${count === 1 ? '' : 's'} to the Recycle Bin...`
+      );
       const trashedPathSet = new Set(result?.trashedPaths || []);
       const trashedIds = toDelete
         .filter((p) => trashedPathSet.has(p.originalRemotePath || p.filePath))
@@ -315,11 +319,20 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
       const trashedSet = new Set(trashedIds);
       const remainingInGroup = activeCluster.photos.filter((p) => !trashedSet.has(p.id));
       const activeId = activeCluster.id;
+      const groupFullyResolved = !(failureMessage && remainingInGroup.length >= 2);
       setClusters((prev) =>
-        failureMessage && remainingInGroup.length >= 2
-          ? prev.map((c) => (c.id === activeId ? { ...c, photos: remainingInGroup } : c))
-          : prev.filter((c) => c.id !== activeId)
+        groupFullyResolved
+          ? prev.filter((c) => c.id !== activeId)
+          : prev.map((c) => (c.id === activeId ? { ...c, photos: remainingInGroup } : c))
       );
+
+      // Opened via "Find Best Shot" on a specific gallery selection (not the general multi-cluster
+      // cleaner, which scans the whole library and has more groups worth reviewing) — once this one
+      // group is fully resolved, there's nothing left to do here, so go straight back to the gallery
+      // instead of leaving the modal open on an empty/"library is clean" state.
+      if (initialCluster && groupFullyResolved) {
+        setTimeout(onClose, failureMessage ? 2500 : 1200);
+      }
     } catch (err: any) {
       notifyError('Move duplicates to the Recycle Bin', err);
     } finally {

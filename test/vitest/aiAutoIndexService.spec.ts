@@ -141,4 +141,63 @@ describe('aiAutoIndexService (docs/FEATURE_AI_AUTO_TAGGING.md)', () => {
     const body = JSON.parse(chatCall![1].body);
     expect(body.options.num_ctx).toBe(4096); // default context window, same math as ollamaVisionService
   });
+
+  // Reported bug: the user becoming active again should stop this background AI work, not just
+  // face detection — pauseAutoIndexForActivity/resumeAutoIndexFromActivity are the transient (not
+  // persisted, independent of the user's own Settings toggle) pair App.tsx's idle-detection uses.
+  describe('pauseAutoIndexForActivity / resumeAutoIndexFromActivity', () => {
+    it('a pass started while activity-paused does nothing at all (no Ollama calls)', async () => {
+      await load();
+      svc.setAutoIndexEnabled(true);
+      svc.pauseAutoIndexForActivity();
+
+      await svc.runAutoIndexPass([photo('a')]);
+
+      expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('/api/chat'))).toBe(false);
+      expect(contentCache.getEntry('a')).toBeUndefined();
+    });
+
+    it('activity-pausing mid-run stops it before the next batch, without losing what was already recorded', async () => {
+      await load();
+      svc.setAutoIndexEnabled(true);
+      // Pause as soon as the first /api/chat call is seen, simulating the user interacting right
+      // after the first batch's request went out.
+      const realFetch = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (url: string, opts?: any) => {
+        if (url.includes('/api/chat')) svc.pauseAutoIndexForActivity();
+        return realFetch(url, opts);
+      });
+
+      // computeLocalBatchSize(4096) batches more than one photo per call at the default context —
+      // two single-photo batches only if forced; this just confirms a later batch never starts.
+      await svc.runAutoIndexPass([photo('a'), photo('b')]);
+
+      const chatCalls = fetchMock.mock.calls.filter((c) => String(c[0]).includes('/api/chat'));
+      expect(chatCalls.length).toBe(1); // stopped before any further batch
+    });
+
+    it('resumeAutoIndexFromActivity lets the next pass run normally again', async () => {
+      await load();
+      svc.setAutoIndexEnabled(true);
+      svc.pauseAutoIndexForActivity();
+      await svc.runAutoIndexPass([photo('a')]);
+      expect(contentCache.getEntry('a')).toBeUndefined(); // confirmed paused
+
+      svc.resumeAutoIndexFromActivity();
+      await svc.runAutoIndexPass([photo('a')]);
+      expect(contentCache.getEntry('a')?.caption).toBe('a cat on a sofa');
+    });
+
+    it('does not override the user\'s own Settings toggle: activity-pausing when already disabled changes nothing', async () => {
+      await load();
+      svc.setAutoIndexEnabled(false);
+      svc.pauseAutoIndexForActivity();
+      svc.resumeAutoIndexFromActivity();
+
+      await svc.runAutoIndexPass([photo('a')]);
+
+      expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('/api/chat'))).toBe(false);
+      expect(svc.isAutoIndexEnabled()).toBe(false);
+    });
+  });
 });

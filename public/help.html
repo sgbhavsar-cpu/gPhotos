@@ -529,7 +529,8 @@
           <li>The <strong>AI Best Shot</strong> is highlighted with a gold border and labeled with specific reasons (e.g., <em>"Crisp face focus • Smiling expression • Looking at camera"</em>).</li>
           <li>Inferior or blurry duplicates are automatically pre-selected as trash candidates.</li>
           <li><strong>You Retain Full Control</strong>: Click <em>"Keep This Instead"</em> on any frame to change the preferred shot.</li>
-          <li><strong>Zero Permanent Deletion Risk</strong>: When you click <em>"Trash Selected Duplicates"</em>, files are moved to your <strong>Windows Recycle Bin</strong> via <code>shell.trashItem</code> so you can restore them anytime if needed.</li>
+          <li><strong>Zero Permanent Deletion Risk</strong>: When you click <em>"Trash Selected Duplicates"</em>, files are moved to your <strong>Windows Recycle Bin</strong> via <code>shell.trashItem</code> so you can restore them anytime if needed — a progress indicator shows while a larger batch is moving. Deleting also cleans up that photo's cached thumbnail and any AI caption/tags recorded for it.</li>
+          <li><strong>"Find Best Shot" from the gallery</strong>: select photos and click <em>Find Best Shot</em> on the selection toolbar to run this same scoring on just that selection — once you delete the rest, the dialog closes itself and returns you to the gallery.</li>
         </ul>
       </div>
     </section>
@@ -777,7 +778,8 @@
         Quickly correct orientation or crop photos directly inside the Lightbox:
       </p>
       <ul>
-        <li><strong>Fit / Fill / 1:1</strong>: the buttons next to the lightbox zoom controls choose how each photo opens — <em>Fit</em> (shrunk to the window, the classic view), <em>Fill</em> (enlarged to use as much of the screen as its shape allows) or <em>1:1</em> (real pixels, drag to pan). Your choice is remembered.</li>
+        <li><strong>Fit / Fill / 1:1</strong>: the buttons next to the lightbox zoom controls choose how each photo opens — <em>Fit</em> (shrunk to the window, the classic view), <em>Fill</em> (the default — enlarged to use as much of the screen as its shape allows) or <em>1:1</em> (real pixels, drag to pan). Your choice is remembered.</li>
+        <li><strong>Face markers are off by default</strong> — click the eye icon in the lightbox to show them.</li>
         <li><strong>Rotate & Flip</strong>: Rotate 90°, 180°, 270°, or flip horizontally.</li>
         <li><strong>Crop</strong>: click "Crop" to drop a handled frame onto the photo, PowerPoint-style — drag inside the frame to move it, or drag any of its 8 corner/edge handles to resize it. Click "Crop" again to hide the frame without losing it, or "Clear Crop" to remove the selection. Only available at 0°/180° rotation.</li>
         <li><strong>Non-Destructive .bak Protection</strong>: When you overwrite an original file, the engine automatically creates a <code>[filename].jpg.bak</code> backup first.</li>

@@ -114,6 +114,22 @@ async function ollamaCall(apiPath: string, body: unknown | undefined, timeoutMs:
   }
 }
 
+/**
+ * Asks Ollama to unload the configured vision + embedding models from memory right away, instead
+ * of waiting for its own default ~5-minute keep_alive — called when the user becomes active again,
+ * so a vision model's multi-GB weights don't stay resident in RAM while nothing's using them. Hits
+ * the same endpoint each model is normally invoked through (keep_alive: 0 with no actual prompt/
+ * input triggers an immediate unload instead of a real inference call) — best-effort: a model that
+ * was never loaded, or an unreachable Ollama, is silently ignored either way.
+ */
+export async function unloadLocalModels(): Promise<void> {
+  const { visionModel, embedModel } = getOllamaConfig();
+  await Promise.all([
+    ollamaCall('/api/generate', { model: visionModel, keep_alive: 0 }, 5000).catch(() => {}),
+    ollamaCall('/api/embed', { model: embedModel, keep_alive: 0 }, 5000).catch(() => {}),
+  ]);
+}
+
 /** Whether Ollama is reachable and has the configured vision model pulled. Never throws. */
 export async function isVisionAvailable(): Promise<boolean> {
   const { visionModel } = getOllamaConfig();

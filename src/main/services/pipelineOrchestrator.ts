@@ -93,8 +93,11 @@ const clusterSessions = new WeakMap<FaceClusterCache, FaceClusterSession>();
  * descriptors from SQLite per photo (~1.6s of synchronous main-thread time,
  * several times that under load). Any write elsewhere (rename, reassign,
  * reset, another storage's scan...) bumps the revision and forces a fresh
- * load. ponytail: holds ~100+MB of descriptors in memory per library while
- * scanning; drop the WeakMap entry if that ever matters.
+ * load. Holds ~100+MB of descriptors in memory per library while scanning —
+ * safe to leave as a WeakMap because db.ts now caps open connections
+ * (MAX_OPEN_LIBRARY_CONNECTIONS) and closes the evicted ones, so once a
+ * switched-away library's DatabaseSync is actually collected, this entry
+ * goes with it instead of accumulating one per library opened all session.
  */
 export function getSharedFaceClusterCache(db: DatabaseSync): FaceClusterCache {
   const hit = sharedFaceClusterCaches.get(db);
@@ -397,6 +400,17 @@ export async function detectFacesForPhoto(
   working.faceScanCompleted = true;
   working.facesLocked = thisPhotoFaces.length === 0; // trivially locked when nothing to confirm
   upsertPhoto(working, db);
+
+  // clusterFaces() above is a synchronous, unbounded scan with no await of its own — on a large
+  // library (thousands of existing faces) it can take tens of seconds of pure CPU time, and
+  // every caller of this function (faces:detect-batch, syncVirtualStorage's per-file loop) runs
+  // it photo after photo with nothing else to yield on in between. That's measured, not
+  // theoretical: the hang-watchdog logged single MAIN PROCESS STALL events up to ~67 seconds
+  // during face detection, freezing the whole app (every window, every click) for that long.
+  // One tick back to the event loop here can't reduce total processing time, but it breaks a
+  // single multi-second-to-minute-long block into many small ones, so the UI (and every other
+  // IPC handler) gets a turn between photos instead of after the whole batch finishes.
+  await new Promise((resolve) => setImmediate(resolve));
 
   if (isOneDrivePath(sourceFilePath) && isReclaimEnabled()) {
     try {

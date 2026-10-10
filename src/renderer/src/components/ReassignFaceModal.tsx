@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { X, UserCheck, AlertCircle, Sparkles } from 'lucide-react';
+import { X, UserCheck, AlertCircle, Sparkles, Loader2 } from 'lucide-react';
 import { DetectedFace, Person, Photo } from '../../../types';
 import { FaceAvatar } from './FaceAvatar';
 import { PersonPicker } from './PersonPicker';
@@ -34,6 +34,13 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
 
   const [mergeEntirePerson, setMergeEntirePerson] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // assign() itself resolves almost immediately now — the library-wide re-cluster that used to run
+  // inline (making this await multi-second clustering before the modal could close) is backgrounded
+  // instead (see CODE_REVIEW §58). This guard just covers the brief in-flight window against a
+  // double Enter/click, same reasoning as MergePeopleModal's isMerging — it's no longer the main
+  // fix for the double-submit bug from CODE_REVIEW §56 (that's now moot: the modal is gone before a
+  // second press could land), just cheap insurance against re-entering mid-await.
+  const [pendingLabel, setPendingLabel] = useState<string | null>(null);
   const storePhotos = libraryStore.getState().photos;
 
   // Handle Escape key
@@ -53,8 +60,15 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
    * Applies the choice immediately — a click on a person, or Enter in the search box, is the whole gesture
    * (no separate confirm button). Pass an existing `person`, or a `newName` to create one.
    */
-  const assign = (target: { person: Person } | { newName: string }) => {
+  const assign = async (target: { person: Person } | { newName: string }) => {
+    if (pendingLabel) return; // already in flight — see pendingLabel's doc comment
     setErrorMessage(null);
+    const targetName = 'person' in target ? target.person.name : target.newName;
+    setPendingLabel(
+      'person' in target && mergeEntirePerson && face.personId
+        ? `Merging "${currentPersonName}" into "${targetName}"...`
+        : `Assigning this face to "${targetName}"...`
+    );
     try {
       if ('person' in target && mergeEntirePerson && face.personId) {
         const check = libraryStore.canMergePeople(target.person.id, face.personId);
@@ -64,12 +78,16 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
           );
           return;
         }
-        if (!libraryStore.mergePeople(target.person.id, face.personId)) {
+        if (!(await libraryStore.mergePeople(target.person.id, face.personId))) {
           setErrorMessage('Merge failed.');
           return;
         }
       } else {
-        const result = libraryStore.reassignFaceToPerson(face.id, 'person' in target ? target.person.id : target.newName);
+        const result = await libraryStore.reassignFaceToPerson(
+          face.id,
+          'person' in target ? target.person.id : target.newName,
+          face.box ? { photoId: photo.id, box: face.box } : undefined
+        );
         if (!result.success) {
           setErrorMessage(result.error || 'Failed to reassign face.');
           return;
@@ -79,6 +97,8 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
       setErrorMessage('Could not complete the change — see the error notice.');
       notifyError('Reassign face', err);
       return;
+    } finally {
+      setPendingLabel(null);
     }
 
     if (onSuccess) onSuccess();
@@ -192,45 +212,70 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
             </div>
           </div>
 
-          {/* Optional: move the WHOLE current person into whoever is picked (instead of just this face). Set BEFORE picking. */}
-          {currentPerson && (
-            <label
+          {pendingLabel ? (
+            // Replaces the picker entirely rather than just disabling it — the library can
+            // genuinely reshuffle (re-clustering, possibly merging/reassigning unrelated people)
+            // while this runs, so showing the picker's old snapshot would either flicker or go
+            // stale. A plain "this is happening, please wait" message is clearer and can't be
+            // mistaken for "nothing happened, press Enter again" (see pendingLabel's doc comment).
+            <div
               style={{
+                flex: 1,
                 display: 'flex',
-                alignItems: 'flex-start',
-                gap: '10px',
-                padding: '10px 12px',
-                borderRadius: 'var(--radius-md)',
-                backgroundColor: mergeEntirePerson ? 'rgba(245, 158, 11, 0.14)' : 'rgba(245, 158, 11, 0.06)',
-                border: '1px solid rgba(245, 158, 11, 0.3)',
-                cursor: 'pointer',
-                fontSize: '0.82rem',
+                flexDirection: 'column',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '12px',
+                padding: '40px 20px',
+                color: 'var(--text-secondary)',
               }}
             >
-              <input
-                type="checkbox"
-                checked={mergeEntirePerson}
-                onChange={(e) => setMergeEntirePerson(e.target.checked)}
-                style={{ marginTop: '2px' }}
-                data-testid="reassign-merge-toggle"
-              />
-              <span>
-                <Sparkles size={13} style={{ verticalAlign: '-2px', marginRight: '4px' }} />
-                <strong>Merge the whole person</strong> — move ALL {currentPerson.photoCount} photo
-                {currentPerson.photoCount === 1 ? '' : 's'} of "{currentPersonName}" into the person I pick (and remove "
-                {currentPersonName}"). Leave this off to reassign only this one face.
-              </span>
-            </label>
-          )}
+              <Loader2 size={28} className="animate-spin" color="var(--accent-primary)" />
+              <div style={{ fontSize: '0.92rem', fontWeight: 600, textAlign: 'center' }}>{pendingLabel}</div>
+            </div>
+          ) : (
+            <>
+              {/* Optional: move the WHOLE current person into whoever is picked (instead of just this face). Set BEFORE picking. */}
+              {currentPerson && (
+                <label
+                  style={{
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    gap: '10px',
+                    padding: '10px 12px',
+                    borderRadius: 'var(--radius-md)',
+                    backgroundColor: mergeEntirePerson ? 'rgba(245, 158, 11, 0.14)' : 'rgba(245, 158, 11, 0.06)',
+                    border: '1px solid rgba(245, 158, 11, 0.3)',
+                    cursor: 'pointer',
+                    fontSize: '0.82rem',
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={mergeEntirePerson}
+                    onChange={(e) => setMergeEntirePerson(e.target.checked)}
+                    style={{ marginTop: '2px' }}
+                    data-testid="reassign-merge-toggle"
+                  />
+                  <span>
+                    <Sparkles size={13} style={{ verticalAlign: '-2px', marginRight: '4px' }} />
+                    <strong>Merge the whole person</strong> — move ALL {currentPerson.photoCount} photo
+                    {currentPerson.photoCount === 1 ? '' : 's'} of "{currentPersonName}" into the person I pick (and remove "
+                    {currentPersonName}"). Leave this off to reassign only this one face.
+                  </span>
+                </label>
+              )}
 
-          <PersonPicker
-            people={availablePeople}
-            photos={storePhotos}
-            onPick={(person) => assign({ person })}
-            onCreateNew={(newName) => assign({ newName })}
-            placeholder="Type a name and press Enter — or click a person below. No match creates a new person."
-            emptyText="No people yet — type a name above to create one."
-          />
+              <PersonPicker
+                people={availablePeople}
+                photos={storePhotos}
+                onPick={(person) => assign({ person })}
+                onCreateNew={(newName) => assign({ newName })}
+                placeholder="Type a name and press Enter — or click a person below. No match creates a new person."
+                emptyText="No people yet — type a name above to create one."
+              />
+            </>
+          )}
 
           {errorMessage && (
             <div

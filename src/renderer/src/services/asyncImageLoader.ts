@@ -18,6 +18,10 @@ import { appendAuthToken } from './webAuthClient';
 // ============================================================================
 
 const spriteCoordCache = new Map<string, SpriteCoordinate | null>();
+// Same unbounded-growth shape batchThumbnailStore was already capped for below (one entry per
+// unique photo path ever scrolled past, never evicted) — just small coordinate objects rather than
+// dataURLs, so a higher cap is fine. Evicted oldest-first same as batchThumbnailStore.
+const MAX_SPRITE_COORD_CACHE = 100_000;
 const pendingSpriteCoordKeys = new Set<string>();
 const spriteCoordListeners = new Set<(updatedKeys: Set<string>) => void>();
 
@@ -54,6 +58,10 @@ async function flushSpriteCoordQueue(): Promise<void> {
     for (const p of chunk) {
       const key = p.toLowerCase();
       spriteCoordCache.set(key, result ? (result[p] ?? result[key] ?? null) : null);
+      if (spriteCoordCache.size > MAX_SPRITE_COORD_CACHE) {
+        const oldest = spriteCoordCache.keys().next().value;
+        if (oldest !== undefined) spriteCoordCache.delete(oldest);
+      }
       pendingSpriteCoordKeys.delete(key);
       updated.add(key);
     }

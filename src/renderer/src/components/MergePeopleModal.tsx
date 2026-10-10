@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect } from 'react';
-import { X, Merge, AlertCircle, Check, Users, ExternalLink } from 'lucide-react';
+import { X, Merge, AlertCircle, Check, Users, ExternalLink, Loader2 } from 'lucide-react';
 import { Person, Photo } from '../../../types';
 import { FaceAvatar } from './FaceAvatar';
 import { PersonPicker } from './PersonPicker';
@@ -42,6 +42,11 @@ export const MergePeopleModal: React.FC<MergePeopleModalProps> = ({
   const [nameChoice, setNameChoice] = useState<'A' | 'B' | 'custom'>('A');
   const [customName, setCustomName] = useState('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // mergePeople now genuinely takes real wall-clock time (clustering runs on a Web Worker — see
+  // CODE_REVIEW §55), so without a guard here a second Enter/submit click while the first merge is
+  // still in flight could fire a second real merge call — same class of bug fixed in
+  // ReassignFaceModal (§56), just via the Confirm button / onEnterOnSelected instead of PersonPicker.
+  const [isMerging, setIsMerging] = useState(false);
 
   // Check if they can merge (single photo constraint)
   const mergeCheck = useMemo(() => {
@@ -85,8 +90,8 @@ export const MergePeopleModal: React.FC<MergePeopleModalProps> = ({
     submitMerge();
   };
 
-  const submitMerge = () => {
-    if (!personB) return;
+  const submitMerge = async () => {
+    if (!personB || isMerging) return;
 
     if (!mergeCheck.canMerge) {
       setErrorMessage(
@@ -105,13 +110,16 @@ export const MergePeopleModal: React.FC<MergePeopleModalProps> = ({
       finalName = customName.trim();
     }
 
+    setIsMerging(true);
     let success = false;
     try {
-      success = libraryStore.mergePeople(personA.id, personB.id, finalName);
+      success = await libraryStore.mergePeople(personA.id, personB.id, finalName);
     } catch (err) {
       setErrorMessage('Merge operation failed — see the error notice.');
       notifyError('Merge people', err);
       return;
+    } finally {
+      setIsMerging(false);
     }
     if (!success) {
       setErrorMessage('Merge operation could not be completed.');
@@ -494,11 +502,11 @@ export const MergePeopleModal: React.FC<MergePeopleModalProps> = ({
             <button
               type="submit"
               className="btn btn-primary"
-              disabled={!mergeCheck.canMerge || !personB}
-              style={{ fontSize: '0.85rem', padding: '8px 20px' }}
+              disabled={!mergeCheck.canMerge || !personB || isMerging}
+              style={{ fontSize: '0.85rem', padding: '8px 20px', gap: '6px' }}
             >
-              <Merge size={16} />
-              <span>Confirm & Merge</span>
+              {isMerging ? <Loader2 size={16} className="animate-spin" /> : <Merge size={16} />}
+              <span>{isMerging ? 'Merging...' : 'Confirm & Merge'}</span>
             </button>
           </div>
         </form>

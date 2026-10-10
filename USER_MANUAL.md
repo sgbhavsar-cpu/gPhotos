@@ -156,10 +156,11 @@ Clicking any photo thumbnail launches the high-performance **Fullscreen Lightbox
 
 ### Lightbox Features:
 - **Fit / Fill / 1:1 buttons** (next to the zoom controls at the bottom): **Fit** shows the photo
-  shrunk to fit the window, never enlarged (the classic view); **Fill** enlarges it to fill as much of
-  the screen as its shape allows (small photos are stretched up, keeping their proportions); **1:1**
-  shows it at its real pixel size — drag to pan around. Your choice is remembered and applied to every
-  photo you open next.
+  shrunk to fit the window, never enlarged (the classic view); **Fill** (the default) enlarges it to
+  fill as much of the screen as its shape allows (small photos are stretched up, keeping their
+  proportions); **1:1** shows it at its real pixel size — drag to pan around. Your choice is
+  remembered and applied to every photo you open next.
+- **Face markers are off by default** — click the eye icon to show them.
 - **Keyboard Navigation**:
   - <kbd>&larr;</kbd> / <kbd>&rarr;</kbd>: Navigate previous / next photo.
   - <kbd>Esc</kbd>: Exit Lightbox.
@@ -360,7 +361,16 @@ Every photo in a duplicate cluster is scored from 0 to 100 points:
 - **Quick Actions**:
   - **"Keep AI Best Only"**: Automatically keeps the single highest-rated shot.
   - **"Keep All Photos"**: Marks all photos in the cluster to be preserved.
-- **Safe Trashing**: Clicking *Delete Unselected Photos* moves files to your **Windows Recycle Bin** via `shell.trashItem`. Files can easily be restored if needed.
+- **Safe Trashing**: Clicking *Delete Unselected Photos* moves files to your **Windows Recycle Bin**
+  via `shell.trashItem`. Files can easily be restored if needed. A "Moving N photo(s) to the Recycle
+  Bin..." indicator shows while this is in progress, so a larger batch never looks like the app has
+  frozen. Deleting also cleans up that photo's cached thumbnail and any AI caption/tags recorded for
+  it — nothing is left behind.
+- **"Find Best Shot" from the gallery**: select photos in the main gallery and click **Find Best
+  Shot** on the selection toolbar to run this same AI scoring on just that selection. Once you delete
+  the non-best photo(s), the dialog closes on its own and returns you to the gallery — there's
+  nothing left to review for that one group, unlike the general Duplicate Cleaner (opened from
+  Network Storage/Settings), which scans the whole library and stays open to show the next group.
 
 ---
 

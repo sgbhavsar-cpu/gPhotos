@@ -4,6 +4,7 @@ import { app, BrowserWindow, ipcMain, dialog, protocol, net, shell, Menu } from 
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { spawn } from 'child_process';
 import { parsePhotoMetadata } from './services/exifParser';
 import {
   scanDirectoryRecursive,
@@ -92,7 +93,7 @@ import type { PhotoContentEntry } from '../types';
 import { getDbForLibraryPath } from './services/db';
 import type { DatabaseSync } from 'node:sqlite';
 import { detectFacesForPhoto, forceRedetectFacesForPhoto, resolveDbForPhoto, getSharedFaceClusterCache, type FaceClusterCache } from './services/pipelineOrchestrator';
-import { detectFaceInRegion, terminateFaceDetectionWorker, getFaceDetectionPoolSize } from './services/faceDetectionWorkerClient';
+import { detectFaceInRegion, terminateFaceDetectionWorker, terminateIdleWorkersNow, getFaceDetectionPoolSize } from './services/faceDetectionWorkerClient';
 import { assertPathsAllowed, isPathAllowed, getDefaultMirrorRoot } from './services/pathSecurity';
 import { exportVideo, getFfmpegPath, probeMedia, makeAudioPreview } from './services/videoExportService';
 import { getOrGenerateVideoPreview } from './services/videoPreviewService';
@@ -103,7 +104,14 @@ import { findMusicTrack } from '../types/musicCatalog';
 import { ollamaRequest, ollamaPull, type OllamaRequest } from './services/ollamaClient';
 import type { VideoExportRequest } from '../types';
 import { detectUprightRotations } from './services/orientationService';
-import { planRelocation, relocatePhotos } from './services/photoRelocation';
+import {
+  planRelocation,
+  relocatePhotos,
+  relocatePhotosWithOfflineQueue,
+  getPendingMoves,
+  processPendingMoves,
+  onPendingMoveApplied
+} from './services/photoRelocation';
 import { browseDirectory } from './services/directoryBrowser';
 import {
   getSpriteCoordinate,
@@ -113,7 +121,7 @@ import {
 } from './services/spriteService';
 import { thumbnailWorker } from './services/thumbnailWorkerService';
 import { libraryStatusService } from './services/libraryStatusService';
-import { isPathReachable, isPathReachableForServing, clearOfflineCache } from './services/networkReachabilityCache';
+import { isPathReachable, isPathReachableForServing, isKnownOfflineStorage, clearOfflineCache } from './services/networkReachabilityCache';
 import { installHangWatchdog, attachRendererHangDetection } from './services/hangWatchdog';
 import { initLogger, applyStoredLogLevelOverride, getLogLevelOverride, setLogLevelOverride, logger } from './services/logger';
 import { getPersonAvatarPath, savePersonAvatar, deletePersonAvatar } from './services/personAvatarService';
@@ -153,6 +161,15 @@ if (!gotSingleInstanceLock) {
   onRotationFailure((info) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('photo:rotation-failed', info);
+    }
+  });
+
+  // A queued two-pane-explorer commit that went through once its target reconnected — the renderer
+  // only sees a commit's outcome via the IPC call that started it, so a later automatic drain needs
+  // this push instead, same forwarding pattern as onRotationFailure above.
+  onPendingMoveApplied((info) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('photos:pending-move-applied', info);
     }
   });
 }
@@ -409,6 +426,22 @@ function createWindow() {
         })
         .catch((err) => console.error('Error displaying crash dialog:', err));
     }
+  });
+
+  // Mirrors the raw DevTools console (every console.log/warn/error/info/debug — React's own
+  // warnings, third-party libs, anything not already wrapped by the renderer's logger.ts/
+  // userActionLogger.ts) into the same rotated main.log file, so a manual-testing session can be
+  // fully reconstructed from the log file alone without anyone needing to have DevTools open at
+  // the time. `on('console-message', ...)` has several overload shapes across Electron versions
+  // (the newest merges everything into one event-like object: level/message/lineNumber/sourceId —
+  // see WebContentsConsoleMessageEventParams); typed loosely here rather than pinned to one
+  // overload's exact param list, which would break on an Electron upgrade.
+  mainWindow.webContents.on('console-message', (event: any) => {
+    const { level, message, sourceId, lineNumber } = event;
+    const meta = sourceId ? { source: `${sourceId}:${lineNumber}` } : undefined;
+    if (level === 'error') logger.error('BrowserConsole', message, meta);
+    else if (level === 'warning') logger.warn('BrowserConsole', message, meta);
+    else logger.debug('BrowserConsole', message, meta);
   });
 
   attachRendererHangDetection(mainWindow, 'main');
@@ -736,14 +769,52 @@ ipcMain.handle('dialog:select-directory', async () => {
   }
 });
 
+// Settings > External Photo Editor's "Browse…" — picks an arbitrary file (an editor executable),
+// unlike select-directory above. Not path-restricted: a program outside the library/mirror roots
+// (GIMP, Photoshop, ...) is exactly what this is for.
+ipcMain.handle('dialog:select-file', async (_event, options?: { filters?: Electron.FileFilter[]; title?: string }) => {
+  logger.debug('Dialog', 'User requested file picker (select-file)');
+  try {
+    if (!mainWindow) return null;
+    const result = await dialog.showOpenDialog(mainWindow, {
+      properties: ['openFile'],
+      title: options?.title || 'Select File',
+      filters: options?.filters,
+    });
+    if (result.canceled || result.filePaths.length === 0) {
+      logger.debug('Dialog', 'File picker canceled by user');
+      return null;
+    }
+    logger.debug('Dialog', 'File picker selection made', { selectedPath: result.filePaths[0] });
+    return result.filePaths[0];
+  } catch (err) {
+    logger.error('Dialog', 'select-file failed', { err: String(err) });
+    return null;
+  }
+});
+
 ipcMain.handle('scanner:scan-directory', async (_event, dirPath: string): Promise<Photo[]> => {
   try {
+    // Bail out immediately if the whole folder is unreachable (offline network storage) — the
+    // per-file statSync below has no timeout and would otherwise block the main process for the
+    // OS's full network timeout, once per file.
+    if (!(await isPathReachable(dirPath))) {
+      console.error(`scanner:scan-directory: ${dirPath} is not reachable — skipping scan.`);
+      return [];
+    }
+
     const filePaths = await scanDirectoryRecursive(dirPath);
     const photos: Photo[] = [];
 
     for (const filePath of filePaths) {
+      // The folder can go offline mid-scan on a large one — isKnownOfflineStorage is a pure,
+      // synchronous cache read (no I/O); skip rather than let the stat below hang.
+      if (isKnownOfflineStorage(filePath)) {
+        console.error(`scanner:scan-directory: skipping ${filePath} — its storage went offline during the scan.`);
+        continue;
+      }
       try {
-        const stats = fs.statSync(filePath);
+        const stats = await fs.promises.stat(filePath);
         const meta = await parsePhotoMetadata(filePath);
         const date = new Date(meta.dateTaken);
 
@@ -1135,6 +1206,48 @@ ipcMain.handle('photos:relocate', async (event, params: { photos: RelocationPhot
     console.error('photos:relocate error:', err);
     logger.error('Relocation', 'relocate failed', { err: String(err?.stack || err) });
     throw err;
+  }
+});
+
+// Two-pane explorer "Commit" button: same move engine as photos:relocate, but a batch that cannot
+// reach its root/destination right now is queued (pending_moves.json) instead of reported as failed,
+// and retried automatically once that storage reconnects (processPendingMoves below).
+ipcMain.handle('photos:commit-relocation', async (event, params: { photos: RelocationPhotoInput[]; targetDir: string; label?: string }) => {
+  try {
+    if (!params || !Array.isArray(params.photos) || typeof params.targetDir !== 'string') throw new Error('invalid request');
+    const storages = getSetting<VirtualStorageConfig[]>('gphotos_virtual_storages_v1', []);
+    const busy = storages.find(
+      (s) => s.localMirrorRoot && params.photos.some((p) => p.isVirtual && p.storageName === s.name) && isStorageSyncInProgress(s.localMirrorRoot, s.name)
+    );
+    if (busy) {
+      return { results: [], root: null, error: `A sync of "${busy.name}" is running right now. Wait for it to finish, then try again.` };
+    }
+    const outcome = await relocatePhotosWithOfflineQueue({
+      photos: params.photos,
+      targetDir: params.targetDir,
+      label: params.label,
+      onProgress: (done, total) => {
+        try {
+          if (!event.sender.isDestroyed()) event.sender.send('photos:relocate-progress', { done, total });
+        } catch {}
+      },
+    });
+    const moved = outcome.results.filter((r) => r.status === 'moved').length;
+    logger.info('Relocation', `Commit: moved ${moved} of ${outcome.results.length} photo(s)${outcome.queued ? ' (queued, storage offline)' : ''}`, { targetDir: params.targetDir, error: outcome.error });
+    return outcome;
+  } catch (err: any) {
+    console.error('photos:commit-relocation error:', err);
+    logger.error('Relocation', 'commit failed', { err: String(err?.stack || err) });
+    throw err;
+  }
+});
+
+ipcMain.handle('photos:get-pending-moves-count', async () => {
+  try {
+    return getPendingMoves().length;
+  } catch (err: any) {
+    logger.error('Relocation', 'get-pending-moves-count failed', { err: String(err?.stack || err) });
+    return 0;
   }
 });
 
@@ -1676,7 +1789,9 @@ ipcMain.handle('person:delete-avatar', async (_event, personId: string) => {
 
 ipcMain.handle('mirror:open-original', async (_event, filePath: string) => {
   try {
-    if (filePath && typeof filePath === 'string' && fs.existsSync(filePath)) {
+    // isPathReachable (not fs.existsSync) — a sync exists check on a dead network path has no
+    // timeout and blocks the main process for the OS's full network timeout.
+    if (filePath && typeof filePath === 'string' && (await isPathReachable(filePath))) {
       shell.showItemInFolder(filePath);
       return true;
     }
@@ -2249,6 +2364,18 @@ ipcMain.handle('service:activity-resume-precache', async () => {
   }
 });
 
+// Frees the face-detection worker pool's ONNX sessions (~100+MB each) the moment the user becomes
+// active again, rather than waiting out the pool's own idle timer — part of the same
+// activity-pause flow as the handlers above, see App.tsx's stopBackgroundTasksImmediately.
+ipcMain.handle('faces:unload-idle-workers', async () => {
+  try {
+    terminateIdleWorkersNow();
+    return { ok: true };
+  } catch (err: any) {
+    return { ok: false, error: err.message };
+  }
+});
+
 // On-demand video hover-preview generation (see docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md §2.5) —
 // `filePath` is preferred when reachable (same preferOriginal-vs-local precedence as the gphoto://
 // protocol handler above), falling back to `originalRemotePath`.
@@ -2312,9 +2439,38 @@ ipcMain.handle('backup:export-zip', async (_event, customTargetZipPath?: string)
   }
 });
 
+// Two-pane explorer context menu: "Open Image externally" (programPath omitted — OS default app)
+// and "Edit with external editor" (programPath given — the user's own configured editor) both go
+// through this one handler, since they differ only in which program gets the file path.
+ipcMain.handle('shell:open-file', async (_event, filePath: string, programPath?: string) => {
+  try {
+    if (typeof filePath !== 'string' || !filePath) return false;
+    assertPathsAllowed([filePath], 'shell:open-file');
+    if (!(await isPathReachable(filePath))) return false;
+    if (programPath) {
+      // Not run through assertPathsAllowed: that check restricts paths to the app's own
+      // library/mirror roots, which a photo editor executable (GIMP, Photoshop, ...) never is.
+      // spawn() itself returns before a bad program path fails (ENOENT arrives as an async
+      // 'error' event, not a thrown exception) — this call already answered "true" by then, so
+      // the only thing a late failure can still do is get logged instead of vanishing silently.
+      spawn(programPath, [filePath], { detached: true, stdio: 'ignore' })
+        .on('error', (err) => console.error(`shell:open-file: external editor "${programPath}" failed to launch:`, err))
+        .unref();
+      return true;
+    }
+    const err = await shell.openPath(filePath);
+    return !err;
+  } catch (err) {
+    console.error('shell:open-file error:', err);
+    return false;
+  }
+});
+
 ipcMain.handle('shell:show-item-in-folder', async (_event, filePath: string) => {
   try {
-    if (fs.existsSync(filePath)) {
+    // isPathReachable (not fs.existsSync) — a sync exists check on a dead network path has no
+    // timeout and blocks the main process for the OS's full network timeout.
+    if (await isPathReachable(filePath)) {
       shell.showItemInFolder(filePath);
       return true;
     }

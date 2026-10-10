@@ -5,6 +5,7 @@ import { spawn, execSync, execFile } from 'child_process';
 import { createCachedProbe } from './cachedProbe';
 import { BackgroundServiceStatus, BackgroundServiceSettings, VirtualStorageConfig } from '../../types';
 import { scanVirtualMirrorDirectory, processPendingRotations, processPendingMetadata, syncVirtualStorage, scanStorageDetailsPhysical } from './virtualMirrorService';
+import { processPendingMoves } from './photoRelocation';
 import os from 'os';
 import { thumbnailWorker } from './thumbnailWorkerService';
 import { setFaceDetectionPoolSize } from './faceDetectionWorkerClient';
@@ -245,6 +246,9 @@ export function initBackgroundDaemon(mainWindow?: BrowserWindow | null) {
     try {
       await processPendingRotations();
     } catch {}
+    try {
+      await processPendingMoves();
+    } catch {}
   }, 30000);
 
   // Periodic offline date/location sync check (every 30 seconds)
@@ -385,6 +389,7 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
     // isolated — a bad pending item must not stop the storages from syncing.
     await processPendingRotations().catch((err) => noteCycleError(`Pending rotations failed: ${err?.message ?? err}`));
     await processPendingMetadata().catch((err) => noteCycleError(`Pending metadata updates failed: ${err?.message ?? err}`));
+    await processPendingMoves().catch((err) => noteCycleError(`Pending moves failed: ${err?.message ?? err}`));
 
     // Self-healing OneDrive reclaim check: evaluate whatever's already
     // pending BEFORE deciding whether reclaim still looks broken — this is

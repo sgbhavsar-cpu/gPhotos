@@ -311,9 +311,9 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
   };
 
   // Face curation actions with Active Learning propagation
-  const handleConfirmFace = (faceId: string, e: React.MouseEvent) => {
+  const handleConfirmFace = async (faceId: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    const result = libraryStore.confirmFace(faceId);
+    const result = await libraryStore.confirmFace(faceId);
     if (result && result.newlyAssignedCount > 0) {
       setLearningNotification(
         `✓ Face confirmed! Discovered ${result.newlyAssignedCount} additional photo${result.newlyAssignedCount > 1 ? 's' : ''} of ${selectedPerson?.name || 'this person'} using learned 2.5x weighted centroid.`
@@ -328,10 +328,10 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
     }, 4500);
   };
 
-  const handleUnassignFace = (faceId: string, personName: string, e?: React.MouseEvent) => {
+  const handleUnassignFace = async (faceId: string, personName: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     setRemovedFaceIds((prev) => new Set([...prev, faceId]));
-    const res = libraryStore.unassignFaceFromPerson(faceId);
+    const res = await libraryStore.unassignFaceFromPerson(faceId);
     const photoName = res?.photoName || 'Photo';
     setLearningNotification(`✕ ${photoName} removed from ${personName}'s album.`);
     setTimeout(() => {
@@ -341,22 +341,24 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
 
   // "Mark all as correct/not correct" — the same per-face actions above, applied to every
   // currently-shown (not yet removed) match at once, for a person with many matches to curate.
-  const handleMarkAllCorrect = () => {
+  const handleMarkAllCorrect = async () => {
     if (!selectedPerson) return;
     const toConfirm = personPhotoItems.filter(({ face }) => !face.isConfirmed);
     if (toConfirm.length === 0) return;
     if (!window.confirm(`Mark all ${toConfirm.length} unconfirmed photo${toConfirm.length === 1 ? '' : 's'} as ${selectedPerson.name}?`)) return;
-    for (const { face } of toConfirm) libraryStore.confirmFace(face.id);
+    // Sequential, not Promise.all: each confirmFace mutates shared state (people/faces), and its own
+    // internal yields already keep the UI responsive across however many faces this is.
+    for (const { face } of toConfirm) await libraryStore.confirmFace(face.id);
     setLearningNotification(`✓ Confirmed ${toConfirm.length} photo${toConfirm.length === 1 ? '' : 's'} of ${selectedPerson.name}.`);
     setTimeout(() => setLearningNotification((curr) => curr?.startsWith('✓') ? null : curr), 4500);
   };
 
-  const handleMarkAllIncorrect = () => {
+  const handleMarkAllIncorrect = async () => {
     if (!selectedPerson || personPhotoItems.length === 0) return;
     if (!window.confirm(`Remove all ${personPhotoItems.length} photo${personPhotoItems.length === 1 ? '' : 's'} from ${selectedPerson.name}'s album? This can't be undone in one step.`)) return;
     const ids = personPhotoItems.map(({ face }) => face.id);
     setRemovedFaceIds((prev) => new Set([...prev, ...ids]));
-    for (const id of ids) libraryStore.unassignFaceFromPerson(id);
+    for (const id of ids) await libraryStore.unassignFaceFromPerson(id);
     setLearningNotification(`✕ Removed ${ids.length} photo${ids.length === 1 ? '' : 's'} from ${selectedPerson.name}'s album.`);
     setTimeout(() => setLearningNotification((curr) => curr?.startsWith('✕') ? null : curr), 3500);
   };
@@ -542,10 +544,10 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
     const findMorePhotosButton = (
       <button
         className="btn btn-ghost btn-icon"
-        onClick={() => {
-          let res: ReturnType<typeof libraryStore.propagateLearnedFaces>;
+        onClick={async () => {
+          let res: Awaited<ReturnType<typeof libraryStore.propagateLearnedFaces>>;
           try {
-            res = libraryStore.propagateLearnedFaces(selectedPerson.id);
+            res = await libraryStore.propagateLearnedFaces(selectedPerson.id);
           } catch (err) {
             notifyError('Find more photos', err);
             return;

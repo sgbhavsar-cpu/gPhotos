@@ -7,6 +7,7 @@ import { PlacesMapView } from './views/PlacesMapView';
 import { OrganizerView } from './views/OrganizerView';
 import { VirtualStorageView } from './views/VirtualStorageView';
 import { FolderTreeView } from './views/FolderTreeView';
+import { ExplorerView } from './views/ExplorerView';
 import { PhotoLightbox } from './components/PhotoLightbox';
 import { FolderBrowserModalHost } from './components/FolderBrowserModal';
 import { DuplicateCleanerModal } from './components/DuplicateCleanerModal';
@@ -24,7 +25,8 @@ import { joinMirrorPath } from './services/pathUtils';
 import { logNavigation } from './services/userActionLogger';
 import { logger } from './services/logger';
 import { faceQueue, isFaceResultFinal } from './services/faceQueue';
-import { runAutoIndexPass } from './services/aiAutoIndexService';
+import { runAutoIndexPass, pauseAutoIndexForActivity, resumeAutoIndexFromActivity } from './services/aiAutoIndexService';
+import { unloadLocalModels } from './services/ollamaVisionService';
 import { notify, notifyError, runAction } from './services/notifications';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { Photo, DetectedFace, VirtualStorageConfig, BackgroundScanProgress, NetworkStorageProgress, DuplicateCluster } from '../../types';
@@ -55,6 +57,13 @@ export const App: React.FC = () => {
   // color) among that photo's face markers — so the face you came to look at is never lost among
   // the others. Cleared alongside activeLightboxContextIds.
   const [activeLightboxHighlightPersonId, setActiveLightboxHighlightPersonId] = useState<string | null>(null);
+  // Set when the lightbox was opened via an explicit "Edit" action (two-pane explorer's per-card
+  // button or its context menu) so it jumps straight into the editor instead of just viewing.
+  const [activeLightboxAutoEdit, setActiveLightboxAutoEdit] = useState(false);
+  // Set whenever the lightbox was opened from the two-pane explorer (any photo, not just an edit) —
+  // that view browses arbitrary folders/albums, not only the tracked library, so a saved edit there
+  // must not create a library catalog entry or a cache thumbnail for a file that was never tracked.
+  const [activeLightboxSkipLibrarySync, setActiveLightboxSkipLibrarySync] = useState(false);
   const [selectedPersonIdForView, setSelectedPersonIdForView] = useState<string | null>(null);
   const [virtualStorages, setVirtualStorages] = useState<VirtualStorageConfig[]>([]);
   const [storageProgressMap, setStorageProgressMap] = useState<Record<string, NetworkStorageProgress>>({});
@@ -135,6 +144,15 @@ export const App: React.FC = () => {
       if (window.electronAPI?.pauseThumbnailPreCacheForActivity) {
         window.electronAPI.pauseThumbnailPreCacheForActivity().catch(() => {});
       }
+      // AI auto-tagging and face detection both run local models that are expensive to keep
+      // resident (a vision model is routinely several GB, each face-detection worker's ONNX
+      // sessions ~100+MB) — stopping the work alone leaves them loaded in memory for no reason
+      // once the user is back at the keyboard, so explicitly unload both here too.
+      pauseAutoIndexForActivity();
+      if (window.electronAPI?.unloadIdleFaceWorkers) {
+        window.electronAPI.unloadIdleFaceWorkers().catch(() => {});
+      }
+      unloadLocalModels().catch(() => {});
     } catch (e) {
       console.warn('[IdleControl] Error stopping background tasks:', e);
     }
@@ -173,7 +191,9 @@ export const App: React.FC = () => {
       }
 
       // 3. AI auto-tagging pass (see docs/FEATURE_AI_AUTO_TAGGING.md) — a no-op when the
-      // Settings toggle is off, Ollama isn't reachable, or a pass is already running.
+      // Settings toggle is off, Ollama isn't reachable, a pass is already running, or activity
+      // paused it (must be lifted before runAutoIndexPass, or it bails out immediately).
+      resumeAutoIndexFromActivity();
       void runAutoIndexPass(currentPhotos);
     } catch (e) {
       console.warn('[IdleControl] Error starting background tasks:', e);
@@ -193,6 +213,8 @@ export const App: React.FC = () => {
         setActiveLightboxPhoto(null);
         setActiveLightboxContextIds(null);
         setActiveLightboxHighlightPersonId(null);
+        setActiveLightboxAutoEdit(false);
+        setActiveLightboxSkipLibrarySync(false);
         return;
       }
 
@@ -1736,6 +1758,25 @@ export const App: React.FC = () => {
           />
         )}
 
+        {activeTab === 'explorer' && (
+          <ExplorerView
+            onSelectPhoto={(p) => {
+              setActiveLightboxSkipLibrarySync(true);
+              setActiveLightboxPhoto(p);
+            }}
+            onEditPhoto={(p) => {
+              setActiveLightboxAutoEdit(true);
+              setActiveLightboxSkipLibrarySync(true);
+              setActiveLightboxPhoto(p);
+            }}
+            storages={virtualStorages}
+            albums={libraryState.albums}
+            photos={libraryState.photos}
+            initialPath={libraryState.selectedFolder || libraryState.currentDirectory || null}
+            resetTrigger={tabResetTrigger}
+          />
+        )}
+
         {activeTab === 'virtual_storage' && (
           <VirtualStorageView
             onLoadMirroredPhotos={handleLoadMirroredPhotos}
@@ -1774,6 +1815,8 @@ export const App: React.FC = () => {
               setActiveLightboxPhoto(null);
               setActiveLightboxContextIds(null);
               setActiveLightboxHighlightPersonId(null);
+              setActiveLightboxAutoEdit(false);
+              setActiveLightboxSkipLibrarySync(false);
             }}
           >
             <PhotoLightbox
@@ -1781,10 +1824,14 @@ export const App: React.FC = () => {
               allPhotos={activeLightboxPhotoList}
               people={libraryState.people}
               highlightPersonId={activeLightboxHighlightPersonId}
+              autoEdit={activeLightboxAutoEdit}
+              skipLibrarySync={activeLightboxSkipLibrarySync}
               onClose={() => {
                 setActiveLightboxPhoto(null);
                 setActiveLightboxContextIds(null);
                 setActiveLightboxHighlightPersonId(null);
+                setActiveLightboxAutoEdit(false);
+                setActiveLightboxSkipLibrarySync(false);
               }}
               onSelectPhoto={(p) => setActiveLightboxPhoto(p)}
               onToggleFavorite={handleToggleFavorite}

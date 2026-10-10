@@ -32,10 +32,13 @@ import {
   Activity,
   Cloud,
   Download,
-  X as XIcon
+  X as XIcon,
+  Edit3,
+  FolderOpen
 } from 'lucide-react';
 import { BackgroundServiceStatus, BackgroundServiceSettings, WebServerStatus, PairedDeviceInfo } from '../../../types';
 import { aiSearchService, AiSearchConfig, AiProvider } from '../services/aiSearchService';
+import { getExternalEditorPath, setExternalEditorPath } from '../services/externalEditorConfig';
 import {
   getOllamaConfig,
   saveOllamaConfig,
@@ -81,6 +84,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   // features can use different providers/keys (or none) independently of one another.
   const [smartFlowsAiConfig, setSmartFlowsAiConfig] = useState<AiSearchConfig>(aiSearchService.getSmartFlowsConfig());
   const [smartFlowsAiFeedback, setSmartFlowsAiFeedback] = useState<string | null>(null);
+
+  // Two-pane explorer's "Edit with External Editor" context-menu command — which program to spawn.
+  const [externalEditorPath, setExternalEditorPathState] = useState(() => getExternalEditorPath());
 
   // Local AI (Ollama) — Smart Flows' local-first classification pass.
   const [ollamaConfig, setOllamaConfig] = useState(() => getOllamaConfig());
@@ -1688,6 +1694,65 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 }} />
               </div>
             </div>
+          </div>
+        </div>
+
+        <div style={{
+          backgroundColor: 'var(--bg-surface)',
+          border: '1px solid var(--border-subtle)',
+          borderRadius: 'var(--radius-lg)',
+          padding: '24px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '14px',
+        }}>
+          <div>
+            <h2 style={{ fontSize: '1.15rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '10px', margin: 0 }}>
+              <Edit3 size={20} color="var(--accent-cyan)" />
+              External Photo Editor
+            </h2>
+            <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginTop: '4px', maxWidth: '680px' }}>
+              The two-pane explorer's "Edit with External Editor" context-menu command launches this
+              program with the photo's path. Leave it blank to use the system's default "Open" action
+              instead.
+            </p>
+          </div>
+
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+            <input
+              className="input"
+              value={externalEditorPath}
+              onChange={(e) => {
+                setExternalEditorPathState(e.target.value);
+                setExternalEditorPath(e.target.value);
+              }}
+              placeholder="e.g. C:\Program Files\GIMP 2\bin\gimp-2.10.exe"
+              style={{ height: '40px', flex: '1 1 320px', minWidth: 0 }}
+            />
+            <button
+              className="btn btn-secondary"
+              style={{ height: '40px', gap: '6px' }}
+              onClick={async () => {
+                const picked = await window.electronAPI?.selectFile?.({ title: 'Select External Photo Editor' });
+                if (picked) {
+                  setExternalEditorPathState(picked);
+                  setExternalEditorPath(picked);
+                }
+              }}
+            >
+              <FolderOpen size={16} />
+              Browse…
+            </button>
+            {externalEditorPath && (
+              <button
+                className="btn btn-ghost"
+                style={{ height: '40px', gap: '6px', color: 'var(--accent-rose)' }}
+                onClick={() => { setExternalEditorPathState(''); setExternalEditorPath(''); }}
+              >
+                <XIcon size={16} />
+                Clear
+              </button>
+            )}
           </div>
         </div>
           </>

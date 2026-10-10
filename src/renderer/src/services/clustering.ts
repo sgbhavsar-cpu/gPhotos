@@ -460,3 +460,67 @@ export function clusterFaces(
     updatedFaces,
   };
 }
+
+/** The handful of DetectedFace fields matchUnassignedFacesToCentroid actually needs — keeping the
+ *  worker message payload small (no EXIF/location/etc. riding along for every photo). */
+export interface SlimFaceForMatching {
+  id: string;
+  personId?: string;
+  isConfirmed?: boolean;
+  descriptor?: number[];
+}
+export interface SlimPhotoForMatching {
+  id: string;
+  faces: SlimFaceForMatching[];
+}
+
+/**
+ * Pure extraction of propagateLearnedFaces's own matching pass (libraryStore.ts): for one person's
+ * centroid, finds — per photo, skipping any photo that already has this person — the single
+ * closest still-unassigned-or-unconfirmed face within `threshold`. Returns just the matches (never
+ * mutates its input), so the caller decides how to apply them; this is what lets the same
+ * computation run equally on the main thread (clusterWorkerClient's synchronous fallback) or inside
+ * a Web Worker (clusterWorker.ts) with no behavior difference either way.
+ */
+export function matchUnassignedFacesToCentroid(
+  photos: SlimPhotoForMatching[],
+  personId: string,
+  centroid: number[],
+  threshold: number
+): Array<{ photoId: string; faceId: string }> {
+  const matches: Array<{ photoId: string; faceId: string }> = [];
+
+  for (const photo of photos) {
+    if (!photo.faces || photo.faces.length === 0) continue;
+
+    // RULE: Single-photo uniqueness! If personId already in photo, skip
+    const alreadyInPhoto = photo.faces.some((f) => f.personId === personId);
+    if (alreadyInPhoto) continue;
+
+    let bestCandidate: SlimFaceForMatching | null = null;
+    let minDistance = Infinity;
+
+    for (const face of photo.faces) {
+      // Only evaluate unassigned faces (or unconfirmed auto-detections)
+      if (face.personId && face.isConfirmed) continue;
+      if (!face.descriptor || face.descriptor.length === 0) continue;
+
+      const cosDist = cosineDistance(face.descriptor, centroid);
+      const euclDist = euclideanDistance(face.descriptor, centroid);
+      const dist = Math.min(cosDist, euclDist);
+
+      if (dist < minDistance) {
+        minDistance = dist;
+        if (dist < threshold) {
+          bestCandidate = face;
+        }
+      }
+    }
+
+    if (bestCandidate) {
+      matches.push({ photoId: photo.id, faceId: bestCandidate.id });
+    }
+  }
+
+  return matches;
+}

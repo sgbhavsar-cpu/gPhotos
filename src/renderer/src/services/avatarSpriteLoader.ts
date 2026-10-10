@@ -16,6 +16,10 @@ import type { AvatarSpriteCoord } from '../../../types';
 
 // key -> tile, or null when that person has no avatar file yet (caller then crops live)
 const cache = new Map<string, AvatarSpriteCoord | null>();
+// Keyed by personId::coverKey, so every cover-photo change adds a new entry on top of the old one
+// (invalidateAvatarSprite only drops the exact old key it's told about) — bounded by people count in
+// practice, but cheap to cap anyway. Same oldest-first eviction as batchThumbnailStore.
+const MAX_AVATAR_SPRITE_CACHE = 20_000;
 const listeners = new Set<(keys: Set<string>) => void>();
 
 interface Item {
@@ -66,6 +70,10 @@ async function work(): Promise<void> {
       const updated = new Set<string>();
       for (const it of chunk) {
         cache.set(it.key, result[it.key] ?? null);
+        if (cache.size > MAX_AVATAR_SPRITE_CACHE) {
+          const oldest = cache.keys().next().value;
+          if (oldest !== undefined) cache.delete(oldest);
+        }
         pending.delete(it.key);
         updated.add(it.key);
       }

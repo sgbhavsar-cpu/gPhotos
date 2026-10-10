@@ -35,6 +35,27 @@ describe('ollamaVisionService', () => {
     });
   });
 
+  describe('unloadLocalModels', () => {
+    it('asks Ollama to unload both the configured vision and embedding models with keep_alive: 0', async () => {
+      await load();
+      fetchMock.mockImplementation(async () => ({ ok: true, json: async () => ({}) }));
+
+      await mod.unloadLocalModels();
+
+      const calls = fetchMock.mock.calls;
+      const generateCall = calls.find((c: any[]) => String(c[0]).includes('/api/generate'));
+      const embedCall = calls.find((c: any[]) => String(c[0]).includes('/api/embed'));
+      expect(JSON.parse(generateCall[1].body)).toMatchObject({ model: 'qwen2.5vl:7b', keep_alive: 0 });
+      expect(JSON.parse(embedCall[1].body)).toMatchObject({ model: 'nomic-embed-text', keep_alive: 0 });
+    });
+
+    it('never throws, even when Ollama is unreachable', async () => {
+      await load();
+      fetchMock.mockImplementation(async () => { throw new Error('ECONNREFUSED'); });
+      await expect(mod.unloadLocalModels()).resolves.toBeUndefined();
+    });
+  });
+
   it('saveOllamaConfig persists a partial override, merged with the rest of the defaults, surviving a reload', async () => {
     await load();
     mod.saveOllamaConfig({ visionModel: 'llava:13b' });

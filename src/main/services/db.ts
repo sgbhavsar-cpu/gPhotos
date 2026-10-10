@@ -326,14 +326,40 @@ function applySchema(db: DatabaseSync): void {
   }
 }
 
+// Caps how many library connections stay open at once — "a handful of recently-used libraries"
+// (see openConnections' own comment), not every library ever opened this session. Each open
+// connection also keeps that library's ~100MB+ shared face-cluster cache alive (keyed off the
+// DatabaseSync object itself, see pipelineOrchestrator.ts's sharedFaceClusterCaches WeakMap), so
+// never evicting here meant switching through N libraries in one session held N of those caches
+// forever. Map iteration order is insertion order, and openConnection() below re-inserts an
+// existing entry on access, so the Map's own key order already IS least-recently-used-first.
+const MAX_OPEN_LIBRARY_CONNECTIONS = 3;
+
+function evictLeastRecentlyUsedConnections(): void {
+  while (openConnections.size > MAX_OPEN_LIBRARY_CONNECTIONS) {
+    const victim = [...openConnections.keys()].find((k) => k !== activeDbPath);
+    if (!victim) break; // everything left is the active library — nothing safe to evict
+    try {
+      openConnections.get(victim)?.close();
+    } catch {}
+    openConnections.delete(victim);
+  }
+}
+
 function openConnection(dbPath: string): DatabaseSync {
   const existing = openConnections.get(dbPath);
-  if (existing) return existing;
+  if (existing) {
+    // Re-insert to move this key to the end (most-recently-used) — see MAX_OPEN_LIBRARY_CONNECTIONS.
+    openConnections.delete(dbPath);
+    openConnections.set(dbPath, existing);
+    return existing;
+  }
 
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   applySchema(db);
   openConnections.set(dbPath, db);
+  evictLeastRecentlyUsedConnections();
   return db;
 }
 
@@ -418,6 +444,11 @@ export function resetDbForTests(): void {
 /** Closes every open library connection (e.g. on app quit). */
 export function closeDb(): void {
   resetDbForTests();
+}
+
+/** Test-only: how many library connections are currently cached open (see MAX_OPEN_LIBRARY_CONNECTIONS). */
+export function getOpenConnectionCountForTests(): number {
+  return openConnections.size;
 }
 
 /** Closes and forgets one library's connection without touching others, e.g. after deleting that library. */

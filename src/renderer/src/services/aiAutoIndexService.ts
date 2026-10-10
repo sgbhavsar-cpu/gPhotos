@@ -34,6 +34,20 @@ try {
   enabled = false;
 }
 
+// Transient, not persisted — separate from `enabled` (the user's own Settings toggle) the same way
+// thumbnailWorkerService's activityPaused is separate from its own manual pause/resume: the user
+// becoming active again must stop a run in progress without touching whether they actually want
+// this feature on, and must never itself be what re-enables a feature the user turned off.
+let activityPaused = false;
+
+export function pauseAutoIndexForActivity(): void {
+  activityPaused = true;
+}
+
+export function resumeAutoIndexFromActivity(): void {
+  activityPaused = false;
+}
+
 let running = false;
 let done = 0;
 let total = 0;
@@ -93,6 +107,7 @@ function candidatesFrom(photos: Photo[]): Photo[] {
 export async function runAutoIndexPass(photos: Photo[]): Promise<void> {
   if (running) return;
   if (!enabled) return;
+  if (activityPaused) return;
 
   await ensureLoaded();
   const candidates = candidatesFrom(photos);
@@ -121,6 +136,7 @@ export async function runAutoIndexPass(photos: Photo[]): Promise<void> {
 
     for (let i = 0; i < candidates.length; i += batchSize) {
       if (!enabled) break;
+      if (activityPaused) break;
       if (isManualFlowRunning()) {
         // Back off while a manual run is in flight rather than fighting it for the same local
         // model; the NEXT scheduled pass (library update / app restart) picks up where this left off.

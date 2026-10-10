@@ -1926,6 +1926,13 @@ export async function trashFiles(filePaths: string[]): Promise<{ success: boolea
       continue;
     }
     try {
+      // Purge cached thumbnails BEFORE the file moves to the Recycle Bin — purgeCachedThumbnailsForFile
+      // stats the file to key the cache entry, which would find nothing (and purge nothing) once the
+      // file is gone. Best-effort: a cache-purge failure must never block the actual trash operation.
+      try {
+        const { purgeCachedThumbnailsForFile } = require('./thumbnailCacheService');
+        await purgeCachedThumbnailsForFile(fp);
+      } catch {}
       if (shell && typeof shell.trashItem === 'function') {
         await shell.trashItem(fp);
       } else {
@@ -1964,6 +1971,12 @@ export async function deleteFilesPermanently(filePaths: string[]): Promise<{ suc
       continue;
     }
     try {
+      // Same reasoning as trashFiles: purge the thumbnail cache while the file (and its mtime) still
+      // exist to stat — best-effort, never blocks the actual delete.
+      try {
+        const { purgeCachedThumbnailsForFile } = require('./thumbnailCacheService');
+        await purgeCachedThumbnailsForFile(fp);
+      } catch {}
       fs.unlinkSync(fp);
       // If this is a virtual mirror photo or has a matching .json sidecar, delete it too
       const jsonSidecar = fp.replace(/\.[^/.]+$/, '') + '.json';

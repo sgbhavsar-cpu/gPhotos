@@ -284,6 +284,30 @@ describe('libraryStore save scan', () => {
     }, 120_000);
   });
 
+  describe('appendCatalogPage: a later page\'s faces must land in state.faces too', () => {
+    // Reported bug: naming an "Unknown Person" face failed with "Face detection not found" / the
+    // staleIdFallback's "refreshed by a recent scan" message on EVERY attempt (not occasionally)
+    // for any photo loaded past the first catalog page — because appendCatalogPage only ever
+    // appended to state.photos, never to the flat state.faces list every face lookup actually
+    // searches (reassignFaceToPerson, clustering, ...). A face that was simply never added there is
+    // indistinguishable from one a rescan made stale, except it fails every single time, not just
+    // after a race.
+    it('a photo loaded on page 2+ has its faces present in state.faces, not just on the Photo object', async () => {
+      const pageOnePhotos = Array.from({ length: 100 }, (_, k) => photo(`pg0_${k}`));
+      const pageTwoFace = face('pg1_0', 0);
+      const pageTwoPhotos = [photo('pg1_0', { faces: [pageTwoFace] }), ...Array.from({ length: 99 }, (_, k) => photo(`pg1_${k + 1}`))];
+      await setup({ catalogPages: (i) => (i === 0 ? pageOnePhotos : pageTwoPhotos) });
+      store.state.catalogMeta = { totalPages: 2, totalPhotos: 200 };
+      store.state.photos = pageOnePhotos;
+      store.currentCatalogPage = 0;
+
+      await store.loadNextCatalogPage();
+
+      expect(store.getState().photos.find((p: any) => p.id === 'pg1_0').faces).toEqual([pageTwoFace]);
+      expect(store.getState().faces.find((f: any) => f.id === pageTwoFace.id)).toEqual(pageTwoFace);
+    });
+  });
+
   describe('coalesced catalog-page notifications', () => {
     const page = (i: number) => Array.from({ length: 100 }, (_, k) => photo(`pg${i}_${k}`));
 
