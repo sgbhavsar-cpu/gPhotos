@@ -1,7 +1,7 @@
 {
   "name": "gphotos-desktop",
   "productName": "gPhotos",
-  "version": "2.7.0",
+  "version": "2.7.1",
   "description": "gPhotos Desktop - Standalone Photo Manager with Face Recognition and Places Map",
   "main": "dist-electron/main/main.js",
   "scripts": {
