@@ -24,4 +24,18 @@ describe('splitStoragesByExistence', () => {
     const { valid } = await splitStoragesByExistence([fresh], async () => false);
     expect(valid).toHaveLength(1);
   });
+
+  it('refuses to prune when EVERY checked storage comes back missing at once (the real incident: a transient hiccup blacklisted all 11 configured storages in one pass)', async () => {
+    const all = ['A', 'B', 'C'].map(storage);
+    const { valid, removed } = await splitStoragesByExistence(all, async () => false);
+    expect(valid.map((s) => s.name)).toEqual(['A', 'B', 'C']);
+    expect(removed).toEqual([]);
+  }, 10000);
+
+  it('still prunes some (but not all) when most, not every, checked storage is missing', async () => {
+    const all = ['A', 'B', 'C'].map(storage);
+    const { valid, removed } = await splitStoragesByExistence(all, async (p) => p.endsWith('\\A'));
+    expect(valid.map((s) => s.name)).toEqual(['A']);
+    expect(removed.map((s) => s.name).sort()).toEqual(['B', 'C']);
+  }, 10000);
 });

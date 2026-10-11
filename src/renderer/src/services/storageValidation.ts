@@ -49,14 +49,27 @@ export async function splitStoragesByExistence(
       // pruned for a folder that's gone missing.
       const neverSynced = !s.lastSynced && !s.totalItems;
       if (neverSynced) {
-        return { storage: s, exists: true };
+        return { storage: s, exists: true, checked: false };
       }
       return {
         storage: s,
         exists: await checkTwice(`${s.localMirrorRoot}\\${s.name}`),
+        checked: true,
       };
     })
   );
+
+  // One stale entry going missing (its folder deleted outside the app) is normal. EVERY checked
+  // entry going missing in the same pass is not — a real mass-deletion event is vanishingly rare
+  // compared to the existence check itself being unreliable for a moment (a stalled event loop, a
+  // busy disk, antivirus holding a lock on the whole mirror root). This was a real incident: a
+  // transient hiccup blacklisted every configured storage — including ones with 10,000+ photos
+  // already mirrored — in a single pass. Trust nothing this round rather than risk that again.
+  const checkedCount = checks.filter((c) => c.checked).length;
+  const missingCount = checks.filter((c) => c.checked && !c.exists).length;
+  if (checkedCount > 1 && missingCount === checkedCount) {
+    return { valid: list, removed: [] };
+  }
 
   return {
     valid: checks.filter((c) => c.exists).map((c) => c.storage),
