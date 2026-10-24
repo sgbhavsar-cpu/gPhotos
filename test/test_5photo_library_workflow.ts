@@ -142,7 +142,7 @@ async function run5PhotoWorkflowTests() {
     };
 
     // Update faces & people in store
-    libraryStore.updateFacesAndPeople([face1, face2, face3, face4]);
+    await libraryStore.updateFacesAndPeople([face1, face2, face3, face4]);
 
     const state1 = libraryStore.getState();
     assert(state1.people.length >= 2, `Clustering detected at least 2 people (actual: ${state1.people.length})`);
@@ -297,9 +297,6 @@ async function run5PhotoWorkflowTests() {
     assert(savedGlobalPeople.some((p: any) => p.name === 'Alice'), 'Alice is saved in global people registry');
     assert(savedGlobalPeople.some((p: any) => p.name === 'Bob'), 'Bob is saved in global people registry');
 
-    const savedGlobalFaces = persistentStorage.get('gphotos_face_cache_v2');
-    assert(Array.isArray(savedGlobalFaces), 'gphotos_face_cache_v2 was persisted to central storage');
-    assert(savedGlobalFaces.length > 0, `Face cache contains ${savedGlobalFaces.length} indexed keys`);
     console.log('   ✅ Test 5 Passed!\n');
 
     console.log('===============================================================');

@@ -22,7 +22,7 @@ export type ClusterWorkerResponse =
   | { id: number; result: Array<{ photoId: string; faceId: string }> }
   | { id: number; error: string };
 
-self.onmessage = (event: MessageEvent<ClusterWorkerRequest>) => {
+if (typeof self !== "undefined") self.onmessage = (event: MessageEvent<ClusterWorkerRequest>) => {
   const req = event.data;
   try {
     if (req.type === 'cluster') {

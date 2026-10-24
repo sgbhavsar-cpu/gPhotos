@@ -1554,7 +1554,7 @@ export class LibraryManager {
   public toggleFavorite(photoId: string) {
     // Replaces the Photo object and the array instead of flipping the flag in place: PhotoCard is
     // memoized on prev.photo.isFavorite vs next.photo.isFavorite (the same object once mutated, so the
-    // heart never updated) and GalleryView's useMemo([photos]) keeps serving the old list.
+    // heart never updated) and GalleryView's memoized-on-[photos] keeps serving the old list.
     const idx = this.state.photos.findIndex((p) => p.id === photoId);
     if (idx >= 0) {
       const photos = this.state.photos.slice();
