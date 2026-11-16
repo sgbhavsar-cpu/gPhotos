@@ -1225,7 +1225,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   const fileSizeMB = (photo.fileSize / (1024 * 1024)).toFixed(2);
 
   return (
-    <div style={{
+    <div data-photo-lightbox style={{
       position: 'fixed',
       top: 0,
       left: 0,

@@ -583,6 +583,13 @@ export interface IElectronAPI {
   readFolderPhotos: (folderPath: string) => Promise<Photo[]>;
   generateThumbnailOnTheFly: (sourceFilePath: string, mirrorDirPath?: string) => Promise<string | null>;
   editPhoto: (options: EditPhotoOptions) => Promise<EditPhotoResult>;
+  setStorageTaskPaused?: (key: string, task: string, paused: boolean) => Promise<void>;
+  setStorageTaskFault?: (key: string, task: string, message?: string) => Promise<void>;
+  logStorageTask?: (key: string, task: string, level: string, message: string) => Promise<void>;
+  getStorageTaskInfo?: (key: string, networkSourcePath: string) => Promise<{ paused: string[]; faults: Record<string, string>; online: boolean }>;
+  getStorageTaskLogs?: (key: string, task?: string) => Promise<Array<{ ts: number; task: string; level: string; message: string }>>;
+  registerStorageTaskKeys?: (keys: string[]) => Promise<void>;
+  countStorageMirrorMedia?: (mirrorDir: string) => Promise<{ images: number; videos: number }>;
   trashFiles: (filePaths: string[]) => Promise<{ success: boolean; trashedCount: number; trashedPaths: string[]; errors: string[] }>;
   deleteFilesPermanently: (filePaths: string[]) => Promise<{ success: boolean; deletedCount: number; deletedPaths: string[]; errors: string[] }>;
   rotatePhoto: (filePath: string, rotationDegrees: number, originalRemotePath?: string) => Promise<{ success: boolean; isQueued?: boolean; newPath?: string; message?: string; error?: string; isHeic?: boolean; isHeicRotated?: boolean; heicRotation?: number; rotation?: number }>;

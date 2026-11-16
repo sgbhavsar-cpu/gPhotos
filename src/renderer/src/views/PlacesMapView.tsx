@@ -130,6 +130,8 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
+      // An open full-screen photo takes this Escape first; selections underneath must survive it.
+      if (document.querySelector('[data-photo-lightbox]')) return;
 
       // stopImmediatePropagation, not stopPropagation — see PeopleView's
       // matching Escape handler for why (App.tsx's global handler is also

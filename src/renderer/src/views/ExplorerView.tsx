@@ -26,6 +26,7 @@ import { Photo, FolderTreeNode, VirtualStorageConfig, RelocationPhotoInput, Relo
 import { getLocalPhotoUrl, libraryStore } from '../services/libraryStore';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { notify, notifyError } from '../services/notifications';
+import { deleteFilesWithProgress } from '../services/deleteProgress';
 import { summariseReasons } from '../services/photoRelocationFlow';
 import { getExternalEditorPath } from '../services/externalEditorConfig';
 import { VirtualCardGrid } from '../components/VirtualCardGrid';
@@ -211,6 +212,19 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({ onSelectPhoto, onEdi
     };
   }, [contextMenu]);
 
+  // Escape: an open photo / context menu goes first; then it just deselects (and stays on this tab).
+  useEffect(() => {
+    if (contextMenu || (left.selected.size === 0 && right.selected.size === 0)) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || document.querySelector('[data-photo-lightbox]')) return;
+      e.stopImmediatePropagation();
+      setLeft((s) => ({ ...s, selected: new Set() }));
+      setRight((s) => ({ ...s, selected: new Set() }));
+    };
+    window.addEventListener('keydown', onKey, { capture: true });
+    return () => window.removeEventListener('keydown', onKey, { capture: true });
+  }, [contextMenu, left.selected.size, right.selected.size]);
+
   const applyMovedResults = (results: RelocationItemResult[]) => {
     const moved = results.filter((r) => r.status === 'moved' && r.newId && r.newFilePath);
     if (moved.length === 0) return;
@@ -383,7 +397,7 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({ onSelectPhoto, onEdi
     if (targets.length === 0) return;
     try {
       const filePaths = targets.map(realPath);
-      const result = await api.deleteFilesPermanently(filePaths);
+      const result = await deleteFilesWithProgress(filePaths);
       const deletedPathSet = new Set(result.deletedPaths);
       const deletedIds = targets.filter((p) => deletedPathSet.has(realPath(p))).map((p) => p.id);
       dropDeletedFromPanes(deletedIds);
@@ -595,6 +609,7 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({ onSelectPhoto, onEdi
                 const selected = pane.selected.has(photo.id);
                 return (
                   <div
+                    className="album-tile"
                     onClick={(e) => {
                       if (e.shiftKey || e.ctrlKey || e.metaKey) toggleSelect(which, photo.id);
                       else onSelectPhoto(photo);
@@ -613,12 +628,15 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({ onSelectPhoto, onEdi
                     title={staged ? `Staged move to ${staged.targetDir}${staged.queued ? ' (queued — storage offline)' : ''} — click the checkbox to select, Commit to apply.` : photo.fileName}
                   >
                     <div
+                      data-hover-ctl
+                      aria-checked={selected}
                       onClick={(e) => { e.stopPropagation(); toggleSelect(which, photo.id); }}
                       style={{ position: 'absolute', top: '4px', left: '4px', zIndex: 2, background: 'rgba(0,0,0,0.5)', borderRadius: '4px', padding: '2px', color: '#fff' }}
                     >
                       {selected ? <CheckSquare size={14} /> : <Square size={14} />}
                     </div>
                     <button
+                      data-hover-ctl
                       onClick={(e) => { e.stopPropagation(); onEditPhoto(photo); }}
                       title="Edit photo"
                       style={{ position: 'absolute', bottom: '36px', right: '4px', zIndex: 2, background: 'rgba(0,0,0,0.55)', border: 'none', borderRadius: '4px', padding: '4px', color: '#fff', cursor: 'pointer', display: 'flex' }}

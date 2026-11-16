@@ -24,7 +24,8 @@ import {
   AlertTriangle,
   MoreVertical,
   RotateCw,
-  Wand2
+  Wand2,
+  FolderInput
 } from 'lucide-react';
 import { Photo, VirtualStorageConfig, Album } from '../../../types';
 import { PhotoCard } from '../components/PhotoCard';
@@ -39,7 +40,9 @@ import { authFetch } from '../services/webAuthClient';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { BulkEditModal } from '../components/BulkEditModal';
 import { autoRotateUpright } from '../services/autoRotateUpright';
+import { movePhotosToFolder } from '../services/photoRelocationFlow';
 import { notify, notifyError } from '../services/notifications';
+import { deleteFilesWithProgress } from '../services/deleteProgress';
 
 interface GalleryViewProps {
   photos: Photo[];
@@ -117,6 +120,8 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
+      // An open full-screen photo takes this Escape first; the selection underneath must survive it.
+      if (document.querySelector('[data-photo-lightbox]')) return;
 
       // stopImmediatePropagation, not stopPropagation — see PeopleView's
       // matching Escape handler for why (App.tsx's global handler is also
@@ -181,6 +186,21 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
     }
   };
 
+  const [isMovingToFolder, setIsMovingToFolder] = useState(false);
+  const handleMoveSelectedToFolder = async () => {
+    if (isMovingToFolder || selectedIds.size === 0) return;
+    setIsMovingToFolder(true);
+    try {
+      const res = await movePhotosToFolder(photos.filter((p) => selectedIds.has(p.id)), { label: 'the selection' });
+      if (res && res.moved > 0) {
+        setSelectedIds(new Set());
+        setIsSelectMode(false);
+      }
+    } finally {
+      setIsMovingToFolder(false);
+    }
+  };
+
   const handleSelectionChange = (newSelected: Set<string>) => {
     setSelectedIds(newSelected);
     if (!isSelectMode && newSelected.size > 0) {
@@ -203,40 +223,18 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       let deletedIds = toDelete.map((p) => p.id);
       let failureMessage: string | null = null;
 
-      if (window.electronAPI?.deleteFilesPermanently) {
-        const result = await window.electronAPI.deleteFilesPermanently(filePaths);
-        const deletedPathSet = new Set(result.deletedPaths);
-        deletedIds = toDelete
-          .filter((p) => deletedPathSet.has(p.originalRemotePath || p.filePath))
-          .map((p) => p.id);
+      const result = await deleteFilesWithProgress(filePaths);
+      const deletedPathSet = new Set(result.deletedPaths);
+      deletedIds = toDelete
+        .filter((p) => deletedPathSet.has(p.originalRemotePath || p.filePath))
+        .map((p) => p.id);
 
-        if (result.errors.length > 0) {
-          const offlineCount = result.errors.filter((e) => e.includes('network storage is not available')).length;
-          failureMessage = offlineCount > 0
-            ? `${offlineCount} of ${toDelete.length} photo(s) skipped — network storage is not available.`
-            : `${result.errors.length} of ${toDelete.length} photo(s) could not be deleted.`;
+      if (result.errors.length > 0) {
+        const offlineCount = result.errors.filter((e) => e.includes('network storage is not available')).length;
+        failureMessage = offlineCount > 0
+          ? `${offlineCount} of ${toDelete.length} photo(s) skipped — network storage is not available.`
+          : `${result.errors.length} of ${toDelete.length} photo(s) could not be deleted.`;
         }
-      } else {
-        const res = await authFetch('/api/delete-files', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filePaths, permanent: true }),
-        });
-        if (!res.ok) throw new Error(`The server refused the delete (HTTP ${res.status}). Nothing was deleted.`);
-        try {
-          // If the server reports exactly what it deleted, only remove those from the library.
-          const body = await res.json();
-          if (body && Array.isArray(body.deletedPaths)) {
-            const deleted = new Set<string>(body.deletedPaths);
-            deletedIds = toDelete.filter((p) => deleted.has(p.originalRemotePath || p.filePath)).map((p) => p.id);
-            if (deletedIds.length < toDelete.length) {
-              failureMessage = `${toDelete.length - deletedIds.length} of ${toDelete.length} photo(s) could not be deleted.`;
-            }
-          }
-        } catch {
-          // Body isn't JSON: an ok status is all we can go on.
-        }
-      }
 
       if (deletedIds.length > 0) {
         libraryStore.removePhotos(deletedIds);
@@ -1246,6 +1244,17 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
             >
               <Calendar size={16} color="var(--accent-cyan)" />
               <span>Edit Info ({selectedIds.size})</span>
+            </button>
+
+            <button
+              className="btn btn-secondary"
+              onClick={handleMoveSelectedToFolder}
+              disabled={isMovingToFolder || selectedIds.size === 0}
+              style={{ fontSize: '0.85rem', gap: '8px', padding: '6px 14px' }}
+              title="Move the original files of the selected photos to another folder"
+            >
+              <FolderInput size={16} color="var(--accent-primary)" />
+              <span>{isMovingToFolder ? 'Moving…' : `Move to Folder (${selectedIds.size})`}</span>
             </button>
 
             {/* Permanently Delete Selected Button */}

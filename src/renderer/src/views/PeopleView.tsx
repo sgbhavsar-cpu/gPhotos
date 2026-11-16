@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo, useDeferredValue } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback, useDeferredValue } from 'react';
 import {
   Users,
   Edit2,
@@ -27,6 +27,7 @@ import {
 import { Person, Photo, DetectedFace } from '../../../types';
 import { PhotoCard } from '../components/PhotoCard';
 import { FaceAvatar } from '../components/FaceAvatar';
+import { PhotoSelectionActions } from '../components/PhotoSelectionActions';
 import { VirtualCardGrid } from '../components/VirtualCardGrid';
 import { prefetchAvatarSprites } from '../services/avatarSpriteLoader';
 import { ChangeCoverFaceModal } from '../components/ChangeCoverFaceModal';
@@ -74,6 +75,8 @@ interface PeopleViewProps {
   onUpdatePersonName: (personId: string, newName: string) => void;
   onMergePeople: (targetPersonId: string, sourcePersonId: string) => void;
   onSelectPhoto: (photo: Photo, contextPhotos?: Photo[], highlightPersonId?: string) => void;
+  onOpenDuplicateCleaner?: (cluster?: any) => void;
+  onRunSmartFlow?: (photos: Photo[]) => void;
   onToggleFavorite: (photoId: string) => void;
   onTriggerFaceDetection: () => void;
   isDetectingFaces: boolean;
@@ -89,6 +92,8 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
   onUpdatePersonName,
   onMergePeople,
   onSelectPhoto,
+  onOpenDuplicateCleaner,
+  onRunSmartFlow,
   onToggleFavorite,
   onTriggerFaceDetection,
   isDetectingFaces,
@@ -123,6 +128,14 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
   const [learningNotification, setLearningNotification] = useState<string | null>(null);
   const [tipDismissed, setTipDismissed] = useState(false);
   const [mergeSelection, setMergeSelection] = useState<string[]>([]);
+  // Multi-select in a person's Photos grid (click checkmark / Ctrl-click / drag), like the main Gallery.
+  const [selectedPhotoIds, setSelectedPhotoIds] = useState<Set<string>>(new Set());
+  const selectedPhotoIdsRef = useRef(selectedPhotoIds);
+  selectedPhotoIdsRef.current = selectedPhotoIds;
+  useEffect(() => { setSelectedPhotoIds(new Set()); }, [selectedPersonId]);
+  const toggleSelectPhoto = useCallback((id: string) => {
+    setSelectedPhotoIds((prev) => { const n = new Set(prev); if (!n.delete(id)) n.add(id); return n; });
+  }, []);
   const [isMergeMode, setIsMergeMode] = useState(false);
   const [viewMode, setViewMode] = useState<'photos' | 'faces'>('photos');
   const [zoomLevel, setZoomLevel] = useState<GalleryZoomLevel>('medium');
@@ -154,6 +167,8 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
+      // An open full-screen photo takes this Escape first; selections underneath must survive it.
+      if (document.querySelector('[data-photo-lightbox]')) return;
 
       // stopImmediatePropagation (not stopPropagation) is required here:
       // App.tsx's global Escape handler is also bound directly to `window`,
@@ -178,6 +193,9 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
         e.stopImmediatePropagation();
         setIsMergeMode(false);
         setMergeSelection([]);
+      } else if (selectedPhotoIdsRef.current.size > 0) {
+        e.stopImmediatePropagation();
+        setSelectedPhotoIds(new Set()); // first Escape only deselects
       } else if (selectedPersonId) {
         e.stopImmediatePropagation();
         setSelectedPersonId(null);
@@ -361,6 +379,28 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
     for (const id of ids) await libraryStore.unassignFaceFromPerson(id);
     setLearningNotification(`✕ Removed ${ids.length} photo${ids.length === 1 ? '' : 's'} from ${selectedPerson.name}'s album.`);
     setTimeout(() => setLearningNotification((curr) => curr?.startsWith('✕') ? null : curr), 3500);
+  };
+
+  // Same per-face actions as "mark all", limited to the photos picked in the Photos grid.
+  const handleSelectedFaces = async (action: 'confirm' | 'remove') => {
+    if (!selectedPerson) return;
+    const items = personPhotoItems.filter(({ photo }) => selectedPhotoIds.has(photo.id));
+    if (items.length === 0) return;
+    const n = items.length;
+    const label = `${n} photo${n === 1 ? '' : 's'}`;
+    if (action === 'remove') {
+      if (!window.confirm(`Remove ${label} from ${selectedPerson.name}'s album?`)) return;
+      const ids = items.map(({ face }) => face.id);
+      setRemovedFaceIds((prev) => new Set([...prev, ...ids]));
+      setSelectedPhotoIds(new Set());
+      for (const id of ids) await libraryStore.unassignFaceFromPerson(id);
+      setLearningNotification(`✕ Removed ${label} from ${selectedPerson.name}'s album.`);
+    } else {
+      setSelectedPhotoIds(new Set());
+      for (const { face } of items) if (!face.isConfirmed) await libraryStore.confirmFace(face.id);
+      setLearningNotification(`✓ Confirmed ${label} of ${selectedPerson.name}.`);
+    }
+    setTimeout(() => setLearningNotification((curr) => (curr?.startsWith('✓') || curr?.startsWith('✕') ? null : curr)), 4000);
   };
 
   const handleDeleteDetection = (faceId: string, e?: React.MouseEvent) => {
@@ -805,9 +845,28 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
         )}
 
         {/* Photos View: Virtualized Timeline Gallery with 6 Zoom Levels (Years, Months, XS, S, M, L) */}
+        {viewMode === 'photos' && selectedPhotoIds.size > 0 && (
+          <div style={{ padding: '6px 32px', display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px', borderBottom: '1px solid var(--border-subtle)', fontSize: '0.85rem' }}>
+            <strong style={{ flex: 1 }}>{selectedPhotoIds.size} selected</strong>
+            <button className="btn btn-ghost" onClick={() => handleSelectedFaces('confirm')} style={{ color: '#10b981' }}><UserCheck size={16} /> Correct</button>
+            <button className="btn btn-ghost" onClick={() => handleSelectedFaces('remove')} style={{ color: '#ef4444' }}><UserX size={16} /> Not this person</button>
+            <PhotoSelectionActions
+              selected={personPhotos.filter((p) => selectedPhotoIds.has(p.id))}
+              allPhotos={photos}
+              onDone={() => setSelectedPhotoIds(new Set())}
+              onOpenDuplicateCleaner={onOpenDuplicateCleaner}
+              onRunSmartFlow={onRunSmartFlow}
+            />
+            <button className="btn btn-ghost" onClick={() => setSelectedPhotoIds(new Set())}>Clear</button>
+          </div>
+        )}
         {viewMode === 'photos' ? (
           <VirtualizedTimelineGallery
             photos={personPhotos}
+            isSelectMode={selectedPhotoIds.size > 0}
+            selectedIds={selectedPhotoIds}
+            onToggleSelect={toggleSelectPhoto}
+            onSelectionChange={setSelectedPhotoIds}
             zoomLevel={zoomLevel}
             onZoomChange={setZoomLevel}
             onSelectPhoto={(p) => onSelectPhoto(p, personPhotos, selectedPerson.id)}

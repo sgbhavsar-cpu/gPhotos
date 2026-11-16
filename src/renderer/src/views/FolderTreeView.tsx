@@ -178,6 +178,7 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        if (document.querySelector('[data-photo-lightbox]')) return;
         if (selectedFolderPath) {
           e.stopImmediatePropagation();
           setSelectedFolderPath(null);

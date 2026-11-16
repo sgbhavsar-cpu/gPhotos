@@ -144,12 +144,13 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
   }, [musicCredit]);
 
   useEffect(() => {
+    if (!isOpen) return; // always mounted in the album view: a closed wizard must not swallow Escape
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !isGenerating) { e.stopImmediatePropagation(); onClose(); }
     };
     window.addEventListener('keydown', handleKeyDown, { capture: true });
     return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [onClose, isGenerating]);
+  }, [isOpen, onClose, isGenerating]);
 
   if (!isOpen) return null;
 

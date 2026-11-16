@@ -1,3 +1,4 @@
+import { deleteFilesWithProgress } from '../services/deleteProgress';
 import React, { useState, useEffect, useRef } from 'react';
 import {
   X,
@@ -23,7 +24,6 @@ import { Photo, DuplicateCluster } from '../../../types';
 import { identifyDuplicateClusters, identifyExactDuplicateClusters } from '../services/deduplication';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { notify, notifyError } from '../services/notifications';
-import { trackBackendCall } from '../services/responseTracker';
 
 interface DuplicateCleanerModalProps {
   photos: Photo[];
@@ -279,15 +279,12 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
       // Only remove photos that were actually trashed — a photo whose network
       // storage is offline is skipped by trashFiles rather than attempted, so
       // it must stay in the library instead of silently disappearing from view.
-      const result = await trackBackendCall(
-        window.electronAPI.trashFiles(deletePaths),
-        `Moving ${count} photo${count === 1 ? '' : 's'} to the Recycle Bin...`
-      );
-      const trashedPathSet = new Set(result?.trashedPaths || []);
+      const result = await deleteFilesWithProgress(deletePaths, { trash: true });
+      const trashedPathSet = new Set(result.deletedPaths);
       const trashedIds = toDelete
         .filter((p) => trashedPathSet.has(p.originalRemotePath || p.filePath))
         .map((p) => p.id);
-      const errors = result?.errors || [];
+      const errors = result.errors;
 
       let failureMessage: string | null = null;
       if (errors.length > 0 || trashedIds.length < count) {

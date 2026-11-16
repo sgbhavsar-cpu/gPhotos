@@ -1844,9 +1844,7 @@ export class LibraryManager {
     }
 
     if (newlyAssignedCount > 0) {
-      const { people, updatedFaces } = await this.cluster(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
-      this.state.people = people;
-      this.state.faces = updatedFaces;
+      this.recountPeople();
       this.notify();
     }
 
@@ -2070,9 +2068,7 @@ export class LibraryManager {
 
     if (unassigned) {
       // Re-calculate people without creating unwanted new clusters for unassigned faces
-      const { people, updatedFaces } = await this.cluster(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
-      this.state.people = people;
-      this.state.faces = updatedFaces;
+      this.recountPeople();
       if (affectedPhotoId) {
         this.recomputeFacesLockedForPhoto(affectedPhotoId);
       }
@@ -2253,6 +2249,34 @@ export class LibraryManager {
     return byOld.size;
   }
 
+  /**
+   * After faces were only REMOVED or (un)assigned by hand/propagation: refresh each person's counts/cover and drop emptied "Person N"
+   * placeholders — one pass over the faces. Replaces a full cluster() round trip (every face and its
+   * 512-d descriptor cloned to the worker and back, new clusters created for all unassigned faces),
+   * which ran the renderer out of memory on a ~18k-people library.
+   */
+  private recountPeople(): void {
+    const faceIds = new Set<string>();
+    const stats = new Map<string, { faces: number; photos: Set<string>; first?: DetectedFace }>();
+    for (const f of this.state.faces) {
+      faceIds.add(f.id);
+      if (!f.personId) continue;
+      let st = stats.get(f.personId);
+      if (!st) stats.set(f.personId, (st = { faces: 0, photos: new Set(), first: f }));
+      st.faces++;
+      st.photos.add(f.photoId);
+    }
+    this.state.people = this.state.people.filter((p) => {
+      const st = stats.get(p.id);
+      p.faceCount = st?.faces ?? 0;
+      p.photoCount = st?.photos.size ?? 0;
+      if (p.coverFaceId && !faceIds.has(p.coverFaceId)) { p.coverFaceId = undefined; p.coverPhotoId = undefined; }
+      if (!p.coverFaceId && st?.first) { p.coverFaceId = st.first.id; p.coverPhotoId = st.first.photoId; }
+      return p.faceCount > 0 || !/^Person(\s+\d+)?$/i.test(p.name.trim());
+    });
+    this.forceFullResign = true;
+  }
+
   public async deleteFaceDetection(faceId: string) {
     const removedFace = this.state.faces.find((f) => f.id === faceId);
     this.state.faces = this.state.faces.filter((f) => f.id !== faceId);
@@ -2261,9 +2285,7 @@ export class LibraryManager {
         photo.faces = photo.faces.filter((f) => f.id !== faceId);
       }
     }
-    const { people, updatedFaces } = await this.cluster(this.state.faces, this.state.people);
-    this.state.people = people;
-    this.state.faces = updatedFaces;
+    this.recountPeople();
     if (removedFace) {
       this.recomputeFacesLockedForPhoto(removedFace.photoId);
     }
@@ -2301,9 +2323,7 @@ export class LibraryManager {
           p.faces = p.faces.filter((f) => !idsToRemove.has(f.id));
         }
       }
-      const { people, updatedFaces } = await this.cluster(this.state.faces, this.state.people);
-      this.state.people = people;
-      this.state.faces = updatedFaces;
+      this.recountPeople();
     }
 
     photo.facesLocked = true;
@@ -2358,9 +2378,7 @@ export class LibraryManager {
           p.faces = p.faces.filter((f) => !idsToRemove.has(f.id));
         }
       }
-      const { people, updatedFaces } = await this.cluster(this.state.faces, this.state.people);
-      this.state.people = people;
-      this.state.faces = updatedFaces;
+      this.recountPeople();
     }
 
     photo.facesLocked = true;
@@ -2397,9 +2415,7 @@ export class LibraryManager {
         }
         return p;
       });
-      const { people, updatedFaces } = await this.cluster(this.state.faces, this.state.people, DEFAULT_MATCH_THRESHOLD, false);
-      this.state.people = people;
-      this.state.faces = updatedFaces;
+      this.recountPeople();
       this.notify(true);
     }
 
@@ -2544,10 +2560,12 @@ export class LibraryManager {
     // 2. Remove the person from people list
     const remainingPeople = this.state.people.filter((p) => p.id !== personId);
 
-    // 3. Recalculate people and faces without creating new clusters for unassigned faces
-    const { people, updatedFaces } = await this.cluster(this.state.faces, remainingPeople, DEFAULT_MATCH_THRESHOLD, false);
-    this.state.people = people;
-    this.state.faces = updatedFaces;
+    // 3. Nothing else to recompute: only this person's own faces changed (unassigned in place above), so
+    // every other person's counts are untouched. A full cluster() pass here posted every face + 512-d
+    // descriptor to the worker and back (and scanned all people per unassigned face) — it ran the
+    // renderer out of memory ("oom" in main.log) on a library with ~18k people.
+    this.state.people = remainingPeople;
+    this.forceFullResign = true;
     this.notify();
     return true;
   }

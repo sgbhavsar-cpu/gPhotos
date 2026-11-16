@@ -1,7 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { FolderInput, Wand2, X } from 'lucide-react';
+import { BookImage, FolderInput, Wand2, X } from 'lucide-react';
 import type { AlbumChapter } from '../../../types';
-import { ChapterPicker } from './ChapterPicker';
 
 export interface Rect { left: number; top: number; right: number; bottom: number }
 
@@ -11,7 +10,7 @@ const MOVE_THRESHOLD_PX = 4;
 const EDGE_SCROLL_ZONE_PX = 40;
 const EDGE_SCROLL_STEP_PX = 16;
 /** A press that starts one of these is theirs (opening a photo, a button, a text box...) — not the start of a rubber band. */
-const NOT_A_BACKGROUND = '[data-album-photo-id], button, input, textarea, select, a, [role="dialog"]';
+const NOT_A_BACKGROUND = 'button, input, textarea, select, a, [role="dialog"]';
 
 interface MarqueeOptions {
   containerRef: React.RefObject<HTMLElement | null>;
@@ -50,6 +49,8 @@ export function useMarqueeSelect({ containerRef, selected, onChange, enabled = t
     const startX = e.clientX;
     const startY = e.clientY;
     const startScroll = container.scrollTop;
+    // Pressing ON a photo also starts the band (like the Photos grid); a plain click there still opens/toggles it.
+    const onTile = !!target.closest('[data-album-photo-id]');
     const additive = onCheckbox || e.ctrlKey || e.metaKey || e.shiftKey;
     const base = additive ? new Set(live.current.selected) : new Set<string>();
     const memory = new Map<string, boolean>();
@@ -108,7 +109,7 @@ export function useMarqueeSelect({ containerRef, selected, onChange, enabled = t
       if (active) {
         suppressClick.current = true;
         setTimeout(() => { suppressClick.current = false; }, 0);
-      } else if (!additive) {
+      } else if (!additive && !onTile) {
         live.current.onChange(new Set()); // a plain click on empty space clears the selection
       }
     };
@@ -205,44 +206,40 @@ export const AlbumSelectionBar: React.FC<{
   count: number;
   chapters: AlbumChapter[];
   anchor: Anchor;
-  onMoveTo: (chapterId: string | null) => void;
-  onCreateChapter: (title: string) => void;
+  /** Opens the shared chapter picker (search / create) for the selection. */
+  onMoveToChapter: () => void;
   onClear: () => void;
   /** Opens Smart Flows pre-scoped to the selected photos. Omitted where the caller has no Smart Flows to offer. */
   onRunSmartFlow?: () => void;
-}> = ({ count, chapters, anchor, onMoveTo, onCreateChapter, onClear, onRunSmartFlow }) => {
-  const [picking, setPicking] = useState(false);
+  /** Opens the album/chapter picker to move the selection into another album. */
+  onMoveToAlbum?: () => void;
+  /** The shared Photos-view bulk actions (PhotoSelectionActions); replaces the lone Smart Flow button. */
+  actions?: React.ReactNode;
+}> = ({ count, anchor, onMoveToChapter, onClear, onRunSmartFlow, onMoveToAlbum, actions }) => {
   return (
     <div
       data-testid="album-selection-bar"
       style={{
-        position: 'fixed', left: anchor.left, width: anchor.width, top: anchor.bottom - 64, zIndex: 950, display: 'flex', justifyContent: 'center', pointerEvents: 'none',
+        position: 'fixed', left: anchor.left, width: anchor.width, bottom: window.innerHeight - anchor.bottom + 12, zIndex: 950, display: 'flex', justifyContent: 'center', pointerEvents: 'none',
       }}
     >
       <div
         style={{
-          pointerEvents: 'auto', display: 'flex', alignItems: 'center', gap: '10px', padding: '8px 12px', borderRadius: 'var(--radius-full)',
+          pointerEvents: 'auto', display: 'flex', flexWrap: 'wrap', justifyContent: 'center', maxWidth: '96%', alignItems: 'center', gap: '10px', padding: '8px 12px', borderRadius: 'var(--radius-lg)',
           backgroundColor: 'var(--bg-surface-elevated)', border: '1px solid var(--border-subtle)', boxShadow: '0 12px 32px rgba(0,0,0,0.55)',
         }}
       >
         <span style={{ fontSize: '0.84rem', fontWeight: 600 }}>{count} selected</span>
-        <span style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>drag them onto a chapter, or</span>
-        <div style={{ position: 'relative' }}>
-          <button className="btn btn-primary" onClick={() => setPicking((p) => !p)} style={{ gap: '6px', padding: '6px 12px', fontSize: '0.8rem' }}>
-            <FolderInput size={14} /> Move to chapter…
+        <button className="btn btn-primary" onClick={onMoveToChapter} style={{ gap: '6px', padding: '6px 12px', fontSize: '0.8rem' }}>
+          <FolderInput size={14} /> Move to chapter…
+        </button>
+        {onMoveToAlbum && (
+          <button className="btn btn-secondary" onClick={onMoveToAlbum} title="Move the selected photos to another album and chapter" style={{ gap: '6px', padding: '6px 12px', fontSize: '0.8rem' }}>
+            <BookImage size={14} /> Move to album…
           </button>
-          {picking && (
-            <ChapterPicker
-              chapters={chapters}
-              currentChapterId={undefined}
-              onPick={(id) => { setPicking(false); onMoveTo(id); }}
-              onCreateNew={(title) => { setPicking(false); onCreateChapter(title); }}
-              onClose={() => setPicking(false)}
-              anchorStyle={{ bottom: '42px', left: 0 }}
-            />
-          )}
-        </div>
-        {onRunSmartFlow && (
+        )}
+        {actions}
+        {!actions && onRunSmartFlow && (
           <button className="btn btn-secondary" onClick={onRunSmartFlow} title="Run one of your Smart Flows against just the selected photos" style={{ gap: '6px', padding: '6px 12px', fontSize: '0.8rem' }}>
             <Wand2 size={14} color="#c084fc" /> Run Smart Flow
           </button>

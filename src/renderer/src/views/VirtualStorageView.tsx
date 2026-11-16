@@ -24,6 +24,7 @@ import {
   Users,
   Image,
   X,
+  ScrollText,
 } from 'lucide-react';
 import { VirtualStorageConfig, MirrorProgress, BackgroundServiceStatus, NetworkStorageProgress, StorageDetails } from '../../../types';
 import { DeleteStorageModal } from '../components/DeleteStorageModal';
@@ -33,6 +34,8 @@ import { selectDirectoryOrPrompt } from '../services/selectDirectory';
 import { joinMirrorPath } from '../services/pathUtils';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { notify, notifyError } from '../services/notifications';
+import { StorageLogModal, useStorageTaskInfo } from '../components/StorageLogModal';
+import { storageTaskKey, isTaskPausedForKey, setTaskPaused, registerStorages, subscribeStorageTasks, type StorageTask } from '../services/storageTasks';
 
 interface VirtualStorageViewProps {
   onLoadMirroredPhotos: (mirrorRootPath: string) => void;
@@ -61,6 +64,11 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
   const isSyncingRef = useRef(false);
   const pollBusyRef = useRef(false);
 
+  const [logStorage, setLogStorage] = useState<VirtualStorageConfig | null>(null);
+  const taskInfo = useStorageTaskInfo(storages);
+  const [, bumpTasks] = useState(0);
+  useEffect(() => subscribeStorageTasks(() => bumpTasks((n) => n + 1)), []);
+  useEffect(() => { registerStorages(storages.map((x) => storageTaskKey(x.localMirrorRoot, x.name))); }, [storages]);
   const [storageDetailsMap, setStorageDetailsMap] = useState<Record<string, StorageDetails>>({});
   // Cards would otherwise briefly render with 0/empty stats before the first
   // getAllStorageDetailsFast() round-trip (checkpoint + SQLite, no disk walk)
@@ -1290,6 +1298,16 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                       </button>
 
                       <button
+                        className="btn btn-secondary"
+                        onClick={() => setLogStorage(s)}
+                        style={{ fontSize: '0.8rem', padding: isMobile ? '6px 8px' : '6px 12px', gap: '6px' }}
+                        title="View status, counts and logs for this storage"
+                      >
+                        <ScrollText size={14} />
+                        {!isMobile && <span>Logs</span>}
+                      </button>
+
+                      <button
                         className="btn btn-ghost"
                         onClick={() => setStorageToDelete(s)}
                         disabled={isSyncing}
@@ -1449,6 +1467,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                             icon={<Image size={14} />}
                             color="var(--accent-cyan)"
                             label="Caching"
+                            task={{ paused: isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'caching'), fault: taskInfo[storageTaskKey(s.localMirrorRoot, s.name)]?.faults?.caching, toggle: () => setTaskPaused(storageTaskKey(s.localMirrorRoot, s.name), 'caching', !isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'caching')) }}
                             current={cachedThumbnails}
                             total={totalPhotos}
                             active={isThumbActive}
@@ -1457,6 +1476,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                             icon={<Users size={14} />}
                             color="#ec4899"
                             label="Face Detection"
+                            task={{ paused: isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'faces'), fault: taskInfo[storageTaskKey(s.localMirrorRoot, s.name)]?.faults?.faces, toggle: () => setTaskPaused(storageTaskKey(s.localMirrorRoot, s.name), 'faces', !isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'faces')) }}
                             current={faceScanned}
                             total={totalPhotos}
                             active={isFaceActive}
@@ -1466,6 +1486,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                             icon={<Sparkles size={14} />}
                             color="#a855f7"
                             label="AI Description"
+                            task={{ paused: isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'ai'), fault: taskInfo[storageTaskKey(s.localMirrorRoot, s.name)]?.faults?.ai, toggle: () => setTaskPaused(storageTaskKey(s.localMirrorRoot, s.name), 'ai', !isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'ai')) }}
                             current={aiCaptioned}
                             total={aiTotal}
                             active={false}
@@ -1725,8 +1746,15 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
       </div>
 
       {/* Delete / Unlink Storage Modal */}
+      {logStorage && (
+        <StorageLogModal
+          storage={logStorage}
+          details={storageDetailsMap[logStorage.name] || storageDetailsMap[logStorage.id]}
+          onClose={() => setLogStorage(null)}
+        />
+      )}
       {storageToDelete && (
-        <DeleteStorageModal
+      <DeleteStorageModal
           storage={storageToDelete}
           onClose={() => setStorageToDelete(null)}
           onConfirmDelete={confirmDeleteStorage}
@@ -1746,7 +1774,8 @@ const StorageStatRow: React.FC<{
   total: number;
   active?: boolean;
   suffix?: string;
-}> = ({ icon, color, label, current, total, active, suffix }) => {
+  task?: { paused: boolean; fault?: string; toggle: () => void };
+}> = ({ icon, color, label, current, total, active, suffix, task }) => {
   const pct = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0;
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
@@ -1765,6 +1794,17 @@ const StorageStatRow: React.FC<{
         <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', whiteSpace: 'nowrap', flexShrink: 0 }}>
           · {suffix}
         </span>
+      )}
+      {task && (
+        <button
+          className="btn btn-secondary"
+          onClick={task.toggle}
+          title={task.fault ? `Fault: ${task.fault}. Click to ${task.paused ? 'run' : 'pause'}.` : task.paused ? `${label} paused — click to run` : `${label} running — click to pause`}
+          style={{ padding: '2px 8px', fontSize: '0.72rem', gap: '4px', flexShrink: 0, minWidth: 64, justifyContent: 'center', ...(task.fault ? { color: '#f59e0b', borderColor: '#f59e0b' } : {}) }}
+        >
+          {task.fault ? <span style={{ fontWeight: 800 }}>?</span> : task.paused ? <Play size={11} /> : <Pause size={11} />}
+          <span>{task.fault ? 'Fault' : task.paused ? 'Run' : 'Pause'}</span>
+        </button>
       )}
     </div>
   );

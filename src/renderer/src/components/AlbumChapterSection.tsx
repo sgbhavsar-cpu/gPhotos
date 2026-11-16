@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ChevronUp, ChevronDown, Pencil, Trash2, Check, X } from 'lucide-react';
+import { ChevronUp, ChevronDown, ChevronRight, Pencil, Trash2, Check, X } from 'lucide-react';
 import type { AlbumChapter, Photo } from '../../../types';
 import { getLocalPhotoUrl } from '../services/libraryStore';
 import { VirtualCardGrid } from './VirtualCardGrid';
@@ -17,7 +17,11 @@ interface AlbumChapterSectionProps {
   onMoveUp?: () => void;
   onMoveDown?: () => void;
   /** Dropping one or more dragged photos onto this section moves them into this chapter. */
-  onDropPhotoIds?: (e: React.DragEvent) => void;
+  selectedCount?: number;
+  onSelectAll?: () => void;
+  onDeselectAll?: () => void;
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
 }
 
 /**
@@ -26,11 +30,10 @@ interface AlbumChapterSectionProps {
  * as an actual photo file — followed by that chapter's own windowed photo grid.
  */
 export const AlbumChapterSection: React.FC<AlbumChapterSectionProps> = ({
-  chapter, photos, scrollRef, rowHeight, minColWidth, gap, renderTile, onRename, onDelete, onMoveUp, onMoveDown, onDropPhotoIds,
+  chapter, photos, scrollRef, rowHeight, minColWidth, gap, renderTile, onRename, onDelete, onMoveUp, onMoveDown, selectedCount = 0, onSelectAll, onDeselectAll, collapsed, onToggleCollapse,
 }) => {
   const [isRenaming, setIsRenaming] = useState(false);
   const [draftTitle, setDraftTitle] = useState(chapter.title);
-  const [isDragOver, setIsDragOver] = useState(false);
 
   const collagePhotos = photos.slice(0, 4);
 
@@ -40,18 +43,13 @@ export const AlbumChapterSection: React.FC<AlbumChapterSectionProps> = ({
   };
 
   return (
-    <div
-      onDragOver={onDropPhotoIds ? (e) => { e.preventDefault(); setIsDragOver(true); } : undefined}
-      onDragLeave={onDropPhotoIds ? () => setIsDragOver(false) : undefined}
-      onDrop={onDropPhotoIds ? (e) => { setIsDragOver(false); onDropPhotoIds(e); } : undefined}
-      style={{
-        borderRadius: 'var(--radius-lg)', padding: isDragOver ? '10px' : '0',
-        border: isDragOver ? '2px dashed #10b981' : '2px dashed transparent',
-        backgroundColor: isDragOver ? 'rgba(16, 185, 129, 0.06)' : 'transparent',
-        transition: 'padding 0.1s ease',
-      }}
-    >
-      <div style={{ display: 'flex', alignItems: 'center', gap: '14px', marginBottom: '14px' }}>
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '14px', marginBottom: collapsed ? 0 : '14px' }}>
+        {onToggleCollapse && (
+          <button className="btn btn-ghost btn-icon" title={collapsed ? 'Expand chapter' : 'Collapse chapter'} aria-expanded={!collapsed} onClick={onToggleCollapse} style={{ width: '30px', height: '30px', flexShrink: 0 }}>
+            {collapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+          </button>
+        )}
         {/* Auto-generated chapter cover: a live collage of its own photos, never saved as a file. */}
         <div
           style={{
@@ -85,6 +83,9 @@ export const AlbumChapterSection: React.FC<AlbumChapterSectionProps> = ({
               <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>{photos.length} photo{photos.length === 1 ? '' : 's'}</span>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '2px', flexShrink: 0 }}>
+              {photos.length > 0 && (selectedCount >= photos.length
+                ? onDeselectAll && <button className="btn btn-ghost" onClick={onDeselectAll} style={{ fontSize: '0.78rem', padding: '4px 10px' }}>Deselect all</button>
+                : onSelectAll && <button className="btn btn-ghost" onClick={onSelectAll} style={{ fontSize: '0.78rem', padding: '4px 10px' }}>Select all</button>)}
               {onMoveUp && <button className="btn btn-ghost btn-icon" title="Move chapter up" onClick={onMoveUp} style={{ width: '30px', height: '30px' }}><ChevronUp size={15} /></button>}
               {onMoveDown && <button className="btn btn-ghost btn-icon" title="Move chapter down" onClick={onMoveDown} style={{ width: '30px', height: '30px' }}><ChevronDown size={15} /></button>}
               <button className="btn btn-ghost btn-icon" title="Rename chapter" onClick={() => setIsRenaming(true)} style={{ width: '30px', height: '30px' }}><Pencil size={14} /></button>
@@ -94,7 +95,7 @@ export const AlbumChapterSection: React.FC<AlbumChapterSectionProps> = ({
         )}
       </div>
 
-      {photos.length === 0 ? (
+      {collapsed ? null : photos.length === 0 ? (
         <div style={{ padding: '20px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.82rem', border: '1px dashed var(--border-subtle)', borderRadius: 'var(--radius-md)' }}>
           No photos in this chapter yet — use a photo's "Move to chapter" button below, or add new photos directly into it.
         </div>

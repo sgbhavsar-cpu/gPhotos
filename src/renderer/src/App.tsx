@@ -15,6 +15,7 @@ import { HelpModal } from './components/HelpModal';
 import { AiAssistantModal } from './components/AiAssistantModal';
 import { SmartFlowsModal } from './components/SmartFlowsModal';
 import { LibrarySwitcherModal } from './components/LibrarySwitcherModal';
+import { DeleteProgressModal } from './components/DeleteProgressModal';
 import { SettingsView } from './views/SettingsView';
 import { MobileTopBar } from './components/MobileTopBar';
 import { MobileBottomNav } from './components/MobileBottomNav';
@@ -261,7 +262,8 @@ export const App: React.FC = () => {
       }
 
       // 4. Pop tab navigation history back to previous tab
-      if (activeTab !== 'photos') {
+      // Albums is a stopping point: its own handler walks selection -> album -> list, then Escape stays put.
+      if (activeTab !== 'photos' && activeTab !== 'albums') {
         const { previousTab, nextHistory } = popTabHistory(tabHistoryRef.current, activeTab, 'photos' as ActiveTab);
         tabHistoryRef.current = nextHistory;
         navigateToTab(previousTab);
@@ -1707,6 +1709,7 @@ export const App: React.FC = () => {
               setActiveLightboxContextIds(contextPhotos ? contextPhotos.map((cp) => cp.id) : null);
             }}
             onRunSmartFlow={handleRunSmartFlowOnSelection}
+            onOpenDuplicateCleaner={handleOpenDuplicateCleaner}
             resetTrigger={tabResetTrigger}
           />
         )}
@@ -1723,6 +1726,8 @@ export const App: React.FC = () => {
               setActiveLightboxHighlightPersonId(highlightPersonId || null);
             }}
             onToggleFavorite={handleToggleFavorite}
+            onOpenDuplicateCleaner={handleOpenDuplicateCleaner}
+            onRunSmartFlow={handleRunSmartFlowOnSelection}
             onTriggerFaceDetection={handleTriggerFaceDetection}
             onResetAndRescan={handleResetAndRescan}
             isDetectingFaces={libraryState.isDetectingFaces}
@@ -1844,6 +1849,7 @@ export const App: React.FC = () => {
       {/* Shared folder-picker dialog — renders itself only when some other
           component (via selectDirectoryOrPrompt) has an active request */}
       <FolderBrowserModalHost />
+      <DeleteProgressModal />
 
       {/* Duplicate & Burst Cleaner Modal */}
       {showDuplicateCleaner && (

@@ -127,6 +127,13 @@ const electronAPI: IElectronAPI = {
   generateThumbnailOnTheFly: (sourceFilePath: string, mirrorDirPath?: string) =>
     ipcRenderer.invoke('storage:generate-thumb-on-the-fly', sourceFilePath, mirrorDirPath),
   editPhoto: (options) => ipcRenderer.invoke('photo:edit', options),
+  setStorageTaskPaused: (key: string, task: string, paused: boolean) => ipcRenderer.invoke('storageTasks:set-paused', key, task, paused),
+  setStorageTaskFault: (key: string, task: string, message?: string) => ipcRenderer.invoke('storageTasks:set-fault', key, task, message),
+  logStorageTask: (key: string, task: string, level: string, message: string) => ipcRenderer.invoke('storageTasks:log', key, task, level, message),
+  getStorageTaskInfo: (key: string, networkSourcePath: string) => ipcRenderer.invoke('storageTasks:get', key, networkSourcePath),
+  getStorageTaskLogs: (key: string, task?: string) => ipcRenderer.invoke('storageTasks:get-logs', key, task),
+  registerStorageTaskKeys: (keys: string[]) => ipcRenderer.invoke('storageTasks:register', keys),
+  countStorageMirrorMedia: (mirrorDir: string) => ipcRenderer.invoke('storageTasks:count-media', mirrorDir),
   trashFiles: (filePaths: string[]) => ipcRenderer.invoke('file:trash-files', filePaths),
   deleteFilesPermanently: (filePaths: string[]) => ipcRenderer.invoke('file:delete-permanently', filePaths),
   rotatePhoto: (filePath: string, rotationDegrees: number, originalRemotePath?: string) =>

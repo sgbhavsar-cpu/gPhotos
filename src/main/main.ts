@@ -1,5 +1,6 @@
 // sharp + fs share libuv's default 4 threads; long resizes would otherwise starve UI file IO.
 process.env.UV_THREADPOOL_SIZE ||= '16';
+import { registerStorageKeys, setTaskPaused, setTaskFault, addTaskLog, getTaskControl, getTaskLogs, type StorageTask, type TaskLogLevel } from './services/storageTaskControl';
 import { app, BrowserWindow, ipcMain, dialog, protocol, net, shell, Menu } from 'electron';
 import path from 'path';
 import fs from 'fs';
@@ -14,6 +15,7 @@ import {
 } from './services/fileOrganizer';
 import {
   syncVirtualStorage,
+  countMirrorMedia,
   scanVirtualMirrorDirectory,
   discoverStoredMirrors,
   readDirectoryTree,
@@ -2092,6 +2094,18 @@ ipcMain.handle('photo:edit', async (_event, options: EditPhotoOptions) => {
     return { success: false, error: err.message };
   }
 });
+
+// Per-storage task control (run/pause, faults, logs) — see storageTaskControl.ts
+ipcMain.handle('storageTasks:set-paused', (_e, key: string, task: StorageTask, paused: boolean) => setTaskPaused(key, task, paused));
+ipcMain.handle('storageTasks:set-fault', (_e, key: string, task: StorageTask, message?: string) => setTaskFault(key, task, message));
+ipcMain.handle('storageTasks:log', (_e, key: string, task: StorageTask, level: TaskLogLevel, message: string) => addTaskLog(key, task, level, message));
+ipcMain.handle('storageTasks:get', async (_e, key: string, networkSourcePath: string) => ({
+  ...getTaskControl(key),
+  online: await isPathReachable(networkSourcePath),
+}));
+ipcMain.handle('storageTasks:register', (_e, keys: string[]) => registerStorageKeys(keys));
+ipcMain.handle('storageTasks:count-media', (_e, mirrorDir: string) => countMirrorMedia(mirrorDir));
+ipcMain.handle('storageTasks:get-logs', (_e, key: string, task?: StorageTask) => getTaskLogs(key, task));
 
 ipcMain.handle('file:trash-files', async (_event, filePaths: string[]) => {
   try {

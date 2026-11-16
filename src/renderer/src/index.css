@@ -485,3 +485,7 @@ select,
   background-size: 200% 100%;
   animation: shimmerPulse 1.6s infinite linear;
 }
+
+/* Album tiles: the select checkbox shows on hover, (a ticked box stays visible). */
+.album-tile [data-marquee-start], .album-tile [data-hover-ctl] { opacity: 0; transition: opacity 0.12s ease; }
+.album-tile:hover [data-marquee-start], .album-tile:hover [data-hover-ctl], [data-marquee-start][aria-checked="true"], [data-hover-ctl][aria-checked="true"] { opacity: 1; }

@@ -428,7 +428,7 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
       {/* View Full Screen — only useful (and only shown) once a selection is active, since that's
           exactly when a plain click toggles selection instead of opening the lightbox, with no
           other way to see a photo full-screen short of clearing the whole selection first. */}
-      {(isSelectMode || isSelected) && onOpenFullscreen && (
+      {isHovered && onOpenFullscreen && (
         <div
           onClick={(e) => {
             e.stopPropagation();
@@ -459,7 +459,7 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
       )}
 
       {/* Multi-Selection Checkbox */}
-      {(isSelectMode || isHovered || isSelected) && onToggleSelect && (
+      {(isHovered || isSelected) && onToggleSelect && (
         <div
           onClick={(e) => {
             e.stopPropagation();

@@ -9,6 +9,7 @@ import { ensureLoaded, getEntry, recordFinding } from './photoContentCache';
 import { isVisionAvailable, classifyImagesBatchLocal, embedText, getOllamaConfig, resolveEffectiveContext, computeLocalBatchSize } from './ollamaVisionService';
 import { isManualFlowRunning } from './visionJobLock';
 import { getLocalPhotoUrl } from './libraryStore';
+import { isFileTaskPaused, logForFile, setFaultForAll } from './storageTasks';
 
 // No real description to match against — this feature only wants the caption/tags every batch
 // classify call already returns regardless of match (see visionClassify.buildBatchClassifyPrompt).
@@ -96,7 +97,7 @@ async function toBase64(photo: Photo): Promise<{ base64: string; mimeType: strin
 
 /** Photos this feature still wants to describe: not a video, and no cached caption yet. */
 function candidatesFrom(photos: Photo[]): Photo[] {
-  return photos.filter((p) => !p.isVideo && !getEntry(p.id)?.caption);
+  return photos.filter((p) => !p.isVideo && !getEntry(p.id)?.caption && !isFileTaskPaused(p.filePath, 'ai'));
 }
 
 /**
@@ -120,10 +121,12 @@ export async function runAutoIndexPass(photos: Photo[]): Promise<void> {
 
   if (!(await isVisionAvailable())) {
     waitingForOllama = true;
+    setFaultForAll('ai', 'Ollama / the vision model is not available');
     notifyListeners();
     return;
   }
   waitingForOllama = false;
+  setFaultForAll('ai', undefined);
 
   running = true;
   done = 0;
@@ -143,7 +146,7 @@ export async function runAutoIndexPass(photos: Photo[]): Promise<void> {
         break;
       }
 
-      const chunk = candidates.slice(i, i + batchSize);
+      const chunk = candidates.slice(i, i + batchSize).filter((p) => !isFileTaskPaused(p.filePath, 'ai'));
       const withImages: Array<{ photo: Photo; img: { base64: string; mimeType: string } }> = [];
       for (const photo of chunk) {
         try {
@@ -159,16 +162,20 @@ export async function runAutoIndexPass(photos: Photo[]): Promise<void> {
 
       try {
         const results = await classifyImagesBatchLocal(withImages.map((w) => w.img), GENERIC_DESCRIPTION, effectiveContext);
+        setFaultForAll('ai', undefined);
         for (let j = 0; j < withImages.length; j++) {
           const { photo } = withImages[j];
           const result = results[j];
           const embedding = result.caption ? await embedText(`${result.caption} ${result.tags.join(' ')}`) : null;
           recordFinding(photo.id, GENERIC_DESCRIPTION, { ...result, embedding });
+          logForFile(photo.filePath, 'ai', 'info', `${photo.fileName}: ${result.caption || '(no caption)'}`);
         }
       } catch (err) {
         // This batch's photos simply stay uncached and are retried on the next pass — not fatal
         // to the run as a whole.
         console.warn('aiAutoIndexService: a batch failed, continuing with the next one', err);
+        for (const w of withImages) logForFile(w.photo.filePath, 'ai', 'error', `${w.photo.fileName}: ${String((err as any)?.message ?? err)}`);
+        setFaultForAll('ai', `AI description failed: ${String((err as any)?.message ?? err)}`);
       }
 
       if (i + batchSize < candidates.length) {

@@ -22,7 +22,8 @@ import { getFaceStatsForLibrary, getCaptionStatsForLibrary, getTotalPhotoCount }
 import { readJsonSafe, writeJsonAtomic, writeJsonAtomicAsync, writeFileAtomic, writeFileAtomicAsync } from './jsonFile';
 import { addSavedRotation, getHeicSavedRotation } from './heicRotationStore';
 import { getDefaultMirrorRoot } from './pathSecurity';
-import { isPathReachable, isNetworkPath } from './networkReachabilityCache';
+import { isPathReachable, isNetworkPath, clearOfflineCache } from './networkReachabilityCache';
+import { storageKey, isTaskPaused, waitWhileTaskPaused, setTaskFault, addTaskLog } from './storageTaskControl';
 import { runFaceDetectionStep, photoIdForSidecar, createFaceClusterCache, type FaceClusterCache, type FaceStepResult } from './pipelineOrchestrator';
 import { getFaceDetectionPoolSize } from './faceDetectionWorkerClient';
 import { logger } from './logger';
@@ -785,8 +786,10 @@ async function syncVirtualStorageImpl(
     remoteFiles = await scanDirectoryRecursive(config.networkSourcePath, scanInfo);
   } else {
     scanInfo.hadErrors = true;
+    addTaskLog(storageKey(config.localMirrorRoot, config.name), 'caching', 'warn', 'Storage is offline — nothing could be scanned');
   }
   const total = remoteFiles.length;
+  addTaskLog(storageKey(config.localMirrorRoot, config.name), 'caching', 'info', `Scan finished: ${total} file(s) found`);
 
   // Intermittent checkpoint resumption check:
   // If an interrupted checkpoint exists with the same total, resume directly from where it stopped!
@@ -912,7 +915,14 @@ async function syncVirtualStorageImpl(
   let sourceLost = false;
   let lastSuccessfulIndex = startIndex - 1;
 
+  const taskKey = storageKey(config.localMirrorRoot, config.name);
+  let faceFailStreak = 0;
   syncLoop: for (let i = startIndex; i < total; i += concurrency) {
+    // Per-storage "pause caching": the face step needs the thumbnail/sidecar, so this holds the whole pipeline.
+    if (isTaskPaused(taskKey, 'caching')) {
+      addTaskLog(taskKey, 'caching', 'info', `Waiting — paused (stopped before photo ${i + 1}/${total})`);
+      await waitWhileTaskPaused(taskKey, 'caching');
+    }
     const batchStartTime = Date.now();
     const batchIndices: number[] = [];
     for (let k = i; k < Math.min(i + concurrency, total); k++) batchIndices.push(k);
@@ -928,7 +938,7 @@ async function syncVirtualStorageImpl(
         const result = await processOneMirrorFile(remoteFile, config, storageMirrorRoot);
         let faceResult: FaceStepResult | null = null;
         let faceErr: unknown = null;
-        if (result.success && runFaceDetection && result.sidecar) {
+        if (result.success && runFaceDetection && result.sidecar && !isTaskPaused(taskKey, 'faces')) {
           try {
             faceResult = await runFaceDetectionStep(remoteFile, result.sidecar, config, faceCache);
           } catch (err) {
@@ -958,6 +968,8 @@ async function syncVirtualStorageImpl(
           newlyAdded++;
           logger.info('Sync', `Background scan — Photo ${i + 1}/${total}: ${fileName}`);
           logger.info('Sync', `  caching thumbnail ..... ${Math.round(result.thumbnailSize / 1024)}kb done`);
+          addTaskLog(taskKey, 'caching', 'info', `Cached ${fileName} (${Math.round(result.thumbnailSize / 1024)}kb) — photo ${i + 1}/${total}`);
+          setTaskFault(taskKey, 'caching', undefined);
         } else {
           skippedCount++;
         }
@@ -965,10 +977,15 @@ async function syncVirtualStorageImpl(
         if (faceErr) {
           console.error(`Face detection step failed for ${remoteFile}:`, faceErr);
           errors.push(`Face detection failed for ${fileName}: ${String(faceErr)}`);
+          addTaskLog(taskKey, 'faces', 'error', `${fileName}: ${String(faceErr)}`);
+          if (++faceFailStreak >= 3) setTaskFault(taskKey, 'faces', `Face detection keeps failing (${String(faceErr)})`);
         } else if (runFaceDetection && result.sidecar && faceResult) {
           if (faceResult.ran) {
             facesDetectedThisRunCount++;
             logger.info('Sync', `  detecting faces ..... ${faceResult.faceCount} detected`);
+            addTaskLog(taskKey, 'faces', 'info', `${fileName}: ${faceResult.faceCount} face(s) detected`);
+            faceFailStreak = 0;
+            setTaskFault(taskKey, 'faces', undefined);
           } else if (faceResult.skippedReason === 'unchanged' || faceResult.skippedReason === 'locked') {
             facesAlreadyDoneCount++;
           } else {
@@ -1024,6 +1041,8 @@ async function syncVirtualStorageImpl(
         // without spamming a line per (near-instant) skipped file.
         if (now - lastLoggedSummaryAt >= 5000 || isLastFile) {
           lastLoggedSummaryAt = now;
+          addTaskLog(taskKey, 'caching', 'info', `Checked ${i + 1}/${total} — ${skippedCount} already cached, ${newlyAdded} new/changed`);
+          if (runFaceDetection) addTaskLog(taskKey, 'faces', 'info', `Checked ${i + 1}/${total} — ${facesAlreadyDoneCount} already done, ${facesDetectedThisRunCount} detected this pass, ${facesDeferredCount} deferred`);
           logger.info(
             'Sync',
             `  checked ${i + 1}/${total} — thumbnails: ${skippedCount} cached, ${newlyAdded} new/changed; faces: ${facesAlreadyDoneCount} already done, ${facesDetectedThisRunCount} detected this pass, ${facesDeferredCount} deferred`
@@ -1031,6 +1050,7 @@ async function syncVirtualStorageImpl(
         }
       } else {
         const msg = `Error syncing ${remoteFile}: ${result.error}`;
+        addTaskLog(taskKey, 'caching', 'error', `${fileName}: ${result.error}`);
         if (errors.length < MAX_REPORTED_ERRORS) {
           console.error(msg);
           errors.push(msg);
@@ -1047,6 +1067,7 @@ async function syncVirtualStorageImpl(
           !(await isPathReachable(config.networkSourcePath))
         ) {
           sourceLost = true;
+          setTaskFault(taskKey, 'caching', 'Storage went offline during sync');
           break;
         }
       }
@@ -1914,17 +1935,6 @@ export async function trashFiles(filePaths: string[]): Promise<{ success: boolea
   }
 
   for (const fp of filePaths) {
-    // isPathReachable (not fs.existsSync) so an offline network share never
-    // gets attempted — it's a bounded, cached probe instead of a sync call
-    // that can hang the main process for the OS's full network timeout.
-    if (!(await isPathReachable(fp))) {
-      errors.push(
-        isNetworkPath(fp)
-          ? `${path.basename(fp)}: network storage is not available (offline). Skipped.`
-          : `${path.basename(fp)}: file not found. Skipped.`
-      );
-      continue;
-    }
     try {
       // Purge cached thumbnails BEFORE the file moves to the Recycle Bin — purgeCachedThumbnailsForFile
       // stats the file to key the cache entry, which would find nothing (and purge nothing) once the
@@ -1939,6 +1949,7 @@ export async function trashFiles(filePaths: string[]): Promise<{ success: boolea
         fs.unlinkSync(fp);
       }
       trashedPaths.push(fp);
+      clearOfflineCache(fp); // a delete that worked proves the storage is online
     } catch (err: any) {
       errors.push(`Failed to trash ${fp}: ${err.message}`);
     }
@@ -1960,16 +1971,6 @@ export async function deleteFilesPermanently(filePaths: string[]): Promise<{ suc
   const deletedPaths: string[] = [];
 
   for (const fp of filePaths) {
-    // Same reachability-first check as trashFiles — never attempt a delete
-    // against a path whose network storage is offline.
-    if (!(await isPathReachable(fp))) {
-      errors.push(
-        isNetworkPath(fp)
-          ? `${path.basename(fp)}: network storage is not available (offline). Skipped.`
-          : `${path.basename(fp)}: file not found. Skipped.`
-      );
-      continue;
-    }
     try {
       // Same reasoning as trashFiles: purge the thumbnail cache while the file (and its mtime) still
       // exist to stat — best-effort, never blocks the actual delete.
@@ -1977,26 +1978,27 @@ export async function deleteFilesPermanently(filePaths: string[]): Promise<{ suc
         const { purgeCachedThumbnailsForFile } = require('./thumbnailCacheService');
         await purgeCachedThumbnailsForFile(fp);
       } catch {}
-      fs.unlinkSync(fp);
+      // Async fs: sync calls on a slow network mount block the whole main process.
+      await fs.promises.unlink(fp);
       // If this is a virtual mirror photo or has a matching .json sidecar, delete it too
       const jsonSidecar = fp.replace(/\.[^/.]+$/, '') + '.json';
-      if (fs.existsSync(jsonSidecar)) {
-        try {
-          // Only remove a sidecar that is this app's own mirror sidecar FOR this
-          // file — never an unrelated same-named .json sitting next to a photo.
-          const meta = JSON.parse(fs.readFileSync(jsonSidecar, 'utf-8'));
-          if (
-            meta &&
-            typeof meta.thumbnailPath === 'string' &&
-            path.resolve(meta.thumbnailPath).toLowerCase() === path.resolve(fp).toLowerCase()
-          ) {
-            fs.unlinkSync(jsonSidecar);
-          }
-        } catch (sidecarErr) {
-          console.warn(`Could not remove sidecar ${jsonSidecar}:`, sidecarErr);
+      // Sidecars only live beside local mirror files; on a network original the read is a wasted round trip.
+      if (!isNetworkPath(fp)) try {
+        // Only remove a sidecar that is this app's own mirror sidecar FOR this
+        // file — never an unrelated same-named .json sitting next to a photo.
+        const meta = JSON.parse(await fs.promises.readFile(jsonSidecar, 'utf-8'));
+        if (
+          meta &&
+          typeof meta.thumbnailPath === 'string' &&
+          path.resolve(meta.thumbnailPath).toLowerCase() === path.resolve(fp).toLowerCase()
+        ) {
+          await fs.promises.unlink(jsonSidecar);
         }
+      } catch (sidecarErr: any) {
+        if (sidecarErr?.code !== 'ENOENT') console.warn(`Could not remove sidecar ${jsonSidecar}:`, sidecarErr);
       }
       deletedPaths.push(fp);
+      clearOfflineCache(fp);
     } catch (err: any) {
       errors.push(`Failed to permanently delete ${fp}: ${err.message}`);
     }
@@ -2717,3 +2719,20 @@ export async function rotatePhotoWithOfflineQueue(params: {
 }
 
 
+
+/** Images / videos / total media files currently in one storage's mirror folder (thumbnails cached on this PC). */
+export async function countMirrorMedia(mirrorDir: string): Promise<{ images: number; videos: number }> {
+  let images = 0, videos = 0;
+  const walk = async (dir: string) => {
+    let entries: fs.Dirent[];
+    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.isDirectory()) { if (!e.name.startsWith('.')) await walk(path.join(dir, e.name)); }
+      else if (e.isFile() && !e.name.endsWith('.json')) {
+        if (isVideoFile(e.name)) videos++; else if (isImageFile(e.name)) images++;
+      }
+    }
+  };
+  await walk(mirrorDir);
+  return { images, videos };
+}

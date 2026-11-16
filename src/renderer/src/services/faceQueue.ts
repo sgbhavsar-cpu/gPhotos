@@ -1,6 +1,7 @@
 import { Photo } from '../../../types';
 import { libraryStore } from './libraryStore';
 import { notifyError } from './notifications';
+import { isFileTaskPaused, logForFile } from './storageTasks';
 
 /**
  * Whether a detectFacesBatch result is a real outcome to adopt (faces found, none found, or
@@ -152,6 +153,15 @@ class FaceQueueService {
     }
 
     const { photo } = item;
+    // Per-storage "pause face detection": drop it (a later enqueue after resume brings it back).
+    if (isFileTaskPaused(photo.filePath, 'faces')) {
+      this.queuedPhotoIds.delete(photo.id);
+      this.totalInSession = Math.max(0, this.totalInSession - 1);
+      this.isRunning = false;
+      this.notify();
+      setTimeout(() => this.processNext(), 0);
+      return;
+    }
     this.processingPhotoId = photo.id;
 
     try {
@@ -163,7 +173,9 @@ class FaceQueueService {
             [{ photoId: result.photoId, faces: result.faces, faceScanCompleted: true, facesLocked: result.locked }],
             people
           );
+          logForFile(photo.filePath, 'faces', 'info', `${photo.fileName}: ${result.faces?.length ?? 0} face(s)`);
         } else if (result && result.skippedReason === 'decode-failed') {
+          logForFile(photo.filePath, 'faces', 'warn', `${photo.fileName}: could not decode image`);
           this.decodeFailures.set(photo.id, (this.decodeFailures.get(photo.id) ?? 0) + 1);
         }
       }
@@ -171,6 +183,7 @@ class FaceQueueService {
       this.failureStreak = 0;
     } catch (err) {
       console.warn(`Error processing face queue for ${photo.fileName}:`, err);
+      logForFile(photo.filePath, 'faces', 'error', `${photo.fileName}: ${String((err as any)?.message ?? err)}`);
       // One bad photo is noise; a run of failures means detection itself is broken — say so once (notices dedupe).
       if (++this.failureStreak >= 3) notifyError('Background face detection is failing', err);
     } finally {
