@@ -1471,6 +1471,11 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                             current={cachedThumbnails}
                             total={totalPhotos}
                             active={isThumbActive}
+                            finished={taskInfo[storageTaskKey(s.localMirrorRoot, s.name)]?.done?.caching
+                              ? (totalPhotos - cachedThumbnails > 0
+                                ? `Completed — everything possible is cached; ${(totalPhotos - cachedThumbnails).toLocaleString()} item${totalPhotos - cachedThumbnails === 1 ? '' : 's'} can't get a thumbnail (see Logs)`
+                                : 'Completed — all cached')
+                              : undefined}
                           />
                           <StorageStatRow
                             icon={<Users size={14} />}
@@ -1481,6 +1486,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                             total={totalPhotos}
                             active={isFaceActive}
                             suffix={`${facesDetected.toLocaleString()} face${facesDetected === 1 ? '' : 's'} found`}
+                            finished={taskInfo[storageTaskKey(s.localMirrorRoot, s.name)]?.done?.faces ? 'Completed — nothing more to scan' : undefined}
                           />
                           <StorageStatRow
                             icon={<Sparkles size={14} />}
@@ -1775,9 +1781,12 @@ const StorageStatRow: React.FC<{
   active?: boolean;
   suffix?: string;
   task?: { paused: boolean; fault?: string; toggle: () => void };
-}> = ({ icon, color, label, current, total, active, suffix, task }) => {
+  /** Set when the task has run to the end: shown under the row so "less than 100%" reads as "done, nothing more is possible". */
+  finished?: string;
+}> = ({ icon, color, label, current, total, active, suffix, task, finished }) => {
   const pct = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0;
   return (
+    <div>
     <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color, width: '150px', flexShrink: 0 }}>
         {icon}
@@ -1806,6 +1815,10 @@ const StorageStatRow: React.FC<{
           <span>{task.fault ? 'Fault' : task.paused ? 'Run' : 'Pause'}</span>
         </button>
       )}
+    </div>
+    {finished && !active && !task?.paused && !task?.fault && (
+      <div style={{ fontSize: '0.7rem', color: '#10b981', marginTop: 3, marginLeft: 160 }}>✓ {finished}</div>
+    )}
     </div>
   );
 };

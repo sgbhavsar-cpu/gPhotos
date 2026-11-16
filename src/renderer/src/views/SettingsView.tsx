@@ -1259,6 +1259,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </p>
             </div>
 
+            <div style={{ flexBasis: '100%', order: 3 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer', fontWeight: 600, fontSize: '0.95rem', color: 'var(--text-primary)' }}>
+                <input
+                  type="checkbox"
+                  checked={serviceStatus?.enableVideoFrameCapture ?? true}
+                  onChange={(e) => handleToggleSetting('enableVideoFrameCapture', e.target.checked)}
+                  style={{ width: '18px', height: '18px', accentColor: 'var(--accent-cyan)' }}
+                />
+                <span>Capture a preview frame for videos</span>
+              </label>
+              <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', marginTop: '6px', lineHeight: 1.5, marginLeft: '28px' }}>
+                Uses ffmpeg to grab one still frame as each video's thumbnail. Turn off to skip videos entirely: they show a placeholder and cloud-only videos (e.g. OneDrive) are never downloaded just for a thumbnail. Applies to all storages.
+              </p>
+            </div>
+
             {/* Quick Pause / Resume button */}
             {(serviceStatus?.enableThumbnailPreCache ?? true) && (
               <div>

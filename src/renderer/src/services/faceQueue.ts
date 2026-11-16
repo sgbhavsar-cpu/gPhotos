@@ -154,7 +154,8 @@ class FaceQueueService {
 
     const { photo } = item;
     // Per-storage "pause face detection": drop it (a later enqueue after resume brings it back).
-    if (isFileTaskPaused(photo.filePath, 'faces')) {
+    // Videos can't be decoded as an image — skip them rather than logging a failure for each one.
+    if (photo.isVideo || isFileTaskPaused(photo.filePath, 'faces')) {
       this.queuedPhotoIds.delete(photo.id);
       this.totalInSession = Math.max(0, this.totalInSession - 1);
       this.isRunning = false;
@@ -196,6 +197,7 @@ class FaceQueueService {
         // Yield 35ms to event loop so browser / UI never lags at 60fps
         setTimeout(() => this.processNext(), 35);
       } else {
+        if (this.completedInSession > 0) logForFile(photo.filePath, 'faces', 'info', `Face recognition completed: ${this.completedInSession} photo(s) scanned${this.decodeFailures.size ? `, ${this.decodeFailures.size} could not be decoded` : ''}`);
         this.totalInSession = 0;
         this.completedInSession = 0;
         this.notify();

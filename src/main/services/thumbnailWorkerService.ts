@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { Photo, ThumbnailWorkerCheckpoint } from '../../types';
-import { getOrGenerateCachedThumbnail, onThumbnailCacheCleared, getCacheKey } from './thumbnailCacheService';
+import { getOrGenerateCachedThumbnail, onThumbnailCacheCleared, getCacheKey, isVideoFrameCaptureEnabled } from './thumbnailCacheService';
 import { libraryStatusService } from './libraryStatusService';
 import { getDefaultMirrorRoot } from './pathSecurity';
 
@@ -550,6 +550,9 @@ class ThumbnailWorkerService {
     this.isProcessing = true;
 
     let fastForwardCount = 0;
+    let newlyCached = 0;
+    const runFailures = new Map<string, number>(); // extension -> count, for the completion summary
+    let lastPathSeen = '';
     // Photos probed as NOT cached, waiting for their turn at `concurrency`. They stay in
     // queuedPaths (so a concurrent enqueuePhotos can't duplicate them) and are put back at the
     // head of the queue if the loop exits early (pause, disable).
@@ -557,6 +560,7 @@ class ThumbnailWorkerService {
 
     const recordCached = (photo: Photo) => {
       fastForwardCount++;
+      lastPathSeen = photo.filePath;
       this.confirmedCachedPaths.add(photo.filePath.toLowerCase());
       this.processedCount = Math.min(this.totalQueuedCount, this.processedCount + 1);
       if (fastForwardCount % 500 === 0) addFileTaskLog(photo.filePath, 'caching', 'info', `Background pre-cache: verified ${fastForwardCount} already-cached photos`);
@@ -574,7 +578,7 @@ class ThumbnailWorkerService {
         if (carry.length < this.limits.concurrency && this.queue.length > 0) {
           const window = this.queue.splice(0, CACHE_PROBE_WINDOW).filter((p) => {
             // Per-storage "pause caching": drop (not defer) — the next enqueue after resume re-adds them.
-            if (!isFileTaskPaused(p.filePath, 'caching')) return true;
+            if (!isFileTaskPaused(p.filePath, 'caching') && (p.isVideo !== true || isVideoFrameCaptureEnabled())) return true;
             this.queuedPaths.delete(p.filePath.toLowerCase());
             this.totalQueuedCount = Math.max(0, this.totalQueuedCount - 1);
             return false;
@@ -599,6 +603,11 @@ class ThumbnailWorkerService {
         const t0 = Date.now();
         const outcomes = await Promise.all(
           batch.map(async (photo) => {
+            // Not cached yet: on a OneDrive/cloud-only file this read triggers a full download and can
+            // take minutes, so say what we're on instead of staying silent until it finishes.
+            const nm = photo.fileName || path.basename(photo.filePath);
+            addFileTaskLog(photo.filePath, 'caching', 'info', `Caching ${nm} …`);
+            const slowTimer = setTimeout(() => addFileTaskLog(photo.filePath, 'caching', 'warn', `Still working on ${nm} (over 30 s — likely downloading from cloud storage)`), 30_000);
             try {
               const res = await getOrGenerateCachedThumbnail(photo.filePath, 250);
               // null = generation failed (missing/corrupt/unwritable) — distinct
@@ -606,6 +615,8 @@ class ThumbnailWorkerService {
               return { photo, isCached: !!res?.isFromCache, failed: !res, error: undefined as unknown };
             } catch (error) {
               return { photo, isCached: false, failed: true, error };
+            } finally {
+              clearTimeout(slowTimer);
             }
           })
         );
@@ -618,6 +629,9 @@ class ThumbnailWorkerService {
             const prior = this.failedPaths.get(key);
             this.failedPaths.set(key, { attempts: (prior?.attempts ?? 0) + 1, lastAt: Date.now() });
             this.failedCount++;
+            const fx = path.extname(photo.filePath).toLowerCase() || '(none)';
+            runFailures.set(fx, (runFailures.get(fx) ?? 0) + 1);
+            lastPathSeen = photo.filePath;
             addFileTaskLog(photo.filePath, 'caching', 'error', `Thumbnail failed: ${photo.fileName || path.basename(photo.filePath)}${error ? ` (${String((error as any)?.message ?? error)})` : ''}`);
             this.lastError = `Thumbnail failed: ${photo.fileName || path.basename(photo.filePath)}${error ? ` (${String((error as any)?.message ?? error)})` : ''}`;
             if (this.failedCount <= 5 || this.failedCount % 100 === 0) {
@@ -631,6 +645,8 @@ class ThumbnailWorkerService {
           }
 
           didRealWork = true;
+          newlyCached++;
+          lastPathSeen = photo.filePath;
           this.currentFileName = photo.fileName || path.basename(photo.filePath);
           addFileTaskLog(photo.filePath, 'caching', 'info', `Background pre-cache: cached ${this.currentFileName}`);
           this.confirmedCachedPaths.add(photo.filePath.toLowerCase());
@@ -690,6 +706,12 @@ class ThumbnailWorkerService {
       const isDone = this.queue.length === 0;
       this.saveCheckpoint(isDone);
       this.notifyStatus();
+      if (isDone && lastPathSeen) {
+        const failedTotal = [...runFailures.values()].reduce((a, b) => a + b, 0);
+        const byType = [...runFailures].map(([e, n]) => `${n} ${e}`).join(', ');
+        addFileTaskLog(lastPathSeen, 'caching', failedTotal ? 'warn' : 'info',
+          `Caching completed: ${fastForwardCount} already cached, ${newlyCached} newly cached, ${failedTotal} could not be cached${byType ? ` (${byType})` : ''}. Photos that fail stay "cloud only" and are retried on the next rescan.`);
+      }
       if (isDone) {
         console.log(`[ThumbnailWorker] All ${this.processedCount} queued photos have been pre-cached to disk!`);
       }

@@ -489,3 +489,7 @@ select,
 /* Album tiles: the select checkbox shows on hover, (a ticked box stays visible). */
 .album-tile [data-marquee-start], .album-tile [data-hover-ctl] { opacity: 0; transition: opacity 0.12s ease; }
 .album-tile:hover [data-marquee-start], .album-tile:hover [data-hover-ctl], [data-marquee-start][aria-checked="true"], [data-hover-ctl][aria-checked="true"] { opacity: 1; }
+
+/* Heartbeat dot for live status. */
+@keyframes gp-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+.gp-pulse { animation: gp-pulse 1.4s ease-in-out infinite; }

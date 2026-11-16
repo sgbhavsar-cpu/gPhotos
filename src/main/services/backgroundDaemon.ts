@@ -8,6 +8,7 @@ import { scanVirtualMirrorDirectory, processPendingRotations, processPendingMeta
 import { processPendingMoves } from './photoRelocation';
 import os from 'os';
 import { thumbnailWorker } from './thumbnailWorkerService';
+import { setVideoFrameCaptureEnabled } from './thumbnailCacheService';
 import { setFaceDetectionPoolSize } from './faceDetectionWorkerClient';
 import { getSetting, setSetting } from './libraryRepository';
 import { setActiveLibrary } from './db';
@@ -50,6 +51,7 @@ let lastSyncTime: string | undefined = undefined;
  * mode's saved values, so flipping back and forth doesn't lose either.
  */
 function applyResourceLimits() {
+  setVideoFrameCaptureEnabled(serviceSettings.enableVideoFrameCapture !== false);
   if (serviceSettings.performanceMode === 'turbo') {
     const workers = Math.max(1, Math.min(LOGICAL_CPU_COUNT, serviceSettings.turboWorkers ?? Math.max(1, LOGICAL_CPU_COUNT - 1)));
     thumbnailWorker.setResourceLimits({
@@ -784,6 +786,7 @@ export function getBackgroundServiceStatus(): BackgroundServiceStatus & {
     maxCpuPercent: serviceSettings.maxCpuPercent ?? 40,
     maxRamMb: serviceSettings.maxRamMb ?? 1024,
     enableThumbnailPreCache: serviceSettings.enableThumbnailPreCache ?? true,
+    enableVideoFrameCapture: serviceSettings.enableVideoFrameCapture !== false,
     performanceMode: serviceSettings.performanceMode ?? 'background',
     turboWorkers: serviceSettings.turboWorkers ?? Math.max(1, LOGICAL_CPU_COUNT - 1),
     turboMaxCpuPercent: serviceSettings.turboMaxCpuPercent ?? 100,

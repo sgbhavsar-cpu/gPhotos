@@ -15,6 +15,12 @@ import { grabVideoFrame, probeMedia } from './videoExportService';
 
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm', '.wmv', '.m4v']);
 
+// System-wide switch (Settings → Background service): when off, no video frame is ever grabbed, so
+// videos show the generic placeholder and cloud-only videos are never downloaded just for a thumbnail.
+let videoFrameCaptureEnabled = true;
+export function setVideoFrameCaptureEnabled(on: boolean): void { videoFrameCaptureEnabled = on; }
+export function isVideoFrameCaptureEnabled(): boolean { return videoFrameCaptureEnabled; }
+
 let sharp: any = null;
 try {
   sharp = require('sharp');
@@ -118,6 +124,7 @@ export async function getOrGenerateCachedThumbnail(
   targetSize: number = 250
 ): Promise<ThumbnailResult | null> {
   if (!sourcePath) return null;
+  if (!videoFrameCaptureEnabled && VIDEO_EXTENSIONS.has(path.extname(sourcePath).toLowerCase())) return null;
 
   let stat: fs.Stats;
   try {

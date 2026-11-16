@@ -586,7 +586,7 @@ export interface IElectronAPI {
   setStorageTaskPaused?: (key: string, task: string, paused: boolean) => Promise<void>;
   setStorageTaskFault?: (key: string, task: string, message?: string) => Promise<void>;
   logStorageTask?: (key: string, task: string, level: string, message: string) => Promise<void>;
-  getStorageTaskInfo?: (key: string, networkSourcePath: string) => Promise<{ paused: string[]; faults: Record<string, string>; online: boolean }>;
+  getStorageTaskInfo?: (key: string, networkSourcePath: string) => Promise<{ paused: string[]; faults: Record<string, string>; online: boolean; done?: Record<string, string | undefined> }>;
   getStorageTaskLogs?: (key: string, task?: string) => Promise<Array<{ ts: number; task: string; level: string; message: string }>>;
   registerStorageTaskKeys?: (keys: string[]) => Promise<void>;
   countStorageMirrorMedia?: (mirrorDir: string) => Promise<{ images: number; videos: number }>;
@@ -885,6 +885,7 @@ export interface BackgroundServiceStatus {
   maxCpuPercent?: number;
   maxRamMb?: number;
   enableThumbnailPreCache?: boolean;
+  enableVideoFrameCapture?: boolean;
   performanceMode?: 'background' | 'turbo';
   turboWorkers?: number;
   turboMaxCpuPercent?: number;
@@ -908,6 +909,7 @@ export interface BackgroundServiceSettings {
   maxCpuPercent?: number; // Background mode: cap background CPU usage (default: 40%)
   maxRamMb?: number; // Background mode: cap background RAM usage in MB (default: 1024 MB / 1 GB)
   enableThumbnailPreCache?: boolean; // Pre-cache thumbnails in background (default: true)
+  enableVideoFrameCapture?: boolean; // Grab a still frame (ffmpeg) as each video's thumbnail (default: true). Off = videos show a placeholder and are never read for thumbnails.
   performanceMode?: 'background' | 'turbo'; // 'background': throttled, low-priority (default). 'turbo': overnight/exclusive-use, uses turboWorkers/turboMaxCpuPercent/turboMaxRamMb below instead of the maxCpuPercent/maxRamMb sliders.
   turboWorkers?: number; // Turbo mode: photos processed in parallel (default: cpu cores - 1)
   turboMaxCpuPercent?: number; // Turbo mode: CPU cap (default: 100%)

@@ -2102,6 +2102,11 @@ ipcMain.handle('storageTasks:log', (_e, key: string, task: StorageTask, level: T
 ipcMain.handle('storageTasks:get', async (_e, key: string, networkSourcePath: string) => ({
   ...getTaskControl(key),
   online: await isPathReachable(networkSourcePath),
+  // A task is "finished" while its newest log line is its own "… completed: …" summary (a later entry means it's working again).
+  done: Object.fromEntries((['caching', 'faces'] as StorageTask[]).map((t) => {
+    const last = getTaskLogs(key, t).slice(-1)[0];
+    return [t, last && /completed:/.test(last.message) ? last.message : undefined];
+  })) as Partial<Record<StorageTask, string>>,
 }));
 ipcMain.handle('storageTasks:register', (_e, keys: string[]) => registerStorageKeys(keys));
 ipcMain.handle('storageTasks:count-media', (_e, mirrorDir: string) => countMirrorMedia(mirrorDir));
