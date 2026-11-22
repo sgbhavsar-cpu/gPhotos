@@ -359,9 +359,8 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
           ))}
         </div>
 
-        <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '20px 24px' }}>
-          {step === 1 && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+        {step === 1 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', padding: '12px 24px 10px', borderBottom: '1px solid var(--border-subtle)' }}>
               <p style={{ margin: 0, fontSize: '0.85rem', color: 'var(--text-muted)' }}>
                 Select 2-4 photos and click <strong>"Group as Collage"</strong> to combine them into one frame. Everything not grouped stays its own slide — you'll choose the order (and can leave any out) in the next step.
               </p>
@@ -372,6 +371,12 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
                   <button className="btn btn-ghost" onClick={() => setPickingForCollage(new Set())} style={{ fontSize: '0.78rem', padding: '5px 12px' }}>Clear</button>
                 </div>
               )}
+          </div>
+        )}
+
+        <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '20px 24px' }}>
+          {step === 1 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(110px, 1fr))', gap: '10px' }}>
                 {step1Groups.map((group) => (
                   <React.Fragment key={group.key}>

@@ -1083,6 +1083,11 @@ export class LibraryManager {
    * Returns whether a page was actually loaded (false if already loading,
    * or the whole catalog is already loaded).
    */
+  /** Loads every remaining catalog page into the store (the grid only needs the first ones; folder/album views need all). */
+  public async loadAllCatalogPages(): Promise<void> {
+    while (await this.loadNextCatalogPage()) { /* keep going */ }
+  }
+
   public async loadNextCatalogPage(): Promise<boolean> {
     if (this.isLoadingCatalogPage || !this.state.catalogMeta) return false;
     if (this.currentCatalogPage + 1 >= this.state.catalogMeta.totalPages) return false;
@@ -1611,16 +1616,26 @@ export class LibraryManager {
   public updatePhotos(updatedList: Array<Partial<Photo> & { id: string }>, recalculatePlaces = false) {
     const map = new Map(updatedList.map((p) => [p.id, p]));
     let locationChanged = recalculatePlaces;
+    let datesChanged = false;
     this.state.photos = this.state.photos.map((p) => {
       const u = map.get(p.id);
       if (u) {
         if (u.location && JSON.stringify(u.location) !== JSON.stringify(p.location)) {
           locationChanged = true;
         }
+        if (u.dateTaken && u.dateTaken !== p.dateTaken) {
+          datesChanged = true;
+          const d = new Date(u.dateTaken);
+          if (!isNaN(d.getTime())) return { ...p, year: d.getFullYear(), month: d.getMonth() + 1, day: d.getDate(), ...u };
+        }
         return { ...p, ...u };
       }
       return p;
     });
+    // Same order the catalog loads in (date_taken DESC, id DESC), so a re-dated photo moves to its new place.
+    if (datesChanged) {
+      this.state.photos = this.state.photos.slice().sort((a, b) => (a.dateTaken === b.dateTaken ? (a.id < b.id ? 1 : -1) : a.dateTaken < b.dateTaken ? 1 : -1));
+    }
     if (locationChanged) {
       this.state.places = groupPhotosByPlace(this.state.photos.filter((p) => !p.isExcluded));
     }

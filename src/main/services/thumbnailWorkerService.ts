@@ -3,7 +3,8 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { Photo, ThumbnailWorkerCheckpoint } from '../../types';
-import { getOrGenerateCachedThumbnail, onThumbnailCacheCleared, getCacheKey, isVideoFrameCaptureEnabled } from './thumbnailCacheService';
+import { getOrGenerateVideoPreview, isVideoPreviewCached, VIDEO_FILE_RE } from './videoPreviewService';
+import { lastThumbnailFailReason, getOrGenerateCachedThumbnail, onThumbnailCacheCleared, getCacheKey, isVideoFrameCaptureEnabled } from './thumbnailCacheService';
 import { libraryStatusService } from './libraryStatusService';
 import { getDefaultMirrorRoot } from './pathSecurity';
 
@@ -411,6 +412,17 @@ class ThumbnailWorkerService {
     return f.attempts >= FAILED_MAX_ATTEMPTS || Date.now() - f.lastAt < FAILED_RETRY_AFTER_MS;
   }
 
+  /** Photos that failed thumbnailing (this session / last checkpoint) under any of the given folders. */
+  public failedCountUnder(...roots: string[]): number {
+    const rs = roots.filter(Boolean).map((r) => r.toLowerCase().replace(/\//g, '\\').replace(/\\+$/, '') + '\\');
+    let n = 0;
+    for (const k of this.failedPaths.keys()) {
+      const kk = k.replace(/\//g, '\\');
+      if (rs.some((r) => kk.startsWith(r))) n++;
+    }
+    return n;
+  }
+
   public enqueuePhotos(photos: Photo[], libraryPath?: string): void {
     if (!photos || photos.length === 0) return;
 
@@ -578,13 +590,14 @@ class ThumbnailWorkerService {
         if (carry.length < this.limits.concurrency && this.queue.length > 0) {
           const window = this.queue.splice(0, CACHE_PROBE_WINDOW).filter((p) => {
             // Per-storage "pause caching": drop (not defer) — the next enqueue after resume re-adds them.
-            if (!isFileTaskPaused(p.filePath, 'caching') && (p.isVideo !== true || isVideoFrameCaptureEnabled())) return true;
+            if (!isFileTaskPaused(p.filePath, 'caching') && (!(p.isVideo === true || VIDEO_FILE_RE.test(p.filePath)) || isVideoFrameCaptureEnabled())) return true;
             this.queuedPaths.delete(p.filePath.toLowerCase());
             this.totalQueuedCount = Math.max(0, this.totalQueuedCount - 1);
             return false;
           });
           if (window.length === 0) continue;
-          const cachedFlags = await Promise.all(window.map((p) => isThumbnailCached(p.filePath, 250)));
+          const cachedFlags = await Promise.all(window.map(async (p) =>
+            (await isThumbnailCached(p.filePath, 250)) && (!VIDEO_FILE_RE.test(p.filePath) || (await isVideoPreviewCached(p.filePath)))));
           window.forEach((photo, i) => {
             if (cachedFlags[i]) {
               this.queuedPaths.delete(photo.filePath.toLowerCase());
@@ -610,6 +623,11 @@ class ThumbnailWorkerService {
             const slowTimer = setTimeout(() => addFileTaskLog(photo.filePath, 'caching', 'warn', `Still working on ${nm} (over 30 s — likely downloading from cloud storage)`), 30_000);
             try {
               const res = await getOrGenerateCachedThumbnail(photo.filePath, 250);
+              // Videos also get their 5 s hover clip cached (best effort — never counts as a failure).
+              if (VIDEO_FILE_RE.test(photo.filePath)) {
+                await getOrGenerateVideoPreview(photo.filePath).catch(() => null);
+                if (res?.isFromCache) return { photo, isCached: false, failed: false, error: undefined as unknown };
+              }
               // null = generation failed (missing/corrupt/unwritable) — distinct
               // from a freshly generated thumbnail.
               return { photo, isCached: !!res?.isFromCache, failed: !res, error: undefined as unknown };
@@ -632,7 +650,7 @@ class ThumbnailWorkerService {
             const fx = path.extname(photo.filePath).toLowerCase() || '(none)';
             runFailures.set(fx, (runFailures.get(fx) ?? 0) + 1);
             lastPathSeen = photo.filePath;
-            addFileTaskLog(photo.filePath, 'caching', 'error', `Thumbnail failed: ${photo.fileName || path.basename(photo.filePath)}${error ? ` (${String((error as any)?.message ?? error)})` : ''}`);
+            addFileTaskLog(photo.filePath, 'caching', 'error', `Thumbnail failed: ${photo.fileName || path.basename(photo.filePath)} (${error ? String((error as any)?.message ?? error) : lastThumbnailFailReason || 'unknown reason'})`);
             this.lastError = `Thumbnail failed: ${photo.fileName || path.basename(photo.filePath)}${error ? ` (${String((error as any)?.message ?? error)})` : ''}`;
             if (this.failedCount <= 5 || this.failedCount % 100 === 0) {
               console.warn(`[ThumbnailWorker] ${this.lastError} (${this.failedCount} failed so far)`);

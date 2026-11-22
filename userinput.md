@@ -325,7 +325,6 @@ AI Search
 2. In local model based AI info extraction, which we are shoing in photo detail page, we need to give edit or deleting the description or Tags.
 3. It should be possible to select multiple photos and edit AI Info similar to date and location, rename this top toolbar button to Edit Info and include all three in that dialogbox.
 
-
 In person, photo display page
 
 1. Need button to mark all as correct or mark all as not correct in top toolbar.
@@ -333,13 +332,9 @@ In person, photo display page
 3. When I click to open the full screen photo detail, we should highlight photo of selected person from where we came in different color of marking so user can immdeatily notice it.
 4. In bottom of the photo where we are showing yes and no button, should have link on name of photo to open that photo in windows explorer.
 5. 
-
-
-
-1. When we open photo default shold be 'do not show photo marker', photo view in fill mode and if disk is not cloud drive show full resolution photo.
-2. While deleting photo using AI best shot, it stall the application, please add the wait dialogbox until delete opetion is completed so user can understand there is operation going on in background. Ensure that when we delete the photo, we remove the cached image, remove related data in database also.
-3. If user has selected photo from galary and click on "Find best shot", after completing operation, it shold close the dialogbox and back to photo galary.
-
+6. When we open photo default shold be 'do not show photo marker', photo view in fill mode and if disk is not cloud drive show full resolution photo.
+7. While deleting photo using AI best shot, it stall the application, please add the wait dialogbox until delete opetion is completed so user can understand there is operation going on in background. Ensure that when we delete the photo, we remove the cached image, remove related data in database also.
+8. If user has selected photo from galary and click on "Find best shot", after completing operation, it shold close the dialogbox and back to photo galary.
 
 20261007
 
@@ -347,3 +342,31 @@ In person, photo display page
 2. Want to make two pane file explorer kind with toolbar having buttons in middle to move photos between folder. It should have two pane windows style explorer with showing top toolbar similar to main photolist, showing thumbnail in main content area and buttons in middle vertical toolbar to move one or all selected photo to either side.
    1. This should have functionality to do this offline and after all the virtual movement of photos of videos, user will have commit button.
    2. In case afrer commit, storage is not online, it will queue all the commits action and execute when storage becomes online.
+
+20261009
+
+1. In two pane explorer, left side should be possible to show any storage location / library and albus so user can move some or all album photo which is basically a logical collection to some physical folder, when we move album photo to some folder, system should automatically update local database to point photo location to new folder.
+2. In two pane explorer, need edit button on photo to open editor.
+3. In two pane explorer, need delete button for multiple selected photo, suggest to add in vertical toolbar in middle to provide delete button which will delete the selected photos in left pane.
+4. Folder we are showing as list on top is not convinient, please make it as one box in the explorer itself or make a 20% box on top with list of folder.
+5. Need search textbox on top of both side of explorer to search photos.
+6. Need thumbnail size button in vertical toolbar like xs,s,m,L.
+7. Need right click context menu on thumbnail with following commands.
+   1. Open Image extrnally
+   2. Open containing folder
+   3. Copy full path of the image to clipboard
+   4. Edit with internal editor
+   5. Edit with external editor
+   6. Delete
+8. When we open photo from two pane explorer and press esc, it should close and return to two pane explorer. Right now it is going back to main photo screen.
+9. In two pane explorer, when I edit the file and save, it should save outside of library as we do not want to generate thumbnail or save data related to thtat file.
+   1. Search should also filter folders as well.
+
+In People photo view, I am not able to do selection.
+
+In People photo view, now check box selection is working, it shows two commands of correct and not this person to bulk change, please also add commands
+
+Add all the commands available in main photo library on multiple select i.e. Auto rotate, Find best shot, Add to album, Run smart flow, edit info, delete,. Exclude from app.
+At main photoview and people photo view, need command move to folder also.
+
+We need same buttons when we open photos of people by clicking people icon.

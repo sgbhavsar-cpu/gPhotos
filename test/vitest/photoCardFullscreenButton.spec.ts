@@ -49,13 +49,21 @@ describe('PhotoCard: full-screen button during selection', () => {
     return { onClick, onToggleSelect, onOpenFullscreen };
   };
 
-  it('is not shown for a plain, unselected tile (nothing to escape from)', async () => {
+  const hover = async () => {
+    const card = host.querySelector('[data-photo-id="p1"]') as HTMLElement;
+    await act(async () => { card.dispatchEvent(new MouseEvent('mouseover', { bubbles: true })); });
+  };
+
+  it('is only shown while the tile is hovered', async () => {
     await mount();
     expect(host.querySelector('[title="View full screen"]')).toBeNull();
+    await hover();
+    expect(host.querySelector('[title="View full screen"]')).not.toBeNull();
   });
 
-  it('appears once the tile is selected, and clicking it opens the lightbox without toggling selection', async () => {
+  it('clicking it opens the lightbox without toggling selection', async () => {
     const { onOpenFullscreen, onToggleSelect, onClick } = await mount({ isSelected: true });
+    await hover();
     const btn = host.querySelector('[title="View full screen"]') as HTMLElement;
     expect(btn).not.toBeNull();
 
@@ -64,10 +72,5 @@ describe('PhotoCard: full-screen button during selection', () => {
     expect(onOpenFullscreen).toHaveBeenCalledTimes(1);
     expect(onToggleSelect).not.toHaveBeenCalled();
     expect(onClick).not.toHaveBeenCalled();
-  });
-
-  it('also appears in select mode even for an unselected tile', async () => {
-    await mount({ isSelectMode: true, isSelected: false });
-    expect(host.querySelector('[title="View full screen"]')).not.toBeNull();
   });
 });

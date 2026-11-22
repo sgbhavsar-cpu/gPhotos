@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import sharp from 'sharp';
-import { parsePhotoMetadata } from './exifParser';
+import { parsePhotoMetadata, fallbackCaptureDate } from './exifParser';
 import { isImageFile, isVideoFile, scanDirectoryRecursive } from './fileOrganizer';
 import { getOrGenerateHeicThumbnail500 } from './heicService';
 import { probeMedia, grabVideoFrame } from './videoExportService';
@@ -18,7 +18,7 @@ import {
   StorageDetails,
 } from '../../types';
 import { libraryStatusService } from './libraryStatusService';
-import { getFaceStatsForLibrary, getCaptionStatsForLibrary, getTotalPhotoCount } from './libraryRepository';
+import { getFaceStatsForLibrary, getCaptionStatsForLibrary, getTotalPhotoCount, getSkippedVideoCountForLibrary } from './libraryRepository';
 import { readJsonSafe, writeJsonAtomic, writeJsonAtomicAsync, writeFileAtomic, writeFileAtomicAsync } from './jsonFile';
 import { addSavedRotation, getHeicSavedRotation } from './heicRotationStore';
 import { getDefaultMirrorRoot } from './pathSecurity';
@@ -310,6 +310,7 @@ function resolveStorageDetails(storageName: string, root: string, liveTotal: num
   let thumbnailCachedCount = liveCached;
   let faceScannedCount = 0;
   let facesDetectedCount = 0;
+  let faceSkippedCount = 0;
   let captionEligibleCount = 0;
   let captionedCount = 0;
 
@@ -333,6 +334,7 @@ function resolveStorageDetails(storageName: string, root: string, liveTotal: num
     // after a source folder shrinks, before a sync has pruned stale rows).
     faceScannedCount = Math.min(faceStats.faceScannedCount, totalPhotos);
     facesDetectedCount = faceStats.facesDetectedCount;
+    faceSkippedCount = Math.min(getSkippedVideoCountForLibrary(mirrorFolder), totalPhotos - faceScannedCount);
 
     // AI Description progress (docs/FEATURE_AI_AUTO_TAGGING.md) — same SQLite catalog, a separate
     // table (photo_content) the background auto-tagging pass and Smart Flows both write to.
@@ -341,10 +343,17 @@ function resolveStorageDetails(storageName: string, root: string, liveTotal: num
     captionedCount = Math.min(captionStats.captionedCount, captionEligibleCount);
   }
 
-  return computeStorageDetails(
+  const details = computeStorageDetails(
     storageName, totalPhotos, thumbnailCachedCount, faceScannedCount, facesDetectedCount,
     captionEligibleCount, captionedCount, cp?.phase
   );
+  details.faceSkippedCount = faceSkippedCount;
+  // Skipped videos can never be scanned, so they must not keep the storage "in progress" forever.
+  if (details.phase === 'faces' && faceScannedCount + faceSkippedCount >= totalPhotos) {
+    details.phase = 'completed';
+    details.canResume = false;
+  }
+  return details;
 }
 
 /**
@@ -2038,6 +2047,13 @@ export async function rotatePhotoFile(
       return { success: true, newPath: filePath };
     }
 
+    // Step timings, logged only when the whole rotate is slow, so a freeze can be traced to one step.
+    const t0 = Date.now();
+    const marks: string[] = [];
+    let tLast = t0;
+    const mark = (step: string) => { const now = Date.now(); marks.push(`${step}=${now - tLast}ms`); tLast = now; };
+    const logIfSlow = () => { if (Date.now() - t0 > 1500) console.warn(`[rotatePhotoFile] slow rotate of ${path.basename(filePath)} (${Date.now() - t0}ms): ${marks.join(' ')}`); };
+
     const ext = path.extname(filePath).toLowerCase();
     let isRawHeic = ext === '.heic' || ext === '.heif';
 
@@ -2048,6 +2064,7 @@ export async function rotatePhotoFile(
     // photo:rotate). An async read still takes as long for THIS call, but lets everything else
     // keep running meanwhile.
     const inputBuf = await fs.promises.readFile(filePath);
+    mark(`read(${inputBuf.length}B)`);
     const isJpegBuffer = inputBuf.length > 2 && inputBuf[0] === 0xff && inputBuf[1] === 0xd8;
     const isWebpBuffer = inputBuf.length > 12 && inputBuf.slice(0, 4).toString() === 'RIFF';
 
@@ -2097,6 +2114,7 @@ export async function rotatePhotoFile(
       }
     }
 
+    mark('bak');
     let outputBuffer: Buffer | null = null;
     let sharpLib: any = null;
     try {
@@ -2122,17 +2140,21 @@ export async function rotatePhotoFile(
       outputBuffer = img.toJPEG(95);
     }
 
+    mark(sharpLib ? 'sharp' : 'nativeImage');
     if (!outputBuffer) {
       return { success: false, error: 'Could not process image rotation' };
     }
 
     await writeFileAtomicAsync(filePath, outputBuffer);
+    mark('write');
 
     // Purge cached thumbnails on disk so fresh orientation displays immediately
     try {
       const { purgeCachedThumbnailsForFile } = require('./thumbnailCacheService');
       await purgeCachedThumbnailsForFile(filePath, prevMtime);
     } catch {}
+    mark('purge');
+    logIfSlow();
 
     return { success: true, newPath: filePath };
   } catch (err: any) {
@@ -2735,4 +2757,44 @@ export async function countMirrorMedia(mirrorDir: string): Promise<{ images: num
   };
   await walk(mirrorDir);
   return { images, videos };
+}
+
+
+/**
+ * One-time repair of capture dates: sidecars whose date equals the original file's modified time got
+ * it from the "no EXIF" fallback (i.e. roughly when the file was copied). For those, re-derive the
+ * date from the file name / the video's own creation_time and fix both the sidecar and the catalog row.
+ * Photos with a real EXIF date (date != file mtime) are never touched.
+ */
+export async function fixStorageDates(config: { localMirrorRoot: string; name: string }): Promise<{ checked: number; fixed: number }> {
+  const root = path.join(config.localMirrorRoot, config.name);
+  const db = getDbForLibraryPath(root);
+  const update = db.prepare('UPDATE photos SET date_taken = ?, file_date = ?, year = ?, month = ?, day = ? WHERE id = ?');
+  let checked = 0;
+  let fixed = 0;
+  const walk = async (dir: string): Promise<void> => {
+    let entries: fs.Dirent[];
+    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) { if (!e.name.startsWith('.')) await walk(full); continue; }
+      if (!e.isFile() || !e.name.endsWith('.json')) continue;
+      try {
+        const meta: VirtualPhotoMetadata = JSON.parse(await fs.promises.readFile(full, 'utf-8'));
+        if (!meta.originalFilePath || typeof meta.sourceMtimeMs !== 'number') continue;
+        checked++;
+        const old = new Date(meta.dateTaken).getTime();
+        if (!(Math.abs(old - meta.sourceMtimeMs) < 2000)) continue; // has a real capture date
+        const d = await fallbackCaptureDate(meta.originalFilePath);
+        if (!d || Math.abs(d.getTime() - old) < 1000) continue;
+        meta.dateTaken = d.toISOString();
+        writeJsonAtomic(full, meta);
+        update.run(meta.dateTaken, meta.dateTaken, d.getFullYear(), d.getMonth() + 1, d.getDate(), Buffer.from(meta.thumbnailPath).toString('base64'));
+        fixed++;
+      } catch {}
+      if (checked % 50 === 0) await new Promise<void>((r) => setImmediate(r));
+    }
+  };
+  await walk(root);
+  return { checked, fixed };
 }

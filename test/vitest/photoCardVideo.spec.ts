@@ -73,13 +73,13 @@ describe('PhotoCard: video badge and hover preview', () => {
     expect(host.querySelector('video')).not.toBeNull();
   });
 
-  it('moving the mouse away before 2s never shows a preview, and never even asks for one', async () => {
+  it('moving the mouse away before the hover delay (700ms) never shows a preview, and never even asks for one', async () => {
     vi.useFakeTimers();
     await mount(videoPhoto);
     const card = host.querySelector('[data-photo-id="v1"]') as HTMLElement;
 
     await act(async () => { card.dispatchEvent(new MouseEvent('mouseover', { bubbles: true })); });
-    await act(async () => { vi.advanceTimersByTime(1000); }); // still within the 2s window
+    await act(async () => { vi.advanceTimersByTime(300); }); // still within the 700ms window
     await act(async () => { card.dispatchEvent(new MouseEvent('mouseout', { bubbles: true })); });
     await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
 

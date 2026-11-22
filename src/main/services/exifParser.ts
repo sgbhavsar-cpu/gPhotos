@@ -2,6 +2,17 @@ import fs from 'fs';
 import path from 'path';
 import exifr from 'exifr';
 import { ExifMetadata, LocationMetadata } from '../../types';
+import { dateFromFileName } from '../../types/dateFromFileName';
+import { probeCreationTime } from './videoExportService';
+
+const VIDEO_RE = /\.(mp4|mov|avi|mkv|webm|wmv|m4v)$/i;
+
+export { dateFromFileName };
+
+/** Date for a file with no usable EXIF: name date, then (videos) the container's creation_time. Never the file's mtime. */
+export async function fallbackCaptureDate(filePath: string): Promise<Date | null> {
+  return dateFromFileName(filePath) ?? (VIDEO_RE.test(filePath) ? await probeCreationTime(filePath) : null);
+}
 
 const FULL_READ_FALLBACK_EXTS = new Set(['.tif', '.tiff', '.dng', '.raw', '.cr2', '.nef', '.heic', '.heif']);
 
@@ -119,8 +130,10 @@ export async function parsePhotoMetadata(filePath: string): Promise<{
         dateTaken = raw.DateTimeOriginal;
       } else if (raw.CreateDate instanceof Date && !isNaN(raw.CreateDate.getTime())) {
         dateTaken = raw.CreateDate;
-      } else if (raw.ModifyDate instanceof Date && !isNaN(raw.ModifyDate.getTime())) {
-        dateTaken = raw.ModifyDate;
+      } else {
+        // A date in the file name beats the EXIF "modified" date (an edit time, not a capture time).
+        dateTaken = dateFromFileName(filePath);
+        if (!dateTaken && raw.ModifyDate instanceof Date && !isNaN(raw.ModifyDate.getTime())) dateTaken = raw.ModifyDate;
       }
 
       width = raw.ExifImageWidth || raw.ImageWidth;
@@ -185,6 +198,7 @@ export async function parsePhotoMetadata(filePath: string): Promise<{
   // Modified time survives most copy/sync tools unchanged from the
   // original capture, so it's the closer of the two to the truth whenever
   // there's no embedded metadata to go by.
+  if (!dateTaken) dateTaken = await fallbackCaptureDate(filePath);
   if (!dateTaken) {
     try {
       const stats = await fs.promises.stat(filePath);

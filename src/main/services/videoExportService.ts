@@ -271,7 +271,8 @@ export interface MediaInfo {
 export function probeMedia(filePath: string): Promise<MediaInfo> {
   return new Promise((resolve) => {
     let stderr = '';
-    const proc = spawn(getFfmpegPath(), ['-i', filePath, '-f', 'null', '-'], { windowsHide: true });
+    // No output file: ffmpeg prints the banner and exits, instead of decoding the whole video to a null sink.
+    const proc = spawn(getFfmpegPath(), ['-hide_banner', '-i', filePath], { windowsHide: true });
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
     proc.on('error', () => resolve({ durationSec: null, hasAudio: false, hasVideo: false }));
     proc.on('close', () => resolve({
@@ -279,6 +280,21 @@ export function probeMedia(filePath: string): Promise<MediaInfo> {
       hasAudio: /Stream #\d+:\d+[^\n]*: Audio:/.test(stderr),
       hasVideo: /Stream #\d+:\d+[^\n]*: Video:/.test(stderr),
     }));
+  });
+}
+
+/** The container's `creation_time` tag (when the video was recorded), or null. Banner-only: reads just the file header. */
+export function probeCreationTime(filePath: string): Promise<Date | null> {
+  return new Promise((resolve) => {
+    let stderr = '';
+    const proc = spawn(getFfmpegPath(), ['-hide_banner', '-i', filePath], { windowsHide: true });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', () => resolve(null));
+    proc.on('close', () => {
+      const m = stderr.match(/creation_time\s*:\s*(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/);
+      const d = m ? new Date(`${m[1]}T${m[2]}Z`) : null;
+      resolve(d && !isNaN(d.getTime()) && d.getFullYear() > 1990 ? d : null);
+    });
   });
 }
 

@@ -9,16 +9,19 @@ import {
   Image as ImageIcon,
   Sparkles,
   ArrowRight,
-  Play
+  Play,
+  BookImage
 } from 'lucide-react';
 import { Photo, FolderTreeNode, VirtualStorageConfig } from '../../../types';
 import { getLocalPhotoUrl, libraryStore } from '../services/libraryStore';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { notifyError } from '../services/notifications';
 import { VirtualCardGrid } from '../components/VirtualCardGrid';
+import { AlbumFromFolderModal } from '../components/AlbumFromFolderModal';
+import { PhotoCard } from '../components/PhotoCard';
 
 // Fixed card height (160px thumbnail + caption) so the folder grid can be windowed.
-const FOLDER_CARD_HEIGHT = 216;
+const FOLDER_CARD_HEIGHT = 210;
 
 interface FolderTreeViewProps {
   onSelectPhoto: (photo: Photo) => void;
@@ -161,6 +164,7 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
   // (the button just sat there, clickable, looking inert).
   const [isStartingScan, setIsStartingScan] = useState(false);
   const [folderError, setFolderError] = useState<string | null>(null);
+  const [showAlbumFromFolder, setShowAlbumFromFolder] = useState(false);
   // Only the most recent folder click may write results (slow shares answer out of order).
   const selectRequestRef = useRef(0);
   const [customPathInput, setCustomPathInput] = useState('');
@@ -237,7 +241,24 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
     setFolderError(null);
 
     try {
-      if (window.electronAPI?.readFolderPhotos) {
+      // Same source as the main Photos library: the cached catalog, not a fresh read of every file in the folder
+      // (which can mean opening each file on OneDrive). Only a folder the library knows nothing about falls
+      // back to reading the folder itself.
+      await libraryStore.loadAllCatalogPages();
+      if (requestId !== selectRequestRef.current) return;
+      const norm = (x: string) => x.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
+      const root = norm(folderPath);
+      const inFolder = libraryStore.getState().photos.filter((p) => {
+        if (p.isExcluded) return false;
+        return [p.originalRemotePath, p.filePath].some((c) => {
+          if (!c) return false;
+          const n = norm(c);
+          return n.startsWith(root + '\\') && !n.slice(root.length + 1).includes('\\');
+        });
+      });
+      if (inFolder.length > 0) {
+        setFolderPhotos(inFolder);
+      } else if (window.electronAPI?.readFolderPhotos) {
         const photos = (await window.electronAPI.readFolderPhotos(folderPath)) || [];
         if (requestId !== selectRequestRef.current) return;
         setFolderPhotos(photos);
@@ -366,6 +387,18 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
 
           {selectedFolderPath && (
             <button
+              className="btn btn-secondary"
+              onClick={() => setShowAlbumFromFolder(true)}
+              style={{ fontSize: '0.82rem', gap: '6px', flexShrink: 0 }}
+              title="Turn this folder into an album, with each sub-folder as a chapter"
+            >
+              <BookImage size={14} />
+              <span>Create album from folder</span>
+            </button>
+          )}
+
+          {selectedFolderPath && (
+            <button
               className="btn btn-primary"
               onClick={async () => {
                 if (isStartingScan) return;
@@ -417,51 +450,20 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
               minColWidth={200}
               gap={16}
               renderItem={(photo) => (
-                <div
+                <PhotoCard
+                  photo={photo}
+                  size="medium"
                   onClick={() => onSelectPhoto(photo)}
-                  style={{
-                    height: '100%',
-                    boxSizing: 'border-box',
-                    backgroundColor: 'var(--bg-surface)',
-                    borderRadius: 'var(--radius-md)',
-                    overflow: 'hidden',
-                    border: '1px solid var(--border-subtle)',
-                    cursor: 'pointer',
-                    boxShadow: 'var(--shadow-sm)',
-                    transition: 'all var(--transition-fast)',
-                  }}
-                >
-                  <div style={{ height: '160px', backgroundColor: '#0f172a', position: 'relative' }}>
-                    <img
-                      src={getLocalPhotoUrl(photo.filePath, photo.originalRemotePath)}
-                      alt={photo.fileName}
-                      style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                      loading="lazy"
-                    />
-                  </div>
-                  <div style={{ padding: '8px 10px' }}>
-                    <div
-                      style={{
-                        fontSize: '0.8rem',
-                        fontWeight: 600,
-                        color: 'var(--text-primary)',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      {photo.fileName}
-                    </div>
-                    <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '2px' }}>
-                      {(photo.fileSize / (1024 * 1024)).toFixed(1)} MB • {photo.dateTaken ? new Date(photo.dateTaken).toLocaleDateString() : ''}
-                    </div>
-                  </div>
-                </div>
+                  onToggleFavorite={(e) => { e.stopPropagation(); libraryStore.toggleFavorite(photo.id); }}
+                />
               )}
             />
           )}
         </div>
       </main>
+      {showAlbumFromFolder && selectedFolderPath && (
+        <AlbumFromFolderModal folderPath={selectedFolderPath} onClose={() => setShowAlbumFromFolder(false)} />
+      )}
     </div>
   );
 };

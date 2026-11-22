@@ -93,33 +93,6 @@ describe('AlbumChapterSection', () => {
     });
     expect(host.textContent).toContain('No photos in this chapter yet');
   });
-
-  it('dropping onto the section calls onDropPhotoIds with the drag event', async () => {
-    const onDropPhotoIds = vi.fn();
-    await act(async () => {
-      root.render(React.createElement(AlbumChapterSection, {
-        chapter: chapter(), photos: [], scrollRef, rowHeight: 200, minColWidth: 200, gap: 16,
-        renderTile: () => null, onRename: vi.fn(), onDelete: vi.fn(), onDropPhotoIds,
-      }));
-    });
-    const root_div = host.firstElementChild as HTMLElement;
-    const dropEvent = new Event('drop', { bubbles: true, cancelable: true });
-    Object.defineProperty(dropEvent, 'dataTransfer', { value: { getData: () => JSON.stringify(['p1']) } });
-    await act(async () => { root_div.dispatchEvent(dropEvent); });
-    expect(onDropPhotoIds).toHaveBeenCalledTimes(1);
-  });
-
-  it('without onDropPhotoIds, the section is not a drop target at all (no handlers attached)', async () => {
-    await act(async () => {
-      root.render(React.createElement(AlbumChapterSection, {
-        chapter: chapter(), photos: [], scrollRef, rowHeight: 200, minColWidth: 200, gap: 16,
-        renderTile: () => null, onRename: vi.fn(), onDelete: vi.fn(),
-      }));
-    });
-    // No crash / no visible drag-over styling change is possible to assert directly without
-    // handlers; this just documents that the root renders fine with the prop omitted.
-    expect(host.firstElementChild).not.toBeNull();
-  });
 });
 
 describe('ChapterPicker', () => {

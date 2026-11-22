@@ -3,7 +3,7 @@ import { X, Wifi, WifiOff } from 'lucide-react';
 import { VirtualStorageConfig, StorageDetails } from '../../../types';
 import { storageTaskKey, type StorageTask } from '../services/storageTasks';
 
-export interface StorageTaskInfo { paused: string[]; faults: Record<string, string>; online: boolean; done?: Record<string, string | undefined> }
+export interface StorageTaskInfo { paused: string[]; faults: Record<string, string>; online: boolean; done?: Record<string, string | undefined>; cachingFailed?: number; lastActive?: Record<string, number | undefined> }
 
 /** Polls main for each storage's online status and task faults (every 3s while mounted). */
 export function useStorageTaskInfo(storages: VirtualStorageConfig[]): Record<string, StorageTaskInfo> {

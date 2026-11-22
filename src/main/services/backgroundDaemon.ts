@@ -9,6 +9,7 @@ import { processPendingMoves } from './photoRelocation';
 import os from 'os';
 import { thumbnailWorker } from './thumbnailWorkerService';
 import { setVideoFrameCaptureEnabled } from './thumbnailCacheService';
+import { addFileTaskLog } from './storageTaskControl';
 import { setFaceDetectionPoolSize } from './faceDetectionWorkerClient';
 import { getSetting, setSetting } from './libraryRepository';
 import { setActiveLibrary } from './db';
@@ -529,6 +530,12 @@ export async function runBackgroundSyncCycle(mainWindow?: BrowserWindow | null):
           phase: result.errors.length === 0 ? 'thumbnails' : 'interrupted',
         });
       } catch {}
+
+      // Make the unattended check visible in the storage's Logs window ("is anything arriving?").
+      addFileTaskLog(path.join(mirrorDir, 'x'), 'caching', 'info',
+        result.newlyAdded > 0
+          ? `Periodic scan: ${result.newlyAdded} new photo(s) found in the network folder — caching them now`
+          : `Periodic scan: no new photos in the network folder (next check in ~${Math.max(5, serviceSettings.syncIntervalMinutes)} min)`);
 
       if (result.newlyAdded > 0) {
         storage.lastSynced = new Date().toISOString();

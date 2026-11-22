@@ -93,6 +93,7 @@ const electronAPI: IElectronAPI = {
   saveLibraryData: (key: string, data: any) => ipcRenderer.invoke('storage:save', key, data),
   loadLibraryData: (key: string, libraryDir?: string, options?: { includePhotos?: boolean; compactDescriptors?: boolean }) => ipcRenderer.invoke('storage:load', key, libraryDir, options),
   syncVirtualStorage: (config) => ipcRenderer.invoke('mirror:sync-storage', config),
+  fixStorageDates: (config) => ipcRenderer.invoke('mirror:fix-dates', config),
   scanVirtualMirror: (mirrorDirPath) => ipcRenderer.invoke('mirror:scan-virtual-mirror', mirrorDirPath),
   discoverMirrors: (rootPath) => ipcRenderer.invoke('mirror:list-stored-mirrors', rootPath),
   getDefaultMirrorRoot: () => ipcRenderer.invoke('mirror:get-default-root'),

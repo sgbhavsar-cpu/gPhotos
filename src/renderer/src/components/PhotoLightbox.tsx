@@ -62,6 +62,7 @@ import { evictAndRefreshThumbnail, invalidateSpriteCoordinate } from '../service
 import { authFetch } from '../services/webAuthClient';
 import { isOneDriveBackedPath } from '../services/storageValidation';
 import { logger } from '../services/logger';
+import { deleteFilesWithProgress } from '../services/deleteProgress';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { notify, notifyError } from '../services/notifications';
 
@@ -130,6 +131,8 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   // side-by-side 370px pane — defaulting it open would hide the photo
   // behind the panel the instant the lightbox opens, so mobile starts closed.
   const [showInfo, setShowInfo] = useState(!isMobile);
+  const [videoFailed, setVideoFailed] = useState(false);
+  useEffect(() => setVideoFailed(false), [photo.id]);
   const [showMobileActions, setShowMobileActions] = useState(false);
   // Default off: face marker boxes are an opt-in overlay, not something every photo should open with.
   const [showFaces, setShowFaces] = useState(false);
@@ -715,13 +718,23 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   // (`applied`) is dropped when the rotated picture has actually loaded (see the <img> onLoad), so there is
   // neither a flash of the old orientation nor a double rotation.
   const rotateStateRef = useRef({ photoId: photo.id, queued: 0, busy: false, applied: 0 });
-  const handleQuickRotate = async () => {
+  // Each click only turns the on-screen preview and restarts a 5 s timer; the file on disk is rotated ONCE,
+  // 5 s after the last click (people usually need 2-3 clicks to get a picture upright). Navigating away or
+  // closing flushes it immediately so nothing is lost.
+  const ROTATE_DELAY_MS = 5000;
+  const rotateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleQuickRotate = () => {
     const st = rotateStateRef.current;
     if (st.busy && st.photoId !== photo.id) return; // the previous photo's rotation is still finishing
     if (st.photoId !== photo.id) Object.assign(st, { photoId: photo.id, queued: 0, applied: 0 });
     setEditRotation((r) => (r + 90) % 360);
     st.queued = (st.queued + 90) % 360;
-    if (st.busy) return;
+    if (rotateTimerRef.current) clearTimeout(rotateTimerRef.current);
+    rotateTimerRef.current = setTimeout(() => { rotateTimerRef.current = null; void flushRotation(); }, ROTATE_DELAY_MS);
+  };
+  const flushRotation = async () => {
+    const st = rotateStateRef.current;
+    if (st.busy || st.queued === 0) return;
     st.busy = true;
     const target = photo;
     let inFlight = 0; // degrees currently being written (not yet in the file)
@@ -780,6 +793,16 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
       st.busy = false;
     }
   };
+
+  // Leaving this photo (or closing the lightbox) applies a pending rotation right away instead of dropping it.
+  useEffect(() => () => {
+    if (rotateTimerRef.current) {
+      clearTimeout(rotateTimerRef.current);
+      rotateTimerRef.current = null;
+      void flushRotation();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [photo.id]);
 
   // Helper to compute normalized coordinates across resolutions
   const getFaceNormalizedCoords = (
@@ -909,8 +932,31 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     if (hasNext) onSelectPhoto(allPhotos[currentIndex + 1]);
   };
 
+  const [deletingPhoto, setDeletingPhoto] = useState(false);
+  const handleDeletePhoto = async () => {
+    if (!window.confirm(`Permanently delete "${photo.fileName}" from disk? This cannot be undone and the file cannot be restored from the Recycle Bin.`)) return;
+    setDeletingPhoto(true);
+    try {
+      const path = photo.originalRemotePath || photo.filePath;
+      const { deletedPaths } = await deleteFilesWithProgress([path]);
+      if (!deletedPaths.includes(path)) {
+        notify('error', 'The photo could not be deleted.');
+        return;
+      }
+      const next = allPhotos[currentIndex + 1] ?? allPhotos[currentIndex - 1];
+      libraryStore.removePhotos([photo.id]);
+      notify('success', 'Photo permanently deleted.');
+      if (next) onSelectPhoto(next);
+      else onClose();
+    } catch (err) {
+      notifyError('Delete photo', err);
+    } finally {
+      setDeletingPhoto(false);
+    }
+  };
+
   // Mouse wheel zoom handler
-  const handleWheel = (e: React.WheelEvent) => {
+  const handleWheel =(e: React.WheelEvent) => {
     e.preventDefault();
     e.stopPropagation();
 
@@ -1496,6 +1542,16 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
           </button>
 
           <button
+            className="btn btn-ghost btn-icon"
+            onClick={handleDeletePhoto}
+            disabled={deletingPhoto}
+            style={{ color: '#ef4444' }}
+            title="Permanently delete this photo from disk"
+          >
+            <Trash2 size={18} />
+          </button>
+
+          <button
             className={`btn btn-icon ${showInfo ? 'btn-secondary' : 'btn-ghost'}`}
             onClick={() => setShowInfo(!showInfo)}
             title={showInfo ? 'Hide photo info panel (I)' : 'Show photo info panel (I)'}
@@ -1730,8 +1786,15 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
 
           {/* A video plays in its own simple element — none of the pan/zoom/crop/face-overlay
               machinery below applies to it (see docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md §2.6). */}
-          {photo.isVideo && (
+          {photo.isVideo && videoFailed && (
+            <div style={{ color: 'var(--text-muted)', textAlign: 'center', maxWidth: 360, display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <span style={{ fontWeight: 700, color: 'white' }}>This video can't be played right now</span>
+              <span style={{ fontSize: '0.8rem' }}>Videos are streamed from their original storage, which is offline or unreachable. Only photo previews are kept on this PC. Bring the storage online and reopen the video.</span>
+            </div>
+          )}
+          {photo.isVideo && !videoFailed && (
             <video
+              onError={() => setVideoFailed(true)}
               src={getLocalPhotoUrl(photo.filePath, photo.originalRemotePath, true, 0)}
               controls
               autoPlay

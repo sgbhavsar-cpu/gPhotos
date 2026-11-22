@@ -5,6 +5,7 @@ import path from 'path';
 import type { DatabaseSync } from 'node:sqlite';
 
 vi.mock('../../src/main/services/videoExportService', () => ({
+  probeCreationTime: vi.fn(async () => null),
   probeMedia: vi.fn(async () => ({ durationSec: 9, hasAudio: false, hasVideo: true })),
 }));
 

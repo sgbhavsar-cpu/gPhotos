@@ -1,6 +1,5 @@
 // On-demand hover-preview clips for video library items (see
-// docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md §2.5) — a short, silent, looping mp4 sampled from ~12
-// frames spread across the source video, generated the first time a video tile is actually
+// docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md §2.5) — the first 5 s of the video as a small (250px) silent looping mp4, generated the first time a video tile is actually
 // hovered long enough to need one, then cached on disk like a thumbnail. Deliberately NOT a
 // background sweep (see the doc's §2.8): the first-ever hover on a given video pays the
 // generation cost once; every hover after that (including a restart) is an instant cache hit.
@@ -9,12 +8,12 @@ import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
 import { app } from 'electron';
-import { probeMedia, grabVideoFrame, runFfmpeg } from './videoExportService';
+import { probeMedia, runFfmpeg } from './videoExportService';
 
-const PREVIEW_FRAME_COUNT = 12;
-const PREVIEW_FPS = 2; // 12 frames @ 2fps = a ~6s looping preview
-const PREVIEW_WIDTH = 320;
-// Skip the first/last 5% of the clip — title cards and fade-to-black make poor preview frames.
+const PREVIEW_SECONDS = 5; // the first 5 s of the video, real motion
+const PREVIEW_FPS = 12;
+const PREVIEW_WIDTH = 250; // same as the default grid thumbnail size
+// Skip the first/last 5% of the clip when sampling timestamps (kept for pickSampleTimestamps).
 const SAMPLE_MARGIN = 0.05;
 
 function getPreviewCacheDir(): string {
@@ -29,7 +28,7 @@ function getPreviewCacheDir(): string {
 
 /** Same scheme as thumbnailCacheService.getCacheKey, kept independent so the two caches never collide. */
 function getPreviewCacheKey(filePath: string, mtimeMs: number): string {
-  return crypto.createHash('sha1').update(`preview:${filePath}:${mtimeMs}`).digest('hex');
+  return crypto.createHash('sha1').update(`preview5s:${filePath}:${mtimeMs}`).digest('hex');
 }
 
 /**
@@ -55,6 +54,17 @@ async function writeFileAtomic(target: string, data: Buffer): Promise<void> {
     fs.promises.unlink(tmp).catch(() => {});
     throw err;
   }
+}
+
+export const VIDEO_FILE_RE = /\.(mp4|mov|avi|mkv|webm|wmv|m4v)$/i;
+
+/** True when the 5 s preview clip for this video is already on disk. */
+export async function isVideoPreviewCached(sourcePath: string): Promise<boolean> {
+  try {
+    const stat = await fs.promises.stat(sourcePath);
+    const c = await fs.promises.stat(path.join(getPreviewCacheDir(), `${getPreviewCacheKey(sourcePath, stat.mtimeMs)}.mp4`));
+    return c.size > 0;
+  } catch { return false; }
 }
 
 // Same in-flight de-dup pattern as thumbnailCacheService — two simultaneous hovers on the same
@@ -95,28 +105,19 @@ export async function getOrGenerateVideoPreview(sourcePath: string): Promise<str
       const info = await probeMedia(sourcePath);
       if (!info.durationSec || info.durationSec <= 0) return null;
 
-      const timestamps = pickSampleTimestamps(info.durationSec, PREVIEW_FRAME_COUNT);
       await fs.promises.mkdir(tempDir, { recursive: true });
-
-      const framePaths: string[] = [];
-      for (let i = 0; i < timestamps.length; i++) {
-        const frame = await grabVideoFrame(sourcePath, timestamps[i]);
-        if (!frame) continue;
-        const framePath = path.join(tempDir, `frame_${String(i).padStart(2, '0')}.jpg`);
-        await fs.promises.writeFile(framePath, frame);
-        framePaths.push(framePath);
-      }
-      if (framePaths.length < 2) return null; // too few usable frames to make a meaningful preview
-
-      await fs.promises.mkdir(cacheDir, { recursive: true });
       const outPath = path.join(tempDir, 'preview.mp4');
+      // -t as an input option: ffmpeg stops reading after ~5 s, so only the start of the file is
+      // touched (matters for OneDrive / network sources).
       const args = [
-        '-y', '-framerate', String(PREVIEW_FPS), '-i', path.join(tempDir, 'frame_%02d.jpg'),
-        '-vf', `scale=${PREVIEW_WIDTH}:-2`, '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        '-y', '-t', String(PREVIEW_SECONDS), '-i', sourcePath, '-an',
+        '-vf', `fps=${PREVIEW_FPS},scale=${PREVIEW_WIDTH}:-2`,
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '30', '-pix_fmt', 'yuv420p',
         '-movflags', '+faststart', outPath,
       ];
-      const result = await runFfmpeg(args, framePaths.length / PREVIEW_FPS);
+      const result = await runFfmpeg(args, Math.min(PREVIEW_SECONDS, info.durationSec));
       if (!result.success || !fs.existsSync(outPath)) return null;
+      await fs.promises.mkdir(cacheDir, { recursive: true });
 
       const buf = await fs.promises.readFile(outPath);
       await writeFileAtomic(cachedFilePath, buf);

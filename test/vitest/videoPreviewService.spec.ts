@@ -6,6 +6,7 @@ import path from 'path';
 // ffmpeg itself is mocked out — these tests exercise the caching/dedup/sampling LOGIC in
 // videoPreviewService.ts, not real video encoding (see docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md §2.5).
 vi.mock('../../src/main/services/videoExportService', () => ({
+  probeCreationTime: vi.fn(async () => null),
   probeMedia: vi.fn(async () => ({ durationSec: 12, hasAudio: false, hasVideo: true })),
   grabVideoFrame: vi.fn(async () => Buffer.from([0xff, 0xd8, 0xff])), // a fake JPEG-ish buffer
   runFfmpeg: vi.fn(async (args: string[]) => {

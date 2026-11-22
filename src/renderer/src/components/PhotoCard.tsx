@@ -45,6 +45,8 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
 }) => {
   const [isHovered, setIsHovered] = useState(false);
   const [imgElementLoaded, setImgElementLoaded] = useState(false);
+  // The gphoto:// <img> can 404/decode-fail even though a src exists (e.g. a video with no cached frame).
+  const [imgFailed, setImgFailed] = useState(false);
 
   // Video hover preview (see docs/FEATURE_VIDEO_LIBRARY_SUPPORT.md §2.5): a short inline clip
   // plays over the thumbnail once the mouse has rested on a video tile for ~2s. `stillHoveredRef`
@@ -133,11 +135,13 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
   const canUseSprite = !!(spriteCoord && !isRotated);
   const hasThumbnail = !!(canUseSprite || displaySrc);
   const isLoading = !hasThumbnail && isBatchLoading;
-  const hasError = !hasThumbnail && isBatchError;
+  const hasError = (!hasThumbnail && isBatchError) || imgFailed;
+  useEffect(() => setImgFailed(false), [photoPath]);
+  const videoNoPreview = !!photo.isVideo && (hasError || (!hasThumbnail && !isLoading));
 
   /**
    * Hover quick-rotate: Rotates thumbnail instantly in the UI.
-   * Debounces for 2 seconds; if no further rotate clicks occur, pushes rotation to actual image file on disk!
+   * Waits until 5 seconds after the LAST click; if no further rotate clicks occur, pushes rotation to actual image file on disk!
    */
   const handleQuickRotate = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -147,7 +151,7 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
     setVisualRotation(nextRot);
     pendingRotationDeltaRef.current = (pendingRotationDeltaRef.current + 90) % 360;
 
-    // Reset 2-second debounce timer
+    // Every click restarts the 5-second wait, so a burst of clicks becomes ONE rotation on disk
     if (debounceTimerRef.current) {
       clearTimeout(debounceTimerRef.current);
     }
@@ -155,7 +159,7 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
     debounceTimerRef.current = setTimeout(() => {
       debounceTimerRef.current = null;
       void persistRotation();
-    }, 2000);
+    }, 5000);
   };
 
   const persistRotation = async () => {
@@ -233,7 +237,7 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
             if (res?.path && stillHoveredRef.current) {
               setPreviewUrl(getLocalPhotoUrl(res.path, undefined, true, 0));
             }
-          }, 2000);
+          }, 700);
         }
       }}
       onMouseLeave={() => {
@@ -280,7 +284,24 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
       )}
 
       {/* Graceful Fallback if Image is Unavailable or Timed Out */}
-      {hasError && (
+      {videoNoPreview && !previewUrl && (
+        <div
+          title="No preview image for this video. It plays by streaming from its storage, so the storage must be online."
+          style={{
+            position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', zIndex: 1,
+            display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'flex-end', gap: '4px',
+            padding: '8px 8px 34px', textAlign: 'center',
+            background: 'linear-gradient(135deg, #1e293b, #0f172a)', color: 'var(--text-muted)',
+          }}
+        >
+          <span style={{ fontSize: '10px', fontWeight: 800, letterSpacing: '0.08em', color: 'rgba(255,255,255,0.7)' }}>
+            {(photo.fileName?.split('.').pop() || 'video').toUpperCase()} VIDEO
+          </span>
+          <span style={{ fontSize: '10px', maxWidth: '90%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{photo.fileName}</span>
+          <span style={{ fontSize: '9px', opacity: 0.7 }}>No preview · plays from storage</span>
+        </div>
+      )}
+      {hasError && !photo.isVideo && (
         <div
           style={{
             position: 'absolute',
@@ -327,7 +348,7 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
       )}
 
       {/* 2. Fallback Batch / Direct Photo Display */}
-      {!canUseSprite && displaySrc && !hasError && (
+      {!canUseSprite && displaySrc && !hasError && !videoNoPreview && (
         <img
           src={
             (cacheBuster || isRotated) && !displaySrc.startsWith('data:')
@@ -337,6 +358,7 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
           alt={photo.fileName}
           decoding="async"
           onLoad={() => setImgElementLoaded(true)}
+          onError={() => setImgFailed(true)}
           style={{
             width: '100%',
             height: '100%',

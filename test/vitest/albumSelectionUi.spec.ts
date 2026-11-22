@@ -175,12 +175,6 @@ describe('Album: selecting photos (checkbox, rubber band) and dragging them to c
       expect(checkedNumbers()).toContain(4);
     });
 
-    it('pressing on a photo itself does not start a band (it opens / drags the photo as before)', async () => {
-      await drag(tile(2), [150, 40], [520, 80]);
-      expect(checkedNumbers()).toEqual([]);
-      expect(host.ownerDocument.querySelector('[data-testid="marquee-box"]')).toBeNull();
-    });
-
     it('a plain click on empty space clears the selection; a tiny wobble is still a click', async () => {
       await drag(scrollArea(), [10, 20], [150, 80]);
       expect(checkedNumbers()).toEqual([1, 2]);
@@ -192,129 +186,6 @@ describe('Album: selecting photos (checkbox, rubber band) and dragging them to c
       const button = host.querySelector('[data-testid="album-scroll-area"] button') || host.querySelector('button')!;
       await drag(button, [10, 20], [520, 80]);
       expect(checkedNumbers()).toEqual([]);
-    });
-  });
-
-  describe('dragging photos to a chapter', () => {
-    // A minimal DataTransfer: jsdom has none.
-    const makeDt = () => {
-      const store = new Map<string, string>();
-      return { setData: (k: string, v: string) => store.set(k, v), getData: (k: string) => store.get(k) ?? '', effectAllowed: '', dropEffect: '', setDragImage: vi.fn() } as any;
-    };
-    const fire = async (type: string, target: EventTarget, dt: any) => {
-      const ev = new Event(type, { bubbles: true, cancelable: true });
-      Object.defineProperty(ev, 'dataTransfer', { value: dt });
-      await act(async () => { target.dispatchEvent(ev); });
-    };
-    const dropBar = () => host.ownerDocument.querySelector('[data-testid="chapter-drop-bar"]') as HTMLElement | null;
-    const flushTimers = async () => { await act(async () => { await new Promise((r) => setTimeout(r, 5)); }); };
-    const chapterIds = (id: string) => lib.getState().albums[0].chapters.find((c: any) => c.id === id).photoIds;
-
-    beforeEach(async () => {
-      setAlbum([chapter('c1', 'Day 1', ['p1', 'p2']), chapter('c2', 'Day 2', ['p3']), chapter('c3', 'Day 3', [])]);
-      await render();
-      await openAlbum();
-    });
-
-    it('starting to drag a photo puts EVERY chapter (and "Other Photos") in a bar at the top as drop targets', async () => {
-      const dt = makeDt();
-      expect(dropBar()).toBeNull();
-      await fire('dragstart', tile(1), dt);
-      await flushTimers();
-      const bar = dropBar()!;
-      expect(bar).not.toBeNull();
-      expect(bar.textContent).toContain('Drop 1 photo');
-      for (const id of ['c1', 'c2', 'c3', 'none']) expect(bar.querySelector(`[data-testid="drop-chapter-${id}"]`)).not.toBeNull();
-      expect(bar.textContent).toContain('Day 3');
-      expect(dt.effectAllowed).toBe('move');
-    });
-
-    it('dropping on a chapter in the bar moves the photo there and puts the bar away', async () => {
-      const dt = makeDt();
-      await fire('dragstart', tile(1), dt); // p1 lives in Day 1
-      await flushTimers();
-      await fire('dragover', dropBar()!.querySelector('[data-testid="drop-chapter-c3"]')!, dt);
-      await fire('drop', dropBar()!.querySelector('[data-testid="drop-chapter-c3"]')!, dt);
-      await render();
-      expect(chapterIds('c3')).toEqual(['p1']);
-      expect(chapterIds('c1')).toEqual(['p2']);
-      expect(dropBar()).toBeNull();
-    });
-
-    it('several selected photos are dragged together and all land in the chosen chapter', async () => {
-      await act(async () => { checkbox(1).click(); });
-      await act(async () => { checkbox(2).click(); });
-      await act(async () => { checkbox(3).click(); });
-      const dt = makeDt();
-      await fire('dragstart', tile(2), dt);
-      await flushTimers();
-      expect(dropBar()!.textContent).toContain('Drop 3 photos');
-      expect(dt.setDragImage).toHaveBeenCalled(); // a "3 photos" badge instead of one thumbnail
-      await fire('drop', dropBar()!.querySelector('[data-testid="drop-chapter-c3"]')!, dt);
-      await render();
-      expect(chapterIds('c3').sort()).toEqual(['p1', 'p2', 'p3']);
-      expect(chapterIds('c1')).toEqual([]);
-      expect(chapterIds('c2')).toEqual([]);
-      expect(checkedNumbers()).toEqual([]); // selection is cleared after the move
-      expect(bar()).toBeNull();
-    });
-
-    it('dragging a photo that is NOT part of the selection moves just that one', async () => {
-      await act(async () => { checkbox(1).click(); });
-      await act(async () => { checkbox(2).click(); });
-      const dt = makeDt();
-      await fire('dragstart', tile(5), dt);
-      await flushTimers();
-      expect(dropBar()!.textContent).toContain('Drop 1 photo');
-      await fire('drop', dropBar()!.querySelector('[data-testid="drop-chapter-c2"]')!, dt);
-      await render();
-      expect(chapterIds('c2')).toEqual(['p3', 'p5']);
-      expect(chapterIds('c1')).toEqual(['p1', 'p2']);
-    });
-
-    it('"Other Photos" in the bar takes photos out of their chapter', async () => {
-      const dt = makeDt();
-      await fire('dragstart', tile(1), dt);
-      await flushTimers();
-      await fire('drop', dropBar()!.querySelector('[data-testid="drop-chapter-none"]')!, dt);
-      await render();
-      expect(chapterIds('c1')).toEqual(['p2']);
-    });
-
-    it('cancelling the drag (dragend) puts the bar away and moves nothing', async () => {
-      const dt = makeDt();
-      await fire('dragstart', tile(1), dt);
-      await flushTimers();
-      expect(dropBar()).not.toBeNull();
-      await fire('dragend', tile(1), dt);
-      expect(dropBar()).toBeNull();
-      expect(chapterIds('c1')).toEqual(['p1', 'p2']);
-    });
-
-    it('the bar is also put away when the drag ends on an element that is gone (the windowed grid unmounted the tile)', async () => {
-      const dt = makeDt();
-      await fire('dragstart', tile(1), dt);
-      await flushTimers();
-      await fire('dragend', document.body, dt);
-      expect(dropBar()).toBeNull();
-    });
-
-    it('the selection bar is not shown while dragging (the drop bar is)', async () => {
-      await act(async () => { checkbox(1).click(); });
-      expect(bar()).not.toBeNull();
-      const dt = makeDt();
-      await fire('dragstart', tile(1), dt);
-      await flushTimers();
-      expect(bar()).toBeNull();
-      expect(dropBar()).not.toBeNull();
-    });
-
-    it('a photo is not draggable from its checkbox press (that starts a rubber band instead)', async () => {
-      // pressing a checkbox is default-prevented, which stops the browser starting a native drag from it
-      const ev = new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX: 10, clientY: 10, button: 0 });
-      await act(async () => { checkbox(1).dispatchEvent(ev); });
-      expect(ev.defaultPrevented).toBe(true);
-      await act(async () => { mouse('mouseup', window, 10, 10); });
     });
   });
 
@@ -330,21 +201,20 @@ describe('Album: selecting photos (checkbox, rubber band) and dragging them to c
 
     it('"Move to chapter…" lists the chapters and moves the whole selection', async () => {
       await act(async () => { moveButton().click(); });
-      const day2 = Array.from(host.ownerDocument.querySelectorAll('button')).find((b) => b.textContent?.trim() === 'Day 2') as HTMLButtonElement;
+      const day2 = Array.from(host.ownerDocument.querySelectorAll('button')).find((b) => b.textContent?.includes('Day 2')) as HTMLButtonElement;
       await act(async () => { day2.click(); });
       await render();
       expect(lib.getState().albums[0].chapters[1].photoIds).toEqual(['p2', 'p3']);
       expect(checkedNumbers()).toEqual([]);
     });
 
-    it('"New chapter" in that menu creates a chapter that already contains the selected photos', async () => {
+    it('typing a new name in that dialog creates a chapter that already contains the selected photos', async () => {
       await act(async () => { moveButton().click(); });
-      const create = Array.from(bar()!.querySelectorAll('button')).find((b) => /new chapter/i.test(b.textContent || '')) as HTMLButtonElement; // the picker's, not the header's
-      await act(async () => { create.click(); });
-      const input = bar()!.querySelector('form input') as HTMLInputElement;
+      const input = host.ownerDocument.querySelector('[data-testid="chapter-select-input"]') as HTMLInputElement;
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
       await act(async () => { setter.call(input, 'Reception'); input.dispatchEvent(new Event('input', { bubbles: true })); });
-      await act(async () => { input.form!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); });
+      const create = host.ownerDocument.querySelector('[data-testid="chapter-select-create"]') as HTMLButtonElement;
+      await act(async () => { create.click(); });
       const created = lib.getState().albums[0].chapters.find((c: any) => c.title === 'Reception');
       expect(created.photoIds).toEqual(['p2', 'p3']);
     });

@@ -155,7 +155,7 @@ class FaceQueueService {
     const { photo } = item;
     // Per-storage "pause face detection": drop it (a later enqueue after resume brings it back).
     // Videos can't be decoded as an image — skip them rather than logging a failure for each one.
-    if (photo.isVideo || isFileTaskPaused(photo.filePath, 'faces')) {
+    if (photo.isVideo || /\.(mp4|mov|avi|mkv|webm|wmv|m4v)$/i.test(photo.filePath) || isFileTaskPaused(photo.filePath, 'faces')) {
       this.queuedPhotoIds.delete(photo.id);
       this.totalInSession = Math.max(0, this.totalInSession - 1);
       this.isRunning = false;

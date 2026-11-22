@@ -335,9 +335,18 @@ function applySchema(db: DatabaseSync): void {
 // existing entry on access, so the Map's own key order already IS least-recently-used-first.
 const MAX_OPEN_LIBRARY_CONNECTIONS = 3;
 
+// A connection used within this window is never closed by eviction: long async work (a storage sync's
+// per-photo face step awaiting a model load / OneDrive read) holds the handle across awaits, and closing
+// it under them surfaces as "database is not open" on the next write. Eviction is retried on every open,
+// so the cap is soft, not broken.
+let EVICTION_GRACE_MS = 3 * 60_000;
+/** Test-only: shrink/restore the in-use grace window. */
+export function setEvictionGraceMsForTests(ms: number): void { EVICTION_GRACE_MS = ms; }
+const lastUsedAt = new Map<string, number>();
+
 function evictLeastRecentlyUsedConnections(): void {
   while (openConnections.size > MAX_OPEN_LIBRARY_CONNECTIONS) {
-    const victim = [...openConnections.keys()].find((k) => k !== activeDbPath);
+    const victim = [...openConnections.keys()].find((k) => k !== activeDbPath && Date.now() - (lastUsedAt.get(k) ?? 0) > EVICTION_GRACE_MS);
     if (!victim) break; // everything left is the active library — nothing safe to evict
     try {
       openConnections.get(victim)?.close();
@@ -347,6 +356,7 @@ function evictLeastRecentlyUsedConnections(): void {
 }
 
 function openConnection(dbPath: string): DatabaseSync {
+  lastUsedAt.set(dbPath, Date.now());
   const existing = openConnections.get(dbPath);
   if (existing) {
     // Re-insert to move this key to the end (most-recently-used) — see MAX_OPEN_LIBRARY_CONNECTIONS.

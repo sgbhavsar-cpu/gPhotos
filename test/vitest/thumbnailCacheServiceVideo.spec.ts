@@ -9,6 +9,7 @@ import path from 'path';
 const FAKE_FRAME_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEUlEQVQImWPgEpHjEpFjgFAABk4A8YCCZIUAAAAASUVORK5CYII=';
 
 vi.mock('../../src/main/services/videoExportService', () => ({
+  probeCreationTime: vi.fn(async () => null),
   grabVideoFrame: vi.fn(async () => Buffer.from(FAKE_FRAME_BASE64, 'base64')),
   probeMedia: vi.fn(async () => ({ durationSec: 10, hasAudio: false, hasVideo: true })),
 }));

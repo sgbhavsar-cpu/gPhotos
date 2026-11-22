@@ -572,6 +572,13 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
     handleSyncStorage(newConfig);
   };
 
+  const [fixDatesMsg, setFixDatesMsg] = useState<Record<string, string>>({});
+  const handleFixDates = async (config: VirtualStorageConfig) => {
+    setFixDatesMsg((m) => ({ ...m, [config.id]: 'Fixing dates…' }));
+    const r = await window.electronAPI?.fixStorageDates?.({ localMirrorRoot: config.localMirrorRoot, name: config.name });
+    setFixDatesMsg((m) => ({ ...m, [config.id]: r?.error ? `Failed: ${r.error}` : `Checked ${(r?.checked ?? 0).toLocaleString()}, corrected ${(r?.fixed ?? 0).toLocaleString()} — reopen Photos to see new order` }));
+  };
+
   const handleSyncStorage = async (config: VirtualStorageConfig, forceRecount = false) => {
     if (!window.electronAPI || isSyncingRef.current) return;
 
@@ -1350,14 +1357,28 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                       ? prog.thumbnailCurrent
                       : (details?.thumbnailCachedCount !== undefined ? details.thumbnailCachedCount : (s.totalItems || 0));
                     const cachedThumbnails = totalPhotos > 0 ? Math.min(rawCached, totalPhotos) : rawCached;
-                    const isThumbActive = prog?.phase === 'thumbnails' || (isSyncing && activeSyncStorageId === s.id);
+                    // The 5 s totals refresh labels any storage with cached < total as 'thumbnails', which never
+                    // clears when some items can't be thumbnailed. The worker's own "Caching completed" log is the
+                    // real signal that it has run to the end (and it clears the moment new work is logged).
+                    const syncingThis = isSyncing && activeSyncStorageId === s.id;
+                    const ti = taskInfo[storageTaskKey(s.localMirrorRoot, s.name)];
+                    // The log is empty after a restart, so also treat "every photo already cached" as finished.
+                    const cachingDone = (!!ti?.done?.caching || (totalPhotos > 0 && cachedThumbnails >= totalPhotos)) && !syncingThis;
+                    const isThumbActive = (prog?.phase === 'thumbnails' && !cachingDone) || syncingThis;
 
                     // Face stats — how many photos have been SCANNED (x/y), separate from how many
                     // faces were FOUND across them (z) — the two numbers the old single-count
                     // "Faces Detected" display conflated.
                     const faceScanned = details?.faceScannedCount ?? prog?.faceCurrent ?? 0;
                     const facesDetected = details?.facesDetectedCount ?? 0;
-                    const isFaceActive = prog?.phase === 'faces';
+                    // phase 'faces' only means "caching done, faces not all scanned" — running means a face log line in the last minute.
+                    const isFaceActive = prog?.phase === 'faces' && Date.now() - (ti?.lastActive?.faces ?? 0) < 60_000;
+                    const faceSkipped = details?.faceSkippedCount ?? 0;
+                    const facesDone = !!ti?.done?.faces || (totalPhotos > 0 && faceScanned + faceSkipped >= totalPhotos);
+                    const faceWaiting = Math.max(0, totalPhotos - faceScanned - faceSkipped);
+                    const cacheFailed = ti?.cachingFailed ?? 0;
+                    const cacheWaiting = Math.max(0, totalPhotos - cachedThumbnails - cacheFailed);
+                    const n = (x: number) => x.toLocaleString();
 
                     // AI Description progress (docs/FEATURE_AI_AUTO_TAGGING.md) — out of this
                     // storage's own eligible (non-video) photo count, not the raw total.
@@ -1375,7 +1396,7 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                         padding: '14px 16px',
                       }}>
                         {/* Active Phase Banner (if active) */}
-                        {prog && prog.phase && prog.phase !== 'idle' && (
+                        {prog && prog.phase && prog.phase !== 'idle' && !(prog.phase === 'thumbnails' && cachingDone) && (
                           <div style={{
                             display: 'flex',
                             flexWrap: isMobile ? 'wrap' : 'nowrap',
@@ -1461,41 +1482,62 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                           <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
                             <Layers size={12} style={{ verticalAlign: '-2px', marginRight: '4px' }} />
                             {totalPhotos.toLocaleString()} total image{totalPhotos === 1 ? '' : 's'}
+                            <button
+                              className="btn btn-secondary"
+                              onClick={() => handleFixDates(s)}
+                              disabled={fixDatesMsg[s.id] === 'Fixing dates…'}
+                              title="Photos and videos with no embedded capture date were dated by when they were copied. This re-dates them from the date in the file name (or the video's own recording time)."
+                              style={{ padding: '1px 8px', fontSize: '0.68rem', marginLeft: 10 }}
+                            >Fix dates</button>
+                            {fixDatesMsg[s.id] && <span style={{ marginLeft: 8 }}>{fixDatesMsg[s.id]}</span>}
                           </div>
 
                           <StorageStatRow
                             icon={<Image size={14} />}
                             color="var(--accent-cyan)"
                             label="Caching"
-                            task={{ paused: isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'caching'), fault: taskInfo[storageTaskKey(s.localMirrorRoot, s.name)]?.faults?.caching, toggle: () => setTaskPaused(storageTaskKey(s.localMirrorRoot, s.name), 'caching', !isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'caching')) }}
+                            task={{ paused: isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'caching'), fault: taskInfo[storageTaskKey(s.localMirrorRoot, s.name)]?.faults?.caching, clearFault: () => void window.electronAPI?.setStorageTaskFault?.(storageTaskKey(s.localMirrorRoot, s.name), 'caching', undefined), toggle: () => setTaskPaused(storageTaskKey(s.localMirrorRoot, s.name), 'caching', !isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'caching')) }}
                             current={cachedThumbnails}
                             total={totalPhotos}
                             active={isThumbActive}
-                            finished={taskInfo[storageTaskKey(s.localMirrorRoot, s.name)]?.done?.caching
+                            doneWord="Cached"
+                            runNow={{ label: 'Cache now', title: 'Run a sync for this storage now — it caches the waiting photos and videos', fn: () => handleSyncStorage(s) }}
+                            detail={`${n(cachedThumbnails)} cached · ${n(cacheFailed)} can't be cached · ${n(cacheWaiting)} waiting`}
+                            failed={taskInfo[storageTaskKey(s.localMirrorRoot, s.name)]?.cachingFailed ?? 0}
+                            finished={cachingDone
                               ? (totalPhotos - cachedThumbnails > 0
                                 ? `Completed — everything possible is cached; ${(totalPhotos - cachedThumbnails).toLocaleString()} item${totalPhotos - cachedThumbnails === 1 ? '' : 's'} can't get a thumbnail (see Logs)`
                                 : 'Completed — all cached')
                               : undefined}
+                            onRescan={() => handleSyncStorage(s)}
                           />
                           <StorageStatRow
                             icon={<Users size={14} />}
                             color="#ec4899"
                             label="Face Detection"
-                            task={{ paused: isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'faces'), fault: taskInfo[storageTaskKey(s.localMirrorRoot, s.name)]?.faults?.faces, toggle: () => setTaskPaused(storageTaskKey(s.localMirrorRoot, s.name), 'faces', !isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'faces')) }}
+                            task={{ paused: isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'faces'), fault: taskInfo[storageTaskKey(s.localMirrorRoot, s.name)]?.faults?.faces, clearFault: () => void window.electronAPI?.setStorageTaskFault?.(storageTaskKey(s.localMirrorRoot, s.name), 'faces', undefined), toggle: () => setTaskPaused(storageTaskKey(s.localMirrorRoot, s.name), 'faces', !isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'faces')) }}
                             current={faceScanned}
                             total={totalPhotos}
                             active={isFaceActive}
                             suffix={`${facesDetected.toLocaleString()} face${facesDetected === 1 ? '' : 's'} found`}
-                            finished={taskInfo[storageTaskKey(s.localMirrorRoot, s.name)]?.done?.faces ? 'Completed — nothing more to scan' : undefined}
+                            skipped={faceSkipped}
+                            skippedWord="Videos skipped"
+                            detail={`${n(faceScanned)} scanned · ${n(faceSkipped)} video${faceSkipped === 1 ? '' : 's'} skipped (no face scan) · ${n(faceWaiting)} waiting${isFaceActive ? '' : ' — not running right now'}`}
+                            runNow={{ label: 'Scan now', title: 'Run a sync for this storage now — it also scans the waiting photos for faces', fn: () => handleSyncStorage(s) }}
+                            finished={facesDone ? (faceSkipped > 0 ? `Completed — ${n(faceSkipped)} video${faceSkipped === 1 ? '' : 's'} skipped (not scanned for faces)` : 'Completed — nothing more to scan') : undefined}
+                            onRescan={() => handleSyncStorage(s)}
                           />
                           <StorageStatRow
                             icon={<Sparkles size={14} />}
                             color="#a855f7"
                             label="AI Description"
-                            task={{ paused: isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'ai'), fault: taskInfo[storageTaskKey(s.localMirrorRoot, s.name)]?.faults?.ai, toggle: () => setTaskPaused(storageTaskKey(s.localMirrorRoot, s.name), 'ai', !isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'ai')) }}
+                            task={{ paused: isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'ai'), fault: taskInfo[storageTaskKey(s.localMirrorRoot, s.name)]?.faults?.ai, clearFault: () => void window.electronAPI?.setStorageTaskFault?.(storageTaskKey(s.localMirrorRoot, s.name), 'ai', undefined), toggle: () => setTaskPaused(storageTaskKey(s.localMirrorRoot, s.name), 'ai', !isTaskPausedForKey(storageTaskKey(s.localMirrorRoot, s.name), 'ai')) }}
                             current={aiCaptioned}
                             total={aiTotal}
                             active={false}
+                            detail={aiTotal > 0 ? `${n(aiCaptioned)} described · ${n(Math.max(0, aiTotal - aiCaptioned))} waiting${ti?.faults?.ai ? ' — ' + ti.faults.ai : ''}` : undefined}
+                            finished={aiTotal > 0 && aiCaptioned >= aiTotal ? 'Completed — every photo is described' : undefined}
+                            onRescan={() => handleSyncStorage(s)}
                           />
                         </div>
                       </div>
@@ -1780,11 +1822,31 @@ const StorageStatRow: React.FC<{
   total: number;
   active?: boolean;
   suffix?: string;
-  task?: { paused: boolean; fault?: string; toggle: () => void };
+  task?: { paused: boolean; fault?: string; clearFault?: () => void; toggle: () => void };
   /** Set when the task has run to the end: shown under the row so "less than 100%" reads as "done, nothing more is possible". */
   finished?: string;
-}> = ({ icon, color, label, current, total, active, suffix, task, finished }) => {
+  /** Items that failed (red segment). Pending = whatever is neither done nor failed. */
+  failed?: number;
+  doneWord?: string;
+  /** When the task is finished, the Pause button turns into Rescan (re-checks the network folder for new photos). */
+  onRescan?: () => void;
+  /** Items deliberately not processed (e.g. videos for face detection): grey segment, not counted as waiting. */
+  skipped?: number;
+  skippedWord?: string;
+  /** One plain-language line of exact numbers shown under the row while work remains. */
+  detail?: string;
+  /** Extra "do it now" button, shown while work remains and the task is idle. */
+  runNow?: { label: string; title: string; fn: () => void };
+}> = ({ icon, color, label, current, total, active, suffix, task, finished, failed = 0, doneWord = 'Done', onRescan, skipped = 0, skippedWord = 'Skipped', detail, runNow }) => {
+  const isFinished = !!finished && !active && !task?.paused && !task?.fault;
   const pct = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0;
+  const failedN = Math.min(failed, Math.max(0, total - current));
+  const failedPct = total > 0 ? (failedN / total) * 100 : 0;
+  const skippedN = Math.min(skipped, Math.max(0, total - current - failedN));
+  const skippedPct = total > 0 ? (skippedN / total) * 100 : 0;
+  const pending = Math.max(0, total - current - failedN - skippedN);
+  const pctOf = (n: number) => (total > 0 ? ` (${((n / total) * 100).toFixed(1)}%)` : '');
+  const breakdown = `${doneWord}: ${current.toLocaleString()}${pctOf(current)}\nFailed / can't process: ${failedN.toLocaleString()}${pctOf(failedN)}${skippedN > 0 ? `\n${skippedWord}: ${skippedN.toLocaleString()}${pctOf(skippedN)}` : ''}\nPending: ${pending.toLocaleString()}${pctOf(pending)}\nTotal: ${total.toLocaleString()}`;
   return (
     <div>
     <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
@@ -1793,8 +1855,10 @@ const StorageStatRow: React.FC<{
         <span style={{ fontSize: '0.78rem', fontWeight: 600 }}>{label}</span>
         {active && <RefreshCw size={11} className="animate-spin" />}
       </div>
-      <div style={{ flex: 1, height: '6px', borderRadius: 'var(--radius-full)', backgroundColor: 'rgba(255,255,255,0.08)', overflow: 'hidden' }}>
-        <div style={{ width: `${pct}%`, height: '100%', backgroundColor: color, borderRadius: 'var(--radius-full)', transition: 'width 0.3s ease' }} />
+      <div title={breakdown} style={{ flex: 1, height: '6px', borderRadius: 'var(--radius-full)', backgroundColor: 'rgba(255,255,255,0.08)', overflow: 'hidden', display: 'flex', cursor: 'help' }}>
+        <div style={{ width: `${pct}%`, height: '100%', backgroundColor: color, transition: 'width 0.3s ease' }} />
+        {failedPct > 0 && <div style={{ width: `${failedPct}%`, height: '100%', backgroundColor: '#ef4444', transition: 'width 0.3s ease' }} />}
+        {skippedPct > 0 && <div style={{ width: `${skippedPct}%`, height: '100%', backgroundColor: '#64748b', transition: 'width 0.3s ease' }} />}
       </div>
       <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem', fontWeight: 700, color: 'var(--text-primary)', whiteSpace: 'nowrap', flexShrink: 0 }}>
         {current.toLocaleString()}/{total.toLocaleString()}
@@ -1804,20 +1868,44 @@ const StorageStatRow: React.FC<{
           · {suffix}
         </span>
       )}
-      {task && (
+      {runNow && !isFinished && !active && pending > 0 && !task?.paused && !task?.fault && (
         <button
           className="btn btn-secondary"
-          onClick={task.toggle}
-          title={task.fault ? `Fault: ${task.fault}. Click to ${task.paused ? 'run' : 'pause'}.` : task.paused ? `${label} paused — click to run` : `${label} running — click to pause`}
+          onClick={runNow.fn}
+          title={runNow.title}
+          style={{ padding: '2px 8px', fontSize: '0.72rem', gap: '4px', flexShrink: 0, justifyContent: 'center' }}
+        >
+          <Play size={11} />
+          <span>{runNow.label}</span>
+        </button>
+      )}
+      {task && isFinished && onRescan ? (
+        <button
+          className="btn btn-secondary"
+          onClick={onRescan}
+          title="Everything possible is done — rescan the network folder for new photos"
+          style={{ padding: '2px 8px', fontSize: '0.72rem', gap: '4px', flexShrink: 0, minWidth: 64, justifyContent: 'center' }}
+        >
+          <RefreshCw size={11} />
+          <span>Rescan</span>
+        </button>
+      ) : task && (
+        <button
+          className="btn btn-secondary"
+          onClick={() => { if (task.fault) { task.clearFault?.(); if (!task.paused) { runNow?.fn(); return; } } task.toggle(); }}
+          title={task.fault ? `Fault: ${task.fault}. Click to clear it and retry.` : task.paused ? `${label} paused — click to run` : `${label} running — click to pause`}
           style={{ padding: '2px 8px', fontSize: '0.72rem', gap: '4px', flexShrink: 0, minWidth: 64, justifyContent: 'center', ...(task.fault ? { color: '#f59e0b', borderColor: '#f59e0b' } : {}) }}
         >
           {task.fault ? <span style={{ fontWeight: 800 }}>?</span> : task.paused ? <Play size={11} /> : <Pause size={11} />}
-          <span>{task.fault ? 'Fault' : task.paused ? 'Run' : 'Pause'}</span>
+          <span>{task.fault ? 'Retry' : task.paused ? 'Run' : 'Pause'}</span>
         </button>
       )}
     </div>
-    {finished && !active && !task?.paused && !task?.fault && (
+    {isFinished && (
       <div style={{ fontSize: '0.7rem', color: '#10b981', marginTop: 3, marginLeft: 160 }}>✓ {finished}</div>
+    )}
+    {!isFinished && detail && (
+      <div style={{ fontSize: '0.7rem', color: task?.fault ? '#f59e0b' : 'var(--text-muted)', marginTop: 3, marginLeft: 160 }}>{detail}</div>
     )}
     </div>
   );

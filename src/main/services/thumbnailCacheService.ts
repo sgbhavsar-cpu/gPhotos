@@ -19,6 +19,8 @@ const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm', '.wmv
 // videos show the generic placeholder and cloud-only videos are never downloaded just for a thumbnail.
 let videoFrameCaptureEnabled = true;
 export function setVideoFrameCaptureEnabled(on: boolean): void { videoFrameCaptureEnabled = on; }
+/** Why the most recent getOrGenerateCachedThumbnail returned null (diagnostics for the caching log). */
+export let lastThumbnailFailReason = '';
 export function isVideoFrameCaptureEnabled(): boolean { return videoFrameCaptureEnabled; }
 
 let sharp: any = null;
@@ -124,12 +126,13 @@ export async function getOrGenerateCachedThumbnail(
   targetSize: number = 250
 ): Promise<ThumbnailResult | null> {
   if (!sourcePath) return null;
-  if (!videoFrameCaptureEnabled && VIDEO_EXTENSIONS.has(path.extname(sourcePath).toLowerCase())) return null;
+  if (!videoFrameCaptureEnabled && VIDEO_EXTENSIONS.has(path.extname(sourcePath).toLowerCase())) { lastThumbnailFailReason = 'video frame capture is turned off in Settings'; return null; }
 
   let stat: fs.Stats;
   try {
     stat = await fs.promises.stat(sourcePath);
-  } catch {
+  } catch (e) {
+    lastThumbnailFailReason = `cannot open source file (${(e as any)?.code ?? e})`;
     return null;
   }
 
@@ -202,6 +205,7 @@ export async function getOrGenerateCachedThumbnail(
           // Couldn't extract a frame at all (corrupt/unreadable video) — nothing else below can
           // help either (HEIC/sharp-from-path/nativeImage all expect an actual image file), so
           // give up cleanly rather than falling through to try to decode the video as an image.
+          lastThumbnailFailReason = 'ffmpeg could not extract a frame from this video';
           return null;
         }
       }
@@ -478,16 +482,25 @@ export async function rotateCachedHeicThumbnail(
   const root = getGlobalCacheDir();
   const knownSizes = [150, 200, 250, 300, 500, 1600];
 
+  // Per-step timings, logged only when the whole rotate is slow, so a freeze can be traced to one step.
+  const t0 = Date.now();
+  let tLast = t0;
+  const marks: string[] = [];
+  const mark = (step: string) => { const n = Date.now(); marks.push(`${step}=${n - tLast}ms`); tLast = n; };
+
   // 1. Record the delta once per path (see addSavedRotation: per-path saves double-counted the original).
   totalRotation = addSavedRotation(Array.from(pathsToRotate), degrees).get(sourcePath) ?? 0;
+  mark('saveRotation');
 
   for (const target of pathsToRotate) {
+    const tag = path.basename(target).slice(0, 18);
     // 2. Rotate all existing cached thumbnail files in cache/thumbnails/{size}/{cacheKey}.jpg
     let stat: fs.Stats | null = null;
     try {
       stat = await fs.promises.stat(target);
     } catch {}
 
+    mark(`${tag}:stat`);
     if (stat) {
       for (const size of knownSizes) {
         const cacheKey = getCacheKey(target, stat.mtimeMs, size);
@@ -510,6 +523,7 @@ export async function rotateCachedHeicThumbnail(
       }
     }
 
+    mark(`${tag}:cachedTiers`);
     // 3. Rotate 500px thumbnail in heicService
     try {
       await rotateHeic500Thumbnail(target, degrees);
@@ -517,13 +531,16 @@ export async function rotateCachedHeicThumbnail(
       console.warn('[ThumbnailCache] Failed to rotate heicService thumbnail:', err);
     }
 
+    mark(`${tag}:heic500`);
     // 4. Pre-generate and cache 250px and 500px thumbnails immediately so they exist rotated
     try {
       await getOrGenerateCachedThumbnail(target, 250);
       await getOrGenerateCachedThumbnail(target, 500);
     } catch {}
+    mark(`${tag}:regen250+500`);
   }
 
+  if (Date.now() - t0 > 1500) console.warn(`[rotateCachedHeicThumbnail] slow rotate (${Date.now() - t0}ms): ${marks.join(' ')}`);
   return totalRotation;
 }
 

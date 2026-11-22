@@ -205,15 +205,15 @@ describe('AlbumsView grids are windowed but every photo stays reachable', () => 
     click(byText(host, 'h3, h2, h4, div', 'Big Album'));
     await flush();
 
-    const names = () => Array.from(host.querySelectorAll('img')).map((i) => i.getAttribute('alt')!);
+    const names = () => Array.from(host.querySelectorAll('[data-album-photo-id]')).map((e) => e.getAttribute('data-album-photo-id')!);
     expect(names().length).toBeGreaterThan(0);
     expect(names().length).toBeLessThan(120); // was 500 + "Show more"
-    expect(names()).toContain('photo-0.jpg');
+    expect(names()).toContain('a0');
     expect(host.textContent).not.toContain('Show more');
 
-    const scroller = Array.from(host.querySelectorAll<HTMLElement>('div')).filter(isScroller).find((d) => d.querySelector('img'))!;
+    const scroller = Array.from(host.querySelectorAll<HTMLElement>('div')).filter(isScroller).find((d) => d.querySelector('[data-album-photo-id]'))!;
     await scrollToEnd(scroller);
-    expect(names()).toContain('photo-2999.jpg');
+    expect(names()).toContain('a2999');
     expect(names().length).toBeLessThan(120);
   });
 

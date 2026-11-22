@@ -225,6 +225,13 @@ export async function detectFacesForPhoto(
     return { ran: false, faceCount: existing?.faces?.length || 0, locked: true, skippedReason: 'locked' };
   }
 
+  // Videos have no face scan: reading one whole (GoPro files are GBs, and a OneDrive read hydrates
+  // it) is pointless and fails past 2 GiB. They stay faceScanCompleted=false → "videos skipped".
+  if (/\.(mp4|mov|avi|mkv|webm|wmv|m4v)$/i.test(sourceFilePath)) {
+    upsertPhoto(working, db);
+    return { ran: false, faceCount: 0, locked: false, skippedReason: 'unchanged' };
+  }
+
   // Change-detection skip: the source file's size and modified-time are
   // captured every time it's actually read (see processOneMirrorFile in
   // virtualMirrorService.ts, which stats the file unconditionally on every

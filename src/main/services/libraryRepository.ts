@@ -48,7 +48,8 @@ function rowToPhoto(row: any): Photo {
     isHeicRotated: toBool(row.is_heic_rotated),
     heicRotation: row.heic_rotation ?? undefined,
     originalMtimeMs: row.original_mtime_ms ?? undefined,
-    isVideo: toBool(row.is_video),
+    // Rows saved before video support have is_video=0 for .mp4 etc. — the extension is the source of truth.
+    isVideo: toBool(row.is_video) || /\.(mp4|mov|avi|mkv|webm|wmv|m4v)$/i.test(row.file_name || row.file_path || ''),
     videoDurationSec: row.video_duration_sec ?? undefined,
   };
   const exif = parseJson<ExifMetadata | null>(row.exif_json, null);
@@ -214,6 +215,16 @@ export function getFaceStatsForLibrary(libraryDir: string): {
  * network storage (VirtualStorageView.tsx / Sidebar.tsx) and in Settings, alongside the existing
  * thumbnail-cache and face-scan counts from getFaceStatsForLibrary.
  */
+/** Videos never go through face detection, so any still-unscanned video is "skipped", not "waiting". */
+export function getSkippedVideoCountForLibrary(libraryDir: string): number {
+  try {
+    const row = getDbForLibraryPath(libraryDir).prepare('SELECT COUNT(*) as c FROM photos WHERE is_video = 1 AND face_scan_completed = 0').get() as any;
+    return row?.c ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
 export function getCaptionStatsForLibrary(libraryDir: string): {
   captionEligibleCount: number;
   captionedCount: number;

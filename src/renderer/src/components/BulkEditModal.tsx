@@ -5,6 +5,7 @@ import { libraryStore } from '../services/libraryStore';
 import { notify, notifyError } from '../services/notifications';
 import { LocationPickerModal } from './LocationPickerModal';
 import { setCaptionAndTags } from '../services/photoContentCache';
+import { DatesFromNamesModal } from './DatesFromNamesModal';
 
 interface BulkEditModalProps {
   photos: Photo[];
@@ -24,6 +25,7 @@ interface BulkEditModalProps {
 export const BulkEditModal: React.FC<BulkEditModalProps> = ({ photos, onClose }) => {
   const [applyDate, setApplyDate] = useState(false);
   const [dateInput, setDateInput] = useState('');
+  const [showNameDates, setShowNameDates] = useState(false);
   const [applyLocation, setApplyLocation] = useState(false);
   const [locationInput, setLocationInput] = useState('');
   const [pickedLatLng, setPickedLatLng] = useState<{ lat: number; lng: number } | null>(null);
@@ -210,6 +212,19 @@ export const BulkEditModal: React.FC<BulkEditModalProps> = ({ photos, onClose })
             )}
           </div>
 
+          {/* Date from file names: opens a review list */}
+          <div>
+            <button
+              className="btn btn-secondary"
+              onClick={() => setShowNameDates(true)}
+              style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.85rem', fontWeight: 600, width: '100%', justifyContent: 'flex-start' }}
+              title="Read the date and time from each file's name (20240608_165442…, IMG-20240727-WA…) and review before applying"
+            >
+              <Calendar size={14} />
+              <span>Set Date &amp; Time from file names…</span>
+            </button>
+          </div>
+
           {/* Location section */}
           <div>
             <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.85rem', fontWeight: 600, marginBottom: '8px', cursor: 'pointer' }}>
@@ -326,6 +341,8 @@ export const BulkEditModal: React.FC<BulkEditModalProps> = ({ photos, onClose })
           </button>
         </div>
       </div>
+
+      {showNameDates && <DatesFromNamesModal photos={photos} onClose={() => setShowNameDates(false)} onDone={onClose} />}
 
       {showLocationPicker && (
         <LocationPickerModal

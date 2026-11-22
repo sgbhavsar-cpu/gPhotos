@@ -559,6 +559,7 @@ export interface IElectronAPI {
   saveLibraryData: (key: string, data: any) => Promise<boolean>;
   loadLibraryData: (key: string, libraryDir?: string, options?: { includePhotos?: boolean; compactDescriptors?: boolean }) => Promise<any>;
   syncVirtualStorage: (config: VirtualStorageConfig) => Promise<SyncVirtualStorageResult>;
+  fixStorageDates?: (config: { localMirrorRoot: string; name: string }) => Promise<{ checked: number; fixed: number; error?: string }>;
   scanVirtualMirror: (mirrorDirPath: string) => Promise<Photo[]>;
   discoverMirrors: (rootPath?: string) => Promise<VirtualStorageConfig[]>;
   getDefaultMirrorRoot?: () => Promise<string>;
@@ -586,7 +587,7 @@ export interface IElectronAPI {
   setStorageTaskPaused?: (key: string, task: string, paused: boolean) => Promise<void>;
   setStorageTaskFault?: (key: string, task: string, message?: string) => Promise<void>;
   logStorageTask?: (key: string, task: string, level: string, message: string) => Promise<void>;
-  getStorageTaskInfo?: (key: string, networkSourcePath: string) => Promise<{ paused: string[]; faults: Record<string, string>; online: boolean; done?: Record<string, string | undefined> }>;
+  getStorageTaskInfo?: (key: string, networkSourcePath: string) => Promise<{ paused: string[]; faults: Record<string, string>; online: boolean; done?: Record<string, string | undefined>; cachingFailed?: number; lastActive?: Record<string, number | undefined> }>;
   getStorageTaskLogs?: (key: string, task?: string) => Promise<Array<{ ts: number; task: string; level: string; message: string }>>;
   registerStorageTaskKeys?: (keys: string[]) => Promise<void>;
   countStorageMirrorMedia?: (mirrorDir: string) => Promise<{ images: number; videos: number }>;
@@ -778,6 +779,8 @@ export interface StorageDetails {
   faceScannedCount: number;
   faceTotalCount: number;
   facesDetectedCount: number;
+  /** Unscanned videos — face detection deliberately skips them, so they don't count as "waiting". */
+  faceSkippedCount?: number;
   // AI Description progress (docs/FEATURE_AI_AUTO_TAGGING.md) — how many of this storage's
   // (non-video) photos have an AI caption/tag recorded, from the background auto-tagging pass or
   // any Smart Flow run. Purely informational: unlike thumbnails/faces, this never affects `phase`/

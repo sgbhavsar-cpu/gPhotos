@@ -4,6 +4,7 @@ import os from 'os';
 import path from 'path';
 
 vi.mock('../../src/main/services/videoExportService', () => ({
+  probeCreationTime: vi.fn(async () => null),
   probeMedia: vi.fn(async () => ({ durationSec: 7.5, hasAudio: true, hasVideo: true })),
 }));
 
@@ -32,7 +33,8 @@ describe('scanPhotoDirectory: videos are scanned alongside photos', () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gphotos-scan-test-'));
   });
   afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
+    // Windows can still hold the scanned file for a moment; a leftover temp dir is harmless.
+    try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* ignore */ }
   });
 
   it('a video gets isVideo:true and a probed duration; a photo gets neither', async () => {

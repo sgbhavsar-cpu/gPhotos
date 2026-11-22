@@ -38,7 +38,8 @@ import {
   getAllStorageDetailsFast,
   confirmAllStorageDetailsPhysical,
   syncOnePhoto,
-  scanStorageInventory
+  scanStorageInventory,
+  fixStorageDates
 } from './services/virtualMirrorService';
 import { Photo, OrganizeOptions, VirtualStorageConfig, EditPhotoOptions, BackgroundServiceSettings, OrientationInput, OrientationResult, RelocationPhotoInput } from '../types';
 import {
@@ -74,7 +75,7 @@ import {
   revokeAllDevices,
   flushWebAuthConfig,
 } from './services/webAuthService';
-import { getOrGenerateCachedThumbnail, refreshThumbnailsFromSource } from './services/thumbnailCacheService';
+import { getOrGenerateCachedThumbnail, refreshThumbnailsFromSource, isVideoFrameCaptureEnabled } from './services/thumbnailCacheService';
 import {
   getCatalogMeta,
   getCatalogPage,
@@ -1094,6 +1095,15 @@ ipcMain.handle('fs:browse-directory', async (_event, targetPath?: string) => {
   return browseDirectory(targetPath);
 });
 
+ipcMain.handle('mirror:fix-dates', async (_event, config: { localMirrorRoot: string; name: string }) => {
+  try {
+    return await fixStorageDates(config);
+  } catch (err) {
+    console.error('mirror:fix-dates error:', err);
+    return { checked: 0, fixed: 0, error: String(err) };
+  }
+});
+
 ipcMain.handle('mirror:get-storage-checkpoints', async (_event, mirrorRoot?: string) => {
   try {
     return getAllStorageCheckpoints(mirrorRoot);
@@ -2102,9 +2112,13 @@ ipcMain.handle('storageTasks:log', (_e, key: string, task: StorageTask, level: T
 ipcMain.handle('storageTasks:get', async (_e, key: string, networkSourcePath: string) => ({
   ...getTaskControl(key),
   online: await isPathReachable(networkSourcePath),
+  cachingFailed: thumbnailWorker.failedCountUnder(key, networkSourcePath),
+  // Timestamp of each task's newest real work line — lets the card tell "running now" from "just not finished".
+  lastActive: Object.fromEntries((['caching', 'faces'] as StorageTask[]).map((t) => [t, getTaskLogs(key, t).filter((l) => !l.message.startsWith('Periodic scan')).slice(-1)[0]?.ts])),
   // A task is "finished" while its newest log line is its own "… completed: …" summary (a later entry means it's working again).
   done: Object.fromEntries((['caching', 'faces'] as StorageTask[]).map((t) => {
-    const last = getTaskLogs(key, t).slice(-1)[0];
+    // "Periodic scan" lines are informational and must not flip a finished task back to "working".
+    const last = getTaskLogs(key, t).filter((l) => !l.message.startsWith('Periodic scan')).slice(-1)[0];
     return [t, last && /completed:/.test(last.message) ? last.message : undefined];
   })) as Partial<Record<StorageTask, string>>,
 }));
@@ -2140,6 +2154,7 @@ ipcMain.handle(
   ) => {
     try {
       assertPathsAllowed([params?.filePath, params?.originalRemotePath].filter(Boolean), 'photo:rotate');
+      console.log(`[photo:rotate] ${params.rotationDegrees}° local=${params.filePath} remote=${params.originalRemotePath ?? '-'}`);
       const res = await rotatePhotoWithOfflineQueue({
         localFilePath: params.filePath,
         originalRemotePath: params.originalRemotePath,
@@ -2400,6 +2415,7 @@ ipcMain.handle('faces:unload-idle-workers', async () => {
 // protocol handler above), falling back to `originalRemotePath`.
 ipcMain.handle('video:get-preview', async (_event, filePath: string, originalRemotePath?: string) => {
   try {
+    if (!isVideoFrameCaptureEnabled()) return { error: 'Video previews are turned off in Settings.' };
     const appOwnedRoots = [app.getPath('userData'), getDefaultMirrorRoot()];
     const source = (originalRemotePath && !(await isPathReachableForServing(filePath, appOwnedRoots)) && (await isPathReachableForServing(originalRemotePath, appOwnedRoots)))
       ? originalRemotePath
