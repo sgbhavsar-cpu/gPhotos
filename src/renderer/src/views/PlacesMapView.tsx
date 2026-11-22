@@ -709,7 +709,7 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
         onKeyDown={(e) => e.stopPropagation()}
         placeholder="Search places..."
         className="input"
-        style={{ width: '100%', fontSize: '0.82rem', padding: '6px 10px 6px 30px' }}
+        style={{ width: '100%', fontSize: isMobile ? '1rem' : '0.82rem', padding: isMobile ? '10px 10px 10px 30px' : '6px 10px 6px 30px' }}
       />
     </div>
   ) : null;

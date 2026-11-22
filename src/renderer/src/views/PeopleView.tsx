@@ -1204,7 +1204,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
         onKeyDown={(e) => e.stopPropagation()}
         placeholder="Search people by name..."
         className="input"
-        style={{ width: '100%', fontSize: '0.82rem', padding: '6px 10px 6px 30px' }}
+        style={{ width: '100%', fontSize: isMobile ? '1rem' : '0.82rem', padding: isMobile ? '10px 10px 10px 30px' : '6px 10px 6px 30px' }}
       />
     </div>
   ) : null;
@@ -1590,7 +1590,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                       </span>
                       <button
                         className="btn btn-ghost btn-icon"
-                        style={{ width: '30px', height: '30px', padding: 0 }}
+                        style={{ width: isMobile ? '40px' : '30px', height: isMobile ? '40px' : '30px', padding: 0 }}
                         onClick={(e) => handleStartRename(person, e)}
                         title="Rename"
                       >
@@ -1628,7 +1628,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                       )}
                       <button
                         className="btn btn-ghost btn-icon"
-                        style={{ width: '24px', height: '24px', padding: 0, color: 'var(--accent-rose)' }}
+                        style={{ width: isMobile ? '40px' : '24px', height: isMobile ? '40px' : '24px', padding: 0, color: 'var(--accent-rose)' }}
                         onClick={(e) => handleDeletePerson(person.id, person.name, e)}
                         title={`Delete ${person.name} and unassign all detections`}
                       >

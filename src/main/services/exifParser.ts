@@ -3,7 +3,7 @@ import path from 'path';
 import exifr from 'exifr';
 import { ExifMetadata, LocationMetadata } from '../../types';
 import { dateFromFileName } from '../../types/dateFromFileName';
-import { probeCreationTime } from './videoExportService';
+import { probeCreationTime, probeLocation } from './videoExportService';
 
 const VIDEO_RE = /\.(mp4|mov|avi|mkv|webm|wmv|m4v)$/i;
 
@@ -188,6 +188,23 @@ export async function parsePhotoMetadata(filePath: string): Promise<{
     }
   } catch (err) {
     // Non-fatal, fallback to filesystem metadata
+  }
+
+  // Videos carry their GPS in the container (not EXIF), so exifr finds none: read it from there.
+  if (!locationData && VIDEO_RE.test(filePath)) {
+    try {
+      const pos = await probeLocation(filePath);
+      if (pos) {
+        const approx = findApproximateLocation(pos.latitude, pos.longitude);
+        locationData = {
+          latitude: Number(pos.latitude.toFixed(6)),
+          longitude: Number(pos.longitude.toFixed(6)),
+          city: approx.city,
+          country: approx.country,
+          label: approx.city ? `${approx.city}, ${approx.country}` : approx.country,
+        };
+      }
+    } catch { /* no GPS for this video */ }
   }
 
   // Fallback to the file's modified time if no EXIF date — NOT its creation

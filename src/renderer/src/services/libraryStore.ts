@@ -782,7 +782,7 @@ export class LibraryManager {
       // 2. Web Browser Fast-Path over HTTP
       if (typeof window !== 'undefined' && window.location?.protocol?.startsWith('http')) {
         try {
-          const metaRes = await authFetch('/api/catalog-meta', { signal: AbortSignal.timeout(1500) });
+          const metaRes = await authFetch('/api/catalog-meta', { signal: AbortSignal.timeout(20_000) });
           if (metaRes.ok) {
             const meta: CatalogMeta = await metaRes.json();
             if (meta && meta.totalPhotos > 0) {
@@ -794,7 +794,7 @@ export class LibraryManager {
               this.state.recentLibraries = meta.recentLibraries || [];
 
               const libraryDirParam = this.state.selectedFolder ? `&libraryDir=${encodeURIComponent(this.state.selectedFolder)}` : '';
-              const pageRes = await authFetch(`/api/catalog-page?page=0&size=100${libraryDirParam}`, { signal: AbortSignal.timeout(2000) });
+              const pageRes = await authFetch(`/api/catalog-page?page=0&size=100${libraryDirParam}`, { signal: AbortSignal.timeout(20_000) });
               if (pageRes.ok) {
                 const pageData = await pageRes.json();
                 if (pageData && pageData.photos && pageData.photos.length > 0) {
@@ -802,8 +802,10 @@ export class LibraryManager {
                   this.stampPersisted(pageData.photos, true);
                   this.currentCatalogPage = 0;
                   try {
-                    const libDirParam = this.state.selectedFolder ? `?libraryDir=${encodeURIComponent(this.state.selectedFolder)}` : '';
-                    const libRes = await authFetch(`/api/library${libDirParam}`, { signal: AbortSignal.timeout(2000) });
+                    // Photos arrive page by page (above/below): ask only for people/faces/albums — the full
+                    // library is too large to send as one JSON document — and allow time for the faces.
+                    const libDirParam = `?includePhotos=false${this.state.selectedFolder ? `&libraryDir=${encodeURIComponent(this.state.selectedFolder)}` : ''}`;
+                    const libRes = await authFetch(`/api/library${libDirParam}`, { signal: AbortSignal.timeout(60_000) });
                     if (libRes.ok) {
                       const full = await libRes.json();
                       const libData = full[STORAGE_KEY] || full;

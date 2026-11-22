@@ -439,13 +439,19 @@ export interface RelocationItemResult {
 export type VideoAspectRatio = '16:9' | '9:16' | '1:1' | '4:3';
 export type VideoResolutionTier = '720p' | '1080p';
 export type VideoQuality = 'draft' | 'good' | 'best';
-export type VideoTransition = 'none' | 'fade' | 'wipeleft' | 'wiperight' | 'slideup' | 'slidedown' | 'circleopen' | 'dissolve';
+export type VideoTransition = import('./videoFormat').VideoTransitionName;
 export type VideoCollageStyle = 'grid' | 'sideBySide' | 'stacked' | 'featured';
 
 export interface VideoSlideInput {
-  kind: 'photo' | 'collage' | 'title' | 'card';
+  kind: 'photo' | 'collage' | 'title' | 'card' | 'clip';
   /** Readable local file paths — 1 for 'photo', up to 4 for 'collage' (extra ones are ignored), unused for 'title'. */
   photoPaths?: string[];
+  /** For 'clip' (an album video used as part of the output): source file, the part to keep, and its own sound. */
+  clipPath?: string;
+  trimStartSec?: number;
+  trimEndSec?: number | null;
+  muted?: boolean;
+  volume?: number;
   /** Layout for a 'collage' slide (default 'grid'). */
   collageStyle?: VideoCollageStyle;
   /** For 'card': the finished title / end-credits picture from the wizard's designer, as a data: URL. */

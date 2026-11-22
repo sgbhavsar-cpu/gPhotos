@@ -40,6 +40,7 @@ import {
   AlertCircle,
   Cloud,
   CloudOff,
+  Download,
   MoreVertical,
   BookImage,
   Star
@@ -59,7 +60,7 @@ import { SetCoverPhotoModal } from './SetCoverPhotoModal';
 import { afterPhotoRotated } from '../services/photoRotation';
 import { bumpImageVersion } from '../services/imageVersion';
 import { evictAndRefreshThumbnail, invalidateSpriteCoordinate } from '../services/asyncImageLoader';
-import { authFetch } from '../services/webAuthClient';
+import { authFetch, appendAuthToken, isBrowserMode } from '../services/webAuthClient';
 import { isOneDriveBackedPath } from '../services/storageValidation';
 import { logger } from '../services/logger';
 import { deleteFilesWithProgress } from '../services/deleteProgress';
@@ -132,6 +133,31 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   // behind the panel the instant the lightbox opens, so mobile starts closed.
   const [showInfo, setShowInfo] = useState(!isMobile);
   const [videoFailed, setVideoFailed] = useState(false);
+  // Phone browsers: the system Back button / back-swipe closes the viewer (instead of leaving the app) — the viewer
+  // takes one history entry while it is open.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  useEffect(() => {
+    if (!isBrowserMode()) return;
+    let closedByBack = false;
+    history.pushState({ gphotosLightbox: true }, '');
+    const onPop = () => { closedByBack = true; onCloseRef.current(); };
+    window.addEventListener('popstate', onPop);
+    return () => {
+      window.removeEventListener('popstate', onPop);
+      if (!closedByBack && history.state?.gphotosLightbox) history.back(); // closed some other way: drop our entry
+    };
+  }, []);
+  // In a browser (a phone over the LAN) a video is streamed as HLS that the PC cuts and converts on the fly from the
+  // original file; players without native HLS (desktop Chrome/Firefox) get the original file directly instead.
+  const videoSrc = (() => {
+    if (!photo.isVideo) return '';
+    const direct = getLocalPhotoUrl(photo.filePath, photo.originalRemotePath, true, 0);
+    if (!isBrowserMode() || typeof document === 'undefined' || !document.createElement('video').canPlayType('application/vnd.apple.mpegurl')) return direct;
+    const q = new URLSearchParams({ path: photo.filePath });
+    if (photo.originalRemotePath) q.set('originalPath', photo.originalRemotePath);
+    return appendAuthToken('/api/video/hls?' + q.toString());
+  })();
   useEffect(() => setVideoFailed(false), [photo.id]);
   const [showMobileActions, setShowMobileActions] = useState(false);
   // Default off: face marker boxes are an opt-in overlay, not something every photo should open with.
@@ -363,7 +389,14 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   const [isOriginalAvailable, setIsOriginalAvailable] = useState<boolean | null>(null);
   const [isLightboxImgLoaded, setIsLightboxImgLoaded] = useState(false);
   const [lightboxImgError, setLightboxImgError] = useState(false);
-  const [fallbackToThumbnail, setFallbackToThumbnail] = useState(false);
+  // A browser session starts on the user's remembered choice (preview on a phone by default) so the first photo does not
+  // load the full-resolution original just to be replaced by the preview a moment later.
+  const [fallbackToThumbnail, setFallbackToThumbnail] = useState(() => {
+    if (!isBrowserMode()) return false;
+    let saved: string | null = null;
+    try { saved = localStorage.getItem('gphotos_viewer_quality'); } catch {}
+    return saved ? saved === 'preview' : isMobile;
+  });
 
   // OneDrive roots, fetched once — used to default a OneDrive-backed photo
   // to its cached thumbnail instead of the full-resolution original, so
@@ -374,6 +407,46 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   // remember their choice across next/prev navigation instead of resetting
   // to the OneDrive-backed default on every photo change.
   const userFallbackPreference = useRef<boolean | null>(null);
+  // In a phone / browser session the choice between the cached preview and the full-resolution original is the user's
+  // (it costs mobile data), is remembered, and a phone defaults to the lighter preview until they ask for more.
+  if (userFallbackPreference.current === null && isBrowserMode()) {
+    let saved: string | null = null;
+    try { saved = localStorage.getItem('gphotos_viewer_quality'); } catch {}
+    userFallbackPreference.current = saved ? saved === 'preview' : isMobile;
+  }
+  const toggleQuality = () => {
+    const next = !fallbackToThumbnail;
+    userFallbackPreference.current = next;
+    try { localStorage.setItem('gphotos_viewer_quality', next ? 'preview' : 'full'); } catch {}
+    setFallbackToThumbnail(next);
+  };
+  const [downloading, setDownloading] = useState(false);
+  // Saves the original file to the device. The server streams it as an attachment; checking first (a 1-byte range) means an
+  // offline original produces a clear message here instead of a failed download in the browser.
+  const handleDownload = async () => {
+    if (downloading) return;
+    setDownloading(true);
+    try {
+      const q = new URLSearchParams({ path: photo.filePath, preferOriginal: '1', download: '1' });
+      if (photo.originalRemotePath) q.set('originalPath', photo.originalRemotePath);
+      const url = '/api/photo?' + q.toString();
+      const probe = await authFetch(url, { headers: { Range: 'bytes=0-0' } });
+      if (!probe.ok && probe.status !== 206) {
+        notify('error', probe.status === 404 ? 'The original file is offline right now, so it cannot be downloaded.' : 'This file cannot be downloaded.');
+        return;
+      }
+      const a = document.createElement('a');
+      a.href = appendAuthToken(url);
+      a.download = photo.fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (err) {
+      notifyError('Download', err);
+    } finally {
+      setDownloading(false);
+    }
+  };
   const [oneDriveRoots, setOneDriveRoots] = useState<string[]>([]);
   useEffect(() => {
     window.electronAPI?.getOneDriveStatus?.().then((status) => {
@@ -1029,20 +1102,127 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     setIsDragging(false);
   };
 
-  const handleDoubleClick = (e: React.MouseEvent) => {
-    if (isTaggingMode || isCropping) return;
-    if ((e.target as HTMLElement).closest('button, .face-tag-label, span')) return;
-    if (zoom > 1) {
-      setZoom(1);
+  // Zoom back to fit, or in to 2.5x around the given screen point (double click / double tap).
+  // The 'fit' zoom is not always 1 (the saved view mode may fit / fill): 'zoomed in' means clearly past it.
+  const baseZoom = () => viewModeZoomRef.current || 1;
+  const isZoomedIn = () => zoom > baseZoom() * 1.05;
+  const toggleZoomAt = (clientX: number, clientY: number) => {
+    if (isZoomedIn()) {
+      setZoom(baseZoom());
       setPan({ x: 0, y: 0 });
     } else {
       if (containerRef.current) {
         const rect = containerRef.current.getBoundingClientRect();
-        const mouseX = e.clientX - (rect.left + rect.width / 2);
-        const mouseY = e.clientY - (rect.top + rect.height / 2);
+        const mouseX = clientX - (rect.left + rect.width / 2);
+        const mouseY = clientY - (rect.top + rect.height / 2);
         setPan({ x: -mouseX * 1.5, y: -mouseY * 1.5 });
       }
-      setZoom(2.5);
+      setZoom(Math.max(2.5, baseZoom() * 2.5));
+    }
+  };
+
+  const lastTouchEndRef = useRef(0);
+  const handleDoubleClick = (e: React.MouseEvent) => {
+    if (isTaggingMode || isCropping) return;
+    // A double tap also makes the browser fire a mouse dblclick afterwards: the touch handler already zoomed, don't undo it.
+    if (Date.now() - lastTouchEndRef.current < 800) return;
+    if ((e.target as HTMLElement).closest('button, .face-tag-label, span')) return;
+    toggleZoomAt(e.clientX, e.clientY);
+  };
+
+  // ── Touch gestures (phone / tablet browser): one finger pans a zoomed photo, or swipes sideways to the
+  // next / previous photo and down to close; two fingers pinch-zoom; double tap zooms in and out. ──
+  const touchRef = useRef<
+    | { mode: 'pinch'; d0: number; z0: number; p0: { x: number; y: number }; c0: { x: number; y: number } }
+    | { mode: 'one'; x0: number; y0: number; t0: number; p0: { x: number; y: number }; moved: boolean; axis: 'h' | 'v' | null }
+    | null
+  >(null);
+  const lastTapRef = useRef({ t: 0, x: 0, y: 0 });
+  const stageTransform = () => `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`;
+  const touchPoint = (t: React.Touch) => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    return { x: t.clientX - (rect ? rect.left + rect.width / 2 : 0), y: t.clientY - (rect ? rect.top + rect.height / 2 : 0) };
+  };
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    if (isTaggingMode || isCropping) return;
+    if (photo.isVideo || (e.target as HTMLElement).closest('button, .face-tag-label, a')) return; // a video has its own touch controls
+    if (e.touches.length === 2) {
+      const [a, b] = [touchPoint(e.touches[0]), touchPoint(e.touches[1])];
+      touchRef.current = {
+        mode: 'pinch', d0: Math.hypot(a.x - b.x, a.y - b.y) || 1, z0: zoom, p0: { ...pan }, c0: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+      };
+    } else if (e.touches.length === 1) {
+      touchRef.current = { mode: 'one', x0: e.touches[0].clientX, y0: e.touches[0].clientY, t0: Date.now(), p0: { ...pan }, moved: false, axis: null };
+    }
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    const g = touchRef.current;
+    if (!g) return;
+    if (g.mode === 'pinch' && e.touches.length >= 2) {
+      const [a, b] = [touchPoint(e.touches[0]), touchPoint(e.touches[1])];
+      const newZoom = Math.min(6, Math.max(baseZoom() * 0.8, g.z0 * (Math.hypot(a.x - b.x, a.y - b.y) / g.d0)));
+      const c = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      const ratio = newZoom / g.z0;
+      // Keep the point between the fingers under the fingers, and follow them as they move.
+      setZoom(newZoom);
+      setPan({ x: c.x - (g.c0.x - g.p0.x) * ratio, y: c.y - (g.c0.y - g.p0.y) * ratio });
+      return;
+    }
+    if (g.mode !== 'one' || e.touches.length !== 1) return;
+    const dx = e.touches[0].clientX - g.x0;
+    const dy = e.touches[0].clientY - g.y0;
+    if (!g.moved && Math.hypot(dx, dy) < 8) return;
+    g.moved = true;
+    if (isZoomedIn()) {
+      setPan({ x: g.p0.x + dx, y: g.p0.y + dy });
+      return;
+    }
+    if (!g.axis) g.axis = Math.abs(dx) > Math.abs(dy) ? 'h' : 'v';
+    // Fit-to-screen: the photo follows the finger, then either flies on to the next one or springs back on release.
+    if (g.axis === 'h' && stageRef.current) stageRef.current.style.transform = `translate(${dx}px, 0px) scale(${zoom})`;
+    else if (g.axis === 'v' && dy > 0 && stageRef.current) stageRef.current.style.transform = `translate(0px, ${dy}px) scale(${Math.max(0.6, 1 - dy / 900)})`;
+  };
+
+  const handleTouchEnd = (e: React.TouchEvent) => {
+    lastTouchEndRef.current = Date.now();
+    const g = touchRef.current;
+    if (!g) return;
+    if (g.mode === 'pinch') {
+      if (e.touches.length < 2) {
+        touchRef.current = null;
+        if (!isZoomedIn()) { setZoom(baseZoom()); setPan({ x: 0, y: 0 }); }
+      }
+      return;
+    }
+    touchRef.current = null;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - g.x0;
+    const dy = t.clientY - g.y0;
+    const springBack = () => { if (stageRef.current) stageRef.current.style.transform = stageTransform(); };
+    if (!g.moved) {
+      // A tap. Two close together = double tap.
+      const now = Date.now();
+      const last = lastTapRef.current;
+      if (now - last.t < 320 && Math.hypot(t.clientX - last.x, t.clientY - last.y) < 40) {
+        lastTapRef.current = { t: 0, x: 0, y: 0 };
+        toggleZoomAt(t.clientX, t.clientY);
+      } else {
+        lastTapRef.current = { t: now, x: t.clientX, y: t.clientY };
+      }
+      return;
+    }
+    if (isZoomedIn()) return;
+    const fast = Date.now() - g.t0 < 300;
+    if (g.axis === 'h' && (Math.abs(dx) > 80 || (fast && Math.abs(dx) > 35))) {
+      springBack();
+      if (dx < 0 && hasNext) handleNext();
+      else if (dx > 0 && hasPrev) handlePrev();
+    } else if (g.axis === 'v' && (dy > 120 || (fast && dy > 50))) {
+      onClose();
+    } else {
+      springBack();
     }
   };
 
@@ -1096,6 +1276,19 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
   const handleUnassignFace = (faceId: string, _personName: string, e: React.MouseEvent) => {
     e.stopPropagation();
     libraryStore.unassignFaceFromPerson(faceId);
+  };
+
+  // A video has no face boxes to draw, so a person is tagged against the whole frame; the shared
+  // reassign dialog then picks/creates the person. Cancelling it drops the placeholder again.
+  const handleAddPersonToVideo = () => {
+    const w = photo.width || 1000;
+    const h = photo.height || 1000;
+    try {
+      const face = libraryStore.addManualFace(photo.id, { x: 0, y: 0, width: w, height: h }, undefined, w, h);
+      setReassignFace({ face, currentPersonName: 'New Person' });
+    } catch (err) {
+      notifyError('Add person', err);
+    }
   };
 
   const handleDeleteDetection = (faceId: string, e: React.MouseEvent) => {
@@ -1286,21 +1479,23 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     }}>
       {/* Header Bar */}
       <header style={{
-        height: '60px',
-        padding: '0 20px',
+        height: isMobile ? 'auto' : '60px',
+        minHeight: '60px',
+        flexShrink: 0,
+        padding: isMobile ? '6px 12px' : '0 20px',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
         borderBottom: '1px solid var(--border-subtle)',
         backgroundColor: 'rgba(15, 23, 42, 0.6)',
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
-          <button className="btn btn-ghost btn-icon" onClick={onClose} title="Close (Esc)">
+        <div style={{ display: 'flex', alignItems: 'center', gap: isMobile ? '8px' : '16px', minWidth: 0, flex: 1 }}>
+          <button className="btn btn-ghost btn-icon" onClick={onClose} title="Close (Esc)" style={{ flexShrink: 0 }}>
             <X size={20} />
           </button>
-          <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <span style={{ fontSize: '0.9rem', fontWeight: 600, color: 'var(--text-primary)' }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: isMobile ? 'wrap' : 'nowrap' }}>
+              <span style={{ fontSize: '0.9rem', fontWeight: 600, color: 'var(--text-primary)', ...(isMobile ? { maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } : {}) }}>
                 {photo.fileName}
               </span>
               {photo.isVideo && (
@@ -1319,6 +1514,17 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                   <PlayCircle size={12} />
                   Video{photo.videoDurationSec ? ` · ${Math.floor(photo.videoDurationSec / 60)}:${String(Math.round(photo.videoDurationSec % 60)).padStart(2, '0')}` : ''}
                 </span>
+              )}
+              {isBrowserMode() && !photo.isVideo && (
+                <button
+                  onClick={toggleQuality}
+                  title={fallbackToThumbnail ? 'Showing the cached preview — tap to load the full-resolution photo' : 'Showing the full-resolution photo — tap to use the lighter cached preview'}
+                  aria-label={fallbackToThumbnail ? 'Cached preview. Tap for full resolution' : 'Full resolution. Tap for cached preview'}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', fontSize: '12px', fontWeight: 700, padding: '5px 10px', minHeight: '30px', borderRadius: 'var(--radius-full)', cursor: 'pointer', color: fallbackToThumbnail ? '#fbbf24' : '#34d399', backgroundColor: fallbackToThumbnail ? 'rgba(245, 158, 11, 0.15)' : 'rgba(16, 185, 129, 0.15)', border: fallbackToThumbnail ? '1px solid rgba(245, 158, 11, 0.45)' : '1px solid rgba(16, 185, 129, 0.45)' }}
+                >
+                  {fallbackToThumbnail ? <CloudOff size={13} /> : <Cloud size={13} />}
+                  {fallbackToThumbnail ? 'Preview' : 'Full-res'}
+                </button>
               )}
               {photo.isVirtual && (
                 <>
@@ -1355,7 +1561,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                       title={`Original source connected from: ${photo.originalRemotePath}`}
                     >
                       <span style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: '#10b981' }} />
-                      Original Full-Res
+                      {fallbackToThumbnail && isBrowserMode() ? 'Original available' : 'Original Full-Res'}
                     </span>
                   ) : (
                     <span
@@ -1560,6 +1766,19 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
           </button>
         </div>
 
+        {isBrowserMode() && (
+          <button
+            className="btn btn-icon btn-ghost"
+            onClick={handleDownload}
+            disabled={downloading}
+            title="Download the original to this device"
+            aria-label="Download"
+            style={{ width: '38px', height: '38px', flexShrink: 0 }}
+          >
+            <Download size={20} />
+          </button>
+        )}
+
         {isMobile && (
           <>
             <button
@@ -1649,6 +1868,10 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
           onMouseUp={handleMouseUp}
           onMouseLeave={handleMouseUp}
           onDoubleClick={handleDoubleClick}
+          onTouchStart={handleTouchStart}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={handleTouchEnd}
+          onTouchCancel={handleTouchEnd}
           style={{
             flex: 1,
             display: 'flex',
@@ -1657,6 +1880,8 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
             padding: '24px',
             position: 'relative',
             overflow: 'hidden',
+            // The page must not scroll / zoom / pull-to-refresh under a finger on the photo: the gestures above own it.
+            touchAction: photo.isVideo ? 'manipulation' : 'none',
             cursor: isTaggingMode ? 'crosshair' : (zoom > 1 ? (isDragging ? 'grabbing' : 'grab') : 'default'),
             userSelect: 'none',
           }}
@@ -1726,7 +1951,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
           )}
 
           {/* Centered Asynchronous Loading Indicator */}
-          {!isLightboxImgLoaded && !lightboxImgError && (
+          {!photo.isVideo && !isLightboxImgLoaded && !lightboxImgError && (
             <div
               style={{
                 position: 'absolute',
@@ -1795,9 +2020,10 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
           {photo.isVideo && !videoFailed && (
             <video
               onError={() => setVideoFailed(true)}
-              src={getLocalPhotoUrl(photo.filePath, photo.originalRemotePath, true, 0)}
+              src={videoSrc}
               controls
               autoPlay
+              playsInline
               style={{
                 maxWidth: '100%',
                 maxHeight: 'calc(100vh - 120px)',
@@ -2539,7 +2765,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                 them here just doubled up the same buttons. */}
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <h2 style={{ fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-primary)', margin: 0 }}>
-                Photo Details
+                {photo.isVideo ? 'Video Details' : 'Photo Details'}
               </h2>
               <button
                 className="btn btn-ghost btn-icon"
@@ -2734,7 +2960,9 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
             </div>
 
             {(() => {
-              const contentInfo = getPhotoContentEntry(photo.id);
+              // A video has no vision-pipeline entry yet, but must still offer the editor for its description/keywords.
+              const contentInfo = getPhotoContentEntry(photo.id)
+                ?? (photo.isVideo ? { caption: '', tags: [], embedding: null, verdicts: {}, updatedAt: '' } : undefined);
               if (!contentInfo) return null;
               return (
                 <>
@@ -3006,6 +3234,17 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                     </span>
                   )}
                   <div style={{ display: 'flex', gap: '4px' }}>
+                    {photo.isVideo && (
+                      <button
+                        className="btn btn-secondary"
+                        onClick={handleAddPersonToVideo}
+                        style={{ fontSize: '0.72rem', padding: '2px 8px', height: '24px', gap: '4px' }}
+                        title="Tag a person who appears in this video"
+                      >
+                        <Plus size={12} />
+                        <span>Add</span>
+                      </button>
+                    )}
                     {unknownFaceCount > 0 && (
                       <button
                         className="btn btn-secondary"
@@ -3238,7 +3477,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
                 </div>
               ) : (
                 <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                  No faces detected in this photo yet.
+                  {photo.isVideo ? 'No people tagged in this video yet — use Add to tag someone.' : 'No faces detected in this photo yet.'}
                 </div>
               )}
             </div>
@@ -3253,7 +3492,13 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
           photo={photo}
           currentPersonName={reassignFace.currentPersonName}
           people={people}
-          onClose={() => setReassignFace(null)}
+          onClose={() => {
+            const f = reassignFace.face;
+            if (photo.isVideo && !libraryStore.getState().faces.find((x) => x.id === f.id)?.personId) {
+              void libraryStore.deleteFaceDetection(f.id);
+            }
+            setReassignFace(null);
+          }}
         />
       )}
 

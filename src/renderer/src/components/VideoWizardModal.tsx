@@ -4,7 +4,7 @@ import {
   FolderOpen, XCircle, RotateCcw, GripVertical, ChevronUp, ChevronDown, Ungroup, ExternalLink,
 } from 'lucide-react';
 import type { Album, Photo, VideoAspectRatio, VideoResolutionTier, VideoQuality, VideoTransition, VideoSlideInput, VideoCollageStyle } from '../../../types';
-import { computeDimensions } from '../../../types/videoFormat';
+import { computeDimensions, VIDEO_TRANSITIONS } from '../../../types/videoFormat';
 import { defaultTitleDesign, defaultCreditsDesign, makeText, type SlideDesign } from '../../../types/slideDesign';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { CollageStylePicker } from './CollageStylePicker';
@@ -22,9 +22,15 @@ interface VideoWizardModalProps {
 
 interface SlideEntry {
   id: string;
-  kind: 'photo' | 'collage';
+  kind: 'photo' | 'collage' | 'clip';
   photoIds: string[];
   included: boolean;
+  /** 'clip' (an album video used as part of the output): the part to keep, in seconds of the source (end null = to the end), and its own sound. */
+  trimStartSec?: number;
+  trimEndSec?: number | null;
+  keepSound?: boolean;
+  /** Photo or collage: how long this slide stays up (seconds); unset = the video's seconds-per-photo setting. */
+  seconds?: number;
   /** The chapter this slide's (first) photo lives in, so step 1 can show photos grouped under their chapter headings. null = not in any chapter. */
   chapterTitle: string | null;
   collageStyle?: VideoCollageStyle;
@@ -33,16 +39,7 @@ interface SlideEntry {
 type TransitionMode = 'single' | 'random' | 'multiple';
 
 
-const TRANSITIONS: Array<{ value: VideoTransition; label: string }> = [
-  { value: 'none', label: 'None (hard cut)' },
-  { value: 'fade', label: 'Fade' },
-  { value: 'dissolve', label: 'Dissolve' },
-  { value: 'wipeleft', label: 'Wipe left' },
-  { value: 'wiperight', label: 'Wipe right' },
-  { value: 'slideup', label: 'Slide up' },
-  { value: 'slidedown', label: 'Slide down' },
-  { value: 'circleopen', label: 'Circle open' },
-];
+const TRANSITIONS: Array<{ value: VideoTransition; label: string }> = VIDEO_TRANSITIONS.map(([value, label]) => ({ value, label }));
 
 const STEP_TITLES = ['Group Photos', 'Arrange Slides', 'Video Settings', 'Music', 'Title & Credits', 'Review & Generate'];
 const LAST_STEP = STEP_TITLES.length;
@@ -69,10 +66,20 @@ function buildInitialSlides(album: Album): SlideEntry[] {
   for (const c of album.chapters || []) for (const id of c.photoIds) titleOf.set(id, c.title);
   const ordered = [...(album.chapters || []).flatMap((c) => c.photoIds), ...libraryStore.getUnchapteredPhotoIds(album)];
   const seen = new Set<string>();
-  return ordered.filter((id) => (seen.has(id) ? false : (seen.add(id), true))).map((id) => ({
-    id: `s_${id}`, kind: 'photo' as const, photoIds: [id], included: true, chapterTitle: titleOf.get(id) ?? null,
-  }));
+  const ids = ordered.filter((id) => (seen.has(id) ? false : (seen.add(id), true)));
+  const idSet = new Set(ids);
+  const videos = new Map<string, Photo>();
+  for (const p of libraryStore.getState().photos) if (p.isVideo && idSet.has(p.id)) videos.set(p.id, p);
+  return ids.map((id): SlideEntry => {
+    const v = videos.get(id);
+    const base = { id: `s_${id}`, photoIds: [id], included: true, chapterTitle: titleOf.get(id) ?? null };
+    // A video becomes a clip slide: by default its first CLIP_DEFAULT_MAX_SEC seconds, with its own sound.
+    return v ? { ...base, kind: 'clip', trimStartSec: 0, trimEndSec: v.videoDurationSec ? Math.min(v.videoDurationSec, CLIP_DEFAULT_MAX_SEC) : null, keepSound: true } : { ...base, kind: 'photo' };
+  });
 }
+
+const CLIP_DEFAULT_MAX_SEC = 15;
+const fmtSec = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 
 /** Default save location: <library folder>/videos/<album name>.mp4 — null when there is no library folder to anchor it to. */
 function defaultOutputPath(albumTitle: string): string | null {
@@ -155,13 +162,17 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
   if (!isOpen) return null;
 
   const includedSlides = slides.filter((s) => s.included);
+  // Clips run for their trimmed length; only the still slides share the per-photo / total-length setting.
+  const clipSeconds = (s: SlideEntry) => Math.max(0, (s.trimEndSec ?? photoMap.get(s.photoIds[0])?.videoDurationSec ?? 0) - (s.trimStartSec ?? 0));
+  const stillSlides = includedSlides.filter((s) => s.kind !== 'clip');
+  const clipTotalSec = includedSlides.filter((s) => s.kind === 'clip').reduce((a, s) => a + clipSeconds(s), 0);
   const photoSlideCount = includedSlides.length;
-  const effectiveSecondsPerItem = durationMode === 'total' && photoSlideCount > 0 ? Math.max(0.5, totalDurationInput / photoSlideCount) : secondsPerItem;
+  const effectiveSecondsPerItem = durationMode === 'total' && stillSlides.length > 0 ? Math.max(0.5, (totalDurationInput - clipTotalSec - stillSlides.reduce((a, s) => a + (s.seconds ?? 0), 0)) / Math.max(1, stillSlides.filter((s) => s.seconds === undefined).length)) : secondsPerItem;
   const totalCount = photoSlideCount + (includeTitle ? 1 : 0) + (includeCredits ? 1 : 0);
   const cardSeconds = (includeTitle ? titleDesign.seconds : 0) + (includeCredits ? creditsDesign.seconds : 0);
   const hasRealTransition = transitionMode !== 'single' || transition !== 'none';
   const useTransition = hasRealTransition && transitionDurationSec > 0 && totalCount > 1;
-  const estimatedTotalDurationSec = Math.max(0, photoSlideCount * effectiveSecondsPerItem + cardSeconds - (useTransition ? transitionDurationSec * (totalCount - 1) : 0));
+  const estimatedTotalDurationSec = Math.max(0, stillSlides.reduce((a, s) => a + (s.seconds ?? effectiveSecondsPerItem), 0) + clipTotalSec + cardSeconds - (useTransition ? transitionDurationSec * (totalCount - 1) : 0));
   // The frame the title / credits are designed in: exactly the size the video will be.
   const frame = computeDimensions(aspectRatio, resolution);
   const albumPhotos = (album.photoIds || []).map((id) => photoMap.get(id)).filter((p): p is Photo => !!p);
@@ -296,10 +307,13 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
     const videoSlides: VideoSlideInput[] = [];
     if (titleCard) videoSlides.push(titleCard);
     for (const s of includedSlides) {
-      if (s.kind === 'collage') videoSlides.push({ kind: 'collage', collageStyle: s.collageStyle || 'grid', photoPaths: s.photoIds.map((id) => photoMap.get(id)?.filePath).filter((p): p is string => !!p) });
-      else {
+      if (s.kind === 'collage') videoSlides.push({ kind: 'collage', seconds: s.seconds, collageStyle: s.collageStyle || 'grid', photoPaths: s.photoIds.map((id) => photoMap.get(id)?.filePath).filter((p): p is string => !!p) });
+      else if (s.kind === 'clip') {
         const p = photoMap.get(s.photoIds[0]);
-        videoSlides.push({ kind: 'photo', photoPaths: p ? [p.filePath] : [] });
+        if (p) videoSlides.push({ kind: 'clip', clipPath: p.filePath, trimStartSec: s.trimStartSec ?? 0, trimEndSec: s.trimEndSec ?? null, muted: !s.keepSound });
+      } else {
+        const p = photoMap.get(s.photoIds[0]);
+        videoSlides.push({ kind: 'photo', seconds: s.seconds, photoPaths: p ? [p.filePath] : [] });
       }
     }
 
@@ -407,10 +421,16 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
                   return (
                     <div
                       key={entry.id}
-                      onClick={() => togglePicking(entry.id)}
+                      onClick={() => (entry.kind === 'clip' ? toggleIncluded(entry.id) : togglePicking(entry.id))}
+                      title={entry.kind === 'clip' ? 'Video clip — click to include or leave it out' : undefined}
                       style={{ position: 'relative', aspectRatio: '1', borderRadius: 'var(--radius-md)', overflow: 'hidden', cursor: 'pointer', border: isPicking ? '2px solid #ec4899' : '1px solid var(--border-subtle)' }}
                     >
-                      <img src={getLocalPhotoUrl(photo.filePath, photo.originalRemotePath, false, 160)} alt={photo.fileName} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                      <img src={getLocalPhotoUrl(photo.filePath, photo.originalRemotePath, false, 160)} alt={photo.fileName} style={{ width: '100%', height: '100%', objectFit: 'cover', opacity: entry.included ? 1 : 0.35 }} />
+                      {entry.kind === 'clip' && (
+                        <span data-testid="step1-clip-badge" style={{ position: 'absolute', left: '6px', bottom: '6px', padding: '2px 6px', borderRadius: '4px', background: 'rgba(10,12,16,0.8)', color: '#f5b942', fontSize: '0.7rem', fontWeight: 700 }}>
+                          {fmtSec(clipSeconds(entry))}
+                        </span>
+                      )}
                       {isPicking && (
                         <div style={{ position: 'absolute', top: '6px', left: '6px', width: '22px', height: '22px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: '#ec4899', border: '1px solid rgba(255,255,255,0.3)' }}>
                           <Check size={13} color="white" />
@@ -431,7 +451,8 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
                 Drag <GripVertical size={12} style={{ verticalAlign: 'middle' }} /> to reorder, or use the arrows. Uncheck anything you don't want in the video.
               </p>
               {slides.map((entry, idx) => {
-                const photo = entry.kind === 'photo' ? thumbFor(entry) : null;
+                const photo = entry.kind !== 'collage' ? thumbFor(entry) : null;
+                const srcDur = entry.kind === 'clip' ? (thumbFor(entry)?.videoDurationSec ?? null) : null;
                 const collageThumb = entry.kind === 'collage' ? thumbFor(entry) : null;
                 return (
                   <div
@@ -455,9 +476,27 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
                           </div>
                         : photo && <img src={getLocalPhotoUrl(photo.filePath, photo.originalRemotePath, false, 60)} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />}
                     </div>
-                    <span style={{ flex: 1, fontSize: '0.85rem' }}>
+                    <span style={{ flex: 1, fontSize: '0.85rem', minWidth: 0 }}>
                       {entry.kind === 'collage' ? <><Layers size={13} style={{ verticalAlign: 'middle', marginRight: '4px' }} />Collage of {entry.photoIds.length}</> : (photo?.fileName || 'Photo')}
+                      {entry.kind === 'clip' && (
+                        <span data-testid="clip-controls" style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginTop: '4px', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                          <span style={{ color: '#f5b942', fontWeight: 700 }}>CLIP {fmtSec(clipSeconds(entry))}</span>
+                          <label>from <input type="number" min={0} step={0.5} value={entry.trimStartSec ?? 0} style={{ width: '60px' }}
+                            onChange={(e) => { const v = Math.max(0, Number(e.target.value) || 0); setSlides((prev) => prev.map((s) => (s.id === entry.id ? { ...s, trimStartSec: srcDur ? Math.min(v, Math.max(0, (s.trimEndSec ?? srcDur) - 0.5)) : v } : s))); }} /> s</label>
+                          <label>to <input type="number" min={0} step={0.5} value={entry.trimEndSec ?? srcDur ?? ''} placeholder="end" style={{ width: '60px' }}
+                            onChange={(e) => { const raw = e.target.value === '' ? null : Number(e.target.value); setSlides((prev) => prev.map((s) => (s.id === entry.id ? { ...s, trimEndSec: raw === null ? null : Math.min(srcDur ?? raw, Math.max(raw, (s.trimStartSec ?? 0) + 0.5)) } : s))); }} /> s{srcDur ? ` of ${fmtSec(srcDur)}` : ''}</label>
+                          <label style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                            <input type="checkbox" checked={!!entry.keepSound} onChange={() => setSlides((prev) => prev.map((s) => (s.id === entry.id ? { ...s, keepSound: !s.keepSound } : s)))} /> Keep sound
+                          </label>
+                        </span>
+                      )}
                     </span>
+                    {entry.kind !== 'clip' && (
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '0.75rem', color: 'var(--text-muted)', flexShrink: 0 }}>
+                        <input type="number" min={0.5} step={0.5} aria-label="Seconds on screen" data-testid="slide-seconds" value={entry.seconds ?? ''} placeholder={String(+effectiveSecondsPerItem.toFixed(1))} style={{ width: '56px' }}
+                          onChange={(e) => { const v = e.target.value === '' ? undefined : Math.max(0.5, Number(e.target.value) || 0.5); setSlides((prev) => prev.map((s) => (s.id === entry.id ? { ...s, seconds: v } : s))); }} /> s
+                      </label>
+                    )}
                     <button className="btn btn-ghost btn-icon" disabled={idx === 0} onClick={() => moveSlide(idx, -1)} style={{ width: '26px', height: '26px' }}><ChevronUp size={14} /></button>
                     <button className="btn btn-ghost btn-icon" disabled={idx === slides.length - 1} onClick={() => moveSlide(idx, 1)} style={{ width: '26px', height: '26px' }}><ChevronDown size={14} /></button>
                   </div>

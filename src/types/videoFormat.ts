@@ -14,3 +14,16 @@ const DIMENSIONS: Record<VideoAspectRatio, Record<VideoResolutionTier, { width: 
 export function computeDimensions(aspect: VideoAspectRatio, resolution: VideoResolutionTier): { width: number; height: number } {
   return DIMENSIONS[aspect][resolution];
 }
+
+/** Every ffmpeg `xfade` transition the wizard offers (value, label), 'none' = hard cut. Each name was checked against the bundled ffmpeg. */
+export const VIDEO_TRANSITIONS = [
+  ['none', 'None (hard cut)'], ['fade', 'Fade'], ['dissolve', 'Dissolve'], ['fadeblack', 'Fade through black'], ['fadewhite', 'Fade through white'], ['fadegrays', 'Fade through grey'],
+  ['wipeleft', 'Wipe left'], ['wiperight', 'Wipe right'], ['wipeup', 'Wipe up'], ['wipedown', 'Wipe down'],
+  ['slideleft', 'Slide left'], ['slideright', 'Slide right'], ['slideup', 'Slide up'], ['slidedown', 'Slide down'],
+  ['smoothleft', 'Smooth left'], ['smoothright', 'Smooth right'], ['coverleft', 'Cover left'], ['revealright', 'Reveal right'],
+  ['circleopen', 'Circle open'], ['circleclose', 'Circle close'], ['circlecrop', 'Circle crop'], ['rectcrop', 'Rectangle crop'],
+  ['vertopen', 'Vertical open'], ['horzopen', 'Horizontal open'], ['radial', 'Radial'], ['zoomin', 'Zoom in'],
+  ['pixelize', 'Pixelize'], ['hblur', 'Horizontal blur'], ['squeezeh', 'Squeeze horizontally'], ['squeezev', 'Squeeze vertically'],
+  ['diagtl', 'Diagonal top-left'], ['diagbr', 'Diagonal bottom-right'], ['hlslice', 'Slice left'], ['vuslice', 'Slice up'],
+] as const;
+export type VideoTransitionName = (typeof VIDEO_TRANSITIONS)[number][0];

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
 export interface TopTabItem {
   id: string;
@@ -25,8 +25,18 @@ export const TopTabs: React.FC<TopTabsProps> = ({ tabs, activeId, onChange, size
   const gap = size === 'md' ? '28px' : '18px';
   const iconSize = size === 'md' ? 16 : 13;
 
+  // More tabs than fit (a phone): fade the right edge while there is more to scroll to, so the cut-off tabs are discoverable.
+  const listRef = useRef<HTMLDivElement>(null);
+  const [moreToRight, setMoreToRight] = useState(false);
+  const measure = () => { const el = listRef.current; if (el) setMoreToRight(el.scrollWidth - el.clientWidth - el.scrollLeft > 4); };
+  useEffect(() => {
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [tabs.length]);
+
   return (
-    <div role="tablist" style={{ display: 'flex', gap, borderBottom: '1px solid var(--border-subtle)', overflowX: 'auto' }}>
+    <div ref={listRef} onScroll={measure} role="tablist" style={{ display: 'flex', gap, borderBottom: '1px solid var(--border-subtle)', overflowX: 'auto', ...(moreToRight ? { WebkitMaskImage: 'linear-gradient(to right, #000 calc(100% - 36px), transparent)', maskImage: 'linear-gradient(to right, #000 calc(100% - 36px), transparent)' } : {}) }}>
       {tabs.map((t) => {
         const active = t.id === activeId;
         const Icon = t.icon;

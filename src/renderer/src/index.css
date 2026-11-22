@@ -493,3 +493,21 @@ select,
 /* Heartbeat dot for live status. */
 @keyframes gp-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 .gp-pulse { animation: gp-pulse 1.4s ease-in-out infinite; }
+
+/* Phones: bigger touch targets for the map zoom buttons (Leaflet default is 30px). */
+@media (max-width: 768px) {
+  .leaflet-touch .leaflet-bar a { width: 40px; height: 40px; line-height: 40px; }
+}
+
+/* Touch / phone-browser behaviour: feel like an app, not a web page. */
+html, body {
+  overscroll-behavior: none;              /* no rubber-banding or pull-to-refresh reloading the whole library */
+  -webkit-tap-highlight-color: transparent;
+}
+button, [role='button'], a, input, select, label, summary {
+  touch-action: manipulation;             /* no 300 ms tap delay, no double-tap page zoom */
+}
+@media (pointer: coarse) {
+  img { -webkit-touch-callout: none; }    /* a long press selects a photo; it must not open the browser's image menu */
+  .btn, button { -webkit-user-select: none; user-select: none; }
+}

@@ -253,6 +253,29 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
     [zoomLevel, onZoomChange]
   );
 
+  // Two-finger pinch on a phone steps the grid zoom, like the Ctrl + wheel gesture does: spread = zoom in (next level,
+  // bigger photos), pinch = zoom out. One finger keeps scrolling the page as usual (touch-action: pan-y below).
+  const pinchRef = useRef<{ d0: number } | null>(null);
+  const pinchHandlers = {
+    onTouchStart: (e: React.TouchEvent) => {
+      if (e.touches.length === 2) pinchRef.current = { d0: Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY) || 1 };
+    },
+    onTouchMove: (e: React.TouchEvent) => {
+      const g = pinchRef.current;
+      if (!g || e.touches.length !== 2) return;
+      const ratio = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY) / g.d0;
+      if (ratio > 1.3 || ratio < 0.77) {
+        const idx = ZOOM_LEVELS.indexOf(zoomLevel);
+        const next = ratio > 1 ? ZOOM_LEVELS[idx + 1] : ZOOM_LEVELS[idx - 1];
+        if (next && idx >= 0) onZoomChange(next);
+        pinchRef.current = { d0: Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY) || 1 }; // one step per pinch stroke
+      }
+    },
+    onTouchEnd: () => { pinchRef.current = null; },
+    onTouchCancel: () => { pinchRef.current = null; },
+  };
+  useEffect(() => { if (containerRef.current) containerRef.current.style.touchAction = 'pan-y'; });
+
   // Group photos by Year for 'years' view
   const yearGroups = useMemo(() => {
     if (zoomLevel !== 'years') return [];
@@ -503,6 +526,7 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
         ref={containerRef}
         onScroll={handleScroll}
         onWheel={handleWheel}
+        {...pinchHandlers}
         style={{ flex: 1, overflowY: 'auto', padding: '24px', outline: 'none' }}
         tabIndex={0}
       >
@@ -617,6 +641,7 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
         ref={containerRef}
         onScroll={handleScroll}
         onWheel={handleWheel}
+        {...pinchHandlers}
         style={{ flex: 1, overflowY: 'auto', padding: '24px', outline: 'none' }}
         tabIndex={0}
       >
@@ -723,6 +748,7 @@ export const VirtualizedTimelineGallery: React.FC<VirtualizedTimelineGalleryProp
         ref={containerRef}
         onScroll={handleScroll}
         onWheel={handleWheel}
+        {...pinchHandlers}
         style={{
           flex: 1,
           overflowY: 'auto',

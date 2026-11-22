@@ -431,7 +431,7 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
         marginBottom: '20px',
       }}>
         {/* Step 1: Directory Selection */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: isMobile ? 'minmax(0, 1fr)' : '1fr 1fr', gap: '20px' }}>
           {/* Source Folder */}
           <div>
             <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '6px', color: 'var(--text-secondary)' }}>
@@ -474,7 +474,7 @@ export const OrganizerView: React.FC<OrganizerViewProps> = ({ onOrganizeComplete
         </div>
 
         {/* Step 2: Folder Scheme & Mode */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1.5fr 1fr', gap: '20px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: isMobile ? 'minmax(0, 1fr)' : '1.5fr 1fr', gap: '20px' }}>
           {/* Structure Selector */}
           <div>
             <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '6px', color: 'var(--text-secondary)' }}>

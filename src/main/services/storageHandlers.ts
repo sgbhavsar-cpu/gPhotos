@@ -26,6 +26,24 @@ const VIRTUAL_STORAGES_KEY = 'gphotos_virtual_storages_v1';
 // the blob; any write replaces the blob with [] so the space is reclaimed.
 export const LEGACY_FACE_CACHE_KEY = 'gphotos_face_cache_v2';
 
+const isPlaceholderName = (n: unknown) => typeof n !== 'string' || /^Person(\s+\d+)?$/i.test(n.trim());
+
+/**
+ * What a paired phone / browser may do to the people registry: add people and change names, but never delete anybody and
+ * never overwrite a real name ("Sachin") with a placeholder ("Person 90"). A web client that could not load the full
+ * registry used to write back the placeholders it rebuilt from face data — a full replace — and wiped every person's name.
+ */
+function mergePeopleFromRemote(incoming: any[]): void {
+  const existing = new Map(getAllPeople().map((p) => [p.id, p]));
+  const merged = incoming
+    .filter((p) => p && typeof p.id === 'string')
+    .map((p) => {
+      const old = existing.get(p.id);
+      return old && isPlaceholderName(p.name) && !isPlaceholderName(old.name) ? { ...p, name: old.name } : p;
+    });
+  upsertPeople(merged as any);
+}
+
 export interface SaveLibraryPayload {
   photos?: any[];
   // True when `photos` is only a partial view of the library (e.g. just the
@@ -107,7 +125,8 @@ export function handleStorageSave(
     }
 
     if (Array.isArray(payload.people) && payload.people.length > 0) {
-      upsertPeople(payload.people as any);
+      if (isRemote) mergePeopleFromRemote(payload.people);
+      else upsertPeople(payload.people as any);
     }
 
     if (Array.isArray(payload.albums)) {
@@ -128,8 +147,10 @@ export function handleStorageSave(
     if (!Array.isArray(data)) {
       throw new Error(`${GLOBAL_PEOPLE_KEY} save rejected: data must be an array`);
     }
-    // An explicit array (even empty) is a deliberate sync: Reset & Rescan / deleting the last person.
-    replaceAllPeople(data, { allowEmpty: true });
+    // From the desktop app, an explicit array (even empty) is a deliberate sync: Reset & Rescan / deleting the last person.
+    // A paired phone / browser never gets to replace the registry (see mergePeopleFromRemote).
+    if (isRemote) mergePeopleFromRemote(data);
+    else replaceAllPeople(data, { allowEmpty: true });
     return { success: true };
   }
 
@@ -216,7 +237,7 @@ function dedupeVirtualStorages(storages: any[]): any[] {
 export async function handleStorageLoad(
   key: string,
   libraryDir?: string | null,
-  options?: { includePhotos?: boolean; compactDescriptors?: boolean }
+  options?: { includePhotos?: boolean; compactDescriptors?: boolean; stripDescriptors?: boolean }
 ): Promise<any> {
   if (key === LEGACY_FACE_CACHE_KEY) return [];
 
@@ -233,12 +254,13 @@ export async function handleStorageLoad(
       const people = getAllPeople();
       const albums = getAllAlbums(db);
       if (getTotalPhotoCount(db) === 0 && people.length === 0 && albums.length === 0) return null;
-      let faces = await getAllFacesChunked(db);
+      let faces = await getAllFacesChunked(db, { skipDescriptors: !!options?.stripDescriptors });
       // compactDescriptors: send each 512-number descriptor as a Float32Array (raw bytes on the
       // wire) instead of a number[] (V8 serialises the ~15M numbers one by one, ~seconds of
       // UI-thread time). The renderer converts them straight back; float32 model output
       // round-trips exactly. Only for callers that opt in — JSON consumers (mobile web) must not.
-      if (options?.compactDescriptors) {
+      // stripDescriptors: the mobile web UI never matches faces (512 numbers each, ~370 MB of JSON on a large library) — send none.
+      if (options?.compactDescriptors && !options.stripDescriptors) {
         faces = faces.map((f) => (f.descriptor && f.descriptor.length ? ({ ...f, descriptor: Float32Array.from(f.descriptor) } as any) : f));
       }
       return {

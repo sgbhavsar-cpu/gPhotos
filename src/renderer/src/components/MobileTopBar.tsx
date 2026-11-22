@@ -76,6 +76,7 @@ export const MobileTopBar: React.FC<MobileTopBarProps> = ({
             border: '1px solid rgba(255, 255, 255, 0.1)',
             borderRadius: '9999px',
             padding: '4px 10px',
+            minHeight: '36px',
             color: 'var(--text-primary)',
             fontSize: '0.8rem',
             fontWeight: 600,

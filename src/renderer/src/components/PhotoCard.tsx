@@ -44,6 +44,12 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
   onOpenFullscreen,
 }) => {
   const [isHovered, setIsHovered] = useState(false);
+  // Touch: press and hold ~0.45 s selects the photo (with a short buzz where the browser allows it), like a native gallery.
+  // The tap that ends the hold must not also open the photo.
+  const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const holdStartRef = useRef<{ x: number; y: number } | null>(null);
+  const heldRef = useRef(false);
+  const cancelHold = () => { if (holdTimerRef.current) clearTimeout(holdTimerRef.current); holdTimerRef.current = null; holdStartRef.current = null; };
   const [imgElementLoaded, setImgElementLoaded] = useState(false);
   // The gphoto:// <img> can 404/decode-fail even though a src exists (e.g. a video with no cached frame).
   const [imgFailed, setImgFailed] = useState(false);
@@ -220,7 +226,29 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
   return (
     <div
       data-photo-id={photo.id}
-      onClick={onClick}
+      onClick={(e) => {
+        if (heldRef.current) { heldRef.current = false; e.stopPropagation(); return; }
+        onClick(e);
+      }}
+      onTouchStart={(e) => {
+        if (!onToggleSelect || e.touches.length !== 1) { cancelHold(); return; }
+        const t = e.touches[0];
+        holdStartRef.current = { x: t.clientX, y: t.clientY };
+        heldRef.current = false;
+        holdTimerRef.current = setTimeout(() => {
+          holdTimerRef.current = null;
+          heldRef.current = true;
+          try { navigator.vibrate?.(15); } catch {}
+          onToggleSelect({ shiftKey: false, ctrlKey: false, metaKey: false, stopPropagation() {}, preventDefault() {} } as unknown as React.MouseEvent);
+        }, 450);
+      }}
+      onTouchMove={(e) => {
+        const s0 = holdStartRef.current;
+        if (s0 && Math.hypot(e.touches[0].clientX - s0.x, e.touches[0].clientY - s0.y) > 10) cancelHold(); // it is a scroll, not a hold
+      }}
+      onTouchEnd={cancelHold}
+      onTouchCancel={cancelHold}
+      onContextMenu={(e) => { if (holdTimerRef.current || heldRef.current) e.preventDefault(); }} // no image menu from the hold
       onMouseDown={(e) => onCardMouseDown && onCardMouseDown(photo.id, e)}
       onMouseEnter={(e) => {
         setIsHovered(true);
@@ -260,6 +288,7 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
         transition: 'transform var(--transition-normal), box-shadow var(--transition-normal), border var(--transition-fast)',
         opacity: photo.isExcluded ? 0.55 : 1,
         userSelect: 'none',
+        WebkitTouchCallout: 'none',
       }}
     >
       {/* Asynchronous Skeleton Shimmer Loading Placeholder */}
@@ -481,7 +510,7 @@ const PhotoCardComponent: React.FC<PhotoCardProps> = ({
       )}
 
       {/* Multi-Selection Checkbox */}
-      {(isHovered || isSelected) && onToggleSelect && (
+      {(isHovered || isSelected || isSelectMode) && onToggleSelect && (
         <div
           onClick={(e) => {
             e.stopPropagation();

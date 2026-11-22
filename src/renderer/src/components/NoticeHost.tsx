@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from 'react';
 import { AlertTriangle, CheckCircle2, Info, X } from 'lucide-react';
+import { useIsMobile } from '../hooks/useIsMobile';
 import { dismissNotice, getNotices, subscribeNotices, NoticeKind } from '../services/notifications';
 
 const COLORS: Record<NoticeKind, { bg: string; border: string }> = {
@@ -18,19 +19,21 @@ const copy = (text: string) => {
 
 /** Renders app-wide notices. Mounted outside the ErrorBoundary so errors are visible even when the UI crashed. */
 export const NoticeHost = () => {
-  const list = useSyncExternalStore(subscribeNotices, getNotices);
+  const all = useSyncExternalStore(subscribeNotices, getNotices);
+  const isMobile = useIsMobile();
+  // On a phone: newest two only, above the bottom tab bar (top-right stacked over the header and hid the page title).
+  const list = isMobile ? all.slice(-2) : all;
   if (list.length === 0) return null;
   return (
     <div
       style={{
         position: 'fixed',
-        top: '20px',
-        right: '24px',
+        ...(isMobile ? { bottom: 'calc(76px + env(safe-area-inset-bottom, 0px))', left: '12px', right: '12px' } : { top: '20px', right: '24px' }),
         zIndex: 20000,
         display: 'flex',
         flexDirection: 'column',
         gap: '8px',
-        maxWidth: 'min(440px, calc(100vw - 32px))',
+        maxWidth: isMobile ? undefined : 'min(440px, calc(100vw - 32px))',
       }}
     >
       {list.map((n) => {
@@ -61,7 +64,7 @@ export const NoticeHost = () => {
             {n.detail && (
               <button
                 onClick={() => copy(`${n.message}\n${n.detail}`)}
-                style={{ background: 'none', border: 'none', color: 'rgba(255,255,255,0.75)', cursor: 'pointer', fontSize: '0.75rem', padding: 0 }}
+                style={{ background: 'none', border: 'none', color: 'rgba(255,255,255,0.75)', cursor: 'pointer', fontSize: '0.75rem', padding: isMobile ? '8px 6px' : 0 }}
               >
                 Copy
               </button>
@@ -69,7 +72,7 @@ export const NoticeHost = () => {
             <button
               onClick={() => dismissNotice(n.id)}
               aria-label="Dismiss"
-              style={{ background: 'none', border: 'none', color: 'rgba(255,255,255,0.75)', cursor: 'pointer', padding: 0, display: 'flex' }}
+              style={{ background: 'none', border: 'none', color: 'rgba(255,255,255,0.75)', cursor: 'pointer', padding: isMobile ? '8px' : 0, margin: isMobile ? '-8px -6px -8px 0' : 0, display: 'flex' }}
             >
               <X size={14} />
             </button>

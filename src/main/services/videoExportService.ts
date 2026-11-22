@@ -7,7 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
 import { computeCollageTiles, MAX_COLLAGE_PHOTOS, type CollageStyle, type CollageTile } from '../../types/collageLayout';
-import { computeDimensions } from '../../types/videoFormat';
+import { computeDimensions, type VideoTransitionName } from '../../types/videoFormat';
 import { layoutText, makeText } from '../../types/slideDesign';
 // @ts-ignore — ffmpeg-static has no types; it's just a string (the binary's path) at runtime.
 import ffmpegPathRaw from 'ffmpeg-static';
@@ -38,7 +38,7 @@ export type AspectRatio = '16:9' | '9:16' | '1:1' | '4:3';
 export type VideoResolutionTier = '720p' | '1080p';
 export type VideoQuality = 'draft' | 'good' | 'best';
 // A curated subset of ffmpeg's `xfade` transition names, enough variety without overwhelming the wizard.
-export type TransitionName = 'none' | 'fade' | 'wipeleft' | 'wiperight' | 'slideup' | 'slidedown' | 'circleopen' | 'dissolve';
+export type TransitionName = VideoTransitionName;
 
 const QUALITY_CRF: Record<VideoQuality, number> = { draft: 30, good: 23, best: 18 };
 
@@ -118,10 +118,29 @@ export async function renderCollageImage(sourcePaths: string[], outPath: string,
 }
 
 export interface SlidePlan {
-  /** Absolute path to an already-generated image, pre-normalized to exactly `width`x`height`. */
+  /** Absolute path to an already-generated image (or, with `clip`, a prepared video), pre-normalized to exactly `width`x`height`. */
   file: string;
   /** How long this slide stays up; defaults to `secondsPerItem` (cards like a title/credits page can differ). */
   seconds?: number;
+  /** Set when `file` is a prepared video clip (see prepareClip) rather than a still image. */
+  clip?: { hasAudio: boolean; volume: number };
+}
+
+/**
+ * Cuts [startSec, startSec+lengthSec) out of a video and normalizes it to the exact output frame
+ * (fit with a blurred copy of itself behind, so portrait phone clips don't get black bars or a hard crop),
+ * constant fps, yuv420p, and stereo 44.1k AAC — so it can join the same xfade chain as the photo slides.
+ */
+export function buildClipPrepArgs(src: string, out: string, o: { width: number; height: number; fps: number; startSec: number; lengthSec: number; withAudio: boolean }): string[] {
+  const { width: W, height: H } = o;
+  const graph = `[0:v]split=2[a][b];[a]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=20:5[bg];` +
+    `[b]scale=${W}:${H}:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=${o.fps},format=yuv420p[v]`;
+  return [
+    '-y', '-ss', Math.max(0, o.startSec).toFixed(3), '-t', o.lengthSec.toFixed(3), '-i', src,
+    '-filter_complex', graph, '-map', '[v]',
+    ...(o.withAudio ? ['-map', '0:a:0', '-ac', '2', '-ar', '44100', '-c:a', 'aac', '-b:a', '160k'] : ['-an']),
+    '-c:v', 'libx264', '-crf', '20', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-t', o.lengthSec.toFixed(3), out,
+  ];
 }
 
 /** Music under the whole video. */
@@ -178,10 +197,11 @@ export function buildFfmpegArgs(slides: SlidePlan[], opts: BuildFfmpegArgsOption
 
   const inputArgs: string[] = [];
   slides.forEach((sl, i) => {
-    inputArgs.push('-loop', '1', '-t', durations[i].toFixed(3), '-i', sl.file);
+    if (sl.clip) inputArgs.push('-i', sl.file);
+    else inputArgs.push('-loop', '1', '-t', durations[i].toFixed(3), '-i', sl.file);
   });
 
-  const formatLabels = slides.map((_, i) => `[${i}:v]format=yuv420p,fps=${fps}[v${i}]`);
+  const formatLabels = slides.map((sl, i) => `[${i}:v]${sl.clip ? 'setpts=PTS-STARTPTS,' : ''}format=yuv420p,fps=${fps}[v${i}]`);
   let filterComplex: string;
   let totalDurationSec: number;
 
@@ -206,7 +226,35 @@ export function buildFfmpegArgs(slides: SlidePlan[], opts: BuildFfmpegArgsOption
 
   const total = Math.max(0, totalDurationSec);
   const audioArgs: string[] = [];
-  if (opts.audio) {
+
+  // Clip sound: each clip's audio is delayed to where its slide starts, then all are mixed into one bus.
+  // With music too, the music is ducked (sidechain compressed) whenever a clip is making noise.
+  const clipAudio = slides.map((sl, i) => ({ sl, i })).filter(({ sl }) => sl.clip?.hasAudio && sl.clip.volume > 0);
+  if (clipAudio.length > 0) {
+    let startAt = 0;
+    const starts = durations.map((d) => { const s = startAt; startAt += d - td; return s; });
+    const parts = clipAudio.map(({ sl, i }) => {
+      const ms = Math.round(starts[i] * 1000);
+      return `[${i}:a]aresample=44100,aformat=channel_layouts=stereo,volume=${sl.clip!.volume.toFixed(2)},adelay=${ms}|${ms}[ca${i}]`;
+    });
+    const labels = clipAudio.map(({ i }) => `[ca${i}]`).join('');
+    parts.push(clipAudio.length === 1 ? `${labels}anull[bus]` : `${labels}amix=inputs=${clipAudio.length}:normalize=0:duration=longest[bus]`);
+    if (opts.audio) {
+      inputArgs.push(...(opts.audio.loop ? ['-stream_loop', '-1'] : []), '-i', opts.audio.file);
+      const mf: string[] = [];
+      if (opts.audio.volume !== undefined && Math.abs(opts.audio.volume - 1) > 0.01) mf.push(`volume=${opts.audio.volume.toFixed(2)}`);
+      const fade = Math.min(opts.audio.fadeOutSec, total);
+      if (fade > 0) mf.push(`afade=t=out:st=${(total - fade).toFixed(3)}:d=${fade.toFixed(3)}`);
+      parts.push(`[${slides.length}:a]${mf.length ? mf.join(',') : 'anull'}[mus]`);
+      parts.push('[bus]asplit=2[sc][cm]');
+      parts.push('[mus][sc]sidechaincompress=threshold=0.03:ratio=10:attack=30:release=600[duck]');
+      parts.push('[duck][cm]amix=inputs=2:normalize=0:duration=longest[outa]');
+    } else {
+      parts.push('[bus]anull[outa]');
+    }
+    filterComplex += ';' + parts.join(';');
+    audioArgs.push('-map', '[outa]', '-c:a', 'aac', '-b:a', '192k', '-t', total.toFixed(3));
+  } else if (opts.audio) {
     // Input options go before their -i: `-stream_loop -1` repeats the clip forever, and the explicit
     // output `-t` (below) is what ends the video at exactly the slideshow's length either way.
     inputArgs.push(...(opts.audio.loop ? ['-stream_loop', '-1'] : []), '-i', opts.audio.file);
@@ -298,6 +346,31 @@ export function probeCreationTime(filePath: string): Promise<Date | null> {
   });
 }
 
+/** ISO 6709 "+23.0225+072.5714+000.0/" (what phones write as the container `location` tag) → degrees, or null. */
+export function parseIso6709(text: string): { latitude: number; longitude: number } | null {
+  const m = text.match(/([+-]\d{1,2}(?:\.\d+)?)([+-]\d{1,3}(?:\.\d+)?)/);
+  if (!m) return null;
+  const latitude = Number(m[1]);
+  const longitude = Number(m[2]);
+  if (!isFinite(latitude) || !isFinite(longitude) || Math.abs(latitude) > 90 || Math.abs(longitude) > 180) return null;
+  if (latitude === 0 && longitude === 0) return null;
+  return { latitude, longitude };
+}
+
+/** GPS position a phone embedded in the video container (`location` / Apple location tag), or null. Banner-only. */
+export function probeLocation(filePath: string): Promise<{ latitude: number; longitude: number } | null> {
+  return new Promise((resolve) => {
+    let stderr = '';
+    const proc = spawn(getFfmpegPath(), ['-hide_banner', '-i', filePath], { windowsHide: true });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', () => resolve(null));
+    proc.on('close', () => {
+      const m = stderr.match(/(?:location(?:-eng)?|com\.apple\.quicktime\.location\.ISO6709)\s*:\s*(\S+)/i);
+      resolve(m ? parseIso6709(m[1]) : null);
+    });
+  });
+}
+
 /** A short low-bitrate mp3 (as a data: URL) of `[startSec, endSec)` of a file, so the wizard can play the chosen section. */
 export function makeAudioPreview(filePath: string, startSec: number, endSec: number | null, maxSeconds = 20): Promise<string | null> {
   return new Promise((resolve) => {
@@ -369,9 +442,15 @@ export function runFfmpeg(args: string[], expectedDurationSec: number, onProgres
 }
 
 export interface VideoSlideSpec {
-  kind: 'photo' | 'collage' | 'title' | 'card';
+  kind: 'photo' | 'collage' | 'title' | 'card' | 'clip';
   /** Absolute source file paths (1 for 'photo', up to 4 for 'collage', unused otherwise). */
   photoPaths?: string[];
+  /** For 'clip': the source video, the part to use (seconds; end null/0 = to the end), and its own sound. */
+  clipPath?: string;
+  trimStartSec?: number;
+  trimEndSec?: number | null;
+  muted?: boolean;
+  volume?: number;
   collageStyle?: CollageStyle;
   title?: string;
   subtitle?: string;
@@ -436,6 +515,22 @@ export async function exportVideo(job: VideoExportJob, onProgress?: (p: VideoExp
     const slide = job.slides[i];
     const outPath = path.join(job.tempDir, `slide_${String(i).padStart(4, '0')}.jpg`);
     try {
+      if (slide.kind === 'clip') {
+        const src = slide.clipPath || '';
+        const info = await probeMedia(src);
+        if (!info.hasVideo) throw new Error('not a readable video');
+        const start = Math.max(0, slide.trimStartSec ?? 0);
+        const end = slide.trimEndSec && slide.trimEndSec > start ? slide.trimEndSec : (info.durationSec ?? start);
+        const len = Math.min(end, info.durationSec ?? end) - start;
+        if (!(len > 0.2)) throw new Error('empty trim range');
+        const clipOut = path.join(job.tempDir, `clip_${String(i).padStart(4, '0')}.mp4`);
+        const withAudio = info.hasAudio && !slide.muted;
+        const prep = await runFfmpeg(buildClipPrepArgs(src, clipOut, { width, height, fps: 30, startSec: start, lengthSec: len, withAudio }), len, undefined, signal);
+        if (!prep.success) throw new Error(prep.error || 'clip preparation failed');
+        slideFiles.push({ file: clipOut, seconds: len, clip: { hasAudio: withAudio, volume: slide.volume ?? 1 } });
+        onProgress?.({ stage: 'preparing', done: i + 1, total: job.slides.length });
+        continue;
+      }
       if (slide.kind === 'card') {
         await prepareCardImage(slide.imageDataUrl || '', outPath, width, height);
       } else if (slide.kind === 'title') {

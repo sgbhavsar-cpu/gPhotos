@@ -555,13 +555,17 @@ export function getAllFaces(db: DatabaseSync = getDb()): DetectedFace[] {
 }
 
 /** Same result as getAllFaces, chunked + yielding — see getAllPhotosChunked's doc comment for why. */
-export async function getAllFacesChunked(db: DatabaseSync = getDb()): Promise<DetectedFace[]> {
+export async function getAllFacesChunked(db: DatabaseSync = getDb(), opts?: { skipDescriptors?: boolean }): Promise<DetectedFace[]> {
   // Keyset pagination on rowid: the same physical order the old un-ORDERed LIMIT/OFFSET scan
   // returned, but O(chunk) per page and with well-defined page boundaries. (An id-ordered keyset
   // would need a random table lookup per row: measured ~3x slower.) replaceFacesForPhoto deletes
   // and re-inserts a photo's faces, moving them to a new (highest) rowid mid-read, so dedupe by
   // id — a moved face is then returned once, and never skipped since its new rowid is ahead.
-  const page = db.prepare('SELECT rowid AS _rid, * FROM faces WHERE rowid > ? ORDER BY rowid LIMIT ?');
+  // skipDescriptors: the 512-number descriptor is nearly all of a face row's bytes; callers that never match faces (the mobile web UI) don't read it.
+  const cols = opts?.skipDescriptors
+    ? 'id, photo_id, person_id, box_x, box_y, box_width, box_height, image_width, image_height, NULL AS descriptor_json, confidence, is_confirmed, is_manual, age, gender, gender_probability, expressions_json, dominant_expression'
+    : '*';
+  const page = db.prepare(`SELECT rowid AS _rid, ${cols} FROM faces WHERE rowid > ? ORDER BY rowid LIMIT ?`);
   const faces: DetectedFace[] = [];
   const seen = new Set<string>();
   let rows = page.all(0, FULL_LOAD_CHUNK_SIZE) as any[];

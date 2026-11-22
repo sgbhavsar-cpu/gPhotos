@@ -63,6 +63,13 @@ export function sendFileStream(
     rs.once('error', fail);
     rs.once('open', () => {
       rs.off('error', fail);
+      // The client may have disconnected while the file was opening (a phone scrolling past an image):
+      // piping into a destroyed response throws ERR_STREAM_UNABLE_TO_PIPE out of this event handler,
+      // which surfaced as the app's "Unexpected Error" dialog. Just drop the stream instead.
+      if (res.destroyed || res.writableEnded) {
+        rs.destroy();
+        return;
+      }
       pipeline(rs, res, (err) => {
         if (err && (err as NodeJS.ErrnoException).code !== 'ERR_STREAM_PREMATURE_CLOSE') {
           console.warn('[EmbeddedWebServer] Stream error:', err.message);

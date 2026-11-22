@@ -3,6 +3,7 @@ import { ChevronUp, ChevronDown, ChevronRight, Pencil, Trash2, Check, X } from '
 import type { AlbumChapter, Photo } from '../../../types';
 import { getLocalPhotoUrl } from '../services/libraryStore';
 import { VirtualCardGrid } from './VirtualCardGrid';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 interface AlbumChapterSectionProps {
   chapter: AlbumChapter;
@@ -32,7 +33,9 @@ interface AlbumChapterSectionProps {
 export const AlbumChapterSection: React.FC<AlbumChapterSectionProps> = ({
   chapter, photos, scrollRef, rowHeight, minColWidth, gap, renderTile, onRename, onDelete, onMoveUp, onMoveDown, selectedCount = 0, onSelectAll, onDeselectAll, collapsed, onToggleCollapse,
 }) => {
+  const isMobile = useIsMobile();
   const [isRenaming, setIsRenaming] = useState(false);
+  const iconBtn = { width: isMobile ? '40px' : '30px', height: isMobile ? '40px' : '30px' };
   const [draftTitle, setDraftTitle] = useState(chapter.title);
 
   const collagePhotos = photos.slice(0, 4);
@@ -44,9 +47,9 @@ export const AlbumChapterSection: React.FC<AlbumChapterSectionProps> = ({
 
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '14px', marginBottom: collapsed ? 0 : '14px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: isMobile ? '8px' : '14px', flexWrap: isMobile ? 'wrap' : 'nowrap', marginBottom: collapsed ? 0 : '14px' }}>
         {onToggleCollapse && (
-          <button className="btn btn-ghost btn-icon" title={collapsed ? 'Expand chapter' : 'Collapse chapter'} aria-expanded={!collapsed} onClick={onToggleCollapse} style={{ width: '30px', height: '30px', flexShrink: 0 }}>
+          <button className="btn btn-ghost btn-icon" title={collapsed ? 'Expand chapter' : 'Collapse chapter'} aria-expanded={!collapsed} onClick={onToggleCollapse} style={{ ...iconBtn, flexShrink: 0 }}>
             {collapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
           </button>
         )}
@@ -76,20 +79,20 @@ export const AlbumChapterSection: React.FC<AlbumChapterSectionProps> = ({
           </form>
         ) : (
           <>
-            <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ flex: isMobile ? '1 1 120px' : 1, minWidth: 0 }}>
               <h3 style={{ margin: 0, fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {chapter.title}
               </h3>
               <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>{photos.length} photo{photos.length === 1 ? '' : 's'}</span>
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '2px', flexShrink: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '2px', ...(isMobile ? { flex: '1 1 100%', justifyContent: 'flex-end' } : { flexShrink: 0 }) }}>
               {photos.length > 0 && (selectedCount >= photos.length
-                ? onDeselectAll && <button className="btn btn-ghost" onClick={onDeselectAll} style={{ fontSize: '0.78rem', padding: '4px 10px' }}>Deselect all</button>
-                : onSelectAll && <button className="btn btn-ghost" onClick={onSelectAll} style={{ fontSize: '0.78rem', padding: '4px 10px' }}>Select all</button>)}
-              {onMoveUp && <button className="btn btn-ghost btn-icon" title="Move chapter up" onClick={onMoveUp} style={{ width: '30px', height: '30px' }}><ChevronUp size={15} /></button>}
-              {onMoveDown && <button className="btn btn-ghost btn-icon" title="Move chapter down" onClick={onMoveDown} style={{ width: '30px', height: '30px' }}><ChevronDown size={15} /></button>}
-              <button className="btn btn-ghost btn-icon" title="Rename chapter" onClick={() => setIsRenaming(true)} style={{ width: '30px', height: '30px' }}><Pencil size={14} /></button>
-              <button className="btn btn-ghost btn-icon" title="Delete chapter (keeps its photos in the album)" onClick={onDelete} style={{ width: '30px', height: '30px' }}><Trash2 size={14} color="#f43f5e" /></button>
+                ? onDeselectAll && <button className="btn btn-ghost" onClick={onDeselectAll} style={{ fontSize: '0.78rem', padding: isMobile ? '10px 12px' : '4px 10px' }}>Deselect all</button>
+                : onSelectAll && <button className="btn btn-ghost" onClick={onSelectAll} style={{ fontSize: '0.78rem', padding: isMobile ? '10px 12px' : '4px 10px' }}>Select all</button>)}
+              {onMoveUp && <button className="btn btn-ghost btn-icon" title="Move chapter up" onClick={onMoveUp} style={iconBtn}><ChevronUp size={15} /></button>}
+              {onMoveDown && <button className="btn btn-ghost btn-icon" title="Move chapter down" onClick={onMoveDown} style={iconBtn}><ChevronDown size={15} /></button>}
+              <button className="btn btn-ghost btn-icon" title="Rename chapter" onClick={() => setIsRenaming(true)} style={iconBtn}><Pencil size={14} /></button>
+              <button className="btn btn-ghost btn-icon" title="Delete chapter (keeps its photos in the album)" onClick={onDelete} style={iconBtn}><Trash2 size={14} color="#f43f5e" /></button>
             </div>
           </>
         )}

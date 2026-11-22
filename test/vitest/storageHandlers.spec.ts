@@ -289,4 +289,27 @@ describe('storage:save / storage:load handlers (end-to-end)', () => {
     expect(getSetting(KEY, null)).toEqual([]);              // ...replacing it with []
     expect(await handleStorageLoad(KEY)).toEqual([]);
   });
+
+  it('a paired phone/browser cannot wipe the people registry or overwrite real names with placeholders', async () => {
+    const mk = (id: string, name: string) => ({ id, name, faceCount: 1, photoCount: 1, createdAt: '2026-01-01T00:00:00Z' });
+    handleStorageSave(GLOBAL_PEOPLE_KEY, [mk('p1', 'Sachin'), mk('p2', 'Monika')]); // the desktop app owns the registry
+
+    // A web client that never loaded the registry rebuilds placeholders from face data and sends them back.
+    handleStorageSave(GLOBAL_PEOPLE_KEY, [mk('p1', 'Person 90'), mk('p3', 'Person 91')], { isRemote: true });
+    let names = ((await handleStorageLoad(GLOBAL_PEOPLE_KEY)) as any[]).map((p) => p.name).sort();
+    expect(names).toEqual(['Monika', 'Person 91', 'Sachin']); // nobody deleted, Sachin kept, the new person added
+
+    // An empty list from a remote client is not a request to clear anyone.
+    handleStorageSave(GLOBAL_PEOPLE_KEY, [], { isRemote: true });
+    names = ((await handleStorageLoad(GLOBAL_PEOPLE_KEY)) as any[]).map((p) => p.name).sort();
+    expect(names).toEqual(['Monika', 'Person 91', 'Sachin']);
+
+    // A real rename from the phone is still honoured.
+    handleStorageSave(GLOBAL_PEOPLE_KEY, [mk('p3', 'Nilesh')], { isRemote: true });
+    expect(((await handleStorageLoad(GLOBAL_PEOPLE_KEY)) as any[]).some((p) => p.name === 'Nilesh')).toBe(true);
+
+    // The desktop app can still replace the registry deliberately.
+    handleStorageSave(GLOBAL_PEOPLE_KEY, [mk('p1', 'Sachin')]);
+    expect(((await handleStorageLoad(GLOBAL_PEOPLE_KEY)) as any[]).length).toBe(1);
+  });
 });

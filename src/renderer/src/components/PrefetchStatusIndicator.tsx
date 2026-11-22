@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { usePrefetchStatus } from '../services/asyncImageLoader';
 import { ImageDown } from 'lucide-react';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 /**
  * Small persistent pill showing live thumbnail-prefetch activity (the
@@ -11,6 +12,7 @@ import { ImageDown } from 'lucide-react';
  */
 export const PrefetchStatusIndicator: React.FC = () => {
   const status = usePrefetchStatus();
+  const isMobile = useIsMobile();
   const [visible, setVisible] = useState(false);
 
   useEffect(() => {
@@ -33,8 +35,9 @@ export const PrefetchStatusIndicator: React.FC = () => {
       aria-label="Thumbnail prefetch activity"
       style={{
         position: 'fixed',
-        bottom: '16px',
-        left: '20px',
+        // On a phone the bottom edge is the tab bar: float above it instead of covering the tabs.
+        bottom: isMobile ? 'calc(76px + env(safe-area-inset-bottom, 0px))' : '16px',
+        left: isMobile ? '12px' : '20px',
         zIndex: 9999,
         backgroundColor: 'rgba(15, 23, 42, 0.90)',
         border: `1px solid ${isDone ? 'rgba(16, 185, 129, 0.45)' : 'rgba(168, 85, 247, 0.45)'}`,

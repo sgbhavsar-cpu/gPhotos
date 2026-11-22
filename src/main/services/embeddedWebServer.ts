@@ -16,6 +16,7 @@ import { getOrGenerateCachedThumbnail, clearThumbnailCache, refreshThumbnailsFro
 import { getCatalogMeta, getCatalogPage, switchCatalogLibrary, ensureMigratedIfEmpty } from './catalogService';
 import { handleStorageSave, handleStorageLoad, STORAGE_KEY, GLOBAL_PEOPLE_KEY } from './storageHandlers';
 import { sendFileStream } from './fileStream';
+import { buildHlsPlaylist, getVideoDurationSec, streamHlsSegment, HLS_SEGMENT_SEC } from './videoStreamService';
 import { isPathAllowedRemote, isSafeRelativeName, getDefaultMirrorRoot } from './pathSecurity';
 import { browseDirectory } from './directoryBrowser';
 import { getSpriteCoordinate, getSpriteCoordinatesBatch, getSpritePath } from './spriteService';
@@ -23,7 +24,8 @@ import { thumbnailWorker } from './thumbnailWorkerService';
 import { getBackgroundServiceStatus } from './backgroundDaemon';
 import { isPathReachable, clearOfflineCache } from './networkReachabilityCache';
 import { detectFacesForPhoto, resolveDbForPhoto } from './pipelineOrchestrator';
-import { getFacesForPhoto, getAllPeople } from './libraryRepository';
+import { getFacesForPhoto, getAllPeople, getTotalPhotoCount } from './libraryRepository';
+import { getDb, getDbForLibraryPath } from './db';
 import { WebServerStatus, Photo } from '../../types';
 import {
   verifyPin,
@@ -61,6 +63,12 @@ const SERVABLE_IMAGE_EXTS = new Set([
   '.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif', '.tiff', '.tif', '.avif',
   '.dng', '.raw', '.cr2', '.nef',
 ]);
+
+// Video containers /api/photo?preferOriginal=1 may stream for in-browser playback (only these, never arbitrary files).
+const VIDEO_MIME_TYPES: Record<string, string> = {
+  '.mp4': 'video/mp4', '.m4v': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
+  '.mkv': 'video/x-matroska', '.avi': 'video/x-msvideo', '.3gp': 'video/3gpp',
+};
 
 const MIN_THUMB_SIZE = 32;
 const MAX_THUMB_SIZE = 2048;
@@ -155,6 +163,7 @@ const MIME_TYPES: Record<string, string> = {
   '.mjs': 'application/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
   '.bin': 'application/octet-stream',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -270,6 +279,16 @@ function isPhotoRequestAllowed(photo: any): boolean {
   return true;
 }
 
+const WEB_FULL_LIBRARY_MAX_PHOTOS = 20_000;
+
+/** True if the path can be accessed within `ms` (a dead share that never answers just times out). */
+function existsWithin(p: string, ms: number): Promise<boolean> {
+  return Promise.race([
+    fs.promises.access(p, fs.constants.F_OK).then(() => true, () => false),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), ms)),
+  ]);
+}
+
 // Request handler for all HTTP requests
 async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   // CORS headers
@@ -376,7 +395,12 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
       if (libraryDir && rejectIfPathNotAllowed(res, [libraryDir], '/api/library')) return;
       try {
         ensureMigratedIfEmpty();
-        const libraryData = (await handleStorageLoad(STORAGE_KEY, libraryDir)) || { photos: [], people: [], faces: [], albums: [] };
+        // includePhotos=false: the web client pages photos in through /api/catalog-page and only needs
+        // people/faces/albums here. Serialising every photo as well overran V8's maximum string length
+        // on a large library ("Invalid string length" → HTTP 500, so the phone never got a library).
+        // A library past WEB_FULL_LIBRARY_MAX_PHOTOS is never sent as one document, whatever the client asked for.
+        const includePhotos = parsedUrl.searchParams.get('includePhotos') !== 'false' && getTotalPhotoCount(libraryDir ? getDbForLibraryPath(libraryDir) : getDb()) <= WEB_FULL_LIBRARY_MAX_PHOTOS;
+        const libraryData = (await handleStorageLoad(STORAGE_KEY, libraryDir, { includePhotos, stripDescriptors: !includePhotos })) || { photos: [], people: [], faces: [], albums: [] };
         const peopleRegistry = await handleStorageLoad(GLOBAL_PEOPLE_KEY);
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify({ [STORAGE_KEY]: libraryData, [GLOBAL_PEOPLE_KEY]: peopleRegistry }));
@@ -891,6 +915,48 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     return;
   }
 
+  // Endpoints: /api/video/hls (playlist) and /api/video/seg (one transcoded ~6 s piece) — phone-playable streaming of a
+  // library video straight from its original file, without downloading or converting the whole thing first.
+  if (pathname === '/api/video/hls' || pathname === '/api/video/seg') {
+    const filePath = parsedUrl.searchParams.get('path');
+    const originalPath = parsedUrl.searchParams.get('originalPath');
+    if (rejectIfPathNotAllowed(res, [filePath, originalPath], pathname)) return;
+    // The original is the real video; the local mirror of a cloud/NAS storage only keeps a thumbnail.
+    const want = originalPath || filePath;
+    // isPathReachable can answer "offline" (and remember it) just because the PC was too busy to answer its 1.5 s probe in time;
+    // a direct, bounded check settles it, so a loaded machine doesn't turn a playable video into a 404.
+    const src = want && ((await isPathReachable(want)) || (await existsWithin(want, 6000))) ? want : null;
+    if (!src || !VIDEO_MIME_TYPES[path.extname(src).toLowerCase()]) {
+      res.statusCode = src ? 415 : 404;
+      res.end(src ? 'Not a video' : 'Video source is offline');
+      return;
+    }
+    const duration = await getVideoDurationSec(src);
+    if (!duration) {
+      res.statusCode = 422;
+      res.end('Could not read this video');
+      return;
+    }
+    if (pathname === '/api/video/hls') {
+      const q = new URLSearchParams({ path: filePath || '' });
+      if (originalPath) q.set('originalPath', originalPath);
+      const token = parsedUrl.searchParams.get('token');
+      if (token) q.set('token', token); // a native HLS player can't send an Authorization header
+      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.end(buildHlsPlaylist(duration, (i) => `seg?${q.toString()}&i=${i}`));
+      return;
+    }
+    const index = parseInt(parsedUrl.searchParams.get('i') || '', 10);
+    if (!Number.isInteger(index) || index < 0 || index * HLS_SEGMENT_SEC >= duration) {
+      res.statusCode = 404;
+      res.end('No such segment');
+      return;
+    }
+    await streamHlsSegment(res, src, index, duration);
+    return;
+  }
+
   // Endpoint: /api/photo?path=...
   if (pathname === '/api/photo') {
     const filePath = parsedUrl.searchParams.get('path');
@@ -903,6 +969,31 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
     const requestedSize = sizeParam ? parseInt(sizeParam, 10) : 0;
 
     if (rejectIfPathNotAllowed(res, [filePath, originalPath], '/api/photo')) return;
+
+    // download=1: hand the real original file over as a download (the phone's "Save"), byte for byte — never a converted
+    // HEIC, a resized preview or the local thumbnail mirror. If the original can't be reached, say so instead of
+    // quietly delivering a 500 px stand-in.
+    if (parsedUrl.searchParams.get('download') === '1') {
+      const want = originalPath || filePath;
+      const ext = want ? path.extname(want).toLowerCase() : '';
+      const mime = VIDEO_MIME_TYPES[ext] || (SERVABLE_IMAGE_EXTS.has(ext) ? MIME_TYPES[ext] || 'application/octet-stream' : '');
+      if (!want || !mime) {
+        res.statusCode = 415;
+        res.end('Unsupported file type');
+        return;
+      }
+      if (!((await isPathReachable(want)) || (await existsWithin(want, 6000)))) {
+        res.statusCode = 404;
+        res.end('The original file is offline');
+        return;
+      }
+      const name = path.basename(want);
+      res.setHeader('Content-Type', mime);
+      res.setHeader('Content-Disposition', `attachment; filename="${name.replace(/[^\x20-\x7e]|["\\]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(name)}`);
+      res.setHeader('Cache-Control', 'private, no-store');
+      sendFileStream(res, want, 500, 'Failed reading file', req);
+      return;
+    }
 
     let targetPath: string | null = null;
     // isPathReachable (not fs.existsSync) is what keeps an offline network
@@ -919,6 +1010,28 @@ async function handleHttpRequest(req: http.IncomingMessage, res: http.ServerResp
 
     if (targetPath) {
       const ext = path.extname(targetPath).toLowerCase();
+
+      // A video is streamed (with Range support, which phone browsers require to play and seek) from its ORIGINAL
+      // file: the local mirror only keeps a thumbnail, so if the original is unreachable there is nothing to play.
+      const videoMime = VIDEO_MIME_TYPES[ext];
+      if (videoMime && preferOriginal) {
+        if (originalPath && targetPath !== originalPath) {
+          res.statusCode = 404;
+          res.end('Video source is offline');
+          return;
+        }
+        try {
+          const stat = await fs.promises.stat(targetPath);
+          res.setHeader('ETag', `"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}"`);
+          res.setHeader('Content-Type', videoMime);
+          res.setHeader('Cache-Control', 'private, max-age=3600');
+          sendFileStream(res, targetPath, 500, 'Failed reading video', req);
+        } catch {
+          res.statusCode = 500;
+          res.end('Failed reading video');
+        }
+        return;
+      }
 
       // Only real image formats are served — never an .html/.svg/.js/.json that happens to sit in a library folder.
       if (!SERVABLE_IMAGE_EXTS.has(ext)) {

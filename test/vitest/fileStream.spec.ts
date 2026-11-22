@@ -98,3 +98,24 @@ describe('sendFileStream over HTTP', () => {
     expect(r.headers['etag']).toBeUndefined();
   });
 });
+
+describe('sendFileStream: client already gone when the file opens', () => {
+  it('does not throw ERR_STREAM_UNABLE_TO_PIPE (that crashed the app with an "Unexpected Error" dialog)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gp_fs_'));
+    const file = path.join(dir, 'a.bin');
+    fs.writeFileSync(file, Buffer.alloc(1024));
+    const uncaught: unknown[] = [];
+    const onUncaught = (e: unknown) => uncaught.push(e);
+    process.on('uncaughtException', onUncaught);
+    try {
+      const res = new http.ServerResponse(new http.IncomingMessage(null as any));
+      res.destroy(); // the client disconnected before the read stream's 'open' fired
+      sendFileStream(res, file);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(uncaught).toEqual([]);
+    } finally {
+      process.off('uncaughtException', onUncaught);
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    }
+  });
+});

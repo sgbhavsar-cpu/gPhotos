@@ -1,9 +1,11 @@
 import React from 'react';
 import { useResponseTracker, responseTracker } from '../services/responseTracker';
 import { RefreshCw, X } from 'lucide-react';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 export const ResponseActivityIndicator: React.FC = () => {
   const { isWaitingBackend, label } = useResponseTracker();
+  const isMobile = useIsMobile();
 
   // If backend responds within 20 to 50 milliseconds (threshold 35ms), or all requests complete/cancelled, hide
   if (!isWaitingBackend) {
@@ -26,8 +28,9 @@ export const ResponseActivityIndicator: React.FC = () => {
       aria-label="Waiting for backend response"
       style={{
         position: 'fixed',
-        top: '12px',
-        right: '20px',
+        // On a phone the top-right corner is the header's search / layers / menu buttons, and just below it sits the page title:
+        // float above the tab bar (and above the pre-fetch pill) instead.
+        ...(isMobile ? { bottom: 'calc(120px + env(safe-area-inset-bottom, 0px))', right: '12px' } : { top: '12px', right: '20px' }),
         zIndex: 9999,
         backgroundColor: 'rgba(15, 23, 42, 0.90)',
         border: '1px solid rgba(56, 189, 248, 0.45)',
@@ -69,8 +72,8 @@ export const ResponseActivityIndicator: React.FC = () => {
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
-          width: '16px',
-          height: '16px',
+          width: isMobile ? '28px' : '16px',
+          height: isMobile ? '28px' : '16px',
           borderRadius: '50%',
           backgroundColor: 'rgba(255, 255, 255, 0.1)',
           border: 'none',

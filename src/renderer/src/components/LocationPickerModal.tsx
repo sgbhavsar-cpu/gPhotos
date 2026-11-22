@@ -1,6 +1,7 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import L from 'leaflet';
-import { X, Search, Check, MapPin, Link2, ExternalLink } from 'lucide-react';
+import { X, Search, Check, MapPin, Link2, ExternalLink, History } from 'lucide-react';
+import { libraryStore } from '../services/libraryStore';
 import { notify, notifyError } from '../services/notifications';
 import { isGoogleMapsUrl, isShortGoogleMapsUrl, parseGoogleMapsUrl } from '../services/googleMapsUrl';
 
@@ -42,6 +43,29 @@ export const LocationPickerModal: React.FC<LocationPickerModalProps> = ({
   const [label, setLabel] = useState(initialLabel || '');
   const [searchQuery, setSearchQuery] = useState('');
   const [isSearching, setIsSearching] = useState(false);
+  const [savedQuery, setSavedQuery] = useState('');
+  // Every distinct place already given to some photo in the library (by label), most-used first.
+  const savedPlaces = useMemo(() => {
+    const byKey = new Map<string, { label: string; lat: number; lng: number; count: number }>();
+    for (const p of libraryStore.getState().photos) {
+      const loc = p.location;
+      const name = (loc?.label || [loc?.city, loc?.country].filter(Boolean).join(', ')).trim();
+      if (!loc || !name || loc.latitude == null || loc.longitude == null || (loc.latitude === 0 && loc.longitude === 0)) continue;
+      const key = name.toLowerCase();
+      const hit = byKey.get(key);
+      if (hit) hit.count++; else byKey.set(key, { label: name, lat: loc.latitude, lng: loc.longitude, count: 1 });
+    }
+    return [...byKey.values()].sort((a, b) => b.count - a.count);
+  }, []);
+  const savedMatches = useMemo(() => {
+    const q = savedQuery.trim().toLowerCase();
+    return (q ? savedPlaces.filter((pl) => pl.label.toLowerCase().includes(q)) : savedPlaces).slice(0, 6);
+  }, [savedPlaces, savedQuery]);
+  const useSavedPlace = (pl: { label: string; lat: number; lng: number }) => {
+    placePin(pl.lat, pl.lng);
+    setLabel(pl.label);
+    mapInstanceRef.current?.flyTo([pl.lat, pl.lng], 13, { duration: 0.8 });
+  };
   const [mapsUrl, setMapsUrl] = useState('');
   const [isResolvingMapsUrl, setIsResolvingMapsUrl] = useState(false);
   const [mapsUrlError, setMapsUrlError] = useState<string | null>(null);
@@ -200,21 +224,16 @@ export const LocationPickerModal: React.FC<LocationPickerModalProps> = ({
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        padding: '24px',
+        padding: 0,
       }}
-      onClick={onClose}
     >
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
           width: '100%',
-          maxWidth: '720px',
-          height: '600px',
-          maxHeight: '85vh',
+          height: '100%',
           backgroundColor: 'var(--bg-surface)',
           border: '1px solid var(--border-subtle)',
-          borderRadius: 'var(--radius-lg)',
-          boxShadow: '0 24px 64px rgba(0, 0, 0, 0.7)',
           overflow: 'hidden',
           display: 'flex',
           flexDirection: 'column',
@@ -257,6 +276,39 @@ export const LocationPickerModal: React.FC<LocationPickerModalProps> = ({
               <span>{isSearching ? 'Searching...' : 'Search'}</span>
             </button>
           </div>
+
+          {savedPlaces.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                <History size={14} color="var(--text-muted)" />
+                <input
+                  type="text"
+                  value={savedQuery}
+                  onChange={(e) => setSavedQuery(e.target.value)}
+                  onKeyDown={(e) => e.stopPropagation()}
+                  placeholder="Reuse a location already used on other photos — type a label..."
+                  className="input"
+                  data-testid="saved-location-search"
+                  style={{ flex: 1, fontSize: '0.85rem' }}
+                />
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                {savedMatches.length === 0 && <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>No saved location matches.</span>}
+                {savedMatches.map((pl) => (
+                  <button
+                    key={pl.label}
+                    type="button"
+                    className="btn btn-secondary"
+                    onClick={() => useSavedPlace(pl)}
+                    title={`${pl.lat.toFixed(4)}, ${pl.lng.toFixed(4)} · ${pl.count} photo${pl.count === 1 ? '' : 's'}`}
+                    style={{ fontSize: '0.75rem', padding: '3px 10px', gap: '5px' }}
+                  >
+                    <MapPin size={12} /> {pl.label} <span style={{ opacity: 0.6 }}>({pl.count})</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
             <div style={{ height: '1px', flex: '0 0 24px', backgroundColor: 'var(--border-subtle)' }} />

@@ -1442,7 +1442,7 @@ let currentVideoExportAbort: AbortController | null = null;
 
 ipcMain.handle('video:export', async (event, request: VideoExportRequest) => {
   try {
-    const photoPaths = request.slides.flatMap((s) => s.photoPaths || []);
+    const photoPaths = request.slides.flatMap((s) => [...(s.photoPaths || []), ...(s.clipPath ? [s.clipPath] : [])]);
     assertPathsAllowed(photoPaths, 'video:export');
     if (typeof request.outputPath !== 'string' || !/.mp4$/i.test(request.outputPath)) throw new Error('The output file must be an .mp4 path.');
     if (!userApprovedVideoOutputs.has(request.outputPath)) assertPathsAllowed([request.outputPath], 'video:export');
