@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { writeFaceCropsFromBuffer, deleteFaceCrops } from './faceCropService';
 import path from 'path';
 import type { DatabaseSync } from 'node:sqlite';
 import { VirtualStorageConfig, VirtualPhotoMetadata, Photo, DetectedFace, Person } from '../../types';
@@ -352,6 +353,33 @@ export async function detectFacesForPhoto(
     imageHeight,
   }));
 
+  // Faces the user confirmed or drew by hand are not thrown away by a re-detection: a new detection that lands on one inherits its
+  // person and confirmation, and a hand-drawn face with no detection under it is kept as it was.
+  // The same goes for "Not this person": a new detection on top of a face with rejections inherits them.
+  const withRejections = (existing?.faces ?? []).filter((f) => f.rejectedPersonIds && f.rejectedPersonIds.length > 0);
+  for (const nf of newFaces) {
+    let best: DetectedFace | null = null, bestIou = 0.4;
+    for (const of_ of withRejections) {
+      const iou = boxIou(nf.box, of_.box);
+      if (iou >= bestIou) { bestIou = iou; best = of_; }
+    }
+    if (best) nf.rejectedPersonIds = [...best.rejectedPersonIds!];
+  }
+  const keptFaces = (existing?.faces ?? []).filter((f) => f.isConfirmed || f.isManual);
+  if (keptFaces.length > 0) {
+    const used = new Set<string>();
+    for (const nf of newFaces) {
+      let best: DetectedFace | null = null, bestIou = 0.4;
+      for (const kf of keptFaces) {
+        if (used.has(kf.id)) continue;
+        const iou = boxIou(nf.box, kf.box);
+        if (iou >= bestIou) { bestIou = iou; best = kf; }
+      }
+      if (best) { used.add(best.id); nf.personId = best.personId; nf.isConfirmed = best.isConfirmed; nf.isManual = best.isManual; }
+    }
+    for (const kf of keptFaces) if (!used.has(kf.id) && kf.isManual) newFaces.push({ ...kf, photoId });
+  }
+
   // Cluster against this library's full existing face set so new faces can
   // match already-known people (see faceClustering.ts) — excluding this
   // photo's OWN existing faces first: reaching this point means the source
@@ -390,6 +418,14 @@ export async function detectFacesForPhoto(
   const revBeforeOwnWrite = getFacesPeopleRevision();
   replaceFacesForPhoto(photoId, thisPhotoFaces, false, db);
   if (changedPeople.length > 0) upsertPeople(changedPeople);
+
+  // Sharp face crops for the Zoomed Faces view, cut from the photo that is already decoded here. Face ids are per photo and index,
+  // so a re-detection reuses them: drop the old crop files first or a stale crop would be kept.
+  {
+    const where = { filePath: photo.filePath, isVirtual: working.isVirtual, storageName: working.storageName };
+    deleteFaceCrops(where, thisPhotoFaces.map((f) => f.id));
+    await writeFaceCropsFromBuffer(detectionBuffer, where, thisPhotoFaces.map((f) => ({ faceId: f.id, box: f.box, imageWidth: f.imageWidth, imageHeight: f.imageHeight })));
+  }
 
   // clusterFaces' own output is already the complete, authoritative new
   // state (every face across the whole set it was given, every person with
@@ -467,4 +503,13 @@ export async function forceRedetectFacesForPhoto(photo: Photo): Promise<FaceStep
   upsertPhoto(unlocked, db);
   const sourceFilePath = photo.isVirtual ? photo.originalRemotePath || photo.filePath : photo.filePath;
   return detectFacesForPhoto(unlocked, sourceFilePath, db);
+}
+
+/** Intersection-over-union of two face boxes. */
+export function boxIou(a: { x: number; y: number; width: number; height: number }, b: { x: number; y: number; width: number; height: number }): number {
+  const w = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
+  const h = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+  if (w <= 0 || h <= 0) return 0;
+  const inter = w * h;
+  return inter / (a.width * a.height + b.width * b.height - inter);
 }

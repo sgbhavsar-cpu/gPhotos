@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
 import { X, UserCheck, AlertCircle, Sparkles, Loader2 } from 'lucide-react';
 import { DetectedFace, Person, Photo } from '../../../types';
 import { FaceAvatar } from './FaceAvatar';
@@ -43,18 +44,7 @@ export const ReassignFaceModal: React.FC<ReassignFaceModalProps> = ({
   const [pendingLabel, setPendingLabel] = useState<string | null>(null);
   const storePhotos = libraryStore.getState().photos;
 
-  // Handle Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopImmediatePropagation();
-        onClose();
-      }
-    };
-    // capture: true — see PeopleView's matching Escape handler for why.
-    window.addEventListener('keydown', handleKeyDown, { capture: true });
-    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [onClose]);
+  useEscapeLayer(true, onClose);
 
   /**
    * Applies the choice immediately — a click on a person, or Enter in the search box, is the whole gesture

@@ -6,6 +6,8 @@ import { createRoot, type Root } from 'react-dom/client';
 const store = vi.hoisted(() => ({
   reassignFaceToPerson: vi.fn(() => ({ success: true })),
   canMergePeople: vi.fn(() => ({ canMerge: true })),
+  getMergeConflictPhotos: vi.fn(() => [] as any[]),
+  markPersonUnknownWhereBothAppear: vi.fn(() => 0),
   mergePeople: vi.fn(() => true),
   getState: vi.fn(() => ({ people: [], photos: [] })),
 }));

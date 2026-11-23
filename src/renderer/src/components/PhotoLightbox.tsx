@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
 import {
   X,
   ChevronDown,
@@ -1347,6 +1348,37 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
     setTimeout(() => setScanStatusMessage(null), 4500);
   };
 
+  // Escape closes one level at a time, innermost first (a text box being typed in cancels its own edit instead).
+  useEscapeLayer(true, () => {
+    // Dialogs opened from here are layers of their own (in front of this one); the rest of the ladder covers the inline editors.
+    if (showLocationPicker) {
+      setShowLocationPicker(false);
+    } else if (showAddToAlbumModal) {
+      setShowAddToAlbumModal(false);
+    } else if (reassignFace) {
+      setReassignFace(null);
+    } else if (coverPhotoTarget) {
+      setCoverPhotoTarget(null);
+    } else if (renamePersonState) {
+      setRenamePersonState(null);
+    } else if (isEditingLocation) {
+      setIsEditingLocation(false);
+    } else if (isEditingDate) {
+      setIsEditingDate(false);
+    } else if (isTaggingMode) {
+      setIsTaggingMode(false);
+      setDrawBox(null);
+    } else if (isEditing) {
+      setIsEditing(false);
+      setEditRotation(0);
+      setEditFlipH(false);
+      setCropRect(null);
+      setIsCropping(false);
+    } else {
+      onClose();
+    }
+  }, { unlessTyping: true });
+
   // Keyboard navigation
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -1362,57 +1394,7 @@ export const PhotoLightbox: React.FC<PhotoLightboxProps> = ({
       // Ctrl/Cmd/Alt combos (e.g. Ctrl+F, Ctrl+I) must not trigger single-key shortcuts.
       const hasModifier = e.ctrlKey || e.metaKey || e.altKey;
 
-      if (e.key === 'Escape') {
-        // Nested modals here (LocationPickerModal, ReassignFaceModal) mount
-        // AFTER this component and register their own capture-phase Escape
-        // listeners too — but capture-phase listeners on the same window
-        // still fire in ATTACHMENT order, so this outer handler would
-        // otherwise run FIRST and close the whole lightbox out from under
-        // whichever inner dialog the user actually meant to dismiss. Closing
-        // the innermost thing directly here (with stopImmediatePropagation)
-        // makes Escape back out one level at a time, same as everywhere else.
-        if (showLocationPicker) {
-          e.stopImmediatePropagation();
-          setShowLocationPicker(false);
-        } else if (showAddToAlbumModal) {
-          e.stopImmediatePropagation();
-          setShowAddToAlbumModal(false);
-        } else if (reassignFace) {
-          e.stopImmediatePropagation();
-          setReassignFace(null);
-        } else if (coverPhotoTarget) {
-          e.stopImmediatePropagation();
-          setCoverPhotoTarget(null);
-        } else if (renamePersonState) {
-          e.stopImmediatePropagation();
-          setRenamePersonState(null);
-        } else if (isEditingLocation) {
-          e.stopImmediatePropagation();
-          setIsEditingLocation(false);
-        } else if (isEditingDate) {
-          e.stopImmediatePropagation();
-          setIsEditingDate(false);
-        } else if (isTaggingMode) {
-          e.stopImmediatePropagation();
-          setIsTaggingMode(false);
-          setDrawBox(null);
-        } else if (isEditing) {
-          e.stopImmediatePropagation();
-          setIsEditing(false);
-          setEditRotation(0);
-          setEditFlipH(false);
-          setCropRect(null);
-          setIsCropping(false);
-        } else {
-          // Every sibling branch above stops the event here so Escape closes one level at a
-          // time instead of leaking to whatever's underneath — this one must too, or closing
-          // the lightbox lets the SAME keypress also reach the tab behind it (e.g. a capture-
-          // phase Escape handler on the two-pane explorer or folder tree), which can look like
-          // "closing the photo also navigated away" even though nothing here asked it to.
-          e.stopImmediatePropagation();
-          onClose();
-        }
-      } else if (e.key === 'ArrowLeft' && !isTaggingMode) {
+      if (e.key === 'ArrowLeft' && !isTaggingMode) {
         handlePrev();
       } else if (e.key === 'ArrowRight' && !isTaggingMode) {
         handleNext();

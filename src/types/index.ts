@@ -34,6 +34,8 @@ export interface DetectedFace {
   imageHeight?: number;
   descriptor: number[]; // 512-dimensional ArcFace embedding vector (see faceDetectionEngine.ts)
   personId?: string;
+  /** People the user said this face is NOT ("Not this person", or moved to someone else). Automatic matching never gives the face back to them. */
+  rejectedPersonIds?: string[];
   confidence: number;
   isConfirmed?: boolean;
   isManual?: boolean;
@@ -164,6 +166,19 @@ export interface DuplicateCluster {
 }
 
 export type InventoryStatus = 'not_started' | 'scanning' | 'completed' | 'failed';
+
+/** What the main process needs to find or make a face's cached crop. */
+export interface FaceCropRequestInput {
+  filePath: string;
+  originalRemotePath?: string;
+  isVirtual?: boolean;
+  storageName?: string;
+  isVideo?: boolean;
+  faceId: string;
+  box: { x: number; y: number; width: number; height: number };
+  imageWidth?: number;
+  imageHeight?: number;
+}
 
 export interface VirtualStorageConfig {
   id: string;
@@ -437,7 +452,7 @@ export interface RelocationItemResult {
 
 // ---- Video export (videoExportService.ts in the main process): the "Create Video" wizard ----
 export type VideoAspectRatio = '16:9' | '9:16' | '1:1' | '4:3';
-export type VideoResolutionTier = '720p' | '1080p';
+export type VideoResolutionTier = '360p' | '720p' | '1080p'; // 360p = the wizard's live preview only
 export type VideoQuality = 'draft' | 'good' | 'best';
 export type VideoTransition = import('./videoFormat').VideoTransitionName;
 export type VideoCollageStyle = 'grid' | 'sideBySide' | 'stacked' | 'featured';
@@ -450,6 +465,12 @@ export interface VideoSlideInput {
   clipPath?: string;
   trimStartSec?: number;
   trimEndSec?: number | null;
+  /** Clip playback speed, 0.25..4 (default 1). */
+  speed?: number;
+  /** Play the clip backwards. */
+  reverse?: boolean;
+  /** Freeze: hold the last frame this many seconds (0..10). */
+  holdSec?: number;
   muted?: boolean;
   volume?: number;
   /** Layout for a 'collage' slide (default 'grid'). */
@@ -460,6 +481,13 @@ export interface VideoSlideInput {
   seconds?: number;
   title?: string;
   subtitle?: string;
+  /** Photo / collage: slow camera movement; 'face' follows `focus` (the people's centre, 0..1 of the photo). */
+  motion?: import('./videoFormat').VideoMotionName;
+  focus?: { x: number; y: number };
+  /** One-tap colour look for this slide (not applied to title / credits cards). */
+  filter?: import('./videoFormat').VideoFilterName;
+  /** A lower-third line of text drawn over the slide (place, date, people, chapter...). */
+  caption?: string;
 }
 
 /** Music under the video: a file (picked or downloaded), the part of it to use, and whether to repeat it. */
@@ -475,9 +503,21 @@ export interface VideoAudioInput {
   volume?: number;
 }
 
+/** A voice-over / extra sound laid over the video, starting `startSec` seconds in. */
+export interface VideoVoiceInput {
+  filePath: string;
+  startSec: number;
+  /** 0..2 (default 1). */
+  volume?: number;
+}
+
 export interface VideoExportRequest {
   slides: VideoSlideInput[];
   audio?: VideoAudioInput;
+  /** Voice-over / extra sound tracks; the music ducks under them. */
+  voice?: VideoVoiceInput[];
+  /** Where captions sit, their size and colour (default: bottom, medium, white). */
+  captionStyle?: import('./videoFormat').VideoCaptionStyle;
   aspectRatio: VideoAspectRatio;
   resolution: VideoResolutionTier;
   quality: VideoQuality;
@@ -627,6 +667,27 @@ export interface IElectronAPI {
     canceled?: boolean;
     error?: string;
   }>;
+  /** A sharp cached crop of a face (file path), made from the original if it is not on disk yet; null when it cannot be made. */
+  getFaceCrop?: (req: FaceCropRequestInput) => Promise<string | null>;
+  /** Idle job: creates the missing crops for these faces. */
+  fillFaceCrops?: (reqs: FaceCropRequestInput[]) => Promise<{ made: number; skipped: number; failed: number }>;
+  stopFillingFaceCrops?: () => Promise<boolean>;
+  /** How many faces a reset of this storage would delete / keep. */
+  previewFaceReset?: (p: { storageName: string; localMirrorRoot?: string }) => Promise<{ success: boolean; error?: string; total?: number; confirmed?: number; wouldDelete?: number; wouldKeep?: number }>;
+  /** Deletes the storage's face detections (keeping confirmed / hand-drawn ones unless told otherwise) and marks its photos unscanned. */
+  resetStorageFaces?: (p: { storageName: string; localMirrorRoot?: string; deleteConfirmed: boolean }) => Promise<{ success: boolean; error?: string; deletedFaces?: number; keptFaces?: number; photosReset?: number }>;
+  /** Second-phase scan: unknown faces matched to confirmed people. */
+  runFaceSecondPass?: (p: { storageName?: string; localMirrorRoot?: string; personId?: string; faceIds?: string[]; scope?: 'storage' | 'all' }) => Promise<{ success: boolean; error?: string; assignments?: Array<{ faceId: string; photoId: string; personId: string }>; candidates?: number; peopleUsed?: number; stillUnknown?: number }>;
+  /** Databases that can be backed up (the shared people/settings one and one per library / network drive). */
+  listDbBackupSources?: () => Promise<Array<{ id: string; kind: 'global' | 'library'; label: string; detail?: string; sizeBytes: number }>>;
+  /** Asks for a folder, then writes one zip per chosen database into it. */
+  runDbBackup?: (ids: string[]) => Promise<{
+    success: boolean;
+    canceled?: boolean;
+    error?: string;
+    folder?: string;
+    results?: Array<{ id: string; label: string; success: boolean; zipPath?: string; zipBytes?: number; error?: string }>;
+  }>;
   openItemInFolder: (filePath: string) => Promise<boolean>;
   openFile: (filePath: string, programPath?: string) => Promise<boolean>;
   getWebServerStatus: () => Promise<WebServerStatus>;
@@ -695,11 +756,17 @@ export interface IElectronAPI {
   // Video export wizard (videoExportService.ts, main process)
   chooseVideoOutputPath?: (suggestedName: string) => Promise<string | null>;
   exportVideo?: (request: VideoExportRequest) => Promise<VideoExportResponse>;
+  /** Renders a quick low-resolution draft of the plan (to a temp file) for the wizard's preview player. */
+  previewVideo?: (request: VideoExportRequest) => Promise<VideoExportResponse>;
   cancelVideoExport?: () => Promise<boolean>;
   openVideoFile?: (filePath: string) => Promise<boolean>;
 
   // Video wizard music: local file, short preview clip, and YouTube audio via yt-dlp (ytDlpService.ts)
   chooseAudioFile?: () => Promise<AudioFileInfo | null>;
+  /** Saves a microphone recording (the browser's MediaRecorder bytes) as a track the video can use. */
+  saveVoiceRecording?: (data: ArrayBuffer) => Promise<AudioFileInfo | null>;
+  /** Tempo and first-beat position of the chosen part of a music file, for "cut on the beat". */
+  analyzeBeats?: (filePath: string, startSec: number, endSec: number | null) => Promise<{ bpm: number; firstBeatSec: number } | null>;
   getAudioPreview?: (filePath: string, startSec: number, endSec: number | null) => Promise<string | null>;
   getYtDlpStatus?: () => Promise<YtDlpStatusInfo>;
   installYtDlp?: () => Promise<{ ok: boolean; error?: string; version?: string }>;

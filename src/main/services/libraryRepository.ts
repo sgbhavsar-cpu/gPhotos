@@ -444,6 +444,8 @@ function rowToFace(row: any): DetectedFace {
     confidence: row.confidence ?? 0,
   };
   if (row.person_id) face.personId = row.person_id;
+  const rejected = parseJson<string[] | null>(row.rejected_person_ids, null);
+  if (Array.isArray(rejected) && rejected.length > 0) face.rejectedPersonIds = rejected;
   if (row.image_width != null) face.imageWidth = row.image_width;
   if (row.image_height != null) face.imageHeight = row.image_height;
   if (row.is_confirmed != null) face.isConfirmed = toBool(row.is_confirmed);
@@ -461,11 +463,11 @@ const UPSERT_FACE_SQL = `
   INSERT INTO faces (
     id, photo_id, person_id, box_x, box_y, box_width, box_height, image_width, image_height,
     descriptor_json, confidence, is_confirmed, is_manual, age, gender, gender_probability,
-    expressions_json, dominant_expression
+    expressions_json, dominant_expression, rejected_person_ids
   ) VALUES (
     @id, @photoId, @personId, @boxX, @boxY, @boxWidth, @boxHeight, @imageWidth, @imageHeight,
     @descriptorJson, @confidence, @isConfirmed, @isManual, @age, @gender, @genderProbability,
-    @expressionsJson, @dominantExpression
+    @expressionsJson, @dominantExpression, @rejectedPersonIds
   )
   ON CONFLICT(id) DO UPDATE SET
     photo_id=excluded.photo_id, person_id=excluded.person_id, box_x=excluded.box_x,
@@ -474,7 +476,8 @@ const UPSERT_FACE_SQL = `
     descriptor_json=excluded.descriptor_json, confidence=excluded.confidence,
     is_confirmed=excluded.is_confirmed, is_manual=excluded.is_manual, age=excluded.age,
     gender=excluded.gender, gender_probability=excluded.gender_probability,
-    expressions_json=excluded.expressions_json, dominant_expression=excluded.dominant_expression
+    expressions_json=excluded.expressions_json, dominant_expression=excluded.dominant_expression,
+    rejected_person_ids=excluded.rejected_person_ids
 `;
 
 function faceToParams(face: DetectedFace): Record<string, any> {
@@ -497,6 +500,7 @@ function faceToParams(face: DetectedFace): Record<string, any> {
     genderProbability: face.genderProbability ?? null,
     expressionsJson: face.expressions ? JSON.stringify(face.expressions) : null,
     dominantExpression: face.dominantExpression ?? null,
+    rejectedPersonIds: face.rejectedPersonIds && face.rejectedPersonIds.length > 0 ? JSON.stringify(face.rejectedPersonIds) : null,
   };
 }
 
@@ -563,7 +567,7 @@ export async function getAllFacesChunked(db: DatabaseSync = getDb(), opts?: { sk
   // id — a moved face is then returned once, and never skipped since its new rowid is ahead.
   // skipDescriptors: the 512-number descriptor is nearly all of a face row's bytes; callers that never match faces (the mobile web UI) don't read it.
   const cols = opts?.skipDescriptors
-    ? 'id, photo_id, person_id, box_x, box_y, box_width, box_height, image_width, image_height, NULL AS descriptor_json, confidence, is_confirmed, is_manual, age, gender, gender_probability, expressions_json, dominant_expression'
+    ? 'id, photo_id, person_id, box_x, box_y, box_width, box_height, image_width, image_height, NULL AS descriptor_json, confidence, is_confirmed, is_manual, age, gender, gender_probability, expressions_json, dominant_expression, rejected_person_ids'
     : '*';
   const page = db.prepare(`SELECT rowid AS _rid, ${cols} FROM faces WHERE rowid > ? ORDER BY rowid LIMIT ?`);
   const faces: DetectedFace[] = [];

@@ -122,7 +122,7 @@ function computePhotoSig(p: Photo): string {
   let faceSig = '';
   if (p.faces) {
     for (const f of p.faces) {
-      faceSig += `${f.id},${f.personId ?? ''},${f.isConfirmed ? 1 : 0},${f.isManual ? 1 : 0},${f.box?.x},${f.box?.y},${f.box?.width},${f.box?.height};`;
+      faceSig += `${f.id},${f.personId ?? ''},${f.isConfirmed ? 1 : 0},${f.isManual ? 1 : 0},${f.box?.x},${f.box?.y},${f.box?.width},${f.box?.height},${f.rejectedPersonIds ? f.rejectedPersonIds.join('+') : ''};`;
     }
   }
   return [
@@ -493,6 +493,7 @@ export class LibraryManager {
             // `existing` may be the very face object a photo holds: edited in place, so re-sign everything.
             if (!existing.personId && face.personId) { existing.personId = face.personId; this.forceFullResign = true; }
             if (!existing.descriptor && face.descriptor) existing.descriptor = face.descriptor;
+            if (face.rejectedPersonIds?.length && !existing.rejectedPersonIds?.length) existing.rejectedPersonIds = face.rejectedPersonIds;
             if (face.isConfirmed && !existing.isConfirmed) { existing.isConfirmed = true; this.forceFullResign = true; }
           } else {
             allFacesMap.set(face.id, { ...face, photoId: photo.id });
@@ -1759,6 +1760,31 @@ export class LibraryManager {
     return { canMerge: true };
   }
 
+  /** Photos in which both people appear (what blocks a merge). */
+  public getMergeConflictPhotos(personId1: string, personId2: string): Photo[] {
+    return this.state.photos.filter((p) => p.faces?.some((f) => f.personId === personId1) && p.faces?.some((f) => f.personId === personId2));
+  }
+
+  /**
+   * Resolves a merge conflict without hand-fixing every photo: in each photo where both people appear, `personId`'s faces go
+   * back to "unknown" (boxes kept), and the photo is unlocked and flagged unscanned so the idle face scan looks at it again
+   * and re-matches those faces. Returns how many photos were changed.
+   */
+  public markPersonUnknownWhereBothAppear(personId: string, otherPersonId: string): number {
+    const ids = new Set(this.getMergeConflictPhotos(personId, otherPersonId).map((p) => p.id));
+    if (ids.size === 0) return 0;
+    const unknownise = (f: DetectedFace): DetectedFace => (f.personId === personId ? { ...f, personId: undefined, isConfirmed: false } : f);
+    const faceIds = new Set<string>();
+    for (const p of this.state.photos) if (ids.has(p.id)) for (const f of p.faces || []) if (f.personId === personId) faceIds.add(f.id);
+    for (const f of this.state.faces) {
+      if (faceIds.has(f.id)) { f.personId = undefined; f.isConfirmed = false; }
+    }
+    this.state.photos = this.state.photos.map((p) => (ids.has(p.id) ? { ...p, faces: (p.faces || []).map(unknownise), faceScanCompleted: false, facesLocked: false } : p));
+    this.recountPeople();
+    this.notify(true);
+    return ids.size;
+  }
+
   public resetAllPeopleAndFaces() {
     this.state.people = [];
     this.state.faces = [];
@@ -1834,7 +1860,7 @@ export class LibraryManager {
       .filter((p) => p.faces && p.faces.length > 0)
       .map((p) => ({
         id: p.id,
-        faces: p.faces!.map((f) => ({ id: f.id, personId: f.personId, isConfirmed: f.isConfirmed, descriptor: f.descriptor })),
+        faces: p.faces!.map((f) => ({ id: f.id, personId: f.personId, rejectedPersonIds: f.rejectedPersonIds, isConfirmed: f.isConfirmed, descriptor: f.descriptor })),
       }));
     const matches = await matchUnassignedFacesToCentroidAsync(slimPhotos, personId, centroid, threshold);
 
@@ -1981,6 +2007,7 @@ export class LibraryManager {
     if (!cleanInput) {
       return { success: false, error: 'Person name cannot be empty' };
     }
+    const previousPersonId = face.personId;
 
     // Check if target is an existing person (by ID or by name)
     let targetPerson = this.state.people.find(
@@ -2026,6 +2053,14 @@ export class LibraryManager {
         pf.isConfirmed = true;
       }
     }
+    // Moved from one person to another: the new one is no longer rejected, the old one now is.
+    {
+      const newId = face.personId;
+      this.editRejections(faceId, (l) => {
+        const kept = l.filter((id) => id !== newId);
+        return previousPersonId && previousPersonId !== newId && !kept.includes(previousPersonId) ? [...kept, previousPersonId] : kept;
+      });
+    }
 
     // The assignment itself is already fully applied above (face.personId/isConfirmed, photo.faces,
     // the new person if one was created) — notify right away so the caller (e.g. ReassignFaceModal)
@@ -2041,8 +2076,28 @@ export class LibraryManager {
     return { success: true };
   }
 
+  /**
+   * Edits the list of people a face was rejected for (see DetectedFace.rejectedPersonIds), on the global face and on the
+   * photo's copy of it, and marks the photo changed so the next save carries it.
+   */
+  private editRejections(faceId: string, change: (list: string[]) => string[]): void {
+    const apply = (f: DetectedFace) => {
+      const next = change(f.rejectedPersonIds ?? []);
+      f.rejectedPersonIds = next.length > 0 ? next : undefined;
+    };
+    for (const f of this.state.faces) if (f.id === faceId) apply(f);
+    for (const photo of this.state.photos) {
+      const pf = photo.faces?.find((f) => f.id === faceId);
+      if (pf) { apply(pf); this.touch(photo); }
+    }
+  }
+
   public async unassignFaceFromPerson(faceId: string): Promise<{ success: boolean; photoName?: string; personName?: string }> {
     let unassigned = false;
+    // Who this face is being taken away from: it is remembered, so no later matching pass gives it back to them.
+    const rejectedPersonId =
+      this.state.faces.find((f) => f.id === faceId)?.personId ??
+      this.state.photos.find((p) => p.faces?.some((f) => f.id === faceId))?.faces?.find((f) => f.id === faceId)?.personId;
     let photoName: string | undefined;
     let personName: string | undefined;
     let affectedPhotoId: string | undefined;
@@ -2084,6 +2139,7 @@ export class LibraryManager {
     });
 
     if (unassigned) {
+      if (rejectedPersonId) this.editRejections(faceId, (l) => (l.includes(rejectedPersonId) ? l : [...l, rejectedPersonId]));
       // Re-calculate people without creating unwanted new clusters for unassigned faces
       this.recountPeople();
       if (affectedPhotoId) {
@@ -2112,6 +2168,7 @@ export class LibraryManager {
     let propagation = { newlyAssignedCount: 0, affectedPhotosCount: 0 };
     if (face) {
       face.isConfirmed = true;
+      if (face.personId) { const confirmedPerson = face.personId; this.editRejections(faceId, (l) => l.filter((id) => id !== confirmedPerson)); }
       for (const photo of this.state.photos) {
         const photoFace = photo.faces?.find((f) => f.id === faceId);
         if (photoFace) {
@@ -2549,6 +2606,68 @@ export class LibraryManager {
     // faces + people incrementally (pipelineOrchestrator). Re-sending the whole
     // library here froze the main process for 10-26s per detection (23K photos).
     this.notifyListeners();
+  }
+
+  /** Ids of every face currently assigned to this person. */
+  public getFaceIdsOfPerson(personId: string): string[] {
+    const ids = new Set<string>();
+    for (const f of this.state.faces) if (f.personId === personId) ids.add(f.id);
+    for (const p of this.state.photos) for (const f of p.faces || []) if (f.personId === personId) ids.add(f.id);
+    return [...ids];
+  }
+
+  /**
+   * Applies second-pass / re-match results the main process already wrote to the database: each listed face goes to its person
+   * (unconfirmed — the user has not looked at it). Faces that were meanwhile given to somebody are left alone.
+   */
+  public applyFaceAssignments(assignments: Array<{ faceId: string; photoId: string; personId: string }>): number {
+    if (assignments.length === 0) return 0;
+    const byFace = new Map(assignments.map((a) => [a.faceId, a.personId]));
+    const applied = new Set<string>();
+    // The photos' copies first (a face somebody has already been given is skipped), then the global face list.
+    this.state.photos = this.state.photos.map((p) => {
+      if (!p.faces || !p.faces.some((f) => byFace.has(f.id) && !f.personId)) return p;
+      return {
+        ...p,
+        faces: p.faces.map((f) => {
+          const personId = byFace.get(f.id);
+          if (personId && !f.personId) { applied.add(f.id); return { ...f, personId, isConfirmed: false }; }
+          return f;
+        }),
+      };
+    });
+    for (const f of this.state.faces) {
+      const personId = byFace.get(f.id);
+      if (personId && (applied.has(f.id) || !f.personId)) { f.personId = personId; f.isConfirmed = false; }
+    }
+    if (applied.size > 0) {
+      this.recountPeople();
+      this.notify(true);
+    }
+    return applied.size;
+  }
+
+  /**
+   * Mirrors, in memory, what the main process just did to a storage's database (faceMaintenanceService.resetFaces): automatic
+   * detections are dropped (all of them with `deleteConfirmed`), and every photo that lost a face or has none is unlocked and
+   * marked unscanned. Without this the window's stale copy would be written straight back to the database by the next autosave.
+   */
+  public applyFaceReset(storageName: string, deleteConfirmed: boolean): void {
+    const keep = (f: DetectedFace) => !deleteConfirmed && (f.isConfirmed || f.isManual);
+    const gone = new Set<string>();
+    this.state.photos = this.state.photos.map((p) => {
+      if (p.storageName !== storageName || p.isVideo) return p;
+      const faces = p.faces || [];
+      const kept = faces.filter(keep);
+      for (const f of faces) if (!keep(f)) gone.add(f.id);
+      const lost = kept.length !== faces.length;
+      const empty = kept.length === 0 && (p.faceScanCompleted || p.facesLocked);
+      if (!lost && !empty) return p;
+      return { ...p, faces: kept, faceScanCompleted: false, facesLocked: false };
+    });
+    if (gone.size > 0) this.state.faces = this.state.faces.filter((f) => !gone.has(f.id));
+    this.recountPeople();
+    this.notify(true);
   }
 
   public async deletePerson(personId: string): Promise<boolean> {

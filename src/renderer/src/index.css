@@ -511,3 +511,7 @@ button, [role='button'], a, input, select, label, summary {
   img { -webkit-touch-callout: none; }    /* a long press selects a photo; it must not open the browser's image menu */
   .btn, button { -webkit-user-select: none; user-select: none; }
 }
+
+/* Two-handle trim slider: the track ignores the pointer so both thumbs stay grabbable. */
+[data-testid="trim-range"] input[type=range]::-webkit-slider-thumb { pointer-events: auto; }
+[data-testid="trim-range"] input[type=range]::-moz-range-thumb { pointer-events: auto; }

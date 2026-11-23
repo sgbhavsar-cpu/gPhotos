@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
 import L from 'leaflet';
 import { X, Search, Check, MapPin, Link2, ExternalLink, History } from 'lucide-react';
 import { libraryStore } from '../services/libraryStore';
@@ -196,19 +197,7 @@ export const LocationPickerModal: React.FC<LocationPickerModalProps> = ({
     }
   };
 
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        // capture + stopImmediatePropagation so App.tsx's global Escape
-        // handler (also bound to window) doesn't ALSO fire and, e.g., pop
-        // tab navigation on top of just closing this modal.
-        e.stopImmediatePropagation();
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown, { capture: true });
-    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [onClose]);
+  useEscapeLayer(true, onClose);
 
   return (
     <div

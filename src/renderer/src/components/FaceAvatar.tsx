@@ -48,6 +48,11 @@ interface FaceAvatarProps {
    */
   preferSprite?: boolean;
   coverKey?: string;
+  /**
+   * Show the face's sharp cached crop (cut from the full-resolution original by the main process and kept on disk) instead of
+   * stretching a crop of the small cached thumbnail. The thumbnail crop is shown first, so there is never a blank card.
+   */
+  sharpCrop?: boolean;
 }
 
 export const FaceAvatar: React.FC<FaceAvatarProps> = ({
@@ -63,6 +68,7 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
   preferOriginal = false,
   preferSprite = false,
   coverKey,
+  sharpCrop = false,
 }) => {
   const [croppedDataUrl, setCroppedDataUrl] = useState<string | null>(null);
   const [hasError, setHasError] = useState(false);
@@ -245,7 +251,20 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
       cropLiveFromSource();
     };
 
-    if (usesPersonCache) {
+    const useSharp = sharpCrop && !!face && !!api?.getFaceCrop && !usesPersonCache;
+    if (useSharp) {
+      // The quick thumbnail crop first, then the sharp one from disk once the main process has it (instantly when already cached).
+      cropLiveFromSource(getLocalPhotoUrl(photo.filePath, undefined, false, 500), false);
+      api!.getFaceCrop!({
+        filePath: photo.filePath, originalRemotePath: photo.originalRemotePath, isVirtual: photo.isVirtual, storageName: photo.storageName, isVideo: photo.isVideo,
+        faceId: face!.id, box, imageWidth: face!.imageWidth, imageHeight: face!.imageHeight,
+      }).then((crop) => {
+        if (isCancelled || !crop) return;
+        finalShown = true;
+        // preferOriginal = the raw file (a 256 px crop must not be re-thumbnailed); the box in the URL changes it when a re-detection moves the face.
+        setCroppedDataUrl(`${getLocalPhotoUrl(crop, undefined, true)}${getLocalPhotoUrl(crop, undefined, true).includes('?') ? '&' : '?'}fb=${Math.round(box.x)}_${Math.round(box.y)}_${Math.round(box.width)}`);
+      }).catch(() => {});
+    } else if (usesPersonCache) {
       api!.getPersonAvatarPath!(personId!, avatarCacheKey).then((localPath) => {
         if (isCancelled) return;
         if (localPath) {
@@ -284,6 +303,7 @@ export const FaceAvatar: React.FC<FaceAvatarProps> = ({
     avatarCacheKey,
     usesPersonCache,
     preferOriginal,
+    sharpCrop,
     sprite.status,
   ]);
 

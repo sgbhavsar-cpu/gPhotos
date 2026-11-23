@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
 import { BookImage, X } from 'lucide-react';
 import { Photo, Album } from '../../../types';
 import { libraryStore } from '../services/libraryStore';
@@ -20,11 +21,7 @@ export const AlbumChapterPickerModal: React.FC<{
   fixedAlbum?: Album;
 }> = ({ title, allPhotos, excludeAlbumId, onConfirm, onClose, fixedAlbum }) => {
   const [pending, setPending] = useState<Album | null>(fixedAlbum ?? null);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.stopImmediatePropagation(); onClose(); } };
-    window.addEventListener('keydown', onKey, { capture: true });
-    return () => window.removeEventListener('keydown', onKey, { capture: true });
-  }, [onClose]);
+  useEscapeLayer(true, onClose);
   return (
     <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(5, 8, 15, 0.88)', backdropFilter: 'blur(10px)', zIndex: 3500, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '24px' }}
       onClick={onClose}>

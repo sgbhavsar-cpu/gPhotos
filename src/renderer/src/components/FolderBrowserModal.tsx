@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
 import { Folder, ArrowUp, X, Check, HardDrive, AlertCircle, RotateCw } from 'lucide-react';
 import { subscribeFolderBrowser, resolveFolderBrowser, FolderBrowserRequest } from '../services/folderBrowserController';
 import { notifyError } from '../services/notifications';
@@ -75,17 +76,7 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopImmediatePropagation();
-        onCancel();
-      }
-    };
-    // capture: true — see PeopleView's matching Escape handler for why.
-    window.addEventListener('keydown', handleKeyDown, { capture: true });
-    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [onCancel]);
+  useEscapeLayer(true, onCancel);
 
   const currentPath = result?.path ?? null;
   const isAtDriveList = currentPath === null;

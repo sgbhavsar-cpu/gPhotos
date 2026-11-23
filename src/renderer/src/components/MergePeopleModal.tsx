@@ -1,10 +1,11 @@
 import React, { useState, useMemo, useEffect } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
 import { X, Merge, AlertCircle, Check, Users, ExternalLink, Loader2 } from 'lucide-react';
 import { Person, Photo } from '../../../types';
 import { FaceAvatar } from './FaceAvatar';
 import { PersonPicker } from './PersonPicker';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
-import { notifyError } from '../services/notifications';
+import { notifyError, notify } from '../services/notifications';
 
 interface MergePeopleModalProps {
   personA: Person;
@@ -47,12 +48,20 @@ export const MergePeopleModal: React.FC<MergePeopleModalProps> = ({
   // still in flight could fire a second real merge call — same class of bug fixed in
   // ReassignFaceModal (§56), just via the Confirm button / onEnterOnSelected instead of PersonPicker.
   const [isMerging, setIsMerging] = useState(false);
+  const [conflictVersion, setConflictVersion] = useState(0); // bumped after a conflict fix so the check re-runs
 
   // Check if they can merge (single photo constraint)
   const mergeCheck = useMemo(() => {
     if (!personB) return { canMerge: false, conflictPhotoName: undefined };
     return libraryStore.canMergePeople(personA.id, personB.id);
-  }, [personA, personB]);
+  }, [personA, personB, conflictVersion]);
+  const conflictCount = useMemo(() => (personB ? libraryStore.getMergeConflictPhotos(personA.id, personB.id).length : 0), [personA, personB, conflictVersion]);
+  const markUnknown = (who: Person, other: Person) => {
+    const n = libraryStore.markPersonUnknownWhereBothAppear(who.id, other.id);
+    setErrorMessage(null);
+    setConflictVersion((v) => v + 1);
+    if (n > 0) notify('info', `${who.name} set to unknown in ${n} photo${n === 1 ? '' : 's'}. They will be checked again when the app is idle.`);
+  };
 
   // Find cover photos and faces
   const getCoverPhotoAndBox = (person: Person) => {
@@ -72,18 +81,7 @@ export const MergePeopleModal: React.FC<MergePeopleModalProps> = ({
     [photos, personB]
   );
 
-  // Handle Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopImmediatePropagation();
-        onClose();
-      }
-    };
-    // capture: true — see PeopleView's matching Escape handler for why.
-    window.addEventListener('keydown', handleKeyDown, { capture: true });
-    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [onClose]);
+  useEscapeLayer(true, onClose);
 
   const handleMerge = (e: React.FormEvent) => {
     e.preventDefault();
@@ -407,6 +405,16 @@ export const MergePeopleModal: React.FC<MergePeopleModalProps> = ({
                       Cannot merge: both <strong>{personA.name}</strong> and <strong>{personB.name}</strong> appear in photo <strong>{mergeCheck.conflictPhotoName}</strong>. A single photo cannot contain two faces of the same person.
                     </div>
                   </div>
+
+                  {conflictCount > 0 && personB && (
+                    <div data-testid="merge-conflict-fix" style={{ display: 'flex', flexDirection: 'column', gap: '6px', fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
+                      <div>{conflictCount === 1 ? 'This is the only photo' : `This happens in ${conflictCount} photos`}. Instead of fixing them one by one, set one person back to <em>unknown</em> in {conflictCount === 1 ? 'it' : 'all of them'}; the faces are checked again when the app is idle.</div>
+                      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                        <button type="button" className="btn btn-secondary" data-testid="mark-b-unknown" onClick={() => markUnknown(personB, personA)}>Mark {personB.name} as unknown in {conflictCount === 1 ? 'it' : 'these photos'}</button>
+                        <button type="button" className="btn btn-ghost" data-testid="mark-a-unknown" onClick={() => markUnknown(personA, personB)}>Mark {personA.name} instead</button>
+                      </div>
+                    </div>
+                  )}
 
                   {mergeCheck.conflictPhoto && (
                     <div

@@ -237,3 +237,34 @@ describe('videoExportService: real ffmpeg integration (uses the bundled binary â
     expect(fs.existsSync(outputPath)).toBe(false);
   }, 15000);
 });
+
+describe('videoExportService: collages of up to 9 photos', () => {
+  const overlaps = (a: any, b: any) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+
+  it.each(['grid', 'sideBySide', 'stacked', 'featured'] as const)('%s: 5-9 photos fit inside the frame, never overlap, and fill the whole frame', (style) => {
+    for (const [w, h] of [[1920, 1080], [1080, 1920], [1080, 1080]]) {
+      for (const n of [5, 6, 7, 8, 9]) {
+        const tiles = computeCollageTiles(n, style, w, h);
+        expect(tiles).toHaveLength(n);
+        expect(tiles.every((t) => t.x >= 0 && t.y >= 0 && t.x + t.w <= w && t.y + t.h <= h && t.w > 0 && t.h > 0)).toBe(true);
+        for (let i = 0; i < tiles.length; i++) for (let j = i + 1; j < tiles.length; j++) expect(overlaps(tiles[i], tiles[j])).toBe(false);
+      }
+    }
+  });
+
+  it('the grid for 9 is 3 x 3, 6 in a wide frame is 3 x 2, and a short last row is stretched across the full width', () => {
+    const nine = computeCollageTiles(9, 'grid', 1800, 1800);
+    expect(new Set(nine.map((t) => t.x)).size).toBe(3);
+    expect(new Set(nine.map((t) => t.y)).size).toBe(3);
+    const six = computeCollageTiles(6, 'grid', 1920, 1080);
+    expect(new Set(six.map((t) => t.y)).size).toBe(2);
+    const seven = computeCollageTiles(7, 'grid', 1920, 1080); // rows of 3 / 3 / 1 or 4 / 3: the last row spans the frame
+    const lastRowY = Math.max(...seven.map((t) => t.y));
+    const last = seven.filter((t) => t.y === lastRowY);
+    expect(last[last.length - 1].x + last[last.length - 1].w).toBe(1920);
+  });
+
+  it('more than 9 photos is capped at 9', () => {
+    expect(computeCollageTiles(12, 'grid', 1920, 1080)).toHaveLength(9);
+  });
+});

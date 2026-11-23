@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
 import {
   Folder,
   FolderOpen,
@@ -178,22 +179,8 @@ export const FolderTreeView: React.FC<FolderTreeViewProps> = ({
     }
   }, [initialFolderPath]);
 
-  // Handle Escape key to clear selected folder drilldown
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        if (document.querySelector('[data-photo-lightbox]')) return;
-        if (selectedFolderPath) {
-          e.stopImmediatePropagation();
-          setSelectedFolderPath(null);
-          setFolderPhotos([]);
-        }
-      }
-    };
-    // capture: true — see PeopleView's matching Escape handler for why.
-    window.addEventListener('keydown', handleKeyDown, { capture: true });
-    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [selectedFolderPath]);
+  // Escape leaves the folder drill-down.
+  useEscapeLayer(!!selectedFolderPath, () => { setSelectedFolderPath(null); setFolderPhotos([]); });
 
   // Initial roots: Local drives and virtual storage mirror roots
   useEffect(() => {

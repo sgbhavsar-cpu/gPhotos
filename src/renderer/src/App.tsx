@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { runFaceCropFill, stopFaceCropFill } from './services/faceCropFill';
+import { useEscapeLayer, observeEscape } from './services/escapeStack';
 import { Sidebar, ActiveTab } from './components/Sidebar';
 import { GalleryView } from './views/GalleryView';
 import { AlbumsView } from './views/AlbumsView';
@@ -154,6 +156,7 @@ export const App: React.FC = () => {
         window.electronAPI.unloadIdleFaceWorkers().catch(() => {});
       }
       unloadLocalModels().catch(() => {});
+      stopFaceCropFill();
     } catch (e) {
       console.warn('[IdleControl] Error stopping background tasks:', e);
     }
@@ -182,7 +185,7 @@ export const App: React.FC = () => {
 
       // 2. Resume / enqueue face detection queue
       const unscannedPhotos = currentPhotos.filter(
-        (p) => !p.facesLocked && !p.faceScanCompleted && (!p.faces || p.faces.length === 0)
+        (p) => !p.facesLocked && !p.faceScanCompleted && !p.faces?.some((f) => f.personId) // photos whose faces were all set back to unknown are re-checked too
       );
       if (unscannedPhotos.length > 0) {
         faceQueue.enqueue(unscannedPhotos);
@@ -196,57 +199,27 @@ export const App: React.FC = () => {
       // paused it (must be lifted before runAutoIndexPass, or it bails out immediately).
       resumeAutoIndexFromActivity();
       void runAutoIndexPass(currentPhotos);
+
+      // 4. Sharp face crops for Zoomed Faces that do not exist yet (named people first); stops as soon as the user is active.
+      void runFaceCropFill();
     } catch (e) {
       console.warn('[IdleControl] Error starting background tasks:', e);
     }
   }, []);
 
-  // Global Escape key navigation handler
+  // Escape: every dialog / full-screen view is a layer on the Escape stack (see services/escapeStack.ts), so only the front-most one
+  // reacts. Any Escape press still pauses background work.
+  useEffect(() => observeEscape(stopBackgroundTasksImmediately), [stopBackgroundTasksImmediately]);
+  useEscapeLayer(showDuplicateCleaner, () => { setShowDuplicateCleaner(false); setDuplicateCleanerCluster(null); });
+  useEscapeLayer(showAiAssistant, () => setShowAiAssistant(false));
+  useEscapeLayer(showSmartFlows, () => setShowSmartFlows(false));
+  useEscapeLayer(showLibrarySwitcher, () => setShowLibrarySwitcher(false));
+  useEscapeLayer(showMobileDrawer, () => setShowMobileDrawer(false));
+
+  // Nothing on top: clear the AI filter / tree folder / person view, then go back a tab.
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
-
-      // Stop background tasks immediately when Esc key is pressed
-      stopBackgroundTasksImmediately();
-
-      // 1. Close lightbox if active
-      if (activeLightboxPhoto) {
-        setActiveLightboxPhoto(null);
-        setActiveLightboxContextIds(null);
-        setActiveLightboxHighlightPersonId(null);
-        setActiveLightboxAutoEdit(false);
-        setActiveLightboxSkipLibrarySync(false);
-        return;
-      }
-
-      // 2. Close global modals
-      if (showDuplicateCleaner) {
-        setShowDuplicateCleaner(false);
-        setDuplicateCleanerCluster(null);
-        return;
-      }
-      if (showHelpModal) {
-        setShowHelpModal(false);
-        return;
-      }
-      if (showAiAssistant) {
-        setShowAiAssistant(false);
-        return;
-      }
-      if (showSmartFlows) {
-        setShowSmartFlows(false);
-        return;
-      }
-      if (showLibrarySwitcher) {
-        setShowLibrarySwitcher(false);
-        return;
-      }
-      if (showMobileDrawer) {
-        setShowMobileDrawer(false);
-        return;
-      }
-
-      // 3. Clear active AI search filter or tree folder selection
       if (activeAiFilter || aiFilteredPhotos) {
         setActiveAiFilter(null);
         setAiFilteredPhotos(null);
@@ -260,33 +233,16 @@ export const App: React.FC = () => {
         setSelectedPersonIdForView(null);
         return;
       }
-
-      // 4. Pop tab navigation history back to previous tab
-      // Albums is a stopping point: its own handler walks selection -> album -> list, then Escape stays put.
+      // Albums is a stopping point: its own layer walks selection -> album -> list, then Escape stays put.
       if (activeTab !== 'photos' && activeTab !== 'albums') {
         const { previousTab, nextHistory } = popTabHistory(tabHistoryRef.current, activeTab, 'photos' as ActiveTab);
         tabHistoryRef.current = nextHistory;
         navigateToTab(previousTab);
       }
     };
-
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [
-    activeLightboxPhoto,
-    showDuplicateCleaner,
-    showHelpModal,
-    showAiAssistant,
-    showSmartFlows,
-    showLibrarySwitcher,
-    showMobileDrawer,
-    activeAiFilter,
-    aiFilteredPhotos,
-    selectedFolderForTree,
-    selectedPersonIdForView,
-    activeTab,
-    stopBackgroundTasksImmediately,
-  ]);
+  }, [activeAiFilter, aiFilteredPhotos, selectedFolderForTree, selectedPersonIdForView, activeTab]);
 
   // Idle Inactivity Detector & Auto-Resume Handler — threshold is
   // configurable (Settings > idleResumeSeconds, default 15s).
@@ -924,7 +880,7 @@ export const App: React.FC = () => {
     const candidates = photosToScan.filter((p) => {
       if (p.facesLocked) return false;
       if (p.faceScanCompleted) return false;
-      if (p.faces && p.faces.length > 0) return false;
+      if (p.faces?.some((f) => f.personId)) return false; // (faces set back to unknown by a merge fix are looked at again)
       return true;
     });
 

@@ -47,9 +47,9 @@ describe('VideoWizardModal', () => {
     delete (window as any).electronAPI;
   });
 
-  const mount = async () => {
+  const mount = async (onClose: () => void = vi.fn()) => {
     await act(async () => {
-      root.render(React.createElement(VideoWizardModal, { isOpen: true, onClose: vi.fn(), album, photos }));
+      root.render(React.createElement(VideoWizardModal, { isOpen: true, onClose, album, photos }));
     });
   };
   const clickNext = async () => {
@@ -295,5 +295,145 @@ describe('VideoWizardModal', () => {
     await mount();
     for (let i = 0; i < 5; i++) await clickNext();
     expect(buttonByText('Generate Video').disabled).toBe(true);
+  });
+
+  it('Look, movement and captions: the step-3 choices (and a slide override) reach the export request', async () => {
+    await mount();
+    await clickNext(); // -> step 2
+    // slide 1 overrides the look and types its own caption
+    const lookSelects = Array.from(host.querySelectorAll('select[aria-label="Look for this slide"]')) as HTMLSelectElement[];
+    const captionInputs = Array.from(host.querySelectorAll('input[aria-label="Caption for this slide"]')) as HTMLInputElement[];
+    expect(lookSelects).toHaveLength(4);
+    const setNative = (el: HTMLElement, proto: any, v: string) => { Object.getOwnPropertyDescriptor(proto, 'value')!.set!.call(el, v); el.dispatchEvent(new Event(el.tagName === 'SELECT' ? 'change' : 'input', { bubbles: true })); };
+    await act(async () => { setNative(lookSelects[0], HTMLSelectElement.prototype, 'vivid'); });
+    await act(async () => { setNative(captionInputs[0], HTMLInputElement.prototype, 'My own caption'); });
+
+    await clickNext(); // -> settings
+    await act(async () => { setNative(host.querySelector('select[aria-label="Colour look"]')!, HTMLSelectElement.prototype, 'bw'); });
+    await act(async () => { setNative(host.querySelector('select[aria-label="Photo movement"]')!, HTMLSelectElement.prototype, 'zoomin'); });
+    const dateBox = Array.from(host.querySelectorAll('[data-testid="look-motion-captions"] label')).find((l) => l.textContent?.includes('Date'))!.querySelector('input') as HTMLInputElement;
+    await act(async () => { dateBox.click(); });
+    await act(async () => { setNative(host.querySelector('select[aria-label="Caption position"]')!, HTMLSelectElement.prototype, 'top'); });
+    await act(async () => { setNative(host.querySelector('select[aria-label="Caption colour"]')!, HTMLSelectElement.prototype, 'yellow'); });
+    await act(async () => { buttonByText('Choose Where to Save').click(); });
+    await act(async () => { await Promise.resolve(); });
+    await toReview();
+    await act(async () => { buttonByText('Generate Video').click(); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    const slides = api.exportVideo.mock.calls[0][0].slides.filter((x: any) => x.kind === 'photo');
+    expect(slides).toHaveLength(4);
+    expect(slides[0]).toMatchObject({ filter: 'vivid', motion: 'zoomin', caption: 'My own caption' }); // the override wins
+    expect(slides[1]).toMatchObject({ filter: 'bw', motion: 'zoomin', caption: '1 Jan 2026' });       // video-wide choices + the automatic caption
+    expect(api.exportVideo.mock.calls[0][0].captionStyle).toEqual({ position: 'top', size: 'medium', color: 'yellow' });
+  });
+
+  it('a template and an export preset set the whole plan in one choice, and the size estimate follows', async () => {
+    await mount();
+    await clickNext(); await clickNext(); // -> settings
+    const setSel = async (label: string, v: string) => {
+      const el = host.querySelector(`select[aria-label="${label}"]`) as HTMLSelectElement;
+      await act(async () => { Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')!.set!.call(el, v); el.dispatchEvent(new Event('change', { bubbles: true })); });
+    };
+    await setSel('Video template', 'reel');
+    const sizeBefore = host.querySelector('[data-testid="size-estimate"]')!.textContent;
+    await setSel('Export for', 'whatsapp');
+    expect(host.querySelector('[data-testid="size-estimate"]')!.textContent).not.toBe(sizeBefore); // 720p / draft is smaller than 1080p
+    await act(async () => { buttonByText('Choose Where to Save').click(); });
+    await act(async () => { await Promise.resolve(); });
+    await toReview();
+    await act(async () => { buttonByText('Generate Video').click(); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    const req = api.exportVideo.mock.calls[0][0];
+    expect(req).toMatchObject({ aspectRatio: '9:16', resolution: '720p', quality: 'draft', transition: 'slideup' });
+    expect(req.slides.find((x: any) => x.kind === 'photo')).toMatchObject({ filter: 'vivid', motion: 'zoomin' });
+  });
+
+  it('"Pick the best shots" keeps only as many as fit the wanted length', async () => {
+    await mount();
+    const setSel = async (label: string, v: string) => {
+      const el = host.querySelector(`select[aria-label="${label}"]`) as HTMLSelectElement;
+      await act(async () => { Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')!.set!.call(el, v); el.dispatchEvent(new Event('change', { bubbles: true })); });
+    };
+    await setSel('Template', 'reel'); // 1.8 s per slide
+    await setSel('Video length', '30');
+    await act(async () => { buttonByText('Pick the best shots').click(); });
+    await clickNext(); // step 2: all 4 photos fit 30 s at 1.8 s each, so none is dropped
+    expect((Array.from(host.querySelectorAll('input[type="checkbox"]')) as HTMLInputElement[]).filter((c) => c.checked)).toHaveLength(4);
+  });
+
+  it('Preview renders a 360p draft of the current plan and plays it in the wizard', async () => {
+    api.previewVideo = vi.fn(async () => ({ success: true, skippedSlides: 0, outputPath: 'C:\\tmp\\preview_1.mp4', durationSec: 8 }));
+    await mount();
+    expect(host.querySelector('[data-testid="preview-button"]')).toBeNull(); // not on step 1
+    await clickNext(); // -> step 2
+    await act(async () => { (host.querySelector('[data-testid="preview-button"]') as HTMLButtonElement).click(); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    const req = api.previewVideo.mock.calls[0][0];
+    expect(req).toMatchObject({ resolution: '360p', quality: 'draft' });
+    expect(req.slides.filter((x: any) => x.kind === 'photo')).toHaveLength(4);
+    const video = host.querySelector('[data-testid="video-preview"] video') as HTMLVideoElement;
+    expect(video).toBeTruthy();
+    expect(video.getAttribute('src')).toContain('preview_1.mp4');
+    await act(async () => { (host.querySelector('button[aria-label="Close preview"]') as HTMLButtonElement).click(); });
+    expect(host.querySelector('[data-testid="video-preview"]')).toBeNull();
+  });
+
+  it('Escape backs out one screen at a time: the preview first, then the wizard', async () => {
+    api.previewVideo = vi.fn(async () => ({ success: true, skippedSlides: 0, outputPath: 'C:\tmp\preview_1.mp4', durationSec: 8 }));
+    const onClose = vi.fn();
+    const behind = vi.fn(); // stands in for the album view underneath, which has its own Escape handler
+    window.addEventListener('keydown', behind);
+    await mount(onClose);
+    await clickNext();
+    await act(async () => { (host.querySelector('[data-testid="preview-button"]') as HTMLButtonElement).click(); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    const esc = () => act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); });
+    await esc();
+    expect(host.querySelector('[data-testid="video-preview"]')).toBeNull(); // only the preview closed
+    expect(onClose).not.toHaveBeenCalled();
+    await esc();
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(behind).not.toHaveBeenCalled(); // nothing underneath ever saw Escape
+    window.removeEventListener('keydown', behind);
+  });
+
+  it('a clip can be split in two, played backwards and frozen at the end', async () => {
+    const video = { ...photo(9), id: 'v9', fileName: 'MOV_9.mp4', filePath: 'C:\\Mirrors\\MOV_9.mp4', isVideo: true, videoDurationSec: 10 } as any;
+    const storePhotos = (libraryStore.getState() as any).photos;
+    (libraryStore.getState() as any).photos = [...storePhotos, video];
+    const a2 = { ...album, photoIds: [...album.photoIds, 'v9'] };
+    try {
+      await act(async () => { root.render(React.createElement(VideoWizardModal, { isOpen: true, onClose: vi.fn(), album: a2, photos: [...photos, video] })); });
+      await clickNext(); // step 2
+      expect(host.querySelectorAll('[data-testid="clip-controls"]')).toHaveLength(1);
+      await act(async () => { (host.querySelector('button[aria-label="Split this clip in two"]') as HTMLButtonElement).click(); });
+      expect(host.querySelectorAll('[data-testid="clip-controls"]')).toHaveLength(2);
+      const rev = host.querySelectorAll('input[aria-label="Play backwards"]')[1] as HTMLInputElement;
+      await act(async () => { rev.click(); });
+      const frz = host.querySelectorAll('select[aria-label="Freeze the last frame"]')[1] as HTMLSelectElement;
+      await act(async () => { Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')!.set!.call(frz, '2'); frz.dispatchEvent(new Event('change', { bubbles: true })); });
+      await clickNext();
+      await act(async () => { buttonByText('Choose Where to Save').click(); });
+      await act(async () => { await Promise.resolve(); });
+      await toReview();
+      await act(async () => { buttonByText('Generate Video').click(); });
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+      const clips = api.exportVideo.mock.calls[0][0].slides.filter((x: any) => x.kind === 'clip');
+      expect(clips).toHaveLength(2);
+      expect(clips[0]).toMatchObject({ trimStartSec: 0, trimEndSec: 5, reverse: false, holdSec: 0 });
+      expect(clips[1]).toMatchObject({ trimStartSec: 5, reverse: true, holdSec: 2 });
+    } finally {
+      (libraryStore.getState() as any).photos = storePhotos;
+    }
+  });
+
+  it('Preview shows the reason when it cannot be made', async () => {
+    api.previewVideo = vi.fn(async () => ({ success: false, error: 'No slides could be prepared', skippedSlides: 4 }));
+    await mount();
+    await clickNext();
+    await act(async () => { (host.querySelector('[data-testid="preview-button"]') as HTMLButtonElement).click(); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(host.querySelector('[data-testid="video-preview"]')!.textContent).toContain('No slides could be prepared');
   });
 });

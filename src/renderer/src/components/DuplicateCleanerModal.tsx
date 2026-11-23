@@ -1,4 +1,5 @@
 import { deleteFilesWithProgress } from '../services/deleteProgress';
+import { useEscapeLayer } from '../services/escapeStack';
 import React, { useState, useEffect, useRef } from 'react';
 import {
   X,
@@ -351,19 +352,15 @@ export const DuplicateCleanerModal: React.FC<DuplicateCleanerModalProps> = ({
   }, 0);
   const totalSpaceMB = (totalSpaceBytes / (1024 * 1024)).toFixed(1);
 
+  // Escape closes the full-screen preview (the cleaner itself is closed by the App's own layer underneath).
+  useEscapeLayer(!!fullscreenPhoto && !!activeCluster, () => setFullscreenPhoto(null));
+
   // Keyboard navigation for Fullscreen Lightbox
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!fullscreenPhoto || !activeCluster) return;
 
-      if (e.key === 'Escape') {
-        // Without this, App.tsx's global Escape handler also fires (it only
-        // knows about the whole modal being open, not this fullscreen
-        // sub-view) and closes the entire duplicate-cleaner modal instead of
-        // just backing out of the fullscreen preview.
-        e.stopImmediatePropagation();
-        setFullscreenPhoto(null);
-      } else if (e.key === 'ArrowRight') {
+      if (e.key === 'ArrowRight') {
         const idx = activeCluster.photos.findIndex((p) => p.id === fullscreenPhoto.id);
         if (idx !== -1 && idx < activeCluster.photos.length - 1) {
           setFullscreenPhoto(activeCluster.photos[idx + 1]);

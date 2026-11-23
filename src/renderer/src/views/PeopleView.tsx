@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, useDeferredValue } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
+import { useMarqueeSelect, MarqueeBox } from '../components/albumSelection';
 import {
   Users,
   Edit2,
@@ -38,6 +40,7 @@ import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { VirtualizedTimelineGallery, GalleryZoomLevel, ZOOM_LEVELS } from '../components/VirtualizedTimelineGallery';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { notify, notifyError } from '../services/notifications';
+import { DeletePersonDialog } from '../components/DeletePersonDialog';
 
 // Fixed card height (px) — VirtualCardGrid needs it to position rows without measuring.
 const PEOPLE_CARD_HEIGHT = 246;
@@ -133,11 +136,32 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
   const selectedPhotoIdsRef = useRef(selectedPhotoIds);
   selectedPhotoIdsRef.current = selectedPhotoIds;
   useEffect(() => { setSelectedPhotoIds(new Set()); }, [selectedPersonId]);
+  // Zoomed Faces: tick boxes on the cards. Shift+click ticks every card between this one and the last one ticked.
+  const lastTickedIndexRef = useRef<number | null>(null);
+  const tickFaceCard = (index: number, photoId: string, ids: string[], shift: boolean) => {
+    const last = lastTickedIndexRef.current; // read now: the updater below runs later, after the ref has moved on
+    setSelectedPhotoIds((prev) => {
+      const next = new Set(prev);
+      if (shift && last !== null && last !== index) {
+        const [a, b] = last < index ? [last, index] : [index, last];
+        for (let i = a; i <= b; i++) next.add(ids[i]);
+      } else if (!next.delete(photoId)) {
+        next.add(photoId);
+      }
+      return next;
+    });
+    lastTickedIndexRef.current = index;
+  };
   const toggleSelectPhoto = useCallback((id: string) => {
     setSelectedPhotoIds((prev) => { const n = new Set(prev); if (!n.delete(id)) n.add(id); return n; });
   }, []);
   const [isMergeMode, setIsMergeMode] = useState(false);
   const [viewMode, setViewMode] = useState<'photos' | 'faces'>('photos');
+  // Zoomed Faces selects like the album / main photo list: tick boxes, any click once something is ticked, and a rubber band.
+  // Zoomed Faces can hide the faces already confirmed, to leave only the ones that still need a decision (remembered).
+  const [showConfirmedFaces, setShowConfirmedFaces] = useState<boolean>(() => { try { return localStorage.getItem('gphotos_faces_show_confirmed') !== '0'; } catch { return true; } });
+  const facesScrollRef = useRef<HTMLDivElement>(null);
+  const facesMarquee = useMarqueeSelect({ containerRef: facesScrollRef, selected: selectedPhotoIds, onChange: setSelectedPhotoIds, enabled: viewMode === 'faces' });
   const [zoomLevel, setZoomLevel] = useState<GalleryZoomLevel>('medium');
   const [peopleSearchQuery, setPeopleSearchQuery] = useState('');
   const [showAllPeople, setShowAllPeople] = useState(false);
@@ -163,61 +187,16 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
 
   const [personForCoverModal, setPersonForCoverModal] = useState<Person | null>(null);
 
-  // Handle Escape key navigation inside PeopleView
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      // An open full-screen photo takes this Escape first; selections underneath must survive it.
-      if (document.querySelector('[data-photo-lightbox]')) return;
-
-      // stopImmediatePropagation (not stopPropagation) is required here:
-      // App.tsx's global Escape handler is also bound directly to `window`,
-      // so stopPropagation (which only blocks bubbling to ancestor elements)
-      // does nothing to stop it — it would otherwise ALSO fire on this same
-      // keypress and pop the tab-navigation history, e.g. sending the user
-      // back to whatever tab they arrived from instead of just backing out
-      // of this one local selection/modal.
-      if (reassignTarget) {
-        e.stopImmediatePropagation();
-        setReassignTarget(null);
-      } else if (personForCoverModal) {
-        e.stopImmediatePropagation();
-        setPersonForCoverModal(null);
-      } else if (mergeModalPair) {
-        e.stopImmediatePropagation();
-        setMergeModalPair(null);
-      } else if (editingPersonId) {
-        e.stopImmediatePropagation();
-        setEditingPersonId(null);
-      } else if (isMergeMode) {
-        e.stopImmediatePropagation();
-        setIsMergeMode(false);
-        setMergeSelection([]);
-      } else if (selectedPhotoIdsRef.current.size > 0) {
-        e.stopImmediatePropagation();
-        setSelectedPhotoIds(new Set()); // first Escape only deselects
-      } else if (selectedPersonId) {
-        e.stopImmediatePropagation();
-        setSelectedPersonId(null);
-        if (onClearSelectedPerson) onClearSelectedPerson();
-      }
-    };
-
-    // capture: true so this runs before App.tsx's global Escape handler
-    // (a normal bubble-phase listener on the same window) regardless of
-    // mount order — otherwise stopImmediatePropagation below would be too
-    // late to stop a handler that already ran.
-    window.addEventListener('keydown', handleKeyDown, { capture: true });
-    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [
-    reassignTarget,
-    personForCoverModal,
-    mergeModalPair,
-    editingPersonId,
-    isMergeMode,
-    selectedPersonId,
-    onClearSelectedPerson,
-  ]);
+  // Escape backs out one level at a time: dialogs, merge mode, the photo selection, then the open person.
+  useEscapeLayer(!!(reassignTarget || personForCoverModal || mergeModalPair || editingPersonId || isMergeMode || selectedPhotoIds.size > 0 || selectedPersonId), () => {
+    if (reassignTarget) setReassignTarget(null);
+    else if (personForCoverModal) setPersonForCoverModal(null);
+    else if (mergeModalPair) setMergeModalPair(null);
+    else if (editingPersonId) setEditingPersonId(null);
+    else if (isMergeMode) { setIsMergeMode(false); setMergeSelection([]); }
+    else if (selectedPhotoIds.size > 0) setSelectedPhotoIds(new Set()); // first Escape only deselects
+    else { setSelectedPersonId(null); if (onClearSelectedPerson) onClearSelectedPerson(); }
+  });
 
   // If a person is selected, show their virtual album
   const selectedPerson = people.find((p) => p.id === selectedPersonId);
@@ -235,6 +214,17 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
   }, [photos, selectedPerson?.id, removedFaceIds]);
   // Stable array identity so VirtualizedTimelineGallery's grouping memo isn't invalidated every render.
   const personPhotos = useMemo(() => personPhotoItems.map((item) => item.photo), [personPhotoItems]);
+  /** What the Zoomed Faces grid shows: everything, or only the faces not yet confirmed. */
+  const visibleFaceItems = useMemo(() => (showConfirmedFaces ? personPhotoItems : personPhotoItems.filter(({ face }) => !face.isConfirmed)), [personPhotoItems, showConfirmedFaces]);
+  const changeShowConfirmed = (show: boolean) => {
+    setShowConfirmedFaces(show);
+    try { localStorage.setItem('gphotos_faces_show_confirmed', show ? '1' : '0'); } catch {}
+    // Hiding the confirmed faces also drops them from the selection, so a bulk action never touches what you cannot see.
+    if (!show) {
+      const hidden = new Set(personPhotoItems.filter(({ face }) => face.isConfirmed).map(({ photo }) => photo.id));
+      setSelectedPhotoIds((prev) => (hidden.size === 0 ? prev : new Set([...prev].filter((id) => !hidden.has(id)))));
+    }
+  };
 
   // Most-photographed first — a name-sorted list buries the people you
   // actually care about among one-off/misdetected entries.
@@ -384,7 +374,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
   // Same per-face actions as "mark all", limited to the photos picked in the Photos grid.
   const handleSelectedFaces = async (action: 'confirm' | 'remove') => {
     if (!selectedPerson) return;
-    const items = personPhotoItems.filter(({ photo }) => selectedPhotoIds.has(photo.id));
+    const items = (viewMode === 'faces' ? visibleFaceItems : personPhotoItems).filter(({ photo }) => selectedPhotoIds.has(photo.id));
     if (items.length === 0) return;
     const n = items.length;
     const label = `${n} photo${n === 1 ? '' : 's'}`;
@@ -408,21 +398,40 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
     libraryStore.deleteFaceDetection(faceId);
   };
 
-  const handleDeletePerson = async (personId: string, personName: string, e?: React.MouseEvent) => {
+  const [personToDelete, setPersonToDelete] = useState<{ id: string; name: string; faceCount: number } | null>(null);
+  const handleDeletePerson = (personId: string, personName: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
-    const confirmed = window.confirm(
-      `Are you sure you want to delete "${personName}" from People?\n\nAll face detections assigned to this person will be unassigned.`
-    );
-    if (!confirmed) return;
+    setPersonToDelete({ id: personId, name: personName, faceCount: libraryStore.getFaceIdsOfPerson(personId).length });
+  };
 
+  const confirmDeletePerson = async (rematch: boolean) => {
+    const target = personToDelete;
+    setPersonToDelete(null);
+    if (!target) return;
     try {
-      if (selectedPersonId === personId) {
+      if (selectedPersonId === target.id) {
         setSelectedPersonId(null);
       }
-      await libraryStore.deletePerson(personId);
-      Promise.resolve(window.electronAPI?.deletePersonAvatar?.(personId)).catch(() => {});
+      const faceIds = libraryStore.getFaceIdsOfPerson(target.id);
+      await libraryStore.deletePerson(target.id);
+      Promise.resolve(window.electronAPI?.deletePersonAvatar?.(target.id)).catch(() => {});
+      // Choice made in the dialog: match the freed faces to the remaining confirmed people, in the background a moment later.
+      if (rematch && faceIds.length > 0 && window.electronAPI?.runFaceSecondPass) {
+        setTimeout(async () => {
+          try {
+            await libraryStore.flushSaveImmediately(); // the faces must be unassigned in the database before they can be matched
+            const res = await window.electronAPI!.runFaceSecondPass!({ scope: 'all', faceIds });
+            if (res.success) {
+              const n = libraryStore.applyFaceAssignments(res.assignments ?? []);
+              notify('info', n > 0 ? `${n.toLocaleString()} of ${target.name}'s faces were matched to other people; ${(faceIds.length - n).toLocaleString()} stay unknown.` : `${target.name}'s faces matched nobody, so they stay unknown.`);
+            }
+          } catch (err) {
+            notifyError('Match the freed faces again', err);
+          }
+        }, 1500);
+      }
     } catch (err) {
-      notifyError(`Delete ${personName}`, err);
+      notifyError(`Delete ${target.name}`, err);
     }
   };
 
@@ -585,10 +594,27 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
       <button
         className="btn btn-ghost btn-icon"
         onClick={async () => {
-          let res: Awaited<ReturnType<typeof libraryStore.propagateLearnedFaces>>;
+          let res: { newlyAssignedCount: number; affectedPhotosCount: number };
           try {
+            if (window.electronAPI?.runFaceSecondPass) {
+              // Second pass: only faces nobody has claimed, matched against the faces you confirmed for this person.
+              setLearningNotification(`Looking for more of ${selectedPerson.name}…`);
+              await libraryStore.flushSaveImmediately();
+              const r = await window.electronAPI.runFaceSecondPass({ scope: 'all', personId: selectedPerson.id });
+              if (!r.success) throw new Error(r.error || 'The search failed.');
+              const n = libraryStore.applyFaceAssignments(r.assignments ?? []);
+              res = { newlyAssignedCount: n, affectedPhotosCount: n };
+              setLearningNotification(
+                n > 0
+                  ? `✓ Found ${n.toLocaleString()} more face${n === 1 ? '' : 's'} of ${selectedPerson.name}. ${(r.stillUnknown ?? 0).toLocaleString()} unknown face${(r.stillUnknown ?? 0) === 1 ? '' : 's'} left.`
+                  : `No more matches for ${selectedPerson.name}: ${(r.candidates ?? 0).toLocaleString()} unknown face${(r.candidates ?? 0) === 1 ? '' : 's'} checked, none close enough. Confirm a few more faces of ${selectedPerson.name} to help.`
+              );
+              setTimeout(() => setLearningNotification(null), 6000);
+              return;
+            }
             res = await libraryStore.propagateLearnedFaces(selectedPerson.id);
           } catch (err) {
+            setLearningNotification(null);
             notifyError('Find more photos', err);
             return;
           }
@@ -603,7 +629,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
           }
           setTimeout(() => setLearningNotification(null), 5000);
         }}
-        title="Find More Photos — scan the library for matching unassigned faces (AI)"
+        title="Find more of this person — checks faces nobody has claimed against the faces you confirmed"
       >
         <Sparkles size={18} color="#c084fc" />
       </button>
@@ -875,7 +901,30 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
           />
         ) : (
           /* Faces Curation View: Zoomed Face Headshots with YES/NO buttons */
-          <div style={{ flex: 1, overflowY: 'auto', padding: '24px' }}>
+          <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+            <div
+              data-testid="face-select-bar"
+              style={{ flexShrink: 0, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px', padding: '10px 24px', borderBottom: '1px solid var(--border-subtle)', backgroundColor: 'var(--bg-surface)', fontSize: '0.85rem' }}
+            >
+              <label data-testid="face-show-confirmed-label" style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', fontSize: '0.8rem' }} title="Untick to see only the faces you have not confirmed yet">
+                <input type="checkbox" data-testid="face-show-confirmed" checked={showConfirmedFaces} onChange={(e) => changeShowConfirmed(e.target.checked)} />
+                Show confirmed photos
+              </label>
+              <button className="btn btn-secondary" data-testid="face-select-all" onClick={() => { setSelectedPhotoIds(new Set(visibleFaceItems.map(({ photo }) => photo.id))); }} style={{ fontSize: '0.78rem', padding: '4px 10px' }}>
+                Select all {visibleFaceItems.length.toLocaleString()}
+              </button>
+              {selectedPhotoIds.size > 0 ? (
+                <>
+                  <strong data-testid="face-selected-count" style={{ flex: 1, minWidth: '90px' }}>{selectedPhotoIds.size} selected</strong>
+                  <button className="btn btn-ghost" data-testid="face-confirm-selected" onClick={() => handleSelectedFaces('confirm')} style={{ color: '#10b981' }}><UserCheck size={16} /> Correct</button>
+                  <button className="btn btn-ghost" data-testid="face-reject-selected" onClick={() => handleSelectedFaces('remove')} style={{ color: '#ef4444' }}><UserX size={16} /> Not this person</button>
+                  <button className="btn btn-ghost" onClick={() => setSelectedPhotoIds(new Set())}>Clear</button>
+                </>
+              ) : (
+                <span style={{ color: 'var(--text-muted)', fontSize: '0.78rem' }}>Tick the boxes, or press and drag across faces to select several (Shift+click for a range), then confirm or reject them together.</span>
+              )}
+            </div>
+          <div ref={facesScrollRef} onMouseDown={facesMarquee.onMouseDown} data-testid="faces-scroll-area" style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '24px' }}>
             <div
               style={{
                 display: 'grid',
@@ -883,13 +932,22 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                 gap: '16px',
               }}
             >
-              {personPhotoItems.map(({ photo, face }) => (
+              {visibleFaceItems.length === 0 && personPhotoItems.length > 0 && (
+                <div data-testid="face-all-confirmed" style={{ gridColumn: '1 / -1', textAlign: 'center', padding: '40px 0', color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+                  Every face of {selectedPerson.name} is confirmed. Tick &ldquo;Show confirmed photos&rdquo; to see them.
+                </div>
+              )}
+              {visibleFaceItems.map(({ photo, face }, cardIndex) => (
                 <div
                   key={photo.id}
+                  data-face-card={photo.id}
+                  data-album-photo-id={photo.id}
                   style={{
                     position: 'relative',
                     backgroundColor: 'var(--bg-surface)',
                     borderRadius: 'var(--radius-md)',
+                    outline: selectedPhotoIds.has(photo.id) ? '3px solid var(--accent-primary)' : 'none',
+                    outlineOffset: '-1px',
                     border: face.isConfirmed
                       ? '2px solid var(--accent-emerald)'
                       : '1px solid var(--border-subtle)',
@@ -920,7 +978,11 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                     });
                     return (
                       <div
-                        onClick={() => onSelectPhoto(photo, personPhotos, selectedPerson.id)}
+                        onClick={(e) => {
+                          if (facesMarquee.suppressClick.current) return; // the click that ends a drag-select
+                          if (e.shiftKey || e.ctrlKey || e.metaKey || selectedPhotoIds.size > 0) tickFaceCard(cardIndex, photo.id, visibleFaceItems.map((it) => it.photo.id), e.shiftKey);
+                          else onSelectPhoto(photo, personPhotos, selectedPerson.id);
+                        }}
                         onMouseEnter={() => setHoveredFaceCardId(face.id)}
                         onMouseLeave={() => setHoveredFaceCardId((curr) => (curr === face.id ? null : curr))}
                         style={{
@@ -939,16 +1001,36 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                           face={face}
                           box={showBox}
                           preferOriginal={showOriginal}
+                          sharpCrop={mode === 'zoomedThumb'}
                           size={210}
                           borderRadius="0px"
                         />
+
+                        <div
+                          data-marquee-start
+                          data-testid="face-checkbox"
+                          role="checkbox"
+                          aria-checked={selectedPhotoIds.has(photo.id)}
+                          aria-label={`Select face in ${photo.fileName}`}
+                          onClick={(e) => { e.stopPropagation(); if (!facesMarquee.suppressClick.current) tickFaceCard(cardIndex, photo.id, visibleFaceItems.map((it) => it.photo.id), e.shiftKey); }}
+                          title={selectedPhotoIds.has(photo.id) ? 'Deselect this face' : 'Select this face (Shift+click for a range; press and drag across faces to select several)'}
+                          style={{
+                            position: 'absolute', top: '8px', left: '8px', zIndex: 15, width: '26px', height: '26px', borderRadius: '6px',
+                            display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+                            backgroundColor: selectedPhotoIds.has(photo.id) ? 'var(--accent-primary)' : 'rgba(15, 23, 42, 0.85)',
+                            border: selectedPhotoIds.has(photo.id) ? 'none' : '2px solid rgba(255, 255, 255, 0.9)', boxShadow: '0 2px 8px rgba(0,0,0,0.6)',
+                            color: 'white', fontSize: '16px', fontWeight: 800, lineHeight: 1,
+                          }}
+                        >
+                          {selectedPhotoIds.has(photo.id) ? '✓' : ''}
+                        </div>
 
                         {face.isConfirmed && (
                           <div
                             style={{
                               position: 'absolute',
                               top: '8px',
-                              left: '8px',
+                              left: '38px',
                               background: 'rgba(16, 185, 129, 0.9)',
                               color: 'white',
                               padding: '2px 8px',
@@ -1121,6 +1203,8 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
                 </div>
               ))}
             </div>
+            <MarqueeBox rect={facesMarquee.marquee} />
+          </div>
           </div>
         )}
 
@@ -1149,6 +1233,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
             modal was only ever rendered in the grid view's JSX further
             down, which this early return never reaches — so the dialog
             silently never appeared. Rendered here too so it actually shows. */}
+        {personToDelete && <DeletePersonDialog personName={personToDelete.name} faceCount={personToDelete.faceCount} onConfirm={confirmDeletePerson} onCancel={() => setPersonToDelete(null)} />}
         {mergeModalPair && (
           <MergePeopleModal
             personA={mergeModalPair.personA}
@@ -1644,6 +1729,7 @@ export const PeopleView: React.FC<PeopleViewProps> = ({
       </div>
 
       {/* Merge People Modal ("Merge both people from people list") */}
+      {personToDelete && <DeletePersonDialog personName={personToDelete.name} faceCount={personToDelete.faceCount} onConfirm={confirmDeletePerson} onCancel={() => setPersonToDelete(null)} />}
       {mergeModalPair && (
         <MergePeopleModal
           personA={mergeModalPair.personA}

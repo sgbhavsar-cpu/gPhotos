@@ -29,6 +29,7 @@ import {
 import { VirtualStorageConfig, MirrorProgress, BackgroundServiceStatus, NetworkStorageProgress, StorageDetails } from '../../../types';
 import { DeleteStorageModal } from '../components/DeleteStorageModal';
 import { libraryStore } from '../services/libraryStore';
+import { ResetFacesDialog, type ResetFacesChoice } from '../components/ResetFacesDialog';
 import { splitStoragesByExistence } from '../services/storageValidation';
 import { selectDirectoryOrPrompt } from '../services/selectDirectory';
 import { joinMirrorPath } from '../services/pathUtils';
@@ -579,6 +580,44 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
     setFixDatesMsg((m) => ({ ...m, [config.id]: r?.error ? `Failed: ${r.error}` : `Checked ${(r?.checked ?? 0).toLocaleString()}, corrected ${(r?.fixed ?? 0).toLocaleString()} — reopen Photos to see new order` }));
   };
 
+  // Face recognition tools on a storage card: reset (delete detections) and the second-phase scan (unknown faces -> confirmed people).
+  const [resetTarget, setResetTarget] = useState<VirtualStorageConfig | null>(null);
+  const [faceToolMsg, setFaceToolMsg] = useState<Record<string, string>>({});
+  const setFaceMsg = (id: string, msg: string) => setFaceToolMsg((m) => ({ ...m, [id]: msg }));
+
+  const handleResetFaces = async (config: VirtualStorageConfig, choice: ResetFacesChoice) => {
+    setResetTarget(null);
+    setFaceMsg(config.id, 'Deleting face recognition…');
+    try {
+      const r = await window.electronAPI?.resetStorageFaces?.({ storageName: config.name, localMirrorRoot: config.localMirrorRoot, deleteConfirmed: choice.deleteConfirmed });
+      if (!r?.success) throw new Error(r?.error || 'The reset failed.');
+      libraryStore.applyFaceReset(config.name, choice.deleteConfirmed);
+      // "Start scanning again when idle" off = the Face Detection task is paused until the user presses Run / Scan now.
+      setTaskPaused(storageTaskKey(config.localMirrorRoot, config.name), 'faces', !choice.startScanning);
+      setFaceMsg(config.id, `Deleted ${(r.deletedFaces ?? 0).toLocaleString()} detected faces, kept ${(r.keptFaces ?? 0).toLocaleString()}. ${choice.startScanning ? 'Scanning starts when the app is idle.' : 'Press Run / Scan now on the Face Detection line to scan again.'}`);
+    } catch (err) {
+      setFaceMsg(config.id, '');
+      notifyError('Delete face recognition', err);
+    }
+  };
+
+  const handleSecondPass = async (config: VirtualStorageConfig) => {
+    setFaceMsg(config.id, 'Second pass: matching unknown faces to the people you confirmed…');
+    try {
+      await libraryStore.flushSaveImmediately(); // the database must have your latest confirmations
+      const r = await window.electronAPI?.runFaceSecondPass?.({ scope: 'storage', storageName: config.name, localMirrorRoot: config.localMirrorRoot });
+      if (!r?.success) throw new Error(r?.error || 'The second pass failed.');
+      const n = libraryStore.applyFaceAssignments(r.assignments ?? []);
+      const matched = r.assignments?.length ?? n;
+      setFaceMsg(config.id, (r.peopleUsed ?? 0) === 0
+        ? 'Second pass: no people with confirmed faces yet. Confirm some faces first, then run it again.'
+        : `Second pass: ${matched.toLocaleString()} face${matched === 1 ? '' : 's'} matched to people you confirmed; ${(r.stillUnknown ?? 0).toLocaleString()} still unknown (checked ${(r.candidates ?? 0).toLocaleString()}).`);
+    } catch (err) {
+      setFaceMsg(config.id, '');
+      notifyError('Second pass', err);
+    }
+  };
+
   const handleSyncStorage = async (config: VirtualStorageConfig, forceRecount = false) => {
     if (!window.electronAPI || isSyncingRef.current) return;
 
@@ -786,6 +825,15 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflowY: 'auto', padding: isMobile ? '16px' : '32px 40px' }}>
+      {resetTarget && (
+        <ResetFacesDialog
+          storageName={resetTarget.name}
+          localMirrorRoot={resetTarget.localMirrorRoot}
+          isOneDrive={/onedrive/i.test(resetTarget.networkSourcePath || '')}
+          onConfirm={(choice) => handleResetFaces(resetTarget, choice)}
+          onCancel={() => setResetTarget(null)}
+        />
+      )}
       {/* Header */}
       <div style={{
         marginBottom: isMobile ? '18px' : '28px',
@@ -1490,6 +1538,13 @@ export const VirtualStorageView: React.FC<VirtualStorageViewProps> = ({
                               style={{ padding: '1px 8px', fontSize: '0.68rem', marginLeft: 10 }}
                             >Fix dates</button>
                             {fixDatesMsg[s.id] && <span style={{ marginLeft: 8 }}>{fixDatesMsg[s.id]}</span>}
+                          </div>
+                          <div data-testid="face-tools" style={{ fontSize: '0.72rem', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                            <Users size={12} />
+                            <span>Face recognition:</span>
+                            <button className="btn btn-secondary" data-testid="second-pass-button" onClick={() => handleSecondPass(s)} disabled={isSyncing} title="Match faces nobody has claimed to the people you confirmed. Nothing already assigned is changed." style={{ padding: '1px 8px', fontSize: '0.68rem' }}>Second pass</button>
+                            <button className="btn btn-secondary" data-testid="reset-faces-button" onClick={() => setResetTarget(s)} disabled={isSyncing} title="Delete this storage's detected faces so they can be scanned again" style={{ padding: '1px 8px', fontSize: '0.68rem', color: '#f87171' }}>Delete face recognition…</button>
+                            {faceToolMsg[s.id] && <span data-testid="face-tool-msg">{faceToolMsg[s.id]}</span>}
                           </div>
 
                           <StorageStatRow

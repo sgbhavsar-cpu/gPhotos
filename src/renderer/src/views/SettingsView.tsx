@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { DatabaseBackupPanel } from '../components/DatabaseBackupPanel';
 import {
   Settings,
   Server,
@@ -2362,6 +2363,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
         {/* Library Data Backup & Export in .zip format Card */}
         {activeSettingsTab === 'backup' && (
+        <>
+        <DatabaseBackupPanel />
         <div style={{
           backgroundColor: 'var(--bg-surface)',
           border: '1px solid var(--border-subtle)',
@@ -2464,6 +2467,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           )}
         </div>
+        </>
         )}
 
       </div>

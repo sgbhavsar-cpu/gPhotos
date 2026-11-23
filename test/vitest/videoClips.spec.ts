@@ -83,6 +83,67 @@ describe('exportVideo with a real clip', () => {
     }
   }, 60000);
 
+  it('speed changes the clip length and chains atempo past 2x', () => {
+    const fast = buildClipPrepArgs('in.mp4', 'out.mp4', { width: 160, height: 90, fps: 30, startSec: 0, lengthSec: 8, withAudio: true, speed: 4 });
+    expect(fast.join(' ')).toContain('setpts=PTS/4.0000');
+    expect(fast[fast.indexOf('-af') + 1]).toBe('atempo=2,atempo=2.0000');
+    expect(fast[fast.lastIndexOf('-t') + 1]).toBe('2.000'); // 8 s of source at 4x
+    const slow = buildClipPrepArgs('in.mp4', 'out.mp4', { width: 160, height: 90, fps: 30, startSec: 0, lengthSec: 2, withAudio: true, speed: 0.25 });
+    expect(slow[slow.indexOf('-af') + 1]).toBe('atempo=0.5,atempo=0.5000');
+    expect(slow[slow.lastIndexOf('-t') + 1]).toBe('8.000');
+    expect(buildClipPrepArgs('in.mp4', 'out.mp4', { width: 160, height: 90, fps: 30, startSec: 0, lengthSec: 2, withAudio: true })).not.toContain('-af');
+  });
+
+  it('a 2x clip renders half as long through real ffmpeg, with its sound', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gp_clips_'));
+    try {
+      const src = path.join(dir, 'src.mp4');
+      expect((await runFfmpeg(['-y', '-f', 'lavfi', '-i', 'testsrc=size=160x90:rate=25:duration=4', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=4', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', src], 0)).success).toBe(true);
+      const out = path.join(dir, 'out.mp4');
+      const res = await exportVideo({
+        slides: [{ kind: 'clip', clipPath: src, trimStartSec: 0, trimEndSec: 4, speed: 2, muted: false }],
+        aspectRatio: '16:9', resolution: '720p', quality: 'draft', transition: 'none', transitionDurationSec: 0, secondsPerItem: 1,
+        outputPath: out, tempDir: path.join(dir, 'tmp'),
+      });
+      expect(res.error).toBeUndefined();
+      expect(res.success).toBe(true);
+      expect(res.durationSec).toBeCloseTo(2, 1);
+      expect((await probeMedia(out)).hasAudio).toBe(true);
+    } finally {
+      try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch {}
+    }
+  }, 60000);
+
+  it('reverse and freeze change the filters and the output length', () => {
+    const a = buildClipPrepArgs('in.mp4', 'out.mp4', { width: 160, height: 90, fps: 30, startSec: 0, lengthSec: 3, withAudio: true, reverse: true, holdSec: 2 });
+    expect(a.join(' ')).toContain('[0:v]reverse,split=2');
+    expect(a.join(' ')).toContain('tpad=stop_mode=clone:stop_duration=2.000');
+    expect(a[a.indexOf('-af') + 1]).toBe('areverse,apad=pad_dur=2.000');
+    expect(a[a.lastIndexOf('-t') + 1]).toBe('5.000'); // 3 s of clip + 2 s frozen
+    const plain = buildClipPrepArgs('in.mp4', 'out.mp4', { width: 160, height: 90, fps: 30, startSec: 0, lengthSec: 3, withAudio: true });
+    expect(plain.join(' ')).not.toMatch(/reverse|tpad/);
+  });
+
+  it('a backwards clip with a frozen end renders through real ffmpeg at the right length, with sound', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gp_clipr_'));
+    try {
+      const src = path.join(dir, 'src.mp4');
+      expect((await runFfmpeg(['-y', '-f', 'lavfi', '-i', 'testsrc=size=160x90:rate=25:duration=3', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=3', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', src], 0)).success).toBe(true);
+      const out = path.join(dir, 'out.mp4');
+      const res = await exportVideo({
+        slides: [{ kind: 'clip', clipPath: src, trimStartSec: 0, trimEndSec: 3, reverse: true, holdSec: 2, muted: false }],
+        aspectRatio: '16:9', resolution: '720p', quality: 'draft', transition: 'none', transitionDurationSec: 0, secondsPerItem: 1,
+        outputPath: out, tempDir: path.join(dir, 'tmp'),
+      });
+      expect(res.error).toBeUndefined();
+      expect(res.success).toBe(true);
+      expect(res.durationSec).toBeCloseTo(5, 1);
+      expect((await probeMedia(out)).hasAudio).toBe(true);
+    } finally {
+      try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch {}
+    }
+  }, 60000);
+
   it('buildClipPrepArgs drops audio when asked', () => {
     const a = buildClipPrepArgs('in.mp4', 'out.mp4', { width: 160, height: 90, fps: 30, startSec: 0, lengthSec: 2, withAudio: false });
     expect(a).toContain('-an');

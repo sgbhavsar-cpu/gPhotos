@@ -460,4 +460,79 @@ describe('VideoWizardModal — music, title screen and end credits', () => {
       expect(host.textContent).toContain('13.6s');
     });
   });
+
+  describe('Voice-over and cut on the beat', () => {
+    const voice = { filePath: 'C:\\Rec\\voice_1.webm', name: 'voice_1.webm', durationSec: 12 };
+    const chooseMusic = async () => { await act(async () => { btn('From this computer').click(); }); await act(async () => { btn('Choose an audio file').click(); }); await flush(); };
+
+    it('a sound file added in step 4 is sent with its start time and volume, and can be removed', async () => {
+      api.chooseAudioFile = vi.fn()
+        .mockResolvedValueOnce(voice);
+      await toMusicStep();
+      expect(host.querySelector('[data-testid="voice-beat-panel"]')).toBeTruthy();
+      const addBtn = Array.from(host.querySelectorAll('[data-testid="voice-beat-panel"] button')).find((b) => b.textContent?.includes('Add a sound file')) as HTMLButtonElement;
+      await act(async () => { addBtn.click(); });
+      await flush();
+      expect(host.querySelectorAll('[data-testid="voice-track"]')).toHaveLength(1);
+      await setValue(byLabel<HTMLInputElement>('Voice-over start (seconds)'), '3.5');
+      await next(2);
+      const req = await clickGenerate();
+      expect(req.voice).toEqual([{ filePath: voice.filePath, startSec: 3.5, volume: 1 }]);
+    });
+
+    it('removing the only voice track leaves no voice in the request', async () => {
+      api.chooseAudioFile = vi.fn().mockResolvedValueOnce(voice);
+      await toMusicStep();
+      const addBtn = Array.from(host.querySelectorAll('[data-testid="voice-beat-panel"] button')).find((b) => b.textContent?.includes('Add a sound file')) as HTMLButtonElement;
+      await act(async () => { addBtn.click(); });
+      await flush();
+      await act(async () => { byLabel<HTMLButtonElement>('Remove this sound').click(); });
+      await next(2);
+      expect((await clickGenerate()).voice).toBeUndefined();
+    });
+
+    it('"cut on the beat" is unavailable without music', async () => {
+      await toMusicStep();
+      expect((host.querySelector('[data-testid="beat-toggle"]') as HTMLInputElement).disabled).toBe(true);
+    });
+
+    it('with music, "cut on the beat" makes every slide a whole number of beats and starts the music on a beat', async () => {
+      api.analyzeBeats = vi.fn(async () => ({ bpm: 100, firstBeatSec: 0.4 })); // 0.6 s per beat; 3 s per slide = 5 beats exactly
+      await toMusicStep();
+      await chooseMusic();
+      const toggle = host.querySelector('[data-testid="beat-toggle"]') as HTMLInputElement;
+      expect(toggle.disabled).toBe(false);
+      await act(async () => { toggle.click(); });
+      await flush();
+      expect(api.analyzeBeats).toHaveBeenCalledWith(tone.filePath, 0, null);
+      expect(host.querySelector('[data-testid="voice-beat-panel"]')!.textContent).toContain('About 100 beats per minute');
+      await next(2);
+      const req = await clickGenerate();
+      expect(req.secondsPerItem).toBeCloseTo(3, 5);
+      expect(req.audio.startSec).toBeCloseTo(0.4, 5); // the music starts on its first beat
+    });
+
+    it('a tempo that does not divide the slide length rounds to the nearest whole number of beats', async () => {
+      api.analyzeBeats = vi.fn(async () => ({ bpm: 128, firstBeatSec: 0 })); // 0.46875 s per beat; 3 s -> 6 beats = 2.8125 s
+      await toMusicStep();
+      await chooseMusic();
+      await act(async () => { (host.querySelector('[data-testid="beat-toggle"]') as HTMLInputElement).click(); });
+      await flush();
+      await next(2);
+      expect((await clickGenerate()).secondsPerItem).toBeCloseTo(2.81, 2);
+    });
+
+    it('switching it off again puts the music start back', async () => {
+      api.analyzeBeats = vi.fn(async () => ({ bpm: 100, firstBeatSec: 0.4 }));
+      await toMusicStep();
+      await chooseMusic();
+      const toggle = () => host.querySelector('[data-testid="beat-toggle"]') as HTMLInputElement;
+      await act(async () => { toggle().click(); });
+      await flush();
+      await act(async () => { toggle().click(); });
+      await flush();
+      await next(2);
+      expect((await clickGenerate()).audio.startSec).toBe(0);
+    });
+  });
 });

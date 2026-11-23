@@ -1,7 +1,9 @@
 // Pure collage layout math, shared by the main-process renderer (videoExportService.ts) and the
 // wizard's style-picker previews (VideoWizardModal.tsx), so what the popup shows is exactly what
 // gets rendered. No I/O, no dependencies.
-export const MAX_COLLAGE_PHOTOS = 4; // same cap as the album chapter's auto-generated cover collage
+export const MAX_COLLAGE_PHOTOS = 4; // the album chapter's auto-generated cover collage
+/** A collage frame in a generated video may hold more: up to 3 x 3. */
+export const MAX_VIDEO_COLLAGE_PHOTOS = 9;
 
 export type CollageStyle = 'grid' | 'sideBySide' | 'stacked' | 'featured';
 
@@ -10,6 +12,25 @@ export interface CollageTile {
   y: number;
   w: number;
   h: number;
+}
+
+/**
+ * 5-9 photos: the most square-looking rows x columns for the frame's shape (a wide frame gets more columns), filled row
+ * by row. A last row with fewer photos shares the full width between them, so no gap is left at the edge.
+ */
+function evenGrid(n: number, width: number, height: number, gap: number): CollageTile[] {
+  const cols = Math.min(n, Math.max(2, Math.round(Math.sqrt((n * width) / height))));
+  const rows = Math.ceil(n / cols);
+  const rowH = Math.floor((height - gap * (rows - 1)) / rows);
+  const tiles: CollageTile[] = [];
+  for (let r = 0; r < rows; r++) {
+    const inRow = r === rows - 1 ? n - cols * (rows - 1) : cols;
+    const w = Math.floor((width - gap * (inRow - 1)) / inRow);
+    for (let c = 0; c < inRow; c++) {
+      tiles.push({ x: c * (w + gap), y: r * (rowH + gap), w: c === inRow - 1 ? width - c * (w + gap) : w, h: r === rows - 1 ? height - r * (rowH + gap) : rowH });
+    }
+  }
+  return tiles;
 }
 
 /**
@@ -23,7 +44,7 @@ export interface CollageTile {
  *  - featured:   the first photo big across the top (~65%), the rest as an equal-width strip below.
  */
 export function computeCollageTiles(count: number, style: CollageStyle, width: number, height: number, gap = 4): CollageTile[] {
-  const n = Math.min(Math.max(count, 1), MAX_COLLAGE_PHOTOS);
+  const n = Math.min(Math.max(count, 1), MAX_VIDEO_COLLAGE_PHOTOS);
   if (n === 1) return [{ x: 0, y: 0, w: width, h: height }];
 
   if (style === 'sideBySide') {
@@ -78,6 +99,7 @@ export function computeCollageTiles(count: number, style: CollageStyle, width: n
       { x: bigW + gap, y: halfH + gap, w: smallW, h: height - halfH - gap },
     ];
   }
+  if (n > 4) return evenGrid(n, width, height, gap);
   const halfW = Math.floor((width - gap) / 2);
   const halfH = Math.floor((height - gap) / 2);
   return [

@@ -42,6 +42,9 @@ export function useMarqueeSelect({ containerRef, selected, onChange, enabled = t
     const { containerRef: ref, enabled: on } = live.current;
     const container = ref.current;
     if (!container || on === false || e.button !== 0) return;
+    // A press on the container's own scroll bar is for scrolling: it must not start a band or clear the selection.
+    const box = container.getBoundingClientRect();
+    if (container.clientWidth > 0 && (e.clientX - box.left >= container.clientWidth || e.clientY - box.top >= container.clientHeight)) return;
     const target = e.target as HTMLElement;
     const onCheckbox = !!target.closest('[data-marquee-start]');
     if (!onCheckbox && target.closest(NOT_A_BACKGROUND)) return;

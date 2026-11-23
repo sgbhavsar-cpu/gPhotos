@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useEffect, useRef, useDeferredValue } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
 import {
   FolderPlus,
   Image as ImageIcon,
@@ -266,37 +267,13 @@ export const AlbumsView: React.FC<AlbumsViewProps> = ({
   const [dragSelectedIds, setDragSelectedIds] = useState<Set<string>>(new Set());
   const dragSelectedIdsRef = useRef<Set<string>>(new Set());
   dragSelectedIdsRef.current = dragSelectedIds;
-  // Handle Escape key navigation inside AlbumsView
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      // An open full-screen photo takes this Escape first; the selection underneath must survive it.
-      if (document.querySelector('[data-photo-lightbox]')) return;
-
-      // stopImmediatePropagation, not stopPropagation — see PeopleView's
-      // matching Escape handler for why (App.tsx's global handler is also
-      // bound to `window` and stopPropagation alone won't stop it firing).
-      if (showMoveToAlbum || showMoveToChapter) {
-        return; // their own modals handle (and swallow) this Escape
-      } else if (showAddPhotosModal) {
-        e.stopImmediatePropagation();
-        setShowAddPhotosModal(false);
-      } else if (showCreateModal) {
-        e.stopImmediatePropagation();
-        setShowCreateModal(false);
-      } else if (selectedAlbumId && dragSelectedIdsRef.current.size > 0) {
-        e.stopImmediatePropagation();
-        setDragSelectedIds(new Set()); // first Escape: just deselect
-      } else if (selectedAlbumId) {
-        e.stopImmediatePropagation();
-        setSelectedAlbumId(null); // next: back to the album list (App.tsx keeps Escape from leaving Albums)
-      }
-    };
-
-    // capture: true — see PeopleView's matching Escape handler for why.
-    window.addEventListener('keydown', handleKeyDown, { capture: true });
-    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [showAddPhotosModal, showCreateModal, showMoveToAlbum, showMoveToChapter, selectedAlbumId]);
+  // Escape backs out one level at a time: add-photos / create dialog, then the photo selection, then the album itself (the album list is where it stops).
+  useEscapeLayer(showAddPhotosModal || showCreateModal || !!selectedAlbumId, () => {
+    if (showAddPhotosModal) setShowAddPhotosModal(false);
+    else if (showCreateModal) setShowCreateModal(false);
+    else if (dragSelectedIdsRef.current.size > 0) setDragSelectedIds(new Set());
+    else setSelectedAlbumId(null);
+  });
   const [dragOverTarget, setDragOverTarget] = useState<string | null>(null); // chapterId, or 'unchaptered'
   // How many photos are being dragged right now (0 = no drag): while > 0 the chapter drop bar is shown.
   const [draggingCount, setDraggingCount] = useState(0);

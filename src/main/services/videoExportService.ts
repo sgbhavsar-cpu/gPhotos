@@ -6,8 +6,8 @@
 import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
-import { computeCollageTiles, MAX_COLLAGE_PHOTOS, type CollageStyle, type CollageTile } from '../../types/collageLayout';
-import { computeDimensions, type VideoTransitionName } from '../../types/videoFormat';
+import { computeCollageTiles, MAX_VIDEO_COLLAGE_PHOTOS, type CollageStyle, type CollageTile } from '../../types/collageLayout';
+import { computeDimensions, CAPTION_COLORS, DEFAULT_CAPTION_STYLE, type VideoCaptionStyle, type VideoTransitionName, type VideoFilterName, type VideoMotionName } from '../../types/videoFormat';
 import { layoutText, makeText } from '../../types/slideDesign';
 // @ts-ignore — ffmpeg-static has no types; it's just a string (the binary's path) at runtime.
 import ffmpegPathRaw from 'ffmpeg-static';
@@ -35,7 +35,7 @@ export function getFfmpegPath(): string {
 }
 
 export type AspectRatio = '16:9' | '9:16' | '1:1' | '4:3';
-export type VideoResolutionTier = '720p' | '1080p';
+export type VideoResolutionTier = '360p' | '720p' | '1080p';
 export type VideoQuality = 'draft' | 'good' | 'best';
 // A curated subset of ffmpeg's `xfade` transition names, enough variety without overwhelming the wizard.
 export type TransitionName = VideoTransitionName;
@@ -98,7 +98,7 @@ export async function prepareCardImage(imageDataUrl: string, outPath: string, wi
 
 /** 1-4 photos combined into one collage frame in the chosen layout style (capped at 4, same as the album chapter cover). */
 export async function renderCollageImage(sourcePaths: string[], outPath: string, width: number, height: number, style: CollageStyle = 'grid'): Promise<void> {
-  const photos = sourcePaths.slice(0, MAX_COLLAGE_PHOTOS);
+  const photos = sourcePaths.slice(0, MAX_VIDEO_COLLAGE_PHOTOS);
   if (photos.length === 0) throw new Error('renderCollageImage needs at least one photo');
   if (photos.length === 1) return prepareSlideImage(photos[0], outPath, width, height);
 
@@ -117,6 +117,39 @@ export async function renderCollageImage(sourcePaths: string[], outPath: string,
     .toFile(outPath);
 }
 
+const even = (n: number) => 2 * Math.round(n / 2);
+
+/**
+ * A transparent, frame-sized picture with one lower-third caption: white text with a soft shadow on a translucent dark
+ * band at the bottom-left. Laid over a slide with ffmpeg's overlay, so it stays still while the photo moves.
+ * Text is wrapped to two lines at an average glyph width (no canvas in the main process, as in renderTitleSlide).
+ */
+export async function renderCaptionPng(text: string, width: number, height: number, outPath: string, style: VideoCaptionStyle = DEFAULT_CAPTION_STYLE): Promise<void> {
+  const esc = (v: string) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const px = Math.round(Math.min(width, height) * ({ small: 0.038, medium: 0.05, large: 0.068 }[style.size] ?? 0.05));
+  const maxChars = Math.max(8, Math.floor((width * 0.84) / (px * 0.56)));
+  const words = text.trim().split(/\s+/);
+  const lines: string[] = [];
+  for (const w of words) {
+    const last = lines[lines.length - 1];
+    if (last !== undefined && (last + ' ' + w).length <= maxChars) lines[lines.length - 1] = last + ' ' + w;
+    else lines.push(w);
+  }
+  const shown = lines.slice(0, 2);
+  if (lines.length > 2) shown[1] = shown[1].slice(0, Math.max(1, maxChars - 1)) + '…';
+  const boxW = Math.min(width * 0.92, Math.max(...shown.map((l) => l.length)) * px * 0.56 + px * 1.6);
+  const boxH = shown.length * px * 1.25 + px * 0.9;
+  const x = Math.round(width * 0.04);
+  const y = Math.round(style.position === 'top' ? height * 0.06 : style.position === 'middle' ? (height - boxH) / 2 : height - boxH - height * 0.06);
+  const fill = (CAPTION_COLORS.find((c) => c[0] === style.color) ?? CAPTION_COLORS[0])[2];
+  const tspans = shown.map((l, i) => `<tspan x="${x + px * 0.8}" y="${y + px * 0.45 + px * 1.25 * (i + 0.8)}">${esc(l)}</tspan>`).join('');
+  const svg = `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+    <rect x="${x}" y="${y}" width="${Math.round(boxW)}" height="${Math.round(boxH)}" rx="${Math.round(px * 0.35)}" fill="rgba(8,12,20,0.55)"/>
+    <text font-family="Arial, Helvetica, sans-serif" font-size="${px}" font-weight="600" fill="${fill}" style="paint-order:stroke" stroke="rgba(0,0,0,0.35)" stroke-width="${Math.max(1, Math.round(px * 0.06))}">${tspans}</text>
+  </svg>`;
+  await requireSharp()(Buffer.from(svg)).png().toFile(outPath);
+}
+
 export interface SlidePlan {
   /** Absolute path to an already-generated image (or, with `clip`, a prepared video), pre-normalized to exactly `width`x`height`. */
   file: string;
@@ -124,6 +157,42 @@ export interface SlidePlan {
   seconds?: number;
   /** Set when `file` is a prepared video clip (see prepareClip) rather than a still image. */
   clip?: { hasAudio: boolean; volume: number };
+  /** Still images only: slow zoom / pan. The image must then have been prepared MOTION_SCALE times larger than the frame. */
+  motion?: VideoMotionName;
+  focus?: { x: number; y: number };
+  filter?: VideoFilterName;
+  /** A transparent frame-sized PNG laid over this slide (see renderCaptionPng). */
+  captionFile?: string;
+}
+
+/** A moving still is cropped from an image this much larger than the frame, so the zoom stays sharp. */
+export const MOTION_SCALE = 1.25;
+
+const FILTER_CHAINS: Record<Exclude<VideoFilterName, 'none'>, string> = {
+  warm: 'colorbalance=rs=.08:gs=.02:bs=-.08:rm=.06:bm=-.06,eq=saturation=1.1',
+  cool: 'colorbalance=rs=-.06:bs=.08:rm=-.05:bm=.07',
+  vintage: 'curves=preset=vintage',
+  bw: 'hue=s=0,eq=contrast=1.1',
+  vivid: 'eq=saturation=1.4:contrast=1.08',
+  cinematic: 'eq=contrast=1.12:saturation=0.92,colorbalance=rs=-.05:bs=.07:rh=.07:bh=-.05',
+};
+
+/** zoompan expression for a still; `frames` = how many output frames the slide lasts. */
+function motionFilter(motion: VideoMotionName, focus: { x: number; y: number } | undefined, frames: number, w: number, h: number, fps: number): string | null {
+  if (motion === 'none') return null;
+  const clamp = (v: number | undefined) => Math.min(0.9, Math.max(0.1, v ?? 0.5));
+  const fx = clamp(focus?.x), fy = clamp(focus?.y);
+  const n = Math.max(1, frames);
+  const t = `on/${n}`;
+  const tail = `:d=1:s=${w}x${h}:fps=${fps}`;
+  const pos = (fxExpr: string) => `:x='(iw-iw/zoom)*${fxExpr}':y='(ih-ih/zoom)*${fy}'`;
+  switch (motion) {
+    case 'zoomout': return `zoompan=z='1.2-0.2*${t}'${pos(String(fx))}${tail}`;
+    case 'panleft': return `zoompan=z='1.18'${pos(`(1-${t})`)}${tail}`;
+    case 'panright': return `zoompan=z='1.18'${pos(t)}${tail}`;
+    case 'face': return `zoompan=z='1+0.3*${t}'${pos(String(fx))}${tail}`;
+    default: return `zoompan=z='1+0.2*${t}'${pos(String(fx))}${tail}`; // zoomin
+  }
 }
 
 /**
@@ -131,15 +200,21 @@ export interface SlidePlan {
  * (fit with a blurred copy of itself behind, so portrait phone clips don't get black bars or a hard crop),
  * constant fps, yuv420p, and stereo 44.1k AAC — so it can join the same xfade chain as the photo slides.
  */
-export function buildClipPrepArgs(src: string, out: string, o: { width: number; height: number; fps: number; startSec: number; lengthSec: number; withAudio: boolean }): string[] {
+export function buildClipPrepArgs(src: string, out: string, o: { width: number; height: number; fps: number; startSec: number; lengthSec: number; withAudio: boolean; speed?: number; reverse?: boolean; holdSec?: number }): string[] {
   const { width: W, height: H } = o;
-  const graph = `[0:v]split=2[a][b];[a]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=20:5[bg];` +
-    `[b]scale=${W}:${H}:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=${o.fps},format=yuv420p[v]`;
+  const speed = Math.min(4, Math.max(0.25, o.speed ?? 1));
+  const hold = Math.min(10, Math.max(0, o.holdSec ?? 0)); // freeze: the last frame stays up this long after the clip
+  const outLen = o.lengthSec / speed + hold;
+  // atempo only accepts 0.5..2 per stage, so 4x / 0.25x chain two stages.
+  const tempo = speed === 1 ? '' : speed > 2 ? `atempo=2,atempo=${(speed / 2).toFixed(4)}` : speed < 0.5 ? `atempo=0.5,atempo=${(speed / 0.5).toFixed(4)}` : `atempo=${speed.toFixed(4)}`;
+  const audioFilters = [o.reverse ? 'areverse' : '', tempo, hold > 0 ? `apad=pad_dur=${hold.toFixed(3)}` : ''].filter(Boolean).join(',');
+  const graph = `[0:v]${o.reverse ? 'reverse,' : ''}split=2[a][b];[a]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=20:5[bg];` +
+    `[b]scale=${W}:${H}:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1${speed === 1 ? '' : `,setpts=PTS/${speed.toFixed(4)}`},fps=${o.fps}${hold > 0 ? `,tpad=stop_mode=clone:stop_duration=${hold.toFixed(3)}` : ''},format=yuv420p[v]`;
   return [
     '-y', '-ss', Math.max(0, o.startSec).toFixed(3), '-t', o.lengthSec.toFixed(3), '-i', src,
     '-filter_complex', graph, '-map', '[v]',
-    ...(o.withAudio ? ['-map', '0:a:0', '-ac', '2', '-ar', '44100', '-c:a', 'aac', '-b:a', '160k'] : ['-an']),
-    '-c:v', 'libx264', '-crf', '20', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-t', o.lengthSec.toFixed(3), out,
+    ...(o.withAudio ? ['-map', '0:a:0', ...(audioFilters ? ['-af', audioFilters] : []), '-ac', '2', '-ar', '44100', '-c:a', 'aac', '-b:a', '160k'] : ['-an']),
+    '-c:v', 'libx264', '-crf', '20', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-t', outLen.toFixed(3), out,
   ];
 }
 
@@ -155,6 +230,18 @@ export interface AudioPlan {
   volume?: number;
 }
 
+/** A spoken / extra sound track laid over the video (voice-over, ambient sound...). */
+export interface VoiceTrackPlan {
+  file: string;
+  /** Where in the VIDEO this track starts (seconds). */
+  startSec: number;
+  /** Which part of the file to use (seconds into the file); length null = to the end. */
+  trimStartSec?: number;
+  lengthSec?: number | null;
+  /** 0..2, default 1. */
+  volume?: number;
+}
+
 export interface BuildFfmpegArgsOptions {
   width: number;
   height: number;
@@ -166,6 +253,8 @@ export interface BuildFfmpegArgsOptions {
   quality: VideoQuality;
   outputPath: string;
   audio?: AudioPlan;
+  /** Extra tracks mixed in; the music is ducked under them (and under clip sound). */
+  voice?: VoiceTrackPlan[];
 }
 
 export interface BuiltFfmpegPlan {
@@ -198,10 +287,33 @@ export function buildFfmpegArgs(slides: SlidePlan[], opts: BuildFfmpegArgsOption
   const inputArgs: string[] = [];
   slides.forEach((sl, i) => {
     if (sl.clip) inputArgs.push('-i', sl.file);
-    else inputArgs.push('-loop', '1', '-t', durations[i].toFixed(3), '-i', sl.file);
+    // A moving still needs frames at the output rate (zoompan advances once per input frame).
+    else inputArgs.push('-loop', '1', ...(sl.motion && sl.motion !== 'none' ? ['-framerate', String(fps)] : []), '-t', durations[i].toFixed(3), '-i', sl.file);
   });
+  // Caption pictures come after the slides (and before any music), one input per captioned slide.
+  const captionInput = new Map<number, number>();
+  slides.forEach((sl, i) => {
+    if (!sl.captionFile) return;
+    captionInput.set(i, slides.length + captionInput.size);
+    inputArgs.push('-loop', '1', '-t', durations[i].toFixed(3), '-i', sl.captionFile);
+  });
+  const voice = opts.voice ?? [];
+  const voiceIdx = voice.map((_, k) => slides.length + captionInput.size + k);
+  voice.forEach((v) => {
+    inputArgs.push(...(v.trimStartSec ? ['-ss', v.trimStartSec.toFixed(3)] : []), ...(v.lengthSec ? ['-t', v.lengthSec.toFixed(3)] : []), '-i', v.file);
+  });
+  const audioIdx = slides.length + captionInput.size + voice.length;
 
-  const formatLabels = slides.map((sl, i) => `[${i}:v]${sl.clip ? 'setpts=PTS-STARTPTS,' : ''}format=yuv420p,fps=${fps}[v${i}]`);
+  const formatLabels = slides.map((sl, i) => {
+    const look = sl.filter && sl.filter !== 'none' ? FILTER_CHAINS[sl.filter] : null;
+    const move = sl.motion && !sl.clip ? motionFilter(sl.motion, sl.focus, Math.round(durations[i] * fps), opts.width, opts.height, fps) : null;
+    const pre = `${sl.clip ? 'setpts=PTS-STARTPTS,' : ''}${move ? move + ',' : ''}`;
+    const cap = captionInput.get(i);
+    // Order: motion, colour look, caption on top (so the caption stays put while the picture moves), then the common format.
+    return cap === undefined
+      ? `[${i}:v]${pre}${look ? look + ',' : ''}format=yuv420p,fps=${fps}[v${i}]`
+      : `[${i}:v]${pre}${look ? look + ',' : ''}format=yuv420p[b${i}];[b${i}][${cap}:v]overlay=0:0:format=auto,format=yuv420p,fps=${fps}[v${i}]`;
+  });
   let filterComplex: string;
   let totalDurationSec: number;
 
@@ -227,30 +339,45 @@ export function buildFfmpegArgs(slides: SlidePlan[], opts: BuildFfmpegArgsOption
   const total = Math.max(0, totalDurationSec);
   const audioArgs: string[] = [];
 
-  // Clip sound: each clip's audio is delayed to where its slide starts, then all are mixed into one bus.
-  // With music too, the music is ducked (sidechain compressed) whenever a clip is making noise.
+  // Everything that has sound of its own is mixed into "loud" buses; the music is ducked (sidechain compressed) whenever a
+  // bus is making noise. Clip sound: each clip's audio is delayed to where its slide starts. Voice tracks: each is delayed to its start.
   const clipAudio = slides.map((sl, i) => ({ sl, i })).filter(({ sl }) => sl.clip?.hasAudio && sl.clip.volume > 0);
-  if (clipAudio.length > 0) {
+  if (clipAudio.length > 0 || voice.length > 0) {
     let startAt = 0;
     const starts = durations.map((d) => { const s = startAt; startAt += d - td; return s; });
-    const parts = clipAudio.map(({ sl, i }) => {
-      const ms = Math.round(starts[i] * 1000);
-      return `[${i}:a]aresample=44100,aformat=channel_layouts=stereo,volume=${sl.clip!.volume.toFixed(2)},adelay=${ms}|${ms}[ca${i}]`;
-    });
-    const labels = clipAudio.map(({ i }) => `[ca${i}]`).join('');
-    parts.push(clipAudio.length === 1 ? `${labels}anull[bus]` : `${labels}amix=inputs=${clipAudio.length}:normalize=0:duration=longest[bus]`);
+    const parts: string[] = [];
+    const loud: string[] = []; // labels of the buses
+    const mixOf = (labels: string[], out: string) => parts.push(labels.length === 1 ? `[${labels[0]}]anull[${out}]` : `${labels.map((l) => `[${l}]`).join('')}amix=inputs=${labels.length}:normalize=0:duration=longest[${out}]`);
+    if (clipAudio.length > 0) {
+      clipAudio.forEach(({ sl, i }) => {
+        const ms = Math.round(starts[i] * 1000);
+        parts.push(`[${i}:a]aresample=44100,aformat=channel_layouts=stereo,volume=${sl.clip!.volume.toFixed(2)},adelay=${ms}|${ms}[ca${i}]`);
+      });
+      mixOf(clipAudio.map(({ i }) => `ca${i}`), 'bus');
+      loud.push('bus');
+    }
+    if (voice.length > 0) {
+      voice.forEach((v, k) => {
+        const ms = Math.max(0, Math.round(v.startSec * 1000));
+        parts.push(`[${voiceIdx[k]}:a]aresample=44100,aformat=channel_layouts=stereo,volume=${(v.volume ?? 1).toFixed(2)},adelay=${ms}|${ms}[vo${k}]`);
+      });
+      mixOf(voice.map((_, k) => `vo${k}`), 'vbus');
+      loud.push('vbus');
+    }
     if (opts.audio) {
       inputArgs.push(...(opts.audio.loop ? ['-stream_loop', '-1'] : []), '-i', opts.audio.file);
       const mf: string[] = [];
       if (opts.audio.volume !== undefined && Math.abs(opts.audio.volume - 1) > 0.01) mf.push(`volume=${opts.audio.volume.toFixed(2)}`);
       const fade = Math.min(opts.audio.fadeOutSec, total);
       if (fade > 0) mf.push(`afade=t=out:st=${(total - fade).toFixed(3)}:d=${fade.toFixed(3)}`);
-      parts.push(`[${slides.length}:a]${mf.length ? mf.join(',') : 'anull'}[mus]`);
-      parts.push('[bus]asplit=2[sc][cm]');
-      parts.push('[mus][sc]sidechaincompress=threshold=0.03:ratio=10:attack=30:release=600[duck]');
-      parts.push('[duck][cm]amix=inputs=2:normalize=0:duration=longest[outa]');
+      parts.push(`[${audioIdx}:a]${mf.length ? mf.join(',') : 'anull'}[mus]`);
+      // each bus is used twice: once to trigger the ducking, once in the final mix
+      loud.forEach((l) => parts.push(`[${l}]asplit=2[${l}_sc][${l}_mx]`));
+      mixOf(loud.map((l) => `${l}_sc`), 'trig');
+      parts.push('[mus][trig]sidechaincompress=threshold=0.03:ratio=10:attack=30:release=600[duck]');
+      parts.push(`[duck]${loud.map((l) => `[${l}_mx]`).join('')}amix=inputs=${loud.length + 1}:normalize=0:duration=longest[outa]`);
     } else {
-      parts.push('[bus]anull[outa]');
+      mixOf(loud, 'outa');
     }
     filterComplex += ';' + parts.join(';');
     audioArgs.push('-map', '[outa]', '-c:a', 'aac', '-b:a', '192k', '-t', total.toFixed(3));
@@ -262,7 +389,7 @@ export function buildFfmpegArgs(slides: SlidePlan[], opts: BuildFfmpegArgsOption
     if (opts.audio.volume !== undefined && Math.abs(opts.audio.volume - 1) > 0.01) filters.push(`volume=${opts.audio.volume.toFixed(2)}`);
     const fade = Math.min(opts.audio.fadeOutSec, total);
     if (fade > 0) filters.push(`afade=t=out:st=${(total - fade).toFixed(3)}:d=${fade.toFixed(3)}`);
-    audioArgs.push('-map', `${slides.length}:a`, '-c:a', 'aac', '-b:a', '192k', ...(filters.length ? ['-af', filters.join(',')] : []), '-t', total.toFixed(3));
+    audioArgs.push('-map', `${audioIdx}:a`, '-c:a', 'aac', '-b:a', '192k', ...(filters.length ? ['-af', filters.join(',')] : []), '-t', total.toFixed(3));
   }
 
   const args = [
@@ -450,6 +577,12 @@ export interface VideoSlideSpec {
   trimStartSec?: number;
   trimEndSec?: number | null;
   muted?: boolean;
+  /** Playback speed of the clip, 0.25..4 (default 1). */
+  speed?: number;
+  /** Play the clip backwards. */
+  reverse?: boolean;
+  /** Hold the last frame (freeze) for this many seconds after the clip, 0..10. */
+  holdSec?: number;
   volume?: number;
   collageStyle?: CollageStyle;
   title?: string;
@@ -458,6 +591,11 @@ export interface VideoSlideSpec {
   imageDataUrl?: string;
   /** Overrides the job's seconds-per-slide for this slide (title / credits cards). */
   seconds?: number;
+  /** See VideoSlideInput (src/types/index.ts): slow camera movement, a colour look, and a lower-third caption. */
+  motion?: VideoMotionName;
+  focus?: { x: number; y: number };
+  filter?: VideoFilterName;
+  caption?: string;
 }
 
 export interface VideoAudioSpec {
@@ -472,6 +610,16 @@ export interface VideoAudioSpec {
   volume?: number;
 }
 
+export interface VideoVoiceSpec {
+  filePath: string;
+  /** Where in the video it starts (seconds). */
+  startSec: number;
+  /** Which part of the file to use. */
+  trimStartSec?: number;
+  lengthSec?: number | null;
+  volume?: number;
+}
+
 export interface VideoExportJob {
   slides: VideoSlideSpec[];
   aspectRatio: AspectRatio;
@@ -483,6 +631,9 @@ export interface VideoExportJob {
   outputPath: string;
   tempDir: string;
   audio?: VideoAudioSpec;
+  /** Voice-over / extra sound tracks over the video. */
+  voice?: VideoVoiceSpec[];
+  captionStyle?: VideoCaptionStyle;
 }
 
 export interface VideoExportProgress {
@@ -523,24 +674,45 @@ export async function exportVideo(job: VideoExportJob, onProgress?: (p: VideoExp
         const end = slide.trimEndSec && slide.trimEndSec > start ? slide.trimEndSec : (info.durationSec ?? start);
         const len = Math.min(end, info.durationSec ?? end) - start;
         if (!(len > 0.2)) throw new Error('empty trim range');
+        const spd = Math.min(4, Math.max(0.25, slide.speed ?? 1));
+        const hold = Math.min(10, Math.max(0, slide.holdSec ?? 0));
         const clipOut = path.join(job.tempDir, `clip_${String(i).padStart(4, '0')}.mp4`);
         const withAudio = info.hasAudio && !slide.muted;
-        const prep = await runFfmpeg(buildClipPrepArgs(src, clipOut, { width, height, fps: 30, startSec: start, lengthSec: len, withAudio }), len, undefined, signal);
+        const prep = await runFfmpeg(buildClipPrepArgs(src, clipOut, { width, height, fps: 30, startSec: start, lengthSec: len, withAudio, speed: slide.speed, reverse: slide.reverse, holdSec: hold }), len / spd + hold, undefined, signal);
         if (!prep.success) throw new Error(prep.error || 'clip preparation failed');
-        slideFiles.push({ file: clipOut, seconds: len, clip: { hasAudio: withAudio, volume: slide.volume ?? 1 } });
+        const clipPlan: SlidePlan = { file: clipOut, seconds: len / spd + hold, clip: { hasAudio: withAudio, volume: slide.volume ?? 1 } };
+        if (slide.filter && slide.filter !== 'none') clipPlan.filter = slide.filter;
+        if (slide.caption?.trim()) {
+          clipPlan.captionFile = path.join(job.tempDir, `caption_${String(i).padStart(4, '0')}.png`);
+          await renderCaptionPng(slide.caption, width, height, clipPlan.captionFile, job.captionStyle);
+        }
+        slideFiles.push(clipPlan);
         onProgress?.({ stage: 'preparing', done: i + 1, total: job.slides.length });
         continue;
       }
+      // A photo / collage that moves is cut from a larger picture so the zoom does not go soft.
+      const motion = (slide.kind === 'photo' || slide.kind === 'collage') && slide.motion && slide.motion !== 'none' ? slide.motion : undefined;
+      const pw = motion ? even(width * MOTION_SCALE) : width;
+      const ph = motion ? even(height * MOTION_SCALE) : height;
       if (slide.kind === 'card') {
         await prepareCardImage(slide.imageDataUrl || '', outPath, width, height);
       } else if (slide.kind === 'title') {
         await renderTitleSlide(slide.title || '', slide.subtitle, width, height, outPath);
       } else if (slide.kind === 'collage') {
-        await renderCollageImage(slide.photoPaths || [], outPath, width, height, slide.collageStyle || 'grid');
+        await renderCollageImage(slide.photoPaths || [], outPath, pw, ph, slide.collageStyle || 'grid');
       } else {
-        await prepareSlideImage((slide.photoPaths || [])[0], outPath, width, height);
+        await prepareSlideImage((slide.photoPaths || [])[0], outPath, pw, ph);
       }
-      slideFiles.push({ file: outPath, seconds: slide.seconds });
+      const plan: SlidePlan = { file: outPath, seconds: slide.seconds };
+      if (motion) { plan.motion = motion; plan.focus = slide.focus; }
+      if (slide.kind !== 'card' && slide.kind !== 'title') {
+        if (slide.filter && slide.filter !== 'none') plan.filter = slide.filter;
+        if (slide.caption?.trim()) {
+          plan.captionFile = path.join(job.tempDir, `caption_${String(i).padStart(4, '0')}.png`);
+          await renderCaptionPng(slide.caption, width, height, plan.captionFile, job.captionStyle);
+        }
+      }
+      slideFiles.push(plan);
     } catch (err) {
       console.warn(`videoExportService: skipping slide ${i} (${slide.kind}):`, err);
       skippedSlides++;
@@ -583,6 +755,7 @@ export async function exportVideo(job: VideoExportJob, onProgress?: (p: VideoExp
       quality: job.quality,
       outputPath: job.outputPath,
       audio: audioPlan,
+      voice: job.voice?.filter((v) => v.filePath && fs.existsSync(v.filePath)).map((v) => ({ file: v.filePath, startSec: v.startSec, trimStartSec: v.trimStartSec, lengthSec: v.lengthSec, volume: v.volume })),
     }
   );
 

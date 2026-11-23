@@ -303,6 +303,8 @@ function applySchema(db: DatabaseSync): void {
   ensureColumn(db, 'photos', 'thumbnail_cached_at', 'TEXT');
   ensureColumn(db, 'photos', 'onedrive_released_at', 'TEXT');
   ensureColumn(db, 'faces', 'detector_version', 'TEXT');
+  // JSON array of person ids the user rejected for this face (see DetectedFace.rejectedPersonIds).
+  ensureColumn(db, 'faces', 'rejected_person_ids', 'TEXT');
   ensureColumn(db, 'virtual_storages', 'storage_type', `TEXT NOT NULL DEFAULT 'plain'`);
   ensureColumn(db, 'virtual_storages', 'inventory_status', `TEXT NOT NULL DEFAULT 'not_started'`);
   ensureColumn(db, 'virtual_storages', 'inventory_total_files', 'INTEGER NOT NULL DEFAULT 0');

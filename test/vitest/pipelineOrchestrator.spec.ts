@@ -301,4 +301,18 @@ describe('pipelineOrchestrator face detection step', () => {
     expect(cache.people.some((p) => p.id === 'person_existing')).toBe(true);
     expect(getAllFaces(db).some((f) => f.id === 'existing_face_1')).toBe(true);
   }, 30000);
+
+  it('a re-detection keeps a face the user drew by hand (and drops a stale automatic one)', async () => {
+    const photo = makeLocalPhoto('keep1', imagePath);
+    upsertPeople([{ id: 'pk', name: 'Kim', faceCount: 1, photoCount: 1, createdAt: 'x' } as any]);
+    const manual: DetectedFace = { id: 'manual_1', photoId: 'keep1', box: { x: 40, y: 40, width: 60, height: 60 }, descriptor: [1, 0, 0, 0], confidence: 1, isConfirmed: true, isManual: true, personId: 'pk' } as any;
+    const stale: DetectedFace = { id: 'keep1_face_0', photoId: 'keep1', box: { x: 200, y: 100, width: 50, height: 50 }, descriptor: [0, 1, 0, 0], confidence: 0.8, isConfirmed: false, isManual: false } as any;
+    upsertPhoto({ ...photo, faceScanCompleted: false, facesLocked: false }, getDb());
+    replaceFacesForPhoto('keep1', [manual, stale], false, getDb());
+    const result = await detectFacesForPhoto(photo, imagePath);
+    expect(result.ran).toBe(true);
+    const faces = getAllFaces().filter((f) => f.photoId === 'keep1');
+    expect(faces.map((f) => f.id)).toEqual(['manual_1']);
+    expect(faces[0]).toMatchObject({ personId: 'pk', isManual: true });
+  }, 30000);
 });

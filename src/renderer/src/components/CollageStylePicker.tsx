@@ -5,7 +5,7 @@ import { computeCollageTiles } from '../../../types/collageLayout';
 import { getLocalPhotoUrl } from '../services/libraryStore';
 
 interface CollageStylePickerProps {
-  /** The 2-4 photos about to be combined, in the order they'll be placed. */
+  /** The 2-9 photos about to be combined, in the order they'll be placed. */
   photos: Photo[];
   aspectRatio: VideoAspectRatio;
   onPick: (style: VideoCollageStyle) => void;

@@ -1,4 +1,5 @@
 import React, { useEffect } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
 import { X, ExternalLink, HelpCircle, BookOpen } from 'lucide-react';
 import { notifyError } from '../services/notifications';
 
@@ -7,13 +8,7 @@ interface HelpModalProps {
 }
 
 export const HelpModal: React.FC<HelpModalProps> = ({ onClose }) => {
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
+  useEscapeLayer(true, onClose);
 
   const handleOpenExternal = async () => {
     try {

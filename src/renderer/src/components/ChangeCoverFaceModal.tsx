@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
 import { X, Star, Sparkles, Check, Image as ImageIcon, CheckCircle2, User } from 'lucide-react';
 import { Person, Photo, DetectedFace } from '../../../types';
 import { FaceAvatar } from './FaceAvatar';
@@ -70,18 +71,7 @@ export const ChangeCoverFaceModal: React.FC<ChangeCoverFaceModalProps> = ({
   const FACE_TILE_HEIGHT = 190;
   const gridScrollRef = useRef<HTMLDivElement>(null);
 
-  // Handle Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopImmediatePropagation();
-        onClose();
-      }
-    };
-    // capture: true — see PeopleView's matching Escape handler for why.
-    window.addEventListener('keydown', handleKeyDown, { capture: true });
-    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [onClose]);
+  useEscapeLayer(true, onClose);
 
   const handleSelectCover = (photoId: string, faceId: string) => {
     setSelectedPhotoId(photoId);

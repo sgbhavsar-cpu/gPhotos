@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
 import {
   Image as ImageIcon,
   Calendar,
@@ -116,37 +117,15 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   const [isRefreshingThumbnails, setIsRefreshingThumbnails] = useState(false);
   const [refreshToast, setRefreshToast] = useState<string | null>(null);
 
-  // Handle Escape key navigation inside GalleryView
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      // An open full-screen photo takes this Escape first; the selection underneath must survive it.
-      if (document.querySelector('[data-photo-lightbox]')) return;
-
-      // stopImmediatePropagation, not stopPropagation — see PeopleView's
-      // matching Escape handler for why (App.tsx's global handler is also
-      // bound to `window` and stopPropagation alone won't stop it firing).
-      if (showBulkEditModal) {
-        e.stopImmediatePropagation();
-        setShowBulkEditModal(false);
-      } else if (showAlbumDialog) {
-        e.stopImmediatePropagation();
-        if (albumPendingChapterSelection) setAlbumPendingChapterSelection(null); // back to picking the album
-        else setShowAlbumDialog(false);
-      } else if (showDeleteConfirmModal) {
-        e.stopImmediatePropagation();
-        setShowDeleteConfirmModal(false);
-      } else if (isSelectMode || selectedIds.size > 0) {
-        e.stopImmediatePropagation();
-        setIsSelectMode(false);
-        setSelectedIds(new Set());
-      }
-    };
-
-    // capture: true — see PeopleView's matching Escape handler for why.
-    window.addEventListener('keydown', handleKeyDown, { capture: true });
-    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [showBulkEditModal, showAlbumDialog, albumPendingChapterSelection, showDeleteConfirmModal, isSelectMode, selectedIds]);
+  // Escape: the bulk-edit / album / delete dialog first, then the selection.
+  useEscapeLayer(showBulkEditModal || showAlbumDialog || showDeleteConfirmModal || isSelectMode || selectedIds.size > 0, () => {
+    if (showBulkEditModal) setShowBulkEditModal(false);
+    else if (showAlbumDialog) {
+      if (albumPendingChapterSelection) setAlbumPendingChapterSelection(null); // back to picking the album
+      else setShowAlbumDialog(false);
+    } else if (showDeleteConfirmModal) setShowDeleteConfirmModal(false);
+    else { setIsSelectMode(false); setSelectedIds(new Set()); }
+  });
 
   // Stable reference so the gallery's near-bottom/bootstrap load-more effects
   // don't re-fire on every unrelated re-render. Loads several pages ahead

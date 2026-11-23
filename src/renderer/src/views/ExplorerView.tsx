@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
 import {
   Folder,
   RefreshCw,
@@ -203,27 +204,18 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({ onSelectPhoto, onEdi
   useEffect(() => {
     if (!contextMenu) return;
     const handleClick = () => setContextMenu(null);
-    const handleKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setContextMenu(null); };
     window.addEventListener('click', handleClick);
-    window.addEventListener('keydown', handleKey);
     return () => {
       window.removeEventListener('click', handleClick);
-      window.removeEventListener('keydown', handleKey);
     };
   }, [contextMenu]);
 
-  // Escape: an open photo / context menu goes first; then it just deselects (and stays on this tab).
-  useEffect(() => {
-    if (contextMenu || (left.selected.size === 0 && right.selected.size === 0)) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape' || document.querySelector('[data-photo-lightbox]')) return;
-      e.stopImmediatePropagation();
-      setLeft((s) => ({ ...s, selected: new Set() }));
-      setRight((s) => ({ ...s, selected: new Set() }));
-    };
-    window.addEventListener('keydown', onKey, { capture: true });
-    return () => window.removeEventListener('keydown', onKey, { capture: true });
-  }, [contextMenu, left.selected.size, right.selected.size]);
+  // Escape: the context menu first; then it just deselects (and stays on this tab).
+  useEscapeLayer(!!contextMenu, () => setContextMenu(null));
+  useEscapeLayer(left.selected.size > 0 || right.selected.size > 0, () => {
+    setLeft((s) => ({ ...s, selected: new Set() }));
+    setRight((s) => ({ ...s, selected: new Set() }));
+  });
 
   const applyMovedResults = (results: RelocationItemResult[]) => {
     const moved = results.filter((r) => r.status === 'moved' && r.newId && r.newFilePath);

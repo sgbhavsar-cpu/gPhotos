@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
 
 interface PromptModalProps {
   title: string;
@@ -20,13 +21,7 @@ interface PromptModalProps {
 export const PromptModal: React.FC<PromptModalProps> = ({ title, message, initialValue = '', placeholder, confirmLabel = 'OK', inputType = 'text', onSubmit, onCancel }) => {
   const [value, setValue] = useState(initialValue);
 
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { e.stopImmediatePropagation(); onCancel(); }
-    };
-    window.addEventListener('keydown', handleKeyDown, { capture: true });
-    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [onCancel]);
+  useEscapeLayer(true, onCancel);
 
   return (
     <div

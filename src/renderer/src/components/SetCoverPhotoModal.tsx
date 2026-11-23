@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
 import { X, Check, Star } from 'lucide-react';
 import { DetectedFace, Photo } from '../../../types';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
@@ -169,17 +170,7 @@ export const SetCoverPhotoModal: React.FC<SetCoverPhotoModalProps> = ({
     dragState.current = { mode: 'resize', corner, startClientX: e.clientX, startClientY: e.clientY, startBox: cropBox };
   };
 
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopImmediatePropagation();
-        onClose();
-      }
-    };
-    // capture: true — see PeopleView's matching Escape handler for why.
-    window.addEventListener('keydown', handleKeyDown, { capture: true });
-    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [onClose]);
+  useEscapeLayer(true, onClose);
 
   const handleConfirm = async () => {
     if (!cropBox || !naturalSize) return;

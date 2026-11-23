@@ -343,7 +343,9 @@ function assignedIn(state: ClusterState, photoId: string): Map<string, DetectedF
 function assignFace(state: ClusterState, face: DetectedFace, threshold: number, allowNewClusters: boolean): void {
   const assignedInThisPhoto = assignedIn(state, face.photoId);
   // RULE: One photo cannot have two faces of the same person!
-  const bestMatchPersonId = findBestPerson(face, state.accs, (id) => assignedInThisPhoto.has(id), threshold);
+  // ...and never somebody the user said this face is not ("Not this person").
+  const rejected = face.rejectedPersonIds;
+  const bestMatchPersonId = findBestPerson(face, state.accs, (id) => assignedInThisPhoto.has(id) || (!!rejected && rejected.includes(id)), threshold);
 
   if (bestMatchPersonId) {
     face.personId = bestMatchPersonId;

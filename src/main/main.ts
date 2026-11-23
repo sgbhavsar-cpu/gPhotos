@@ -53,6 +53,7 @@ import {
   getServiceLogs,
 } from './services/backgroundDaemon';
 import { exportLibraryBackupZip } from './services/zipBackupService';
+import { listDbBackupSources, backupDatabases } from './services/dbBackupService';
 import {
   getOrGenerateHeicThumbnail500,
   getHeicHighQualityJpegBuffer,
@@ -93,12 +94,15 @@ import {
   upsertPhotoContentEntry,
 } from './services/libraryRepository';
 import type { PhotoContentEntry } from '../types';
-import { getDbForLibraryPath } from './services/db';
+import { getDbForLibraryPath, getDb } from './services/db';
+import { ensureFaceCrop, fillFaceCrops, clearMirrorFaceCrops, type FaceCropRequest } from './services/faceCropService';
+import { previewResetFaces, resetFaces, secondPass } from './services/faceMaintenanceService';
 import type { DatabaseSync } from 'node:sqlite';
 import { detectFacesForPhoto, forceRedetectFacesForPhoto, resolveDbForPhoto, getSharedFaceClusterCache, type FaceClusterCache } from './services/pipelineOrchestrator';
 import { detectFaceInRegion, terminateFaceDetectionWorker, terminateIdleWorkersNow, getFaceDetectionPoolSize } from './services/faceDetectionWorkerClient';
 import { assertPathsAllowed, isPathAllowed, getDefaultMirrorRoot } from './services/pathSecurity';
 import { exportVideo, getFfmpegPath, probeMedia, makeAudioPreview } from './services/videoExportService';
+import { analyzeBeats } from './services/beatService';
 import { getOrGenerateVideoPreview } from './services/videoPreviewService';
 import { serveFileWithRangeSupport } from './services/rangeFileServer';
 import { resolveYtDlp, installYtDlp, downloadYouTubeAudio } from './services/ytDlpService';
@@ -1314,6 +1318,34 @@ ipcMain.handle('video:choose-output-path', async (_event, suggestedName: string)
 const userApprovedAudioFiles = new Set<string>();
 const audioInfo = async (filePath: string) => ({ filePath, name: path.basename(filePath), durationSec: (await probeMedia(filePath)).durationSec });
 
+// A voice-over recorded in the wizard (MediaRecorder bytes, webm/opus): saved to a temp file the video can then use.
+ipcMain.handle('audio:save-recording', async (_event, data: ArrayBuffer) => {
+  try {
+    if (!(data instanceof ArrayBuffer) || data.byteLength < 1000 || data.byteLength > 200 * 1024 * 1024) return null;
+    const dir = path.join(os.tmpdir(), 'gphotos_voiceovers');
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, `voice_${Date.now()}.webm`);
+    fs.writeFileSync(filePath, Buffer.from(data));
+    userApprovedAudioFiles.add(filePath);
+    return await audioInfo(filePath);
+  } catch (err) {
+    console.error('audio:save-recording error:', err);
+    return null;
+  }
+});
+
+ipcMain.handle('audio:analyze-beats', async (_event, filePath: string, startSec: number, endSec: number | null) => {
+  try {
+    if (typeof filePath !== 'string' || !userApprovedAudioFiles.has(filePath)) return null;
+    const start = Math.max(0, Number(startSec) || 0);
+    const span = endSec != null && Number(endSec) > start ? Math.min(60, Number(endSec) - start) : 60;
+    return await analyzeBeats(filePath, start, span);
+  } catch (err) {
+    console.error('audio:analyze-beats error:', err);
+    return null;
+  }
+});
+
 ipcMain.handle('audio:choose-file', async () => {
   try {
     if (!mainWindow) return null;
@@ -1447,6 +1479,7 @@ ipcMain.handle('video:export', async (event, request: VideoExportRequest) => {
     if (typeof request.outputPath !== 'string' || !/.mp4$/i.test(request.outputPath)) throw new Error('The output file must be an .mp4 path.');
     if (!userApprovedVideoOutputs.has(request.outputPath)) assertPathsAllowed([request.outputPath], 'video:export');
     if (request.audio && !userApprovedAudioFiles.has(request.audio.filePath)) throw new Error('The chosen music file was not picked through the app.');
+    if (request.voice?.some((v) => !userApprovedAudioFiles.has(v.filePath))) throw new Error('A voice-over file was not picked or recorded through the app.');
 
     const tempDir = path.join(os.tmpdir(), 'gphotos_video_export', `job_${Date.now()}`);
     const controller = new AbortController();
@@ -1471,7 +1504,44 @@ ipcMain.handle('video:export', async (event, request: VideoExportRequest) => {
   }
 });
 
+// The wizard's live preview: the same renderer as the export, at 360p / draft quality, into a temp file the wizard can play.
+// Single-flight too: asking for a new preview (or closing the wizard) cancels the one still rendering.
+let currentVideoPreviewAbort: AbortController | null = null;
+let lastVideoPreviewPath: string | null = null;
+ipcMain.handle('video:preview', async (event, request: VideoExportRequest) => {
+  try {
+    assertPathsAllowed(request.slides.flatMap((s) => [...(s.photoPaths || []), ...(s.clipPath ? [s.clipPath] : [])]), 'video:preview');
+    if (request.audio && !userApprovedAudioFiles.has(request.audio.filePath)) throw new Error('The chosen music file was not picked through the app.');
+    if (request.voice?.some((v) => !userApprovedAudioFiles.has(v.filePath))) throw new Error('A voice-over file was not picked or recorded through the app.');
+    currentVideoPreviewAbort?.abort();
+    const controller = new AbortController();
+    currentVideoPreviewAbort = controller;
+    const dir = path.join(os.tmpdir(), 'gphotos_video_preview');
+    fs.mkdirSync(dir, { recursive: true });
+    const outputPath = path.join(dir, `preview_${Date.now()}.mp4`);
+    try {
+      const res = await exportVideo(
+        { ...request, resolution: '360p', quality: 'draft', outputPath, tempDir: path.join(dir, `job_${Date.now()}`) },
+        (p) => { try { if (!event.sender.isDestroyed()) event.sender.send('video:export-progress', p); } catch {} },
+        controller.signal
+      );
+      if (res.success) {
+        // Only the newest preview is kept on disk.
+        if (lastVideoPreviewPath && lastVideoPreviewPath !== outputPath) { try { fs.rmSync(lastVideoPreviewPath, { force: true }); } catch {} }
+        lastVideoPreviewPath = outputPath;
+      }
+      return res;
+    } finally {
+      if (currentVideoPreviewAbort === controller) currentVideoPreviewAbort = null;
+    }
+  } catch (err: any) {
+    logger.error('VideoExport', 'preview failed', { err: String(err?.stack || err) });
+    return { success: false, error: err.message || 'Preview failed', skippedSlides: 0 };
+  }
+});
+
 ipcMain.handle('video:cancel-export', async () => {
+  currentVideoPreviewAbort?.abort();
   currentVideoExportAbort?.abort();
   return true;
 });
@@ -1730,6 +1800,87 @@ ipcMain.handle('mirror:list-source-files', async (_event, sourcePath: string) =>
   } catch (err) {
     console.error('mirror:list-source-files error:', err);
     return [];
+  }
+});
+
+// ---- Face crops, reset and second-pass (see faceCropService.ts / faceMaintenanceService.ts) ----
+const validCropRequest = (r: any): r is FaceCropRequest =>
+  !!r && typeof r.filePath === 'string' && typeof r.faceId === 'string' && r.box && ['x', 'y', 'width', 'height'].every((k) => typeof r.box[k] === 'number');
+
+ipcMain.handle('faces:get-crop', async (_event, req: FaceCropRequest) => {
+  try {
+    return validCropRequest(req) ? await ensureFaceCrop(req) : null;
+  } catch (err) {
+    console.error('faces:get-crop error:', err);
+    return null;
+  }
+});
+
+let faceCropFillStop = false;
+ipcMain.handle('faces:fill-crops', async (_event, reqs: FaceCropRequest[]) => {
+  try {
+    if (!Array.isArray(reqs)) return { made: 0, skipped: 0, failed: 0 };
+    faceCropFillStop = false;
+    return await fillFaceCrops(reqs.slice(0, 60).filter(validCropRequest), () => faceCropFillStop);
+  } catch (err) {
+    console.error('faces:fill-crops error:', err);
+    return { made: 0, skipped: 0, failed: 0 };
+  }
+});
+ipcMain.handle('faces:fill-crops-stop', async () => { faceCropFillStop = true; return true; });
+
+const mirrorDbFor = (storageName?: string, localMirrorRoot?: string) => {
+  if (!storageName) return { db: getDb(), folder: null as string | null };
+  const folder = path.join(localMirrorRoot || getDefaultMirrorRoot(), storageName);
+  if (!fs.existsSync(path.join(folder, '.gphotos_catalog', 'gphotos.db'))) throw new Error('This storage has no face database yet.');
+  return { db: getDbForLibraryPath(folder), folder };
+};
+
+ipcMain.handle('faces:reset-preview', async (_event, p: { storageName: string; localMirrorRoot?: string }) => {
+  try {
+    const { db } = mirrorDbFor(p?.storageName, p?.localMirrorRoot);
+    return { success: true, ...previewResetFaces(db, false) };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Could not read the face data.' };
+  }
+});
+
+ipcMain.handle('faces:reset-storage', async (_event, p: { storageName: string; localMirrorRoot?: string; deleteConfirmed: boolean }) => {
+  try {
+    if (!p?.storageName) return { success: false, error: 'No storage given.' };
+    const { db, folder } = mirrorDbFor(p.storageName, p.localMirrorRoot);
+    const res = resetFaces(db, { deleteConfirmed: !!p.deleteConfirmed });
+    if (folder) clearMirrorFaceCrops(folder, p.deleteConfirmed ? undefined : res.deletedFaceIds);
+    const { deletedFaceIds, ...counts } = res;
+    return { success: true, ...counts };
+  } catch (err: any) {
+    console.error('faces:reset-storage error:', err);
+    return { success: false, error: err?.message || 'Reset failed.' };
+  }
+});
+
+// Second pass: unknown faces matched to the people the user confirmed. scope 'storage' = that mirror's faces; 'all' = every library
+// (used by "Find more of this person", optionally for one person); faceIds limits it to those faces (re-matching after a delete).
+ipcMain.handle('faces:second-pass', async (_event, p: { storageName?: string; localMirrorRoot?: string; personId?: string; faceIds?: string[]; scope?: 'storage' | 'all' }) => {
+  try {
+    const sources = listDbBackupSources().filter((s) => s.kind === 'library' && s.dir);
+    const referenceDbs = sources.map((s) => getDbForLibraryPath(s.dir!));
+    const active = getDb();
+    if (!referenceDbs.includes(active)) referenceDbs.push(active);
+    const known = new Set(getAllPeople().map((x) => x.id));
+    const targets = p?.scope === 'all' ? referenceDbs : [mirrorDbFor(p?.storageName, p?.localMirrorRoot).db];
+    const assignments: Array<{ faceId: string; photoId: string; personId: string }> = [];
+    let candidates = 0, peopleUsed = 0;
+    for (const db of targets) {
+      const r = await secondPass(db, referenceDbs, { onlyFaceIds: p?.faceIds, onlyPersonId: p?.personId, knownPeopleIds: known });
+      assignments.push(...r.assignments);
+      candidates += r.candidates;
+      peopleUsed = Math.max(peopleUsed, r.peopleUsed);
+    }
+    return { success: true, assignments, candidates, peopleUsed, stillUnknown: Math.max(0, candidates - assignments.length) };
+  } catch (err: any) {
+    console.error('faces:second-pass error:', err);
+    return { success: false, error: err?.message || 'Second pass failed.' };
   }
 });
 
@@ -2471,6 +2622,32 @@ ipcMain.handle('backup:export-zip', async (_event, customTargetZipPath?: string)
   } catch (err: any) {
     console.error('backup:export-zip error:', err);
     return { success: false, error: err.message };
+  }
+});
+
+// Database backups: one zip per library / network drive, plus one for the shared people & settings database.
+ipcMain.handle('backup:list-db-sources', async () => {
+  try {
+    return listDbBackupSources().map(({ id, kind, label, detail, sizeBytes }) => ({ id, kind, label, detail, sizeBytes }));
+  } catch (err) {
+    console.error('backup:list-db-sources error:', err);
+    return [];
+  }
+});
+
+ipcMain.handle('backup:run-db-backup', async (_event, ids: string[]) => {
+  try {
+    if (!Array.isArray(ids) || ids.length === 0 || ids.some((i) => typeof i !== 'string')) return { success: false, error: 'Nothing was selected.' };
+    const pick = await dialog.showOpenDialog(mainWindow ?? undefined as any, { title: 'Choose a folder for the backup zip files', properties: ['openDirectory', 'createDirectory'], defaultPath: app.getPath('documents') });
+    if (pick.canceled || !pick.filePaths[0]) return { success: false, canceled: true };
+    const known = listDbBackupSources();
+    const chosen = ids.map((id) => known.find((s) => s.id === id)).filter((s): s is NonNullable<typeof s> => !!s);
+    if (chosen.length === 0) return { success: false, error: 'None of the selected databases could be found.' };
+    const results = await backupDatabases(chosen, pick.filePaths[0], app.getVersion());
+    return { success: results.every((r) => r.success), folder: pick.filePaths[0], results };
+  } catch (err: any) {
+    console.error('backup:run-db-backup error:', err);
+    return { success: false, error: err?.message || 'Backup failed' };
   }
 });
 

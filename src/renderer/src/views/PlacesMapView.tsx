@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState, useMemo, useCallback, useDeferredValue } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
 import L from 'leaflet';
 import {
   MapPin,
@@ -126,33 +127,11 @@ export const PlacesMapView: React.FC<PlacesMapViewProps> = ({
     }
   }, [resetTrigger]);
 
-  // Handle Escape key navigation inside PlacesMapView
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      // An open full-screen photo takes this Escape first; selections underneath must survive it.
-      if (document.querySelector('[data-photo-lightbox]')) return;
-
-      // stopImmediatePropagation, not stopPropagation — see PeopleView's
-      // matching Escape handler for why (App.tsx's global handler is also
-      // bound to `window` and stopPropagation alone won't stop it firing).
-      if (showAssignModal) {
-        e.stopImmediatePropagation();
-        setShowAssignModal(false);
-        setAssignModalOverridePhotos(null);
-      } else if (isEditingClusterLocation) {
-        e.stopImmediatePropagation();
-        setIsEditingClusterLocation(false);
-      } else if (selectedCluster) {
-        e.stopImmediatePropagation();
-        setSelectedCluster(null);
-      }
-    };
-
-    // capture: true — see PeopleView's matching Escape handler for why.
-    window.addEventListener('keydown', handleKeyDown, { capture: true });
-    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [showAssignModal, isEditingClusterLocation, selectedCluster]);
+  useEscapeLayer(showAssignModal || isEditingClusterLocation || !!selectedCluster, () => {
+    if (showAssignModal) { setShowAssignModal(false); setAssignModalOverridePhotos(null); }
+    else if (isEditingClusterLocation) setIsEditingClusterLocation(false);
+    else setSelectedCluster(null);
+  });
 
   // Unlocated photos
   const unlocatedPhotos = useMemo(() => {

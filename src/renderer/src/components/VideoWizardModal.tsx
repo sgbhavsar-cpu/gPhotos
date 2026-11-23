@@ -1,13 +1,20 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useEscapeLayer } from '../services/escapeStack';
 import {
   X, Film, Check, Layers, PlayCircle, ChevronLeft, ChevronRight,
   FolderOpen, XCircle, RotateCcw, GripVertical, ChevronUp, ChevronDown, Ungroup, ExternalLink,
 } from 'lucide-react';
 import type { Album, Photo, VideoAspectRatio, VideoResolutionTier, VideoQuality, VideoTransition, VideoSlideInput, VideoCollageStyle } from '../../../types';
-import { computeDimensions, VIDEO_TRANSITIONS } from '../../../types/videoFormat';
+import { MAX_VIDEO_COLLAGE_PHOTOS } from '../../../types/collageLayout';
+import { computeDimensions, VIDEO_TRANSITIONS, VIDEO_FILTERS, VIDEO_MOTIONS, CAPTION_POSITIONS, CAPTION_SIZES, CAPTION_COLORS, DEFAULT_CAPTION_STYLE, type VideoCaptionStyle, type VideoFilterName, type VideoMotionName } from '../../../types/videoFormat';
+import { buildAutoCaption, faceFocus, NO_CAPTIONS, type CaptionOptions } from '../services/videoCaption';
+import { VIDEO_TEMPLATES, EXPORT_PRESETS, estimateSizeMB, formatSizeMB, autoPickIds, type VideoTemplate, type ExportPreset } from '../services/videoPresets';
 import { defaultTitleDesign, defaultCreditsDesign, makeText, type SlideDesign } from '../../../types/slideDesign';
 import { libraryStore, getLocalPhotoUrl } from '../services/libraryStore';
 import { CollageStylePicker } from './CollageStylePicker';
+import { SlideTimeline, type TimelineItem } from './SlideTimeline';
+import { TrimRange } from './TrimRange';
+import { VoiceAndBeatPanel, type VoiceTrack } from './VoiceAndBeatPanel';
 import { MusicStep, type MusicSelection } from './MusicStep';
 import { SlideDesigner, designPhotoUrl } from './SlideDesigner';
 import { renderDesignToDataUrl } from '../services/slideDesignRender';
@@ -28,9 +35,17 @@ interface SlideEntry {
   /** 'clip' (an album video used as part of the output): the part to keep, in seconds of the source (end null = to the end), and its own sound. */
   trimStartSec?: number;
   trimEndSec?: number | null;
+  /** Clip playback speed (default 1). */
+  speed?: number;
+  reverse?: boolean;
+  holdSec?: number;
   keepSound?: boolean;
   /** Photo or collage: how long this slide stays up (seconds); unset = the video's seconds-per-photo setting. */
   seconds?: number;
+  /** Per-slide overrides of the video-wide motion / look; a caption typed here replaces the automatic one. */
+  motion?: VideoMotionName;
+  filter?: VideoFilterName;
+  caption?: string;
   /** The chapter this slide's (first) photo lives in, so step 1 can show photos grouped under their chapter headings. null = not in any chapter. */
   chapterTitle: string | null;
   collageStyle?: VideoCollageStyle;
@@ -56,7 +71,7 @@ function withMusicCredit(design: SlideDesign, credit?: string): SlideDesign {
 }
 
 const titleDesignFor = (album: Album) => defaultTitleDesign(album.title, album.eventDate ? new Date(album.eventDate).getFullYear().toString() : undefined);
-const MAX_COLLAGE = 4;
+const MAX_COLLAGE = MAX_VIDEO_COLLAGE_PHOTOS; // up to 3 x 3 in one frame
 // Random / multiple modes only pick real effects — a hard cut can't be mixed into one crossfade chain.
 const REAL_TRANSITIONS = TRANSITIONS.filter((t) => t.value !== 'none').map((t) => t.value);
 
@@ -98,6 +113,7 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
   const [showStylePicker, setShowStylePicker] = useState(false);
   const [pickingForCollage, setPickingForCollage] = useState<Set<string>>(new Set()); // entry ids
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
+  const [timelineSelectedId, setTimelineSelectedId] = useState<string | null>(null);
 
   // Step 3
   const [aspectRatio, setAspectRatio] = useState<VideoAspectRatio>('16:9');
@@ -111,6 +127,14 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
   const [secondsPerItem, setSecondsPerItem] = useState(3);
   const [totalDurationInput, setTotalDurationInput] = useState(30);
   const [outputPath, setOutputPath] = useState<string | null>(null);
+  // Step 3: video-wide look, camera movement on photos, and automatic captions (each slide can override them in step 2).
+  const [defaultFilter, setDefaultFilter] = useState<VideoFilterName>('none');
+  const [defaultMotion, setDefaultMotion] = useState<VideoMotionName>('none');
+  const [captionOpts, setCaptionOpts] = useState<CaptionOptions>(NO_CAPTIONS);
+  const [captionStyle, setCaptionStyle] = useState<VideoCaptionStyle>(DEFAULT_CAPTION_STYLE);
+  // Step 1 "auto-pick": how long the finished video should be, and an optional template applied together with it.
+  const [autoPickSec, setAutoPickSec] = useState(60);
+  const [autoTemplateId, setAutoTemplateId] = useState('');
 
   // Step 4 (music) and step 5 (title screen / end credits, both made with the same designer)
   const [music, setMusic] = useState<MusicSelection | null>(null);
@@ -125,6 +149,14 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
   const [progress, setProgress] = useState<{ stage: 'preparing' | 'encoding'; done: number; total: number } | null>(null);
   const [result, setResult] = useState<{ success: boolean; error?: string; skippedSlides: number; outputPath?: string } | null>(null);
   const unsubscribeRef = useRef<(() => void) | undefined>(undefined);
+  // Live preview (see runPreview): state lives up here with the other hooks, before the closed-dialog early return.
+  const [preview, setPreview] = useState<{ status: 'idle' | 'rendering' | 'ready' | 'error'; url?: string; error?: string; pct?: number }>({ status: 'idle' });
+  const previewUnsubRef = useRef<(() => void) | undefined>(undefined);
+  // Step 4 extras: voice-over tracks, and "cut on the beat" (the tempo found for the chosen music).
+  const [voiceTracks, setVoiceTracks] = useState<VoiceTrack[]>([]);
+  const [beat, setBeat] = useState<{ bpm: number } | null>(null);
+  const [beatBusy, setBeatBusy] = useState(false);
+  const beatShiftRef = useRef(0); // how far "cut on the beat" moved the music start, so switching it off can undo that
 
   useEffect(() => {
     if (!isOpen) return;
@@ -135,6 +167,8 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
     setSlides(buildInitialSlides(album));
     setPickingForCollage(new Set());
     setMusic(null);
+    setVoiceTracks([]);
+    setBeat(null);
     setIncludeTitle(true);
     setTitleDesign(titleDesignFor(album));
     setIncludeCredits(false);
@@ -150,20 +184,16 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
     if (musicCredit) setIncludeCredits(true);
   }, [musicCredit]);
 
-  useEffect(() => {
-    if (!isOpen) return; // always mounted in the album view: a closed wizard must not swallow Escape
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !isGenerating) { e.stopImmediatePropagation(); onClose(); }
-    };
-    window.addEventListener('keydown', handleKeyDown, { capture: true });
-    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [isOpen, onClose, isGenerating]);
+  // Escape backs out one screen at a time: the preview player first (registered after the wizard, so it is in front), then the wizard.
+  // While a video is being made Escape does nothing (it is swallowed, so it cannot reach the album view underneath).
+  useEscapeLayer(isOpen, () => { if (!isGenerating) onClose(); });
+  useEscapeLayer(isOpen && preview.status !== 'idle', () => { window.electronAPI?.cancelVideoExport?.(); setPreview({ status: 'idle' }); });
 
   if (!isOpen) return null;
 
   const includedSlides = slides.filter((s) => s.included);
   // Clips run for their trimmed length; only the still slides share the per-photo / total-length setting.
-  const clipSeconds = (s: SlideEntry) => Math.max(0, (s.trimEndSec ?? photoMap.get(s.photoIds[0])?.videoDurationSec ?? 0) - (s.trimStartSec ?? 0));
+  const clipSeconds = (s: SlideEntry) => Math.max(0, (s.trimEndSec ?? photoMap.get(s.photoIds[0])?.videoDurationSec ?? 0) - (s.trimStartSec ?? 0)) / (s.speed ?? 1) + (s.holdSec ?? 0);
   const stillSlides = includedSlides.filter((s) => s.kind !== 'clip');
   const clipTotalSec = includedSlides.filter((s) => s.kind === 'clip').reduce((a, s) => a + clipSeconds(s), 0);
   const photoSlideCount = includedSlides.length;
@@ -243,7 +273,100 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
     });
   };
 
+  /**
+   * "Cut on the beat": every slide lasts a whole number of beats (as close to the chosen length as the tempo allows), and the
+   * music starts on its first beat, so each cut lands on a beat. Switching it off puts the music start back.
+   */
+  const toggleBeat = async (on: boolean) => {
+    if (!on) {
+      if (beat && music) setMusic({ ...music, startSec: Math.max(0, music.startSec - beatShiftRef.current) });
+      beatShiftRef.current = 0;
+      setBeat(null);
+      return;
+    }
+    const api = window.electronAPI;
+    if (!music || !api?.analyzeBeats) return;
+    setBeatBusy(true);
+    try {
+      const info = await api.analyzeBeats(music.file.filePath, music.startSec, music.endSec);
+      if (!info) { notifyError('Cut on the beat', new Error('No clear beat could be found in this music.')); return; }
+      const beatSec = 60 / info.bpm;
+      const beats = Math.max(1, Math.round(secondsPerItem / beatSec));
+      setDurationMode('perPhoto');
+      setSecondsPerItem(Math.round(beats * beatSec * 100) / 100);
+      beatShiftRef.current = info.firstBeatSec;
+      setMusic({ ...music, startSec: music.startSec + info.firstBeatSec });
+      setBeat({ bpm: Math.round(info.bpm) });
+    } finally {
+      setBeatBusy(false);
+    }
+  };
+
+  const applyTemplate = (t: VideoTemplate) => {
+    setAspectRatio(t.aspectRatio);
+    setResolution(t.resolution);
+    if (Array.isArray(t.transition)) { setTransitionMode('multiple'); setMultiPool(new Set(t.transition)); }
+    else { setTransitionMode('single'); setTransition(t.transition); }
+    setTransitionDurationSec(t.transitionDurationSec);
+    setSecondsPerItem(t.secondsPerItem);
+    if (t.maxTotalSec) { setDurationMode('total'); setTotalDurationInput(t.maxTotalSec); } else setDurationMode('perPhoto');
+    setDefaultFilter(t.filter);
+    setDefaultMotion(t.motion);
+    setCaptionOpts(t.captions);
+  };
+
+  const applyExportPreset = (pr: ExportPreset) => {
+    setAspectRatio(pr.aspectRatio);
+    setResolution(pr.resolution);
+    setQuality(pr.quality);
+    // A platform length limit: squeeze the slides so the video fits it.
+    if (pr.maxSec && estimatedTotalDurationSec > pr.maxSec) { setDurationMode('total'); setTotalDurationInput(pr.maxSec); }
+  };
+
+  /** One click: apply a template (if chosen) and keep only the best shots that fit the wanted length. */
+  const autoPick = () => {
+    const tpl = VIDEO_TEMPLATES.find((t) => t.id === autoTemplateId);
+    if (tpl) applyTemplate(tpl);
+    const per = tpl ? tpl.secondsPerItem : secondsPerItem;
+    const target = Math.max(2, Math.round(autoPickSec / Math.max(0.5, per)));
+    const candidates = slides.filter((e) => e.kind !== 'collage').map((e) => photoMap.get(e.photoIds[0])).filter((p): p is Photo => !!p);
+    const keep = new Set(autoPickIds(candidates, target));
+    setSlides((prev) => prev.map((e) => (e.kind === 'collage' ? e : { ...e, included: keep.has(e.photoIds[0]) })));
+  };
+
+  /** Splits a clip at the middle of its kept part into two clips that play one after the other (each can then be trimmed or sped up on its own). */
+  const splitClip = (entryId: string) => setSlides((prev) => {
+    const i = prev.findIndex((s) => s.id === entryId);
+    const c = prev[i];
+    if (!c || c.kind !== 'clip') return prev;
+    const dur = photoMap.get(c.photoIds[0])?.videoDurationSec ?? null;
+    const a = c.trimStartSec ?? 0, b = c.trimEndSec ?? dur;
+    if (b === null || b - a < 1) return prev; // too short to split
+    const mid = Math.round(((a + b) / 2) * 10) / 10;
+    const second: SlideEntry = { ...c, id: `${c.id}_b${Date.now().toString(36)}`, trimStartSec: mid, holdSec: c.holdSec };
+    return [...prev.slice(0, i), { ...c, trimEndSec: mid, holdSec: 0 }, second, ...prev.slice(i + 1)];
+  });
   const toggleIncluded = (entryId: string) => setSlides((prev) => prev.map((s) => (s.id === entryId ? { ...s, included: !s.included } : s)));
+
+  const reorderSlide = (from: number, to: number) => setSlides((prev) => {
+    if (from === to || from < 0 || to < 0 || from >= prev.length || to >= prev.length) return prev;
+    const arr = [...prev];
+    const [moved] = arr.splice(from, 1);
+    arr.splice(to, 0, moved);
+    return arr;
+  });
+  const timelineItems: TimelineItem[] = slides.map((e) => ({
+    id: e.id,
+    kind: e.kind,
+    label: e.kind === 'collage' ? `Collage of ${e.photoIds.length}` : (photoMap.get(e.photoIds[0])?.fileName || 'Photo'),
+    seconds: e.kind === 'clip' ? clipSeconds(e) : (e.seconds ?? effectiveSecondsPerItem),
+    included: e.included,
+    thumbUrl: (() => { const ph = photoMap.get(e.photoIds[0]); return ph ? getLocalPhotoUrl(ph.filePath, ph.originalRemotePath, false, 60) : undefined; })(),
+  }));
+  const selectTimelineSlide = (id: string) => {
+    setTimelineSelectedId(id);
+    document.querySelector(`[data-slide-row="${id}"]`)?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+  };
 
   const moveSlide = (idx: number, delta: number) => {
     setSlides((prev) => {
@@ -274,6 +397,70 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
     const chosen = await api.chooseVideoOutputPath(suggested);
     if (chosen) setOutputPath(chosen);
   };
+
+  /** The photo / collage / clip slides as the exporter takes them, with each slide's look, movement and caption applied. */
+  const buildSlideInputs = (): VideoSlideInput[] => {
+    const out: VideoSlideInput[] = [];
+    for (const s of includedSlides) {
+      const lead = photoMap.get(s.photoIds[0]);
+      const peopleList = libraryStore.getState().people;
+      const filter = s.filter ?? defaultFilter;
+      const motion = s.motion ?? defaultMotion;
+      // A caption typed on the slide wins; otherwise the automatic one from the switches in step 3.
+      const caption = s.caption !== undefined ? s.caption : buildAutoCaption(lead, peopleList, s.chapterTitle, captionOpts);
+      const look = { filter, ...(caption ? { caption } : {}) };
+      const move = s.kind === 'clip' ? {} : { motion, ...(motion === 'face' ? { focus: faceFocus(lead) } : {}) };
+      if (s.kind === 'collage') out.push({ kind: 'collage', seconds: s.seconds, collageStyle: s.collageStyle || 'grid', photoPaths: s.photoIds.map((id) => photoMap.get(id)?.filePath).filter((p): p is string => !!p), ...look, ...move });
+      else if (s.kind === 'clip') {
+        const p = photoMap.get(s.photoIds[0]);
+        if (p) out.push({ kind: 'clip', clipPath: p.filePath, trimStartSec: s.trimStartSec ?? 0, trimEndSec: s.trimEndSec ?? null, speed: s.speed ?? 1, reverse: !!s.reverse, holdSec: s.holdSec ?? 0, muted: !s.keepSound, ...look });
+      } else {
+        const p = photoMap.get(s.photoIds[0]);
+        out.push({ kind: 'photo', seconds: s.seconds, photoPaths: p ? [p.filePath] : [], ...look, ...move });
+      }
+    }
+    return out;
+  };
+
+  /** One effect for every cut, or (random / multiple) an independently random pick per cut. */
+  const pickTransitions = (slideCount: number): VideoTransition | VideoTransition[] => {
+    const pool: VideoTransition[] = transitionMode === 'multiple' && multiPool.size > 0 ? Array.from(multiPool) : REAL_TRANSITIONS;
+    return transitionMode === 'single' ? transition : Array.from({ length: Math.max(0, slideCount - 1) }, () => pool[Math.floor(Math.random() * pool.length)]);
+  };
+
+  // ── Live preview: a quick 360p draft of the first ~20 seconds of the current plan, played right in the wizard ──
+  const runPreview = async () => {
+    const api = window.electronAPI;
+    if (!api?.previewVideo) return;
+    // Keep the slides that fit the first ~20 s (always at least two, so a transition is visible).
+    const all = buildSlideInputs();
+    const kept: VideoSlideInput[] = [];
+    let acc = 0;
+    for (const sl of all) {
+      if (kept.length >= 2 && acc >= 20) break;
+      kept.push(sl);
+      acc += sl.kind === 'clip' ? Math.max(0, ((sl.trimEndSec ?? 0) - (sl.trimStartSec ?? 0)) / (sl.speed ?? 1) + (sl.holdSec ?? 0)) || effectiveSecondsPerItem : (sl.seconds ?? effectiveSecondsPerItem);
+    }
+    setPreview({ status: 'rendering', pct: 0 });
+    previewUnsubRef.current?.();
+    previewUnsubRef.current = api.onVideoExportProgress?.((pr) => setPreview((cur) => (cur.status === 'rendering' ? { ...cur, pct: pr.stage === 'preparing' ? Math.round((pr.done / Math.max(1, pr.total)) * 50) : 50 + Math.round(pr.done / 2) } : cur)));
+    try {
+      const res = await api.previewVideo({
+        slides: kept, aspectRatio, resolution: '360p', quality: 'draft', transition: pickTransitions(kept.length), transitionDurationSec,
+        secondsPerItem: effectiveSecondsPerItem, outputPath: '',
+        voice: voiceTracks.length ? voiceTracks.map((v) => ({ filePath: v.file.filePath, startSec: v.startSec, volume: v.volume })) : undefined,
+        captionStyle,
+        audio: music ? { filePath: music.file.filePath, startSec: music.startSec, endSec: music.endSec, loop: music.loop, fadeOutSec: 0, volume: music.volume } : undefined,
+      });
+      if (res.success && res.outputPath) setPreview({ status: 'ready', url: getLocalPhotoUrl(res.outputPath, undefined, true, 0) + '&t=' + Date.now() });
+      else setPreview({ status: 'error', error: res.error || 'The preview could not be made.' });
+    } catch (err) {
+      setPreview({ status: 'error', error: (err as Error)?.message || 'The preview could not be made.' });
+    } finally {
+      previewUnsubRef.current?.();
+    }
+  };
+  const closePreview = () => { window.electronAPI?.cancelVideoExport?.(); setPreview({ status: 'idle' }); };
 
   const handleGenerate = async () => {
     const api = window.electronAPI;
@@ -306,30 +493,19 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
 
     const videoSlides: VideoSlideInput[] = [];
     if (titleCard) videoSlides.push(titleCard);
-    for (const s of includedSlides) {
-      if (s.kind === 'collage') videoSlides.push({ kind: 'collage', seconds: s.seconds, collageStyle: s.collageStyle || 'grid', photoPaths: s.photoIds.map((id) => photoMap.get(id)?.filePath).filter((p): p is string => !!p) });
-      else if (s.kind === 'clip') {
-        const p = photoMap.get(s.photoIds[0]);
-        if (p) videoSlides.push({ kind: 'clip', clipPath: p.filePath, trimStartSec: s.trimStartSec ?? 0, trimEndSec: s.trimEndSec ?? null, muted: !s.keepSound });
-      } else {
-        const p = photoMap.get(s.photoIds[0]);
-        videoSlides.push({ kind: 'photo', seconds: s.seconds, photoPaths: p ? [p.filePath] : [] });
-      }
-    }
+    videoSlides.push(...buildSlideInputs());
 
     if (creditsCard) videoSlides.push(creditsCard);
 
-    // One effect for every cut, or (random / multiple) an independently random pick per cut from
-    // either every real effect or just the ones ticked. Decided once here so the export is repeatable.
-    const cuts = Math.max(0, videoSlides.length - 1);
-    const pool: VideoTransition[] = transitionMode === 'multiple' && multiPool.size > 0 ? Array.from(multiPool) : REAL_TRANSITIONS;
-    const transitionSpec: VideoTransition | VideoTransition[] =
-      transitionMode === 'single' ? transition : Array.from({ length: cuts }, () => pool[Math.floor(Math.random() * pool.length)]);
+    // Decided once here so the export is repeatable.
+    const transitionSpec = pickTransitions(videoSlides.length);
 
     try {
       const res = await api.exportVideo({
         slides: videoSlides, aspectRatio, resolution, quality, transition: transitionSpec, transitionDurationSec,
         secondsPerItem: effectiveSecondsPerItem, outputPath,
+        voice: voiceTracks.length ? voiceTracks.map((v) => ({ filePath: v.file.filePath, startSec: v.startSec, volume: v.volume })) : undefined,
+        captionStyle,
         audio: music ? { filePath: music.file.filePath, startSec: music.startSec, endSec: music.endSec, loop: music.loop, fadeOutSec: music.fadeOutSec, volume: music.volume } : undefined,
       });
       setResult(res);
@@ -376,11 +552,25 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
         {step === 1 && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', padding: '12px 24px 10px', borderBottom: '1px solid var(--border-subtle)' }}>
               <p style={{ margin: 0, fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-                Select 2-4 photos and click <strong>"Group as Collage"</strong> to combine them into one frame. Everything not grouped stays its own slide — you'll choose the order (and can leave any out) in the next step.
+                Select 2-9 photos and click <strong>"Group as Collage"</strong> to combine them into one frame. Everything not grouped stays its own slide — you'll choose the order (and can leave any out) in the next step.
               </p>
+              <div data-testid="auto-pick" style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', fontSize: '0.82rem' }}>
+                <strong>Auto video:</strong>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                  <select className="input" aria-label="Video length" value={autoPickSec} onChange={(e) => setAutoPickSec(Number(e.target.value))} style={{ height: '32px' }}>
+                    {[30, 60, 90, 120, 180].map((n) => <option key={n} value={n}>{n} s</option>)}
+                  </select>
+                </label>
+                <select className="input" aria-label="Template" value={autoTemplateId} onChange={(e) => setAutoTemplateId(e.target.value)} style={{ height: '32px' }}>
+                  <option value="">No template</option>
+                  {VIDEO_TEMPLATES.map((t) => <option key={t.id} value={t.id}>{t.label}</option>)}
+                </select>
+                <button className="btn btn-secondary" onClick={autoPick} style={{ fontSize: '0.78rem', padding: '5px 12px' }}>Pick the best shots</button>
+                <span style={{ color: 'var(--text-muted)' }}>Keeps favourites, sharp shots and people; skips near-duplicates.</span>
+              </div>
               {pickingForCollage.size > 0 && (
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '8px 12px', borderRadius: 'var(--radius-md)', background: 'rgba(236, 72, 153, 0.12)', border: '1px solid rgba(236, 72, 153, 0.35)' }}>
-                  <span style={{ fontSize: '0.82rem', flex: 1 }}>{pickingForCollage.size} photo{pickingForCollage.size === 1 ? '' : 's'} selected (2-4)</span>
+                  <span style={{ fontSize: '0.82rem', flex: 1 }}>{pickingForCollage.size} photo{pickingForCollage.size === 1 ? '' : 's'} selected (2-9)</span>
                   <button className="btn btn-secondary" disabled={pickingForCollage.size < 2} onClick={() => setShowStylePicker(true)} style={{ fontSize: '0.78rem', padding: '5px 12px' }}>Group as Collage</button>
                   <button className="btn btn-ghost" onClick={() => setPickingForCollage(new Set())} style={{ fontSize: '0.78rem', padding: '5px 12px' }}>Clear</button>
                 </div>
@@ -450,6 +640,13 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
               <p style={{ margin: 0, fontSize: '0.85rem', color: 'var(--text-muted)' }}>
                 Drag <GripVertical size={12} style={{ verticalAlign: 'middle' }} /> to reorder, or use the arrows. Uncheck anything you don't want in the video.
               </p>
+              <SlideTimeline
+                items={timelineItems}
+                selectedId={timelineSelectedId}
+                onSelect={selectTimelineSlide}
+                onReorder={reorderSlide}
+                onResize={(id, sec) => setSlides((prev) => prev.map((x) => (x.id === id ? { ...x, seconds: sec } : x)))}
+              />
               {slides.map((entry, idx) => {
                 const photo = entry.kind !== 'collage' ? thumbFor(entry) : null;
                 const srcDur = entry.kind === 'clip' ? (thumbFor(entry)?.videoDurationSec ?? null) : null;
@@ -457,6 +654,7 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
                 return (
                   <div
                     key={entry.id}
+                    data-slide-row={entry.id}
                     draggable
                     onDragStart={() => setDraggedIndex(idx)}
                     onDragOver={(e) => e.preventDefault()}
@@ -485,11 +683,44 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
                             onChange={(e) => { const v = Math.max(0, Number(e.target.value) || 0); setSlides((prev) => prev.map((s) => (s.id === entry.id ? { ...s, trimStartSec: srcDur ? Math.min(v, Math.max(0, (s.trimEndSec ?? srcDur) - 0.5)) : v } : s))); }} /> s</label>
                           <label>to <input type="number" min={0} step={0.5} value={entry.trimEndSec ?? srcDur ?? ''} placeholder="end" style={{ width: '60px' }}
                             onChange={(e) => { const raw = e.target.value === '' ? null : Number(e.target.value); setSlides((prev) => prev.map((s) => (s.id === entry.id ? { ...s, trimEndSec: raw === null ? null : Math.min(srcDur ?? raw, Math.max(raw, (s.trimStartSec ?? 0) + 0.5)) } : s))); }} /> s{srcDur ? ` of ${fmtSec(srcDur)}` : ''}</label>
+                          {srcDur ? (
+                            <TrimRange duration={srcDur} start={entry.trimStartSec ?? 0} end={entry.trimEndSec ?? srcDur}
+                              onChange={(a, b) => setSlides((prev) => prev.map((s) => (s.id === entry.id ? { ...s, trimStartSec: a, trimEndSec: b } : s)))} />
+                          ) : null}
+                          <label>speed <select aria-label="Clip speed" value={entry.speed ?? 1} style={{ fontSize: '0.78rem' }}
+                            onChange={(e) => { const v = Number(e.target.value); setSlides((prev) => prev.map((s) => (s.id === entry.id ? { ...s, speed: v } : s))); }}>
+                            {[0.25, 0.5, 1, 1.5, 2, 4].map((v) => <option key={v} value={v}>{v === 1 ? 'Normal' : `${v}x`}</option>)}
+                          </select></label>
+                          <label style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                            <input type="checkbox" aria-label="Play backwards" checked={!!entry.reverse} onChange={() => setSlides((prev) => prev.map((s) => (s.id === entry.id ? { ...s, reverse: !s.reverse } : s)))} /> Backwards
+                          </label>
+                          <label>freeze <select aria-label="Freeze the last frame" value={entry.holdSec ?? 0} style={{ fontSize: '0.78rem' }}
+                            onChange={(e) => { const v = Number(e.target.value); setSlides((prev) => prev.map((s) => (s.id === entry.id ? { ...s, holdSec: v } : s))); }}>
+                            {[0, 1, 2, 3, 5].map((v) => <option key={v} value={v}>{v === 0 ? 'No' : `${v} s`}</option>)}
+                          </select></label>
+                          <button type="button" className="btn btn-ghost" aria-label="Split this clip in two" title="Split at the middle of the kept part" style={{ padding: '0 6px', fontSize: '0.75rem' }}
+                            onClick={() => splitClip(entry.id)}>Split</button>
                           <label style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                             <input type="checkbox" checked={!!entry.keepSound} onChange={() => setSlides((prev) => prev.map((s) => (s.id === entry.id ? { ...s, keepSound: !s.keepSound } : s)))} /> Keep sound
                           </label>
                         </span>
                       )}
+                    </span>
+                    <span data-testid="slide-look-controls" style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
+                      {entry.kind !== 'clip' && (
+                        <select aria-label="Movement for this slide" title="Camera movement for this slide" value={entry.motion ?? ''} style={{ width: '92px', fontSize: '0.72rem' }}
+                          onChange={(e) => { const v = (e.target.value || undefined) as VideoMotionName | undefined; setSlides((prev) => prev.map((s) => (s.id === entry.id ? { ...s, motion: v } : s))); }}>
+                          <option value="">Movement: video default</option>
+                          {VIDEO_MOTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                        </select>
+                      )}
+                      <select aria-label="Look for this slide" title="Colour look for this slide" value={entry.filter ?? ''} style={{ width: '82px', fontSize: '0.72rem' }}
+                        onChange={(e) => { const v = (e.target.value || undefined) as VideoFilterName | undefined; setSlides((prev) => prev.map((s) => (s.id === entry.id ? { ...s, filter: v } : s))); }}>
+                        <option value="">Look: video default</option>
+                        {VIDEO_FILTERS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                      </select>
+                      <input type="text" aria-label="Caption for this slide" title="Caption for this slide (empty = the automatic one)" placeholder="Caption" value={entry.caption ?? ''} style={{ width: '110px', fontSize: '0.72rem' }}
+                        onChange={(e) => { const v = e.target.value; setSlides((prev) => prev.map((s) => (s.id === entry.id ? { ...s, caption: v === '' ? undefined : v } : s))); }} />
                     </span>
                     {entry.kind !== 'clip' && (
                       <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '0.75rem', color: 'var(--text-muted)', flexShrink: 0 }}>
@@ -508,6 +739,22 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
 
           {step === 3 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '22px' }}>
+              <div data-testid="templates-presets" style={{ display: 'flex', gap: '16px', flexWrap: 'wrap', alignItems: 'center' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.85rem', fontWeight: 600 }}>
+                  Template
+                  <select className="input" aria-label="Video template" defaultValue="" onChange={(e) => { const t = VIDEO_TEMPLATES.find((x) => x.id === e.target.value); if (t) applyTemplate(t); }} style={{ height: '36px', width: '200px', fontWeight: 400 }}>
+                    <option value="">Choose a template…</option>
+                    {VIDEO_TEMPLATES.map((t) => <option key={t.id} value={t.id}>{t.label}</option>)}
+                  </select>
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.85rem', fontWeight: 600 }}>
+                  Export for
+                  <select className="input" aria-label="Export for" defaultValue="" onChange={(e) => { const pr = EXPORT_PRESETS.find((x) => x.id === e.target.value); if (pr) applyExportPreset(pr); }} style={{ height: '36px', width: '260px', fontWeight: 400 }}>
+                    <option value="">Choose a destination…</option>
+                    {EXPORT_PRESETS.map((pr) => <option key={pr.id} value={pr.id}>{pr.label}</option>)}
+                  </select>
+                </label>
+              </div>
               <div>
                 <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '10px' }}>Aspect Ratio</label>
                 <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
@@ -599,7 +846,44 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
                   {durationMode === 'total' && <input type="number" className="input" min={1} max={600} step={1} value={totalDurationInput} onChange={(e) => setTotalDurationInput(Math.max(1, parseFloat(e.target.value) || 1))} style={{ height: '36px', width: '90px' }} />}
                 </div>
                 <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '6px' }}>
-                  {photoSlideCount} slide{photoSlideCount === 1 ? '' : 's'} (~{effectiveSecondsPerItem.toFixed(1)}s each) → estimated total length: <strong>{estimatedTotalDurationSec.toFixed(1)}s</strong>
+                  {photoSlideCount} slide{photoSlideCount === 1 ? '' : 's'} (~{effectiveSecondsPerItem.toFixed(1)}s each) → estimated total length: <strong>{estimatedTotalDurationSec.toFixed(1)}s</strong> · about <strong data-testid="size-estimate">{formatSizeMB(estimateSizeMB(estimatedTotalDurationSec, resolution, quality, !!music))}</strong>
+                </div>
+              </div>
+              <div data-testid="look-motion-captions">
+                <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: 600, marginBottom: '8px' }}>Look, Movement &amp; Captions</label>
+                <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap', alignItems: 'center' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.82rem' }}>
+                    Colour look
+                    <select className="input" aria-label="Colour look" value={defaultFilter} onChange={(e) => setDefaultFilter(e.target.value as VideoFilterName)} style={{ height: '36px', width: '150px' }}>
+                      {VIDEO_FILTERS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                    </select>
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.82rem' }}>
+                    Photo movement
+                    <select className="input" aria-label="Photo movement" value={defaultMotion} onChange={(e) => setDefaultMotion(e.target.value as VideoMotionName)} style={{ height: '36px', width: '170px' }}>
+                      {VIDEO_MOTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                    </select>
+                  </label>
+                </div>
+                <div style={{ display: 'flex', gap: '14px', flexWrap: 'wrap', alignItems: 'center', marginTop: '10px', fontSize: '0.82rem' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>Add a caption with:</span>
+                  {([['chapter', 'Chapter'], ['place', 'Place'], ['date', 'Date'], ['people', 'People']] as Array<[keyof CaptionOptions, string]>).map(([k, label]) => (
+                    <label key={k} style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                      <input type="checkbox" checked={captionOpts[k]} onChange={() => setCaptionOpts((o) => ({ ...o, [k]: !o[k] }))} /> {label}
+                    </label>
+                  ))}
+                </div>
+                <div data-testid="caption-style" style={{ display: 'flex', gap: '14px', flexWrap: 'wrap', alignItems: 'center', marginTop: '10px', fontSize: '0.82rem' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>Caption style:</span>
+                  <select className="input" aria-label="Caption position" value={captionStyle.position} onChange={(e) => setCaptionStyle((c) => ({ ...c, position: e.target.value as VideoCaptionStyle['position'] }))} style={{ height: '32px' }}>
+                    {CAPTION_POSITIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                  </select>
+                  <select className="input" aria-label="Caption size" value={captionStyle.size} onChange={(e) => setCaptionStyle((c) => ({ ...c, size: e.target.value as VideoCaptionStyle['size'] }))} style={{ height: '32px' }}>
+                    {CAPTION_SIZES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                  </select>
+                  <select className="input" aria-label="Caption colour" value={captionStyle.color} onChange={(e) => setCaptionStyle((c) => ({ ...c, color: e.target.value as VideoCaptionStyle['color'] }))} style={{ height: '32px' }}>
+                    {CAPTION_COLORS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                  </select>
                 </div>
               </div>
               <div>
@@ -614,7 +898,12 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
             </div>
           )}
 
-          {step === 4 && <MusicStep music={music} onChange={setMusic} videoLengthSec={estimatedTotalDurationSec} />}
+          {step === 4 && (
+            <>
+              <MusicStep music={music} onChange={(m) => { if (beat) { setBeat(null); beatShiftRef.current = 0; } setMusic(m); }} videoLengthSec={estimatedTotalDurationSec} />
+              <VoiceAndBeatPanel tracks={voiceTracks} onChange={setVoiceTracks} videoLengthSec={estimatedTotalDurationSec} hasMusic={!!music} beat={beat} beatBusy={beatBusy} onBeatToggle={toggleBeat} />
+            </>
+          )}
 
           {step === 5 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
@@ -699,9 +988,16 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
         </div>
 
         <div style={{ display: 'flex', justifyContent: 'space-between', padding: '16px 24px', borderTop: '1px solid var(--border-subtle)' }}>
-          <button className="btn btn-ghost" onClick={() => setStep((s) => Math.max(1, s - 1))} disabled={step === 1 || isGenerating} style={{ gap: '6px' }}>
-            <ChevronLeft size={16} /> Back
-          </button>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <button className="btn btn-ghost" onClick={() => setStep((s) => Math.max(1, s - 1))} disabled={step === 1 || isGenerating} style={{ gap: '6px' }}>
+              <ChevronLeft size={16} /> Back
+            </button>
+            {step >= 2 && !!window.electronAPI?.previewVideo && (
+              <button className="btn btn-secondary" data-testid="preview-button" onClick={runPreview} disabled={isGenerating || preview.status === 'rendering' || photoSlideCount === 0} style={{ gap: '6px' }}>
+                <PlayCircle size={16} /> Preview
+              </button>
+            )}
+          </div>
           {step < LAST_STEP ? (
             <button className="btn btn-primary" disabled={step === 2 && photoSlideCount === 0} onClick={() => setStep((s) => Math.min(LAST_STEP, s + 1))} style={{ gap: '6px' }}>
               Next <ChevronRight size={16} />
@@ -715,6 +1011,27 @@ export const VideoWizardModal: React.FC<VideoWizardModalProps> = ({ isOpen, onCl
           )}
         </div>
       </div>
+
+      {preview.status !== 'idle' && (
+        <div data-testid="video-preview" style={{ position: 'fixed', inset: 0, zIndex: 1100, backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '24px' }} onClick={(e) => { if (e.target === e.currentTarget) closePreview(); }}>
+          <div style={{ backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-xl)', padding: '16px', width: 'min(720px, 100%)', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <strong>Preview (first ~20 s, draft quality)</strong>
+              <button className="btn btn-ghost btn-icon" onClick={closePreview} aria-label="Close preview"><X size={18} /></button>
+            </div>
+            {preview.status === 'rendering' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', padding: '30px 0', alignItems: 'center' }}>
+                <span style={{ fontSize: '0.85rem' }}>Making the preview… {preview.pct ?? 0}%</span>
+                <div style={{ width: '60%', height: '6px', borderRadius: '3px', backgroundColor: 'var(--bg-surface-elevated)', overflow: 'hidden' }}>
+                  <div style={{ height: '100%', width: `${preview.pct ?? 0}%`, backgroundColor: '#ec4899' }} />
+                </div>
+              </div>
+            )}
+            {preview.status === 'ready' && preview.url && <video src={preview.url} controls autoPlay style={{ width: '100%', maxHeight: '60vh', backgroundColor: '#000', borderRadius: 'var(--radius-md)' }} />}
+            {preview.status === 'error' && <div style={{ color: '#f87171', fontSize: '0.85rem', padding: '16px 0' }}>{preview.error}</div>}
+          </div>
+        </div>
+      )}
 
       {showStylePicker && (
         <CollageStylePicker

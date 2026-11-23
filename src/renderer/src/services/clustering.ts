@@ -332,7 +332,9 @@ function assignedIn(state: ClusterState, photoId: string): Set<string> {
 function assignFace(state: ClusterState, face: DetectedFace, threshold: number, allowNewClusters: boolean): void {
   const assignedInThisPhoto = assignedIn(state, face.photoId);
   // RULE: One photo cannot have two faces of the same person!
-  const bestMatchPersonId = findBestPerson(face, state.accs, (id) => assignedInThisPhoto.has(id), threshold);
+  // ...and never somebody the user said this face is not ("Not this person").
+  const rejected = face.rejectedPersonIds;
+  const bestMatchPersonId = findBestPerson(face, state.accs, (id) => assignedInThisPhoto.has(id) || (!!rejected && rejected.includes(id)), threshold);
 
   if (bestMatchPersonId) {
     face.personId = bestMatchPersonId;
@@ -466,6 +468,7 @@ export function clusterFaces(
 export interface SlimFaceForMatching {
   id: string;
   personId?: string;
+  rejectedPersonIds?: string[];
   isConfirmed?: boolean;
   descriptor?: number[];
 }
@@ -503,6 +506,7 @@ export function matchUnassignedFacesToCentroid(
     for (const face of photo.faces) {
       // Only evaluate unassigned faces (or unconfirmed auto-detections)
       if (face.personId && face.isConfirmed) continue;
+      if (face.rejectedPersonIds?.includes(personId)) continue; // the user said this face is not that person
       if (!face.descriptor || face.descriptor.length === 0) continue;
 
       const cosDist = cosineDistance(face.descriptor, centroid);
